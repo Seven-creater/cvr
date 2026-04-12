@@ -1,0 +1,102 @@
+[
+  {
+    "video_id": "src_arena_walk",
+    "title": "People walking into the arena",
+    "summary": "People walk outside a sports arena before the event begins.",
+    "caption": "A crowd moves toward the arena entrance.",
+    "asr": "We are heading inside now.",
+    "audio_tags": ["crowd", "chatter", "traffic"],
+    "visual_objects": ["crowd", "arena", "flags"],
+    "scene_tags": ["arena", "outdoor", "event"],
+    "temporal_tags": ["global"]
+  },
+  {
+    "video_id": "cand_arena_quiet",
+    "title": "Quiet stadium crowd",
+    "summary": "A crowd sits inside a stadium holding flags before the match starts.",
+    "caption": "Spectators wait quietly in the stadium seats.",
+    "asr": "The game is about to begin.",
+    "audio_tags": ["crowd", "murmur"],
+    "visual_objects": ["crowd", "stadium", "flags"],
+    "scene_tags": ["arena", "event", "stadium"],
+    "temporal_tags": ["global"]
+  },
+  {
+    "video_id": "cand_arena_cheer",
+    "title": "Cheering stadium crowd",
+    "summary": "A packed stadium crowd cheers loudly during a sports event.",
+    "caption": "Fans jump and wave while cheering in the stadium.",
+    "asr": "Listen to that cheering crowd.",
+    "audio_tags": ["crowd", "cheering", "applause"],
+    "visual_objects": ["crowd", "stadium", "banners"],
+    "scene_tags": ["arena", "event", "stadium"],
+    "temporal_tags": ["global"]
+  },
+  {
+    "video_id": "src_park_dog",
+    "title": "Dog walk in the park",
+    "summary": "A person walks a dog past a bench in a city park.",
+    "caption": "A dog and owner pass a bench outdoors.",
+    "asr": "Good dog, keep walking.",
+    "audio_tags": ["birds", "footsteps"],
+    "visual_objects": ["dog", "bench", "trees"],
+    "scene_tags": ["park", "outdoor", "walk"],
+    "temporal_tags": ["global"]
+  },
+  {
+    "video_id": "cand_park_dog",
+    "title": "Dog near the bench",
+    "summary": "A dog pauses near a bench while walking in the same park.",
+    "caption": "The dog lingers by the bench outdoors.",
+    "asr": "Stay here for a second.",
+    "audio_tags": ["birds", "footsteps"],
+    "visual_objects": ["dog", "bench", "trees"],
+    "scene_tags": ["park", "outdoor", "walk"],
+    "temporal_tags": ["global"]
+  },
+  {
+    "video_id": "cand_park_cat",
+    "title": "Cat jumps near the bench",
+    "summary": "A cat jumps onto a bench in a city park while a person walks nearby.",
+    "caption": "A cat leaps near the park bench.",
+    "asr": "Look at the cat by the bench.",
+    "audio_tags": ["birds", "footsteps"],
+    "visual_objects": ["cat", "bench", "trees"],
+    "scene_tags": ["park", "outdoor", "walk"],
+    "temporal_tags": ["global"]
+  },
+  {
+    "video_id": "src_concert_violin",
+    "title": "Concert with violin intro",
+    "summary": "A concert begins on stage with a violin introduction and audience applause.",
+    "caption": "Musicians stand on stage as the violin starts first.",
+    "asr": "The violin opens the performance.",
+    "audio_tags": ["violin", "applause"],
+    "visual_objects": ["stage", "musicians", "audience"],
+    "scene_tags": ["concert", "indoor", "performance"],
+    "temporal_tags": ["opening"]
+  },
+  {
+    "video_id": "cand_concert_piano_late",
+    "title": "Piano enters late",
+    "summary": "A concert performance where the piano joins near the end after a long violin section.",
+    "caption": "The stage performance shifts to piano late in the clip.",
+    "asr": "The piano comes in later.",
+    "audio_tags": ["violin", "piano", "applause"],
+    "visual_objects": ["stage", "piano", "audience"],
+    "scene_tags": ["concert", "indoor", "performance"],
+    "temporal_tags": ["late"]
+  },
+  {
+    "video_id": "cand_concert_piano_early",
+    "title": "Piano starts early",
+    "summary": "A concert performance where the piano starts in the opening seconds.",
+    "caption": "The piano opens the stage performance immediately.",
+    "asr": "The piano starts right away.",
+    "audio_tags": ["piano", "applause"],
+    "visual_objects": ["stage", "piano", "audience"],
+    "scene_tags": ["concert", "indoor", "performance"],
+    "temporal_tags": ["opening"]
+  }
+]
+

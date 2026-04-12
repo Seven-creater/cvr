@@ -1,0 +1,36 @@
+[
+  {
+    "video_id": "real_src_cafe",
+    "title": "Cafe street musician source",
+    "summary": "A musician performs outside a cafe on a busy street.",
+    "caption": "A small crowd watches a performer by the cafe.",
+    "asr": "Thanks everyone for listening.",
+    "audio_tags": ["guitar", "street-noise", "crowd"],
+    "visual_objects": ["guitar", "cafe", "crowd"],
+    "scene_tags": ["street", "music", "outdoor"],
+    "temporal_tags": ["global"]
+  },
+  {
+    "video_id": "real_band_quiet",
+    "title": "Quiet street performance",
+    "summary": "A performer stands outside the cafe with a crowd nearby.",
+    "caption": "A musician outside a cafe without strong applause.",
+    "asr": "We will start in a moment.",
+    "audio_tags": ["guitar", "street-noise"],
+    "visual_objects": ["guitar", "cafe", "crowd"],
+    "scene_tags": ["street", "music", "outdoor"],
+    "temporal_tags": ["global"]
+  },
+  {
+    "video_id": "real_band_cheer",
+    "title": "Street musician with applause",
+    "summary": "A musician performs outside the cafe while the crowd cheers and applauds.",
+    "caption": "The street crowd cheers during the cafe performance.",
+    "asr": "That applause is amazing.",
+    "audio_tags": ["guitar", "applause", "cheering"],
+    "visual_objects": ["guitar", "cafe", "crowd"],
+    "scene_tags": ["street", "music", "outdoor"],
+    "temporal_tags": ["global"]
+  }
+]
+

@@ -1,0 +1,14 @@
+[
+  {
+    "query_id": "real_q_audio",
+    "source_video_id": "real_src_cafe",
+    "edit_instruction": "Retrieve a similar street music clip but with clear cheering and applause from the crowd.",
+    "target_video_id": "real_band_cheer",
+    "preserve_tags": ["street", "music", "outdoor", "crowd"],
+    "required_audio_tags": ["cheering", "applause"],
+    "required_objects": [],
+    "required_temporal": null,
+    "notes": "File-backed replay sample."
+  }
+]
+

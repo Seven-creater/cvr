@@ -1,0 +1,189 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass(slots=True)
+class RetrievalParams:
+    video_weight: float = 0.7
+    audio_weight: float = 0.3
+    object_focus: str = "none"
+    temporal_focus: str = "global"
+    topk: int = 5
+
+    def __post_init__(self) -> None:
+        total = self.video_weight + self.audio_weight
+        if total <= 0:
+            raise ValueError("video_weight + audio_weight must be positive")
+        self.video_weight = max(0.0, self.video_weight / total)
+        self.audio_weight = max(0.0, self.audio_weight / total)
+        if self.topk <= 0:
+            raise ValueError("topk must be positive")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class QueryCase:
+    query_id: str
+    source_video_id: str
+    edit_instruction: str
+    target_video_id: str | None = None
+    preserve_tags: list[str] = field(default_factory=list)
+    required_audio_tags: list[str] = field(default_factory=list)
+    required_objects: list[str] = field(default_factory=list)
+    required_temporal: str | None = None
+    notes: str = ""
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "QueryCase":
+        return cls(
+            query_id=payload["query_id"],
+            source_video_id=payload["source_video_id"],
+            edit_instruction=payload["edit_instruction"],
+            target_video_id=payload.get("target_video_id"),
+            preserve_tags=list(payload.get("preserve_tags", [])),
+            required_audio_tags=list(payload.get("required_audio_tags", [])),
+            required_objects=list(payload.get("required_objects", [])),
+            required_temporal=payload.get("required_temporal"),
+            notes=payload.get("notes", ""),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class CandidateMetadata:
+    video_id: str
+    title: str
+    summary: str
+    caption: str
+    asr: str
+    audio_tags: list[str] = field(default_factory=list)
+    visual_objects: list[str] = field(default_factory=list)
+    scene_tags: list[str] = field(default_factory=list)
+    temporal_tags: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "CandidateMetadata":
+        return cls(
+            video_id=payload["video_id"],
+            title=payload["title"],
+            summary=payload["summary"],
+            caption=payload["caption"],
+            asr=payload.get("asr", ""),
+            audio_tags=list(payload.get("audio_tags", [])),
+            visual_objects=list(payload.get("visual_objects", [])),
+            scene_tags=list(payload.get("scene_tags", [])),
+            temporal_tags=list(payload.get("temporal_tags", [])),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class RetrievalCandidate:
+    candidate_id: str
+    score: float
+    video_score: float
+    audio_score: float
+    summary: str
+    audio_tags: list[str]
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class InspectionRecord:
+    candidate_id: str
+    title: str
+    summary: str
+    caption: str
+    asr: str
+    audio_tags: list[str]
+    visual_objects: list[str]
+    temporal_tags: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class CompareResult:
+    candidate_id: str
+    satisfied: list[str] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class ToolCallTrace:
+    tool_name: str
+    arguments: dict[str, Any]
+    result_preview: dict[str, Any]
+    round_index: int
+    created_at: str = field(default_factory=utc_now_iso)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class RoundRecord:
+    round_index: int
+    retrieval_params: RetrievalParams | None = None
+    retrieved_candidates: list[str] = field(default_factory=list)
+    inspected_candidates: list[str] = field(default_factory=list)
+    comparisons: dict[str, CompareResult] = field(default_factory=dict)
+    decision: str = "pending"
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["comparisons"] = {
+            candidate_id: result.to_dict()
+            for candidate_id, result in self.comparisons.items()
+        }
+        if self.retrieval_params is not None:
+            payload["retrieval_params"] = self.retrieval_params.to_dict()
+        return payload
+
+
+@dataclass(slots=True)
+class RunTrace:
+    query: QueryCase
+    planner_name: str
+    rounds: list[RoundRecord] = field(default_factory=list)
+    tool_history: list[ToolCallTrace] = field(default_factory=list)
+    final_candidate_id: str | None = None
+    final_explanation: str = ""
+    success: bool | None = None
+    created_at: str = field(default_factory=utc_now_iso)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "query": self.query.to_dict(),
+            "planner_name": self.planner_name,
+            "rounds": [item.to_dict() for item in self.rounds],
+            "tool_history": [item.to_dict() for item in self.tool_history],
+            "final_candidate_id": self.final_candidate_id,
+            "final_explanation": self.final_explanation,
+            "success": self.success,
+            "created_at": self.created_at,
+        }
+

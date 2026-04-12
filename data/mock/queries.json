@@ -1,0 +1,36 @@
+[
+  {
+    "query_id": "q_audio_cheer",
+    "source_video_id": "src_arena_walk",
+    "edit_instruction": "Find a similar arena scene, but with loud cheering crowd audio inside the stadium.",
+    "target_video_id": "cand_arena_cheer",
+    "preserve_tags": ["arena", "crowd", "event"],
+    "required_audio_tags": ["cheering"],
+    "required_objects": [],
+    "required_temporal": null,
+    "notes": "Audio-centric correction case."
+  },
+  {
+    "query_id": "q_object_cat",
+    "source_video_id": "src_park_dog",
+    "edit_instruction": "Keep the same outdoor park walk, but focus on a cat jumping near the bench.",
+    "target_video_id": "cand_park_cat",
+    "preserve_tags": ["park", "outdoor", "walk", "bench"],
+    "required_audio_tags": [],
+    "required_objects": ["cat"],
+    "required_temporal": null,
+    "notes": "Object-focused correction case."
+  },
+  {
+    "query_id": "q_temporal_piano",
+    "source_video_id": "src_concert_violin",
+    "edit_instruction": "Find a concert clip where the piano starts in the opening seconds.",
+    "target_video_id": "cand_concert_piano_early",
+    "preserve_tags": ["concert", "performance", "stage"],
+    "required_audio_tags": ["piano"],
+    "required_objects": [],
+    "required_temporal": "opening",
+    "notes": "Temporal and audio correction case."
+  }
+]
+
