@@ -67,7 +67,7 @@ class ScriptedController:
                 )
             else:
                 current_round.decision = "retry"
-                current_round.notes = self._retry_reason(best_compare)
+                current_round.notes = self._retry_reason(primary_compare, best_compare)
 
         return trace
 
@@ -102,10 +102,19 @@ class ScriptedController:
             topk=params.topk,
         )
 
-    def _retry_reason(self, comparison: dict[str, object]) -> str:
-        missing = comparison.get("missing", [])
-        conflicts = comparison.get("conflicts", [])
-        return f"retry because missing={missing}, conflicts={conflicts}"
+    def _retry_reason(
+        self,
+        primary_comparison: dict[str, object],
+        best_comparison: dict[str, object],
+    ) -> str:
+        primary_missing = primary_comparison.get("missing", [])
+        primary_conflicts = primary_comparison.get("conflicts", [])
+        best_candidate_gap = primary_comparison != best_comparison
+        return (
+            f"retry because top-1 missing={primary_missing}, "
+            f"top-1 conflicts={primary_conflicts}, "
+            f"better_inspected_candidate={best_candidate_gap}"
+        )
 
     def _build_explanation(
         self,
