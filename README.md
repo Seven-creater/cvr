@@ -16,6 +16,12 @@ Replay with file-backed sample data:
 python -m app.demo --mode real --config configs/real.yaml
 ```
 
+Validate a file-backed dataset before replay:
+
+```bash
+python -m app.validate_data --candidates data/real_sample/candidates.json --queries data/real_sample/queries.json --scores data/real_sample/retrieval_scores.json
+```
+
 Run local tests:
 
 ```bash
@@ -29,5 +35,10 @@ set OPENAI_API_KEY=...
 python -m app.demo --mode mock --planner openai --model gpt-4.1-mini
 ```
 
-Artifacts are written to `runs/`.
+Evaluate one or more batch logs:
 
+```bash
+python -m app.eval --input "runs/*.jsonl"
+```
+
+Artifacts are written to `runs/`.

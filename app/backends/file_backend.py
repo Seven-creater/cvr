@@ -1,9 +1,121 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from app.backends.base import RetrievalBackend, describe_reason, load_json, normalize_tokens, overlap_score
 from app.schemas import CandidateMetadata, QueryCase, RetrievalCandidate, RetrievalParams
+
+
+def _normalize_query_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("queries", "items", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        if all(isinstance(value, dict) for value in payload.values()):
+            items = []
+            for key, value in payload.items():
+                item = dict(value)
+                item.setdefault("query_id", key)
+                items.append(item)
+            return items
+    raise ValueError("unsupported query file format")
+
+
+def _normalize_candidate_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("candidates", "videos", "items", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        if all(isinstance(value, dict) for value in payload.values()):
+            items = []
+            for key, value in payload.items():
+                item = dict(value)
+                item.setdefault("video_id", key)
+                items.append(item)
+            return items
+    raise ValueError("unsupported candidate file format")
+
+
+def _normalize_score_payload(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "video_score": float(item.get("video_score", item.get("score", 0.0))),
+        "audio_score": float(item.get("audio_score", item.get("audio", 0.0))),
+        "object_scores": dict(item.get("object_scores", item.get("objects", {})) or {}),
+        "temporal_scores": dict(item.get("temporal_scores", item.get("temporal", {})) or {}),
+    }
+
+
+def _normalize_retrieval_scores(payload: Any) -> dict[str, dict[str, dict[str, Any]]]:
+    if not payload:
+        return {}
+
+    if isinstance(payload, dict):
+        if any(key in payload for key in ("results", "retrieval_scores", "queries", "items")):
+            for key in ("results", "retrieval_scores", "queries", "items"):
+                value = payload.get(key)
+                if value is not None:
+                    return _normalize_retrieval_scores(value)
+
+        normalized: dict[str, dict[str, dict[str, Any]]] = {}
+        for query_id, value in payload.items():
+            if isinstance(value, dict):
+                normalized[query_id] = {}
+                for candidate_id, score_payload in value.items():
+                    if isinstance(score_payload, dict):
+                        normalized[query_id][candidate_id] = _normalize_score_payload(score_payload)
+            elif isinstance(value, list):
+                normalized[query_id] = {}
+                for score_payload in value:
+                    if not isinstance(score_payload, dict):
+                        continue
+                    candidate_id = (
+                        score_payload.get("candidate_id")
+                        or score_payload.get("video_id")
+                        or score_payload.get("id")
+                    )
+                    if candidate_id is None:
+                        continue
+                    normalized[query_id][candidate_id] = _normalize_score_payload(score_payload)
+        if normalized:
+            return normalized
+
+    if isinstance(payload, list):
+        normalized = {}
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            query_id = item.get("query_id") or item.get("id")
+            if query_id is None:
+                continue
+            normalized[query_id] = {}
+            results = (
+                item.get("results")
+                or item.get("ranked_candidates")
+                or item.get("candidates")
+                or item.get("items")
+                or []
+            )
+            for score_payload in results:
+                if not isinstance(score_payload, dict):
+                    continue
+                candidate_id = (
+                    score_payload.get("candidate_id")
+                    or score_payload.get("video_id")
+                    or score_payload.get("id")
+                )
+                if candidate_id is None:
+                    continue
+                normalized[query_id][candidate_id] = _normalize_score_payload(score_payload)
+        return normalized
+
+    raise ValueError("unsupported retrieval score format")
 
 
 class FileRetrievalBackend(RetrievalBackend):
@@ -13,16 +125,16 @@ class FileRetrievalBackend(RetrievalBackend):
         queries_path: str | Path,
         retrieval_scores_path: str | Path | None = None,
     ) -> None:
-        candidates = load_json(candidates_path)
-        queries = load_json(queries_path)
-        self._candidates = {
-            item["video_id"]: CandidateMetadata.from_dict(item) for item in candidates
-        }
-        self._queries = {
-            item["query_id"]: QueryCase.from_dict(item) for item in queries
-        }
+        candidates = _normalize_candidate_items(load_json(candidates_path))
+        queries = _normalize_query_items(load_json(queries_path))
+        candidate_rows = [CandidateMetadata.from_dict(item) for item in candidates]
+        query_rows = [QueryCase.from_dict(item) for item in queries]
+        self._candidates = {item.video_id: item for item in candidate_rows}
+        self._queries = {item.query_id: item for item in query_rows}
         self._retrieval_scores = (
-            load_json(retrieval_scores_path) if retrieval_scores_path else {}
+            _normalize_retrieval_scores(load_json(retrieval_scores_path))
+            if retrieval_scores_path
+            else {}
         )
 
     def list_queries(self) -> list[QueryCase]:

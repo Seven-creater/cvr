@@ -5,6 +5,23 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+def _first(payload: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if key in payload and payload[key] is not None:
+            return payload[key]
+    return default
+
+
+def _ensure_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -45,15 +62,15 @@ class QueryCase:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "QueryCase":
         return cls(
-            query_id=payload["query_id"],
-            source_video_id=payload["source_video_id"],
-            edit_instruction=payload["edit_instruction"],
-            target_video_id=payload.get("target_video_id"),
-            preserve_tags=list(payload.get("preserve_tags", [])),
-            required_audio_tags=list(payload.get("required_audio_tags", [])),
-            required_objects=list(payload.get("required_objects", [])),
-            required_temporal=payload.get("required_temporal"),
-            notes=payload.get("notes", ""),
+            query_id=_first(payload, "query_id", "id"),
+            source_video_id=_first(payload, "source_video_id", "source_id", "source_video", "source"),
+            edit_instruction=_first(payload, "edit_instruction", "instruction", "text", "query"),
+            target_video_id=_first(payload, "target_video_id", "target_id", "target_video", "target"),
+            preserve_tags=list(_ensure_list(_first(payload, "preserve_tags", "preserve", "preserved_tags", default=[]))),
+            required_audio_tags=list(_ensure_list(_first(payload, "required_audio_tags", "audio_tags", "audio_requirements", default=[]))),
+            required_objects=list(_ensure_list(_first(payload, "required_objects", "objects", "object_requirements", default=[]))),
+            required_temporal=_first(payload, "required_temporal", "temporal_focus", "temporal"),
+            notes=_first(payload, "notes", "meta", default=""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -75,15 +92,15 @@ class CandidateMetadata:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "CandidateMetadata":
         return cls(
-            video_id=payload["video_id"],
-            title=payload["title"],
-            summary=payload["summary"],
-            caption=payload["caption"],
-            asr=payload.get("asr", ""),
-            audio_tags=list(payload.get("audio_tags", [])),
-            visual_objects=list(payload.get("visual_objects", [])),
-            scene_tags=list(payload.get("scene_tags", [])),
-            temporal_tags=list(payload.get("temporal_tags", [])),
+            video_id=_first(payload, "video_id", "candidate_id", "id"),
+            title=_first(payload, "title", "name", default=""),
+            summary=_first(payload, "summary", "description", "text", default=""),
+            caption=_first(payload, "caption", "video_caption", default=""),
+            asr=_first(payload, "asr", "transcript", "speech_text", default=""),
+            audio_tags=list(_ensure_list(_first(payload, "audio_tags", "audio_events", default=[]))),
+            visual_objects=list(_ensure_list(_first(payload, "visual_objects", "objects", default=[]))),
+            scene_tags=list(_ensure_list(_first(payload, "scene_tags", "scene_labels", "tags", default=[]))),
+            temporal_tags=list(_ensure_list(_first(payload, "temporal_tags", "temporal", "time_tags", default=[]))),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -186,4 +203,3 @@ class RunTrace:
             "success": self.success,
             "created_at": self.created_at,
         }
-

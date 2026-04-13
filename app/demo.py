@@ -71,7 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--planner", choices=["scripted", "openai"])
     parser.add_argument("--model", default="gpt-4.1-mini")
     parser.add_argument("--query-id", help="Run one query only")
+    parser.add_argument("--max-queries", type=int, help="Run at most N queries")
+    parser.add_argument("--jsonl-output", help="Optional output path for the batch jsonl")
     parser.add_argument("--output-prefix", help="Optional artifact prefix")
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Keep running remaining queries if one query fails",
+    )
     return parser.parse_args()
 
 
@@ -81,10 +88,20 @@ def main() -> None:
     backend = build_backend(args.mode, args.config)
     controller = build_controller(planner_name, backend, args.model)
     queries = [backend.get_query(args.query_id)] if args.query_id else backend.list_queries()
+    if args.max_queries is not None:
+        queries = queries[: args.max_queries]
 
     traces = []
+    failures: list[tuple[str, str]] = []
     for query in queries:
-        trace = controller.run(query.query_id)
+        try:
+            trace = controller.run(query.query_id)
+        except Exception as exc:
+            if not args.continue_on_error:
+                raise
+            failures.append((query.query_id, str(exc)))
+            print(f"[error] query={query.query_id} message={exc}")
+            continue
         traces.append(trace)
         paths = write_run_artifacts(
             trace=trace,
@@ -96,8 +113,12 @@ def main() -> None:
             f"json={paths['json']} md={paths['md']}"
         )
 
-    jsonl_path = append_jsonl(traces)
+    jsonl_path = append_jsonl(traces, path=args.jsonl_output)
     print(f"[batch] wrote {jsonl_path}")
+    if failures:
+        print(f"[summary] failures={len(failures)}")
+        for query_id, message in failures[:10]:
+            print(f"  - {query_id}: {message}")
 
 
 if __name__ == "__main__":

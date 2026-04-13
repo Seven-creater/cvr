@@ -9,7 +9,8 @@ from typing import Any
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate saved run traces")
-    parser.add_argument("--input", required=True, help="Path to a run jsonl file")
+    parser.add_argument("--input", required=True, help="Path or glob for run jsonl files")
+    parser.add_argument("--report-output", help="Optional text report output path")
     return parser.parse_args()
 
 
@@ -20,6 +21,17 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
             if line.strip():
                 rows.append(json.loads(line))
     return rows
+
+
+def resolve_input_paths(value: str) -> list[Path]:
+    direct = Path(value)
+    if direct.exists():
+        return [direct]
+
+    matches = sorted(Path().glob(value))
+    if matches:
+        return [path for path in matches if path.is_file()]
+    raise FileNotFoundError(f"no input matched: {value}")
 
 
 def query_type(row: dict[str, Any]) -> str:
@@ -137,8 +149,10 @@ def print_failed_cases(rows: list[dict[str, Any]]) -> None:
 
 def main() -> None:
     args = parse_args()
-    path = Path(args.input)
-    rows = load_rows(path)
+    rows: list[dict[str, Any]] = []
+    paths = resolve_input_paths(args.input)
+    for path in paths:
+        rows.extend(load_rows(path))
 
     total = len(rows)
     successes = sum(1 for row in rows if row.get("success") is True)
@@ -152,14 +166,26 @@ def main() -> None:
         if target and retrieved and retrieved[0] == target:
             first_round_hits += 1
 
-    print(f"runs={total}")
-    print(f"success_rate={successes / max(1, total):.3f}")
-    print(f"avg_rounds={avg_rounds:.2f}")
-    print(f"avg_tool_calls={avg_tools:.2f}")
-    print(f"first_round_top1={first_round_hits / max(1, total):.3f}")
+    lines = [
+        f"inputs={len(paths)}",
+        f"runs={total}",
+        f"success_rate={successes / max(1, total):.3f}",
+        f"avg_rounds={avg_rounds:.2f}",
+        f"avg_tool_calls={avg_tools:.2f}",
+        f"first_round_top1={first_round_hits / max(1, total):.3f}",
+    ]
+    for line in lines:
+        print(line)
     print_type_breakdown(rows)
     print_error_breakdown(rows)
     print_failed_cases(rows)
+
+    if args.report_output:
+        report_path = Path(args.report_output)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with report_path.open("w", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(line + "\n")
 
 
 if __name__ == "__main__":
