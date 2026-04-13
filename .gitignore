@@ -26,6 +26,10 @@ pids
 
 # Output directories
 runs/
+hahahhaha.text
+sh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com
+ubprocess
+ubprocess*
 
 # Dependency directories
 node_modules/
