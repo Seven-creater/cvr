@@ -16,6 +16,12 @@ Replay with file-backed sample data:
 python -m app.demo --mode real --config configs/real.yaml
 ```
 
+Build a pilot replay pack from raw MSR-VTT annotations:
+
+```bash
+python -m app.prepare_msrvtt_replay --msrvtt-json /path/to/MSRVTT_data.json --split-csv /path/to/MSRVTT_train.9k.csv --output-dir data/msrvtt_pilot --max-queries 90
+```
+
 Validate a file-backed dataset before replay:
 
 ```bash
