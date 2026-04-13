@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from app.backends import FileRetrievalBackend
+from app.demo import build_backend
 from app.prepare_msrvtt_replay import prepare_replay_pack
 
 
@@ -59,6 +60,7 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
             self.assertTrue((out_dir / "queries.json").exists())
             self.assertTrue((out_dir / "retrieval_scores.json").exists())
             self.assertTrue((out_dir / "real.yaml").exists())
+            self.assertEqual(pack.config["candidates_path"], "candidates.json")
 
             backend = FileRetrievalBackend(
                 candidates_path=out_dir / "candidates.json",
@@ -66,6 +68,8 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
                 retrieval_scores_path=out_dir / "retrieval_scores.json",
             )
             self.assertGreaterEqual(len(backend.list_queries()), 1)
+            built_backend = build_backend("real", str(out_dir / "real.yaml"))
+            self.assertGreaterEqual(len(built_backend.list_queries()), 1)
 
 
 if __name__ == "__main__":

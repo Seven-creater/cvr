@@ -375,9 +375,9 @@ def prepare_replay_pack(
     candidates_payload = [item.to_dict() for item in candidates]
     queries_payload = [item.to_dict() for item in queries]
     config = {
-        "candidates_path": str((output_dir / "candidates.json").as_posix()),
-        "queries_path": str((output_dir / "queries.json").as_posix()),
-        "retrieval_scores_path": str((output_dir / "retrieval_scores.json").as_posix()),
+        "candidates_path": "candidates.json",
+        "queries_path": "queries.json",
+        "retrieval_scores_path": "retrieval_scores.json",
     }
     stats = {
         "candidate_count": len(candidates_payload),
