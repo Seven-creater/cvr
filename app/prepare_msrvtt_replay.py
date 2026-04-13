@@ -11,6 +11,7 @@ from typing import Any
 
 import yaml
 
+from app.backends.base import heuristic_compare, overlap_score
 from app.schemas import CandidateMetadata, QueryCase
 
 AUDIO_LEXICON = {
@@ -118,6 +119,16 @@ class ReplayPack:
     retrieval_scores: dict[str, dict[str, dict[str, Any]]]
     config: dict[str, Any]
     stats: dict[str, Any]
+
+
+@dataclass(slots=True)
+class QueryDiscriminability:
+    accepted: bool
+    target_rank: int
+    target_score: float
+    second_score: float
+    score_margin: float
+    strong_match_count: int
 
 
 def build_candidate_rows(
@@ -238,11 +249,90 @@ def make_query(
     )
 
 
+def query_priority_score(
+    query: QueryCase,
+    source: CandidateMetadata,
+    candidate: CandidateMetadata,
+) -> tuple[float, dict[str, Any]]:
+    comparison = heuristic_compare(query, source, candidate)
+    preserve_ratio = overlap_score(query.preserve_tags, [*candidate.scene_tags, *candidate.visual_objects]) if query.preserve_tags else 1.0
+    object_ratio = overlap_score(query.required_objects, candidate.visual_objects) if query.required_objects else 0.0
+    audio_ratio = overlap_score(query.required_audio_tags, candidate.audio_tags) if query.required_audio_tags else 0.0
+    temporal_ratio = (
+        1.0 if query.required_temporal and query.required_temporal in candidate.temporal_tags else 0.0
+    ) if query.required_temporal else 0.0
+    source_scene_overlap = len(set(source.scene_tags) & set(candidate.scene_tags)) / max(1, len(source.scene_tags) or 1)
+    source_object_overlap = len(set(source.visual_objects) & set(candidate.visual_objects)) / max(1, len(source.visual_objects) or 1)
+    token_overlap = len(tokenize(query.edit_instruction) & tokenize(candidate.summary + " " + candidate.caption)) / max(
+        1, len(tokenize(query.edit_instruction))
+    )
+
+    required_signal = max(audio_ratio, object_ratio, temporal_ratio)
+    score = (
+        0.45 * comparison.confidence
+        + 0.20 * preserve_ratio
+        + 0.20 * required_signal
+        + 0.10 * token_overlap
+        + 0.05 * (0.5 * source_scene_overlap + 0.5 * source_object_overlap)
+    )
+    if comparison.conflicts:
+        score -= 0.10 * len(comparison.conflicts)
+    return round(score, 4), comparison.to_dict()
+
+
+def assess_query_discriminability(
+    query: QueryCase,
+    source: CandidateMetadata,
+    target: CandidateMetadata,
+    candidates: list[CandidateMetadata],
+    min_target_margin: float,
+    max_strong_matches: int,
+) -> QueryDiscriminability:
+    scored: list[tuple[float, str, dict[str, Any]]] = []
+    strong_match_count = 0
+    for candidate in candidates:
+        if candidate.video_id == source.video_id:
+            continue
+        score, comparison = query_priority_score(query, source, candidate)
+        scored.append((score, candidate.video_id, comparison))
+        if not comparison["missing"] and not comparison["conflicts"]:
+            strong_match_count += 1
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    ranks = [video_id for _, video_id, _ in scored]
+    if target.video_id not in ranks:
+        return QueryDiscriminability(
+            accepted=False,
+            target_rank=len(ranks) + 1,
+            target_score=0.0,
+            second_score=0.0,
+            score_margin=0.0,
+            strong_match_count=strong_match_count,
+        )
+
+    target_rank = ranks.index(target.video_id) + 1
+    target_score = next(score for score, video_id, _ in scored if video_id == target.video_id)
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+    top_score = scored[0][0] if scored else 0.0
+    score_margin = round(target_score - second_score, 4) if target_rank == 1 else round(target_score - top_score, 4)
+    accepted = target_rank == 1 and (strong_match_count <= max_strong_matches or score_margin >= min_target_margin)
+    return QueryDiscriminability(
+        accepted=accepted,
+        target_rank=target_rank,
+        target_score=target_score,
+        second_score=second_score,
+        score_margin=score_margin,
+        strong_match_count=strong_match_count,
+    )
+
+
 def build_query_rows(
     candidates: list[CandidateMetadata],
     max_queries: int = 100,
     seed: int = 13,
-) -> list[QueryCase]:
+    min_target_margin: float = 0.04,
+    max_strong_matches: int = 1,
+) -> tuple[list[QueryCase], dict[str, int]]:
     random.seed(seed)
     pairs: list[tuple[float, str, CandidateMetadata, CandidateMetadata, str]] = []
     for source in candidates:
@@ -278,22 +368,42 @@ def build_query_rows(
         "object": max(1, max_queries // 3),
         "temporal": max(1, max_queries // 3),
     }
+    filter_stats = {
+        "rejected_duplicate": 0,
+        "rejected_type_quota": 0,
+        "rejected_ambiguous": 0,
+    }
 
     for _, query_type, source, target, value in pairs:
         if len(queries) >= max_queries:
             break
         key = (query_type, source.video_id, target.video_id, value)
         if key in used_triplets:
+            filter_stats["rejected_duplicate"] += 1
             continue
         if type_counts[query_type] >= type_limits[query_type]:
+            filter_stats["rejected_type_quota"] += 1
             continue
 
         query_id = f"msrvtt_{query_type}_{len(queries):05d}"
-        queries.append(make_query(query_id, source, target, query_type, value))
+        candidate_query = make_query(query_id, source, target, query_type, value)
+        discriminability = assess_query_discriminability(
+            query=candidate_query,
+            source=source,
+            target=target,
+            candidates=candidates,
+            min_target_margin=min_target_margin,
+            max_strong_matches=max_strong_matches,
+        )
+        if not discriminability.accepted:
+            filter_stats["rejected_ambiguous"] += 1
+            continue
+
+        queries.append(candidate_query)
         used_triplets.add(key)
         type_counts[query_type] += 1
 
-    return queries
+    return queries, filter_stats
 
 
 def build_retrieval_scores(
@@ -362,6 +472,8 @@ def prepare_replay_pack(
     max_candidates: int | None,
     max_queries: int,
     seed: int,
+    min_target_margin: float,
+    max_strong_matches: int,
 ) -> ReplayPack:
     output_dir = Path(output_dir)
     candidates = build_candidate_rows(
@@ -369,7 +481,13 @@ def prepare_replay_pack(
         split_csv_path=split_csv_path,
         max_candidates=max_candidates,
     )
-    queries = build_query_rows(candidates, max_queries=max_queries, seed=seed)
+    queries, filter_stats = build_query_rows(
+        candidates,
+        max_queries=max_queries,
+        seed=seed,
+        min_target_margin=min_target_margin,
+        max_strong_matches=max_strong_matches,
+    )
     retrieval_scores = build_retrieval_scores(candidates, queries)
 
     candidates_payload = [item.to_dict() for item in candidates]
@@ -385,6 +503,9 @@ def prepare_replay_pack(
         "audio_queries": sum(1 for item in queries if item.required_audio_tags),
         "object_queries": sum(1 for item in queries if item.required_objects),
         "temporal_queries": sum(1 for item in queries if item.required_temporal),
+        "min_target_margin": min_target_margin,
+        "max_strong_matches": max_strong_matches,
+        **filter_stats,
     }
 
     write_json(output_dir / "candidates.json", candidates_payload)
@@ -412,6 +533,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-candidates", type=int, help="Optional cap on candidate videos")
     parser.add_argument("--max-queries", type=int, default=90, help="Number of auto-generated replay queries")
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--min-target-margin", type=float, default=0.04)
+    parser.add_argument("--max-strong-matches", type=int, default=1)
     return parser.parse_args()
 
 
@@ -424,6 +547,8 @@ def main() -> None:
         max_candidates=args.max_candidates,
         max_queries=args.max_queries,
         seed=args.seed,
+        min_target_margin=args.min_target_margin,
+        max_strong_matches=args.max_strong_matches,
     )
     print(json.dumps(pack.stats, ensure_ascii=False, indent=2))
     print(f"config={Path(args.output_dir) / 'real.yaml'}")

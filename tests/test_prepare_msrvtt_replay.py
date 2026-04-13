@@ -6,7 +6,8 @@ from pathlib import Path
 
 from app.backends import FileRetrievalBackend
 from app.demo import build_backend
-from app.prepare_msrvtt_replay import prepare_replay_pack
+from app.prepare_msrvtt_replay import assess_query_discriminability, make_query, prepare_replay_pack
+from app.schemas import CandidateMetadata
 
 
 class PrepareMsrvttReplayTests(unittest.TestCase):
@@ -52,6 +53,8 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
                 max_candidates=None,
                 max_queries=6,
                 seed=7,
+                min_target_margin=0.04,
+                max_strong_matches=1,
             )
 
             self.assertGreaterEqual(pack.stats["candidate_count"], 4)
@@ -70,6 +73,52 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
             self.assertGreaterEqual(len(backend.list_queries()), 1)
             built_backend = build_backend("real", str(out_dir / "real.yaml"))
             self.assertGreaterEqual(len(built_backend.list_queries()), 1)
+
+    def test_discriminability_rejects_ambiguous_queries(self) -> None:
+        source = CandidateMetadata(
+            video_id="src1",
+            title="source",
+            summary="A dog runs in the park.",
+            caption="Dog in park.",
+            asr="",
+            audio_tags=[],
+            visual_objects=["dog", "trees"],
+            scene_tags=["park", "outdoor"],
+            temporal_tags=["global"],
+        )
+        target = CandidateMetadata(
+            video_id="target1",
+            title="target",
+            summary="A cat runs in the park.",
+            caption="Cat in park.",
+            asr="",
+            audio_tags=[],
+            visual_objects=["cat", "trees"],
+            scene_tags=["park", "outdoor"],
+            temporal_tags=["global"],
+        )
+        distractor = CandidateMetadata(
+            video_id="target2",
+            title="distractor",
+            summary="A cat moves through the park.",
+            caption="Cat outdoors in park.",
+            asr="",
+            audio_tags=[],
+            visual_objects=["cat", "trees"],
+            scene_tags=["park", "outdoor"],
+            temporal_tags=["global"],
+        )
+        query = make_query("q1", source, target, "object", "cat")
+        result = assess_query_discriminability(
+            query=query,
+            source=source,
+            target=target,
+            candidates=[source, target, distractor],
+            min_target_margin=0.04,
+            max_strong_matches=1,
+        )
+        self.assertFalse(result.accepted)
+        self.assertGreaterEqual(result.strong_match_count, 2)
 
 
 if __name__ == "__main__":

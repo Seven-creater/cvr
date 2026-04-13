@@ -22,6 +22,12 @@ Build a pilot replay pack from raw MSR-VTT annotations:
 python -m app.prepare_msrvtt_replay --msrvtt-json /path/to/MSRVTT_data.json --split-csv /path/to/MSRVTT_train.9k.csv --output-dir data/msrvtt_pilot --max-queries 90
 ```
 
+If the generated pilot set is too ambiguous, tighten it with:
+
+```bash
+python -m app.prepare_msrvtt_replay --msrvtt-json /path/to/MSRVTT_data.json --split-csv /path/to/MSRVTT_train.9k.csv --output-dir data/msrvtt_pilot --max-queries 90 --min-target-margin 0.06 --max-strong-matches 1
+```
+
 Validate a file-backed dataset before replay:
 
 ```bash
