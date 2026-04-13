@@ -1,12 +1,30 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
+from pathlib import Path
 
 from app.artifacts import append_jsonl, write_run_artifacts
 from app.backends import FileRetrievalBackend, MockRetrievalBackend
 from app.config import load_yaml
-from app.controller import OpenAIResponsesController, ScriptedController
+from app.controller import ScriptedController
+
+
+def resolve_config_path(config_path: str, value: str | None) -> str | None:
+    if value is None:
+        return None
+    path = Path(value)
+    if path.is_absolute():
+        return str(path)
+
+    config_dir = Path(config_path).resolve().parent
+    direct_candidate = (config_dir / path).resolve()
+    if direct_candidate.exists():
+        return str(direct_candidate)
+
+    project_candidate = (config_dir.parent / path).resolve()
+    return str(project_candidate)
 
 
 def build_backend(mode: str, config_path: str | None):
@@ -17,15 +35,23 @@ def build_backend(mode: str, config_path: str | None):
             raise ValueError("--config is required in real mode")
         config = load_yaml(config_path)
         return FileRetrievalBackend(
-            candidates_path=config["candidates_path"],
-            queries_path=config["queries_path"],
-            retrieval_scores_path=config.get("retrieval_scores_path"),
+            candidates_path=resolve_config_path(config_path, config["candidates_path"]),
+            queries_path=resolve_config_path(config_path, config["queries_path"]),
+            retrieval_scores_path=resolve_config_path(config_path, config.get("retrieval_scores_path")),
         )
     raise ValueError(f"unsupported mode: {mode}")
 
 
+def openai_available() -> bool:
+    return importlib.util.find_spec("openai") is not None
+
+
 def build_controller(planner: str, backend, model: str):
     if planner == "openai":
+        if not openai_available():
+            raise RuntimeError("planner=openai requires the openai package to be installed")
+        from app.controller import OpenAIResponsesController
+
         return OpenAIResponsesController(backend=backend, model=model)
     return ScriptedController(backend=backend)
 
@@ -33,7 +59,9 @@ def build_controller(planner: str, backend, model: str):
 def resolve_default_planner(explicit: str | None) -> str:
     if explicit:
         return explicit
-    return "openai" if os.environ.get("OPENAI_API_KEY") else "scripted"
+    if os.environ.get("OPENAI_API_KEY") and openai_available():
+        return "openai"
+    return "scripted"
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,11 +80,7 @@ def main() -> None:
     planner_name = resolve_default_planner(args.planner)
     backend = build_backend(args.mode, args.config)
     controller = build_controller(planner_name, backend, args.model)
-    queries = (
-        [backend.get_query(args.query_id)]
-        if args.query_id
-        else backend.list_queries()
-    )
+    queries = [backend.get_query(args.query_id)] if args.query_id else backend.list_queries()
 
     traces = []
     for query in queries:

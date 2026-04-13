@@ -12,12 +12,12 @@ class RealBackendReplayTests(unittest.TestCase):
             retrieval_scores_path="data/real_sample/retrieval_scores.json",
         )
         controller = ScriptedController(backend)
-        trace = controller.run("real_q_audio")
-        self.assertEqual(trace.final_candidate_id, "real_band_cheer")
-        self.assertTrue(trace.success)
-        self.assertLessEqual(len(trace.rounds), 3)
+        for query in backend.list_queries():
+            trace = controller.run(query.query_id)
+            self.assertEqual(trace.final_candidate_id, query.target_video_id, query.query_id)
+            self.assertTrue(trace.success, query.query_id)
+            self.assertLessEqual(len(trace.rounds), 3, query.query_id)
 
 
 if __name__ == "__main__":
     unittest.main()
-

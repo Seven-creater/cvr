@@ -9,10 +9,22 @@ from typing import Any
 from app.schemas import CandidateMetadata, CompareResult, InspectionRecord, QueryCase, RetrievalCandidate, RetrievalParams
 
 TOKEN_RE = re.compile(r"[a-z0-9]+")
+APP_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = APP_ROOT.parent
+
+
+def resolve_data_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    direct = (PROJECT_ROOT / candidate).resolve()
+    if direct.exists():
+        return direct
+    return (APP_ROOT / candidate).resolve()
 
 
 def load_json(path: str | Path) -> Any:
-    with Path(path).open("r", encoding="utf-8") as handle:
+    with resolve_data_path(path).open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -129,4 +141,3 @@ class RetrievalBackend(ABC):
         source = self.get_candidate(query.source_video_id)
         candidate = self.get_candidate(candidate_id)
         return heuristic_compare(query, source, candidate)
-
