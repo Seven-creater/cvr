@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+from app.backends.base import PROJECT_ROOT
 from app.schemas import RunTrace
 
 
@@ -14,6 +15,8 @@ def _stamp() -> str:
 
 def ensure_runs_dir(path: str | Path = "runs") -> Path:
     runs_dir = Path(path)
+    if not runs_dir.is_absolute():
+        runs_dir = (PROJECT_ROOT / runs_dir).resolve()
     runs_dir.mkdir(parents=True, exist_ok=True)
     return runs_dir
 
@@ -36,6 +39,8 @@ def write_run_artifacts(trace: RunTrace, prefix: str | None = None) -> dict[str,
 def append_jsonl(traces: Iterable[RunTrace], path: str | Path | None = None) -> Path:
     runs_dir = ensure_runs_dir()
     jsonl_path = Path(path) if path else runs_dir / f"batch-{_stamp()}.jsonl"
+    if not jsonl_path.is_absolute():
+        jsonl_path = (PROJECT_ROOT / jsonl_path).resolve()
     with jsonl_path.open("w", encoding="utf-8") as handle:
         for trace in traces:
             handle.write(json.dumps(trace.to_dict(), ensure_ascii=False) + "\n")

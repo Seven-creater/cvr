@@ -41,7 +41,17 @@ class ScriptedController:
                 compare = tools.call_tool("compare_to_request", {"candidate_id": candidate_id})
                 if candidate_id == primary_candidate_id:
                     primary_compare = compare
-                if best_compare is None or compare["confidence"] > best_compare["confidence"]:
+                candidate_priority = self._priority_tuple(query, candidate, compare)
+                best_priority = (
+                    self._priority_tuple(
+                        query,
+                        {"audio_score": -1.0, "video_score": -1.0, "score": -1.0},
+                        best_compare,
+                    )
+                    if best_compare is not None
+                    else None
+                )
+                if best_compare is None or candidate_priority > best_priority:
                     best_candidate_id = candidate_id
                     best_compare = compare
 
@@ -127,4 +137,20 @@ class ScriptedController:
         return (
             f"Submitted {candidate_id} at round {round_index}. "
             f"Satisfied: {satisfied}. Missing: {missing}."
+        )
+
+    def _priority_tuple(
+        self,
+        query,
+        candidate: dict[str, object],
+        comparison: dict[str, object],
+    ) -> tuple[float, float, float, float]:
+        modality_score = float(candidate.get("video_score", 0.0))
+        if query.required_audio_tags:
+            modality_score = float(candidate.get("audio_score", 0.0))
+        return (
+            float(comparison.get("confidence", 0.0)),
+            modality_score,
+            float(candidate.get("score", 0.0)),
+            -float(len(comparison.get("missing", []))),
         )
