@@ -1,4 +1,0 @@
-candidates_path: data/real_sample/candidates.json
-queries_path: data/real_sample/queries.json
-retrieval_scores_path: data/real_sample/retrieval_scores.json
-
