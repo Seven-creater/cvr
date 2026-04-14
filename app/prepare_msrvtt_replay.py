@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from app.backends.base import overlap_score
+from app.backends.base import heuristic_compare, overlap_score
 from app.schemas import CandidateMetadata, QueryCase
 
 AUDIO_LEXICON = {
@@ -130,7 +130,12 @@ class QueryDiscriminability:
     strong_match_count: int
     round1_target_rank: int
     round2_target_rank: int
+    round3_target_rank: int
     retry_favorable: bool
+    agent_success: bool
+    retry_rounds: int
+    target_visible_rounds: int
+    final_candidate_id: str | None
     hardness: float
 
 
@@ -143,9 +148,11 @@ class FilterPolicy:
     max_target_deficit: float
     round1_rank_cutoff: int
     round2_rank_cutoff: int
+    round3_rank_cutoff: int
     max_source_uses: int
     max_target_uses: int
     prefer_retry_candidates: bool
+    prefer_agent_failure_candidates: bool
 
 
 FILTER_PRESETS: dict[str, FilterPolicy] = {
@@ -157,9 +164,11 @@ FILTER_PRESETS: dict[str, FilterPolicy] = {
         max_target_deficit=0.0,
         round1_rank_cutoff=1,
         round2_rank_cutoff=1,
+        round3_rank_cutoff=1,
         max_source_uses=8,
         max_target_uses=8,
         prefer_retry_candidates=False,
+        prefer_agent_failure_candidates=False,
     ),
     "medium-hard": FilterPolicy(
         name="medium-hard",
@@ -169,9 +178,11 @@ FILTER_PRESETS: dict[str, FilterPolicy] = {
         max_target_deficit=0.0,
         round1_rank_cutoff=1,
         round2_rank_cutoff=1,
+        round3_rank_cutoff=1,
         max_source_uses=5,
         max_target_uses=5,
         prefer_retry_candidates=False,
+        prefer_agent_failure_candidates=False,
     ),
     "strict": FilterPolicy(
         name="strict",
@@ -181,9 +192,11 @@ FILTER_PRESETS: dict[str, FilterPolicy] = {
         max_target_deficit=0.0,
         round1_rank_cutoff=1,
         round2_rank_cutoff=1,
+        round3_rank_cutoff=1,
         max_source_uses=4,
         max_target_uses=4,
         prefer_retry_candidates=False,
+        prefer_agent_failure_candidates=False,
     ),
     "hard": FilterPolicy(
         name="hard",
@@ -193,9 +206,25 @@ FILTER_PRESETS: dict[str, FilterPolicy] = {
         max_target_deficit=0.03,
         round1_rank_cutoff=2,
         round2_rank_cutoff=1,
+        round3_rank_cutoff=1,
         max_source_uses=3,
         max_target_uses=3,
         prefer_retry_candidates=True,
+        prefer_agent_failure_candidates=False,
+    ),
+    "agent-hard": FilterPolicy(
+        name="agent-hard",
+        min_target_margin=0.0,
+        max_strong_matches=5,
+        generation_rank_cutoff=3,
+        max_target_deficit=0.15,
+        round1_rank_cutoff=5,
+        round2_rank_cutoff=5,
+        round3_rank_cutoff=5,
+        max_source_uses=3,
+        max_target_uses=3,
+        prefer_retry_candidates=True,
+        prefer_agent_failure_candidates=True,
     ),
 }
 
@@ -215,9 +244,11 @@ def resolve_filter_policy(
             max_target_deficit=preset.max_target_deficit,
             round1_rank_cutoff=preset.round1_rank_cutoff,
             round2_rank_cutoff=preset.round2_rank_cutoff,
+            round3_rank_cutoff=preset.round3_rank_cutoff,
             max_source_uses=preset.max_source_uses,
             max_target_uses=preset.max_target_uses,
             prefer_retry_candidates=preset.prefer_retry_candidates,
+            prefer_agent_failure_candidates=preset.prefer_agent_failure_candidates,
         )
     return FilterPolicy(
         name="custom",
@@ -227,9 +258,11 @@ def resolve_filter_policy(
         max_target_deficit=0.0,
         round1_rank_cutoff=1,
         round2_rank_cutoff=1,
+        round3_rank_cutoff=1,
         max_source_uses=6,
         max_target_uses=6,
         prefer_retry_candidates=False,
+        prefer_agent_failure_candidates=False,
     )
 
 
@@ -473,13 +506,13 @@ def scripted_round_params(query: QueryCase, round_index: int) -> dict[str, Any]:
     return params
 
 
-def rank_candidates_for_query(
+def build_ranked_candidates_for_query(
     query: QueryCase,
     source: CandidateMetadata,
     candidates: list[CandidateMetadata],
     params: dict[str, Any],
-) -> list[tuple[float, str]]:
-    ranked: list[tuple[float, str]] = []
+) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
     for candidate in candidates:
         if candidate.video_id == source.video_id:
             continue
@@ -493,10 +526,109 @@ def rank_candidates_for_query(
             video_score += float(score_payload["temporal_scores"].get(params["temporal_focus"], 0.0))
 
         combined = params["video_weight"] * video_score + params["audio_weight"] * audio_score
-        ranked.append((round(combined, 4), candidate.video_id))
+        ranked.append(
+            {
+                "candidate_id": candidate.video_id,
+                "score": round(combined, 4),
+                "video_score": round(video_score, 4),
+                "audio_score": round(audio_score, 4),
+            }
+        )
 
-    ranked.sort(key=lambda item: item[0], reverse=True)
+    ranked.sort(key=lambda item: item["score"], reverse=True)
     return ranked
+
+
+def rank_candidates_for_query(
+    query: QueryCase,
+    source: CandidateMetadata,
+    candidates: list[CandidateMetadata],
+    params: dict[str, Any],
+) -> list[tuple[float, str]]:
+    return [
+        (float(item["score"]), str(item["candidate_id"]))
+        for item in build_ranked_candidates_for_query(query, source, candidates, params)
+    ]
+
+
+def scripted_priority_tuple(
+    query: QueryCase,
+    candidate: dict[str, Any],
+    comparison,
+) -> tuple[float, float, float, float]:
+    modality_score = float(candidate.get("audio_score", 0.0)) if query.required_audio_tags else float(
+        candidate.get("video_score", 0.0)
+    )
+    return (
+        float(comparison.confidence),
+        modality_score,
+        float(candidate.get("score", 0.0)),
+        -float(len(comparison.missing)),
+    )
+
+
+def simulate_scripted_rollout(
+    query: QueryCase,
+    source: CandidateMetadata,
+    target: CandidateMetadata,
+    candidates: list[CandidateMetadata],
+    max_rounds: int = 3,
+) -> dict[str, Any]:
+    candidate_map = {item.video_id: item for item in candidates}
+    round_rankings = [
+        build_ranked_candidates_for_query(query, source, candidates, scripted_round_params(query, round_index))
+        for round_index in range(1, max_rounds + 1)
+    ]
+    round_target_ranks: list[int] = []
+    for ranked in round_rankings:
+        order = [str(item["candidate_id"]) for item in ranked]
+        rank = order.index(target.video_id) + 1 if target.video_id in order else len(order) + 1
+        round_target_ranks.append(rank)
+
+    target_visible_rounds = sum(1 for rank in round_target_ranks if rank <= 2)
+    final_candidate_id: str | None = None
+    rounds_used = 0
+    retry_rounds = 0
+
+    for round_index, ranked in enumerate(round_rankings, start=1):
+        rounds_used = round_index
+        inspected = ranked[:2]
+        if not inspected:
+            break
+
+        primary_compare = None
+        best_candidate = None
+        best_compare = None
+        for candidate in inspected:
+            candidate_id = str(candidate["candidate_id"])
+            compare = heuristic_compare(query, source, candidate_map[candidate_id])
+            if primary_compare is None:
+                primary_compare = compare
+            if best_compare is None or scripted_priority_tuple(query, candidate, compare) > scripted_priority_tuple(
+                query,
+                best_candidate,
+                best_compare,
+            ):
+                best_candidate = candidate
+                best_compare = compare
+
+        if primary_compare is None or best_candidate is None:
+            break
+        if not primary_compare.missing or round_index >= max_rounds:
+            final_candidate_id = str(best_candidate["candidate_id"])
+            break
+        retry_rounds += 1
+
+    return {
+        "round1_target_rank": round_target_ranks[0] if len(round_target_ranks) >= 1 else len(candidates) + 1,
+        "round2_target_rank": round_target_ranks[1] if len(round_target_ranks) >= 2 else len(candidates) + 1,
+        "round3_target_rank": round_target_ranks[2] if len(round_target_ranks) >= 3 else len(candidates) + 1,
+        "target_visible_rounds": target_visible_rounds,
+        "final_candidate_id": final_candidate_id,
+        "agent_success": final_candidate_id == target.video_id if final_candidate_id else False,
+        "rounds_used": rounds_used,
+        "retry_rounds": retry_rounds,
+    }
 
 
 def assess_query_discriminability(
@@ -528,7 +660,12 @@ def assess_query_discriminability(
             strong_match_count=strong_match_count,
             round1_target_rank=len(ranks) + 1,
             round2_target_rank=len(ranks) + 1,
+            round3_target_rank=len(ranks) + 1,
             retry_favorable=False,
+            agent_success=False,
+            retry_rounds=0,
+            target_visible_rounds=0,
+            final_candidate_id=None,
             hardness=0.0,
         )
 
@@ -537,12 +674,10 @@ def assess_query_discriminability(
     second_score = scored[1][0] if len(scored) > 1 else 0.0
     top_score = scored[0][0] if scored else 0.0
     score_margin = round(target_score - second_score, 4) if target_rank == 1 else round(target_score - top_score, 4)
-    round1_ranked = rank_candidates_for_query(query, source, candidates, scripted_round_params(query, round_index=1))
-    round2_ranked = rank_candidates_for_query(query, source, candidates, scripted_round_params(query, round_index=2))
-    round1_order = [candidate_id for _, candidate_id in round1_ranked]
-    round2_order = [candidate_id for _, candidate_id in round2_ranked]
-    round1_target_rank = round1_order.index(target.video_id) + 1 if target.video_id in round1_order else len(round1_order) + 1
-    round2_target_rank = round2_order.index(target.video_id) + 1 if target.video_id in round2_order else len(round2_order) + 1
+    rollout = simulate_scripted_rollout(query, source, target, candidates)
+    round1_target_rank = int(rollout["round1_target_rank"])
+    round2_target_rank = int(rollout["round2_target_rank"])
+    round3_target_rank = int(rollout["round3_target_rank"])
     retry_favorable = (
         round1_target_rank > 1
         and round1_target_rank <= policy.round1_rank_cutoff
@@ -560,14 +695,16 @@ def assess_query_discriminability(
         and strong_match_count <= policy.max_strong_matches
         and round1_target_rank <= policy.round1_rank_cutoff
         and round2_target_rank <= policy.round2_rank_cutoff
+        and round3_target_rank <= policy.round3_rank_cutoff
     )
 
     hardness = (
-        0.35 * float(retry_favorable)
+        0.30 * float(retry_favorable)
         + 0.20 * float(round1_target_rank > 1)
-        + 0.20 * min(1.0, strong_match_count / max(1, policy.max_strong_matches))
+        + 0.15 * min(1.0, strong_match_count / max(1, policy.max_strong_matches))
         + 0.15 * max(0.0, 1.0 - min(1.0, max(score_margin, 0.0) / max(1e-6, policy.min_target_margin or 0.01)))
-        + 0.10 * (1.0 / max(1, target_rank))
+        + 0.10 * (1.0 - (float(rollout["target_visible_rounds"]) / 3.0))
+        + 0.10 * float(not rollout["agent_success"])
     )
     return QueryDiscriminability(
         accepted=accepted,
@@ -578,7 +715,12 @@ def assess_query_discriminability(
         strong_match_count=strong_match_count,
         round1_target_rank=round1_target_rank,
         round2_target_rank=round2_target_rank,
+        round3_target_rank=round3_target_rank,
         retry_favorable=retry_favorable,
+        agent_success=bool(rollout["agent_success"]),
+        retry_rounds=int(rollout["retry_rounds"]),
+        target_visible_rounds=int(rollout["target_visible_rounds"]),
+        final_candidate_id=rollout["final_candidate_id"],
         hardness=round(hardness, 4),
     )
 
@@ -653,7 +795,15 @@ def build_query_rows(
             continue
 
         retry_bonus = 0.5 if policy.prefer_retry_candidates and discriminability.retry_favorable else 0.0
-        selection_priority = retry_bonus + discriminability.hardness + (1.0 - min(1.0, similarity_score(source, target)))
+        failure_bonus = 0.8 if policy.prefer_agent_failure_candidates and not discriminability.agent_success else 0.0
+        hidden_bonus = 0.15 * max(0, 3 - discriminability.target_visible_rounds)
+        selection_priority = (
+            failure_bonus
+            + retry_bonus
+            + hidden_bonus
+            + discriminability.hardness
+            + (1.0 - min(1.0, similarity_score(source, target)))
+        )
         accepted_records.append((selection_priority, query_type, source, target, value))
         used_triplets.add(key)
 
@@ -705,6 +855,38 @@ def build_retrieval_scores(
     return scores
 
 
+def summarize_selected_queries(
+    candidates: list[CandidateMetadata],
+    queries: list[QueryCase],
+    policy: FilterPolicy,
+) -> dict[str, Any]:
+    candidate_map = {item.video_id: item for item in candidates}
+    discriminability_rows = [
+        assess_query_discriminability(
+            query=query,
+            source=candidate_map[query.source_video_id],
+            target=candidate_map[query.target_video_id],
+            candidates=candidates,
+            policy=policy,
+        )
+        for query in queries
+    ]
+    total = len(discriminability_rows)
+    failure_count = sum(1 for item in discriminability_rows if not item.agent_success)
+    retry_count = sum(1 for item in discriminability_rows if item.retry_rounds > 0)
+    avg_visible_rounds = (
+        sum(item.target_visible_rounds for item in discriminability_rows) / total
+        if total
+        else 0.0
+    )
+    return {
+        "predicted_agent_failures": failure_count,
+        "predicted_agent_successes": total - failure_count,
+        "predicted_retry_queries": retry_count,
+        "predicted_target_visible_rounds_avg": round(avg_visible_rounds, 2),
+    }
+
+
 def prepare_replay_pack(
     msrvtt_json_path: str | Path,
     split_csv_path: str | Path | None,
@@ -734,6 +916,7 @@ def prepare_replay_pack(
         policy=policy,
     )
     retrieval_scores = build_retrieval_scores(candidates, queries)
+    rollout_stats = summarize_selected_queries(candidates, queries, policy)
 
     candidates_payload = [item.to_dict() for item in candidates]
     queries_payload = [item.to_dict() for item in queries]
@@ -755,12 +938,16 @@ def prepare_replay_pack(
         "max_target_deficit": policy.max_target_deficit,
         "round1_rank_cutoff": policy.round1_rank_cutoff,
         "round2_rank_cutoff": policy.round2_rank_cutoff,
+        "round3_rank_cutoff": policy.round3_rank_cutoff,
         "max_source_uses": policy.max_source_uses,
         "max_target_uses": policy.max_target_uses,
         "prefer_retry_candidates": policy.prefer_retry_candidates,
+        "prefer_agent_failure_candidates": policy.prefer_agent_failure_candidates,
         "discriminability_scorer": "generation_v2_decoupled",
         "retrieval_scorer": "heuristic_replay_full_catalog",
+        "rollout_scorer": "scripted_controller_v1",
         "expected_scored_candidates_per_query": max(0, len(candidates_payload) - 1),
+        **rollout_stats,
         **filter_stats,
     }
 

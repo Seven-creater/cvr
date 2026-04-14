@@ -11,6 +11,7 @@ from app.prepare_msrvtt_replay import (
     make_query,
     prepare_replay_pack,
     resolve_filter_policy,
+    simulate_scripted_rollout,
 )
 from app.schemas import CandidateMetadata
 
@@ -71,7 +72,10 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
             self.assertTrue((out_dir / "real.yaml").exists())
             self.assertEqual(pack.config["candidates_path"], "candidates.json")
             self.assertEqual(pack.stats["discriminability_scorer"], "generation_v2_decoupled")
+            self.assertEqual(pack.stats["rollout_scorer"], "scripted_controller_v1")
             self.assertEqual(pack.stats["expected_scored_candidates_per_query"], pack.stats["candidate_count"] - 1)
+            self.assertIn("predicted_agent_failures", pack.stats)
+            self.assertIn("predicted_retry_queries", pack.stats)
 
             backend = FileRetrievalBackend(
                 candidates_path=out_dir / "candidates.json",
@@ -155,6 +159,79 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
         self.assertEqual(policy.round1_rank_cutoff, 2)
         self.assertEqual(policy.round2_rank_cutoff, 1)
         self.assertTrue(policy.prefer_retry_candidates)
+
+    def test_agent_hard_policy_prefers_agent_failures(self) -> None:
+        policy = resolve_filter_policy(
+            difficulty_preset="agent-hard",
+            min_target_margin=0.99,
+            max_strong_matches=99,
+        )
+        self.assertEqual(policy.name, "agent-hard")
+        self.assertEqual(policy.generation_rank_cutoff, 3)
+        self.assertEqual(policy.round1_rank_cutoff, 5)
+        self.assertEqual(policy.round2_rank_cutoff, 5)
+        self.assertEqual(policy.round3_rank_cutoff, 5)
+        self.assertTrue(policy.prefer_retry_candidates)
+        self.assertTrue(policy.prefer_agent_failure_candidates)
+
+    def test_scripted_rollout_detects_hidden_target_failure(self) -> None:
+        source = CandidateMetadata(
+            video_id="src",
+            title="source",
+            summary="A dog runs in the park near trees.",
+            caption="A dog runs in the park near trees.",
+            asr="",
+            audio_tags=[],
+            visual_objects=["dog", "trees"],
+            scene_tags=["park", "outdoor"],
+            temporal_tags=["global"],
+        )
+        target = CandidateMetadata(
+            video_id="target",
+            title="target",
+            summary="A cat waits in the park.",
+            caption="A cat waits in the park.",
+            asr="",
+            audio_tags=[],
+            visual_objects=["cat"],
+            scene_tags=["park"],
+            temporal_tags=["global"],
+        )
+        distractor_a = CandidateMetadata(
+            video_id="dist_a",
+            title="distractor-a",
+            summary="A cat and dog run together in the outdoor park near trees.",
+            caption="A cat and dog run together in the outdoor park near trees.",
+            asr="",
+            audio_tags=[],
+            visual_objects=["cat", "dog", "trees"],
+            scene_tags=["park", "outdoor"],
+            temporal_tags=["global"],
+        )
+        distractor_b = CandidateMetadata(
+            video_id="dist_b",
+            title="distractor-b",
+            summary="A cat plays with a dog in the outdoor park.",
+            caption="A cat plays with a dog in the outdoor park.",
+            asr="",
+            audio_tags=[],
+            visual_objects=["cat", "dog"],
+            scene_tags=["park", "outdoor"],
+            temporal_tags=["global"],
+        )
+        query = make_query("q_hidden_target", source, target, "object", "cat")
+
+        rollout = simulate_scripted_rollout(
+            query=query,
+            source=source,
+            target=target,
+            candidates=[source, target, distractor_a, distractor_b],
+        )
+
+        self.assertGreaterEqual(rollout["round1_target_rank"], 3)
+        self.assertGreaterEqual(rollout["round2_target_rank"], 3)
+        self.assertFalse(rollout["agent_success"])
+        self.assertIn(rollout["final_candidate_id"], {"dist_a", "dist_b"})
 
 
 if __name__ == "__main__":
