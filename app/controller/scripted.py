@@ -20,6 +20,8 @@ class ScriptedPolicy:
             "max_rounds": self.max_rounds,
             "adaptive_params": self.adaptive_params,
             "fixed_params": self.fixed_params.to_dict(),
+            "target_visible_during_runtime": False,
+            "success_computed_offline": True,
         }
 
 
@@ -76,13 +78,14 @@ class ScriptedController:
 
     def run(self, query_id: str) -> RunTrace:
         query = self.backend.get_query(query_id)
+        runtime_query = query.without_target()
         trace = RunTrace(
-            query=query,
+            query=runtime_query,
             planner_name=self.name,
             planner_metadata=self.policy.to_trace_metadata(),
         )
         state = AgentSessionState(
-            query=query,
+            query=runtime_query,
             trace=trace,
             max_rounds=self.policy.max_rounds,
         )

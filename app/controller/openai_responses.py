@@ -44,8 +44,17 @@ class OpenAIResponsesController:
 
     def run(self, query_id: str) -> RunTrace:
         query = self.backend.get_query(query_id)
-        trace = RunTrace(query=query, planner_name=self.name)
-        state = AgentSessionState(query=query, trace=trace)
+        runtime_query = query.without_target()
+        trace = RunTrace(
+            query=runtime_query,
+            planner_name=self.name,
+            planner_metadata={
+                "profile": "openai",
+                "target_visible_during_runtime": False,
+                "success_computed_offline": True,
+            },
+        )
+        state = AgentSessionState(query=runtime_query, trace=trace)
         tools = SessionTools(self.backend, state)
         user_input = (
             "Solve this composed retrieval query.\n\n"

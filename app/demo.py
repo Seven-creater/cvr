@@ -141,6 +141,12 @@ def main() -> None:
             failures.append((query.query_id, str(exc)))
             print(f"[error] query={query.query_id} message={exc}")
             continue
+        trace.query.target_video_id = query.target_video_id
+        trace.success = (
+            query.target_video_id == trace.final_candidate_id
+            if query.target_video_id
+            else None
+        )
         traces.append(trace)
         paths = write_run_artifacts(
             trace=trace,

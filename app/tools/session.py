@@ -221,16 +221,10 @@ class SessionTools:
         current.notes = explanation
         self.state.trace.final_candidate_id = candidate_id
         self.state.trace.final_explanation = explanation
-        self.state.trace.success = (
-            self.state.query.target_video_id == candidate_id
-            if self.state.query.target_video_id
-            else None
-        )
         self.state.final_submitted = True
         return {
             "status": "submitted",
             "candidate_id": candidate_id,
-            "success": self.state.trace.success,
             "explanation": explanation,
         }
 

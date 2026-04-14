@@ -14,7 +14,8 @@ class MockLoopTests(unittest.TestCase):
             trace = self.controller.run(query.query_id)
             self.assertLessEqual(len(trace.rounds), 3, query.query_id)
             self.assertEqual(trace.final_candidate_id, query.target_video_id, query.query_id)
-            self.assertTrue(trace.success, query.query_id)
+            self.assertIsNone(trace.query.target_video_id)
+            self.assertIsNone(trace.success, query.query_id)
 
     def test_audio_query_increases_audio_weight_after_retry(self) -> None:
         trace = self.controller.run("q_audio_cheer")
@@ -51,6 +52,8 @@ class MockLoopTests(unittest.TestCase):
             self.assertEqual(round_row.retrieval_params.to_dict(), first_params.to_dict())
         self.assertEqual(trace.planner_metadata["profile"], "fixed")
         self.assertFalse(trace.planner_metadata["adaptive_params"])
+        self.assertFalse(trace.planner_metadata["target_visible_during_runtime"])
+        self.assertTrue(trace.planner_metadata["success_computed_offline"])
 
     def test_single_round_fixed_profile_stops_after_one_round(self) -> None:
         controller = ScriptedController(

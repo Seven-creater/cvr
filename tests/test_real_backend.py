@@ -15,7 +15,8 @@ class RealBackendReplayTests(unittest.TestCase):
         for query in backend.list_queries():
             trace = controller.run(query.query_id)
             self.assertEqual(trace.final_candidate_id, query.target_video_id, query.query_id)
-            self.assertTrue(trace.success, query.query_id)
+            self.assertIsNone(trace.success, query.query_id)
+            self.assertIsNone(trace.query.target_video_id, query.query_id)
             self.assertLessEqual(len(trace.rounds), 3, query.query_id)
 
 

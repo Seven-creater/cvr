@@ -76,6 +76,11 @@ class QueryCase:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def without_target(self) -> "QueryCase":
+        payload = self.to_dict()
+        payload["target_video_id"] = None
+        return QueryCase.from_dict(payload)
+
 
 @dataclass(slots=True)
 class CandidateMetadata:

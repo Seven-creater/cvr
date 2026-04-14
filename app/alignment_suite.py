@@ -185,6 +185,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
                 f"### {profile['profile']}",
                 "",
                 f"- planner: `{profile['planner_name']}`",
+                f"- planner_metadata: `{profile['planner_metadata']}`",
                 f"- runs: `{metrics['runs']}`",
                 f"- success_rate: `{metrics['success_rate']}`",
                 f"- avg_rounds: `{metrics['avg_rounds']}`",
@@ -243,6 +244,12 @@ def main() -> None:
                     raise
                 failures.append({"query_id": query.query_id, "error": str(exc)})
                 continue
+            trace.query.target_video_id = query.target_video_id
+            trace.success = (
+                query.target_video_id == trace.final_candidate_id
+                if query.target_video_id
+                else None
+            )
             traces.append(trace)
             if args.write_per_query_artifacts:
                 write_run_artifacts(trace, prefix=f"{profile}-{query.query_id}")
