@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Protocol
+
+from app.retriever import TextRow, VideoRow
+
+
+@dataclass(frozen=True, slots=True)
+class CheckerResult:
+    is_match: bool
+    confidence: float
+    visual_match: float
+    audio_match: float
+    main_events: list[str]
+    missing_elements: list[str]
+    reason: str
+    rewrite_suggestion: str
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "CheckerResult":
+        return cls(
+            is_match=bool(payload.get("is_match", False)),
+            confidence=float(payload.get("confidence", 0.0)),
+            visual_match=float(payload.get("visual_match", 0.0)),
+            audio_match=float(payload.get("audio_match", 0.0)),
+            main_events=[str(item) for item in payload.get("main_events", [])],
+            missing_elements=[str(item) for item in payload.get("missing_elements", [])],
+            reason=str(payload.get("reason", "")),
+            rewrite_suggestion=str(payload.get("rewrite_suggestion", "")),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "is_match": self.is_match,
+            "confidence": round(self.confidence, 4),
+            "visual_match": round(self.visual_match, 4),
+            "audio_match": round(self.audio_match, 4),
+            "main_events": list(self.main_events),
+            "missing_elements": list(self.missing_elements),
+            "reason": self.reason,
+            "rewrite_suggestion": self.rewrite_suggestion,
+        }
+
+
+class OmniChecker(Protocol):
+    def inspect_t2v(self, query_text: str, candidate_video: VideoRow, *, rank: int, score: float) -> CheckerResult:
+        ...
+
+    def inspect_v2t(self, query_video: VideoRow, candidate_text: TextRow, *, rank: int, score: float) -> CheckerResult:
+        ...
+
+
+def _extract_json(text: str) -> dict:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = [line for line in text.splitlines() if not line.startswith("```")]
+        text = "\n".join(lines).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("response did not contain a JSON object")
+    return json.loads(text[start : end + 1])
+
+
+def build_t2v_user_content(query_text: str, candidate_video: VideoRow, *, rank: int, score: float) -> list[dict]:
+    if not candidate_video.video_path:
+        raise ValueError("candidate_video.video_path is required")
+    prompt = (
+        f"Task: text-to-video retrieval check\n"
+        f"Query text: {query_text}\n"
+        f"Candidate rank: {rank}\n"
+        f"Retriever score: {score:.6f}\n"
+        "Please inspect whether the candidate video truly matches the query. "
+        "Do not use any dataset labels."
+    )
+    return [
+        {"type": "text", "text": prompt},
+        {"type": "video_url", "video_url": {"url": candidate_video.video_path}},
+    ]
+
+
+def build_v2t_user_content(query_video: VideoRow, candidate_text: TextRow, *, rank: int, score: float) -> list[dict]:
+    if not query_video.video_path:
+        raise ValueError("query_video.video_path is required")
+    prompt = (
+        f"Task: video-to-text retrieval check\n"
+        f"Candidate text: {candidate_text.text}\n"
+        f"Candidate rank: {rank}\n"
+        f"Retriever score: {score:.6f}\n"
+        "Please inspect whether the text truly describes the query video. "
+        "Do not use any dataset labels."
+    )
+    return [
+        {"type": "text", "text": prompt},
+        {"type": "video_url", "video_url": {"url": query_video.video_path}},
+    ]
+
+
+class OpenAIOmniChecker:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout_seconds: float = 120.0,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+
+    def _request(self, user_content: list[dict], system_prompt: str) -> CheckerResult:
+        payload = {
+            "model": self.model,
+            "modalities": ["text"],
+            "temperature": 0.0,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+        }
+        request = urllib.request.Request(
+            url=f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                raw = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:  # pragma: no cover
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"omni checker request failed: {detail}") from exc
+        content = raw["choices"][0]["message"]["content"]
+        return CheckerResult.from_dict(_extract_json(content))
+
+    def inspect_t2v(self, query_text: str, candidate_video: VideoRow, *, rank: int, score: float) -> CheckerResult:
+        system_prompt = (
+            "You are a video retrieval checker. "
+            "Return exactly one JSON object with fields: "
+            "is_match, confidence, visual_match, audio_match, main_events, "
+            "missing_elements, reason, rewrite_suggestion."
+        )
+        return self._request(build_t2v_user_content(query_text, candidate_video, rank=rank, score=score), system_prompt)
+
+    def inspect_v2t(self, query_video: VideoRow, candidate_text: TextRow, *, rank: int, score: float) -> CheckerResult:
+        system_prompt = (
+            "You are a text retrieval checker. "
+            "Return exactly one JSON object with fields: "
+            "is_match, confidence, visual_match, audio_match, main_events, "
+            "missing_elements, reason, rewrite_suggestion."
+        )
+        return self._request(build_v2t_user_content(query_video, candidate_text, rank=rank, score=score), system_prompt)
+
+
+class MockOmniChecker:
+    def __init__(
+        self,
+        *,
+        t2v_results: dict[str, CheckerResult | dict] | None = None,
+        v2t_results: dict[str, CheckerResult | dict] | None = None,
+    ) -> None:
+        self.t2v_results = {
+            key: value if isinstance(value, CheckerResult) else CheckerResult.from_dict(value)
+            for key, value in (t2v_results or {}).items()
+        }
+        self.v2t_results = {
+            key: value if isinstance(value, CheckerResult) else CheckerResult.from_dict(value)
+            for key, value in (v2t_results or {}).items()
+        }
+
+    def _resolve(self, store: dict, primary_key: str, secondary_key: str) -> CheckerResult | None:
+        return store.get(secondary_key) or store.get(primary_key)
+
+    def inspect_t2v(self, query_text: str, candidate_video: VideoRow, *, rank: int, score: float) -> CheckerResult:
+        resolved = self._resolve(self.t2v_results, candidate_video.video_id, f"{query_text}::{candidate_video.video_id}")
+        return resolved or CheckerResult(
+            is_match=False,
+            confidence=0.1,
+            visual_match=0.1,
+            audio_match=0.1,
+            main_events=[],
+            missing_elements=["unknown"],
+            reason="mock fallback",
+            rewrite_suggestion=query_text,
+        )
+
+    def inspect_v2t(self, query_video: VideoRow, candidate_text: TextRow, *, rank: int, score: float) -> CheckerResult:
+        resolved = self._resolve(self.v2t_results, candidate_text.text_id, f"{query_video.video_id}::{candidate_text.text_id}")
+        return resolved or CheckerResult(
+            is_match=False,
+            confidence=0.1,
+            visual_match=0.1,
+            audio_match=0.1,
+            main_events=[],
+            missing_elements=["unknown"],
+            reason="mock fallback",
+            rewrite_suggestion="",
+        )
