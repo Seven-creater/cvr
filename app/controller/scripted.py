@@ -1,20 +1,91 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from app.backends.base import RetrievalBackend
 from app.schemas import RetrievalParams, RunTrace
 from app.tools import AgentSessionState, SessionTools
 
 
-class ScriptedController:
-    name = "scripted"
+@dataclass(slots=True)
+class ScriptedPolicy:
+    name: str
+    max_rounds: int
+    adaptive_params: bool
+    fixed_params: RetrievalParams
 
-    def __init__(self, backend: RetrievalBackend) -> None:
+    def to_trace_metadata(self) -> dict[str, object]:
+        return {
+            "profile": self.name,
+            "max_rounds": self.max_rounds,
+            "adaptive_params": self.adaptive_params,
+            "fixed_params": self.fixed_params.to_dict(),
+        }
+
+
+def resolve_scripted_policy(
+    profile: str = "adaptive",
+    *,
+    fixed_video_weight: float = 0.7,
+    fixed_audio_weight: float = 0.3,
+    fixed_object_focus: str = "none",
+    fixed_temporal_focus: str = "global",
+    fixed_topk: int = 5,
+) -> ScriptedPolicy:
+    fixed_params = RetrievalParams(
+        video_weight=fixed_video_weight,
+        audio_weight=fixed_audio_weight,
+        object_focus=fixed_object_focus,
+        temporal_focus=fixed_temporal_focus,
+        topk=fixed_topk,
+    )
+
+    if profile == "adaptive":
+        return ScriptedPolicy(
+            name="adaptive",
+            max_rounds=3,
+            adaptive_params=True,
+            fixed_params=fixed_params,
+        )
+    if profile == "fixed":
+        return ScriptedPolicy(
+            name="fixed",
+            max_rounds=3,
+            adaptive_params=False,
+            fixed_params=fixed_params,
+        )
+    if profile == "single-round-fixed":
+        return ScriptedPolicy(
+            name="single-round-fixed",
+            max_rounds=1,
+            adaptive_params=False,
+            fixed_params=fixed_params,
+        )
+    raise ValueError(f"unsupported scripted profile: {profile}")
+
+
+class ScriptedController:
+    def __init__(
+        self,
+        backend: RetrievalBackend,
+        policy: ScriptedPolicy | None = None,
+    ) -> None:
         self.backend = backend
+        self.policy = policy or resolve_scripted_policy()
+        self.name = f"scripted:{self.policy.name}"
 
     def run(self, query_id: str) -> RunTrace:
         query = self.backend.get_query(query_id)
-        trace = RunTrace(query=query, planner_name=self.name)
-        state = AgentSessionState(query=query, trace=trace)
+        trace = RunTrace(
+            query=query,
+            planner_name=self.name,
+            planner_metadata=self.policy.to_trace_metadata(),
+        )
+        state = AgentSessionState(
+            query=query,
+            trace=trace,
+            max_rounds=self.policy.max_rounds,
+        )
         tools = SessionTools(self.backend, state)
 
         while not state.is_finished():
@@ -30,6 +101,8 @@ class ScriptedController:
                 },
             )
             candidates = retrieval["candidates"][:2]
+            if not candidates:
+                raise RuntimeError("retrieve_candidates returned no candidates")
             primary_candidate_id = candidates[0]["candidate_id"]
             primary_compare = None
             best_candidate_id = None
@@ -67,7 +140,11 @@ class ScriptedController:
                 or current_round.round_index >= state.max_rounds
             )
             if should_submit:
-                explanation = self._build_explanation(best_candidate_id, best_compare, current_round.round_index)
+                explanation = self._build_explanation(
+                    best_candidate_id,
+                    best_compare,
+                    current_round.round_index,
+                )
                 tools.call_tool(
                     "submit_best_candidate",
                     {
@@ -82,9 +159,19 @@ class ScriptedController:
         return trace
 
     def _choose_params(self, state: AgentSessionState) -> RetrievalParams:
+        if not self.policy.adaptive_params:
+            params = self.policy.fixed_params
+            return RetrievalParams(
+                video_weight=params.video_weight,
+                audio_weight=params.audio_weight,
+                object_focus=params.object_focus,
+                temporal_focus=params.temporal_focus,
+                topk=params.topk,
+            )
+
         query = state.query
         current_round_index = len(state.trace.rounds) + 1
-        params = RetrievalParams(topk=5)
+        params = RetrievalParams(topk=self.policy.fixed_params.topk)
 
         needs_audio = bool(query.required_audio_tags)
         if needs_audio:

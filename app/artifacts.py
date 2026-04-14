@@ -52,6 +52,7 @@ def render_markdown(trace: RunTrace) -> str:
         f"# Run {trace.query.query_id}",
         "",
         f"- Planner: `{trace.planner_name}`",
+        f"- Planner metadata: `{trace.planner_metadata}`",
         f"- Source: `{trace.query.source_video_id}`",
         f"- Target: `{trace.query.target_video_id}`",
         f"- Final candidate: `{trace.final_candidate_id}`",

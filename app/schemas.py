@@ -185,6 +185,7 @@ class RoundRecord:
 class RunTrace:
     query: QueryCase
     planner_name: str
+    planner_metadata: dict[str, Any] = field(default_factory=dict)
     rounds: list[RoundRecord] = field(default_factory=list)
     tool_history: list[ToolCallTrace] = field(default_factory=list)
     final_candidate_id: str | None = None
@@ -196,6 +197,7 @@ class RunTrace:
         return {
             "query": self.query.to_dict(),
             "planner_name": self.planner_name,
+            "planner_metadata": dict(self.planner_metadata),
             "rounds": [item.to_dict() for item in self.rounds],
             "tool_history": [item.to_dict() for item in self.tool_history],
             "final_candidate_id": self.final_candidate_id,

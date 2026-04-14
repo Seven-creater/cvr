@@ -167,6 +167,9 @@ class AcceptedQueryRecord:
     outcome_bucket: str
 
 
+SELECTION_MODES = ("target-aware", "unbiased")
+
+
 FILTER_PRESETS: dict[str, FilterPolicy] = {
     "loose": FilterPolicy(
         name="loose",
@@ -811,6 +814,28 @@ def balanced_bucket_targets(type_limit: int) -> dict[str, int]:
     }
 
 
+def pair_selection_priority(
+    source: CandidateMetadata,
+    target: CandidateMetadata,
+    query_type: str,
+    value: str,
+) -> float:
+    similarity = similarity_score(source, target)
+    preserve_overlap = len(set(source.scene_tags) & set(target.scene_tags)) / max(
+        1,
+        len(set(source.scene_tags) | set(target.scene_tags)) or 1,
+    )
+    novelty = 0.0
+    if query_type == "audio":
+        novelty = float(value in target.audio_tags and value not in source.audio_tags)
+    elif query_type == "object":
+        novelty = float(value in target.visual_objects and value not in source.visual_objects)
+    elif query_type == "temporal":
+        novelty = float(value in target.temporal_tags and value not in source.temporal_tags)
+
+    return round(0.55 * similarity + 0.30 * novelty + 0.15 * preserve_overlap, 4)
+
+
 def select_balanced_query_rows(
     accepted_records: list[AcceptedQueryRecord],
     max_queries: int,
@@ -902,7 +927,10 @@ def build_query_rows(
     max_queries: int = 100,
     seed: int = 13,
     policy: FilterPolicy | None = None,
+    selection_mode: str = "target-aware",
 ) -> tuple[list[QueryCase], dict[str, int]]:
+    if selection_mode not in SELECTION_MODES:
+        raise ValueError(f"unsupported selection_mode: {selection_mode}")
     policy = policy or FILTER_PRESETS["medium-hard"]
     random.seed(seed)
     pairs: list[tuple[float, str, CandidateMetadata, CandidateMetadata, str]] = []
@@ -954,27 +982,49 @@ def build_query_rows(
 
         query_id = f"draft_{query_type}_{len(accepted_records):05d}"
         candidate_query = make_query(query_id, source, target, query_type, value)
-        discriminability = assess_query_discriminability(
-            query=candidate_query,
-            source=source,
-            target=target,
-            candidates=candidates,
-            policy=policy,
-        )
-        if not discriminability.accepted:
-            filter_stats["rejected_ambiguous"] += 1
-            continue
+        if selection_mode == "target-aware":
+            discriminability = assess_query_discriminability(
+                query=candidate_query,
+                source=source,
+                target=target,
+                candidates=candidates,
+                policy=policy,
+            )
+            if not discriminability.accepted:
+                filter_stats["rejected_ambiguous"] += 1
+                continue
 
-        retry_bonus = 0.5 if policy.prefer_retry_candidates and discriminability.retry_favorable else 0.0
-        failure_bonus = 0.8 if policy.prefer_agent_failure_candidates and not discriminability.agent_success else 0.0
-        hidden_bonus = 0.15 * max(0, 3 - discriminability.target_visible_rounds)
-        selection_priority = (
-            failure_bonus
-            + retry_bonus
-            + hidden_bonus
-            + discriminability.hardness
-            + (1.0 - min(1.0, similarity_score(source, target)))
-        )
+            retry_bonus = 0.5 if policy.prefer_retry_candidates and discriminability.retry_favorable else 0.0
+            failure_bonus = 0.8 if policy.prefer_agent_failure_candidates and not discriminability.agent_success else 0.0
+            hidden_bonus = 0.15 * max(0, 3 - discriminability.target_visible_rounds)
+            selection_priority = (
+                failure_bonus
+                + retry_bonus
+                + hidden_bonus
+                + discriminability.hardness
+                + (1.0 - min(1.0, similarity_score(source, target)))
+            )
+            outcome_bucket = classify_outcome_bucket(discriminability)
+        else:
+            discriminability = QueryDiscriminability(
+                accepted=True,
+                target_rank=0,
+                target_score=0.0,
+                second_score=0.0,
+                score_margin=0.0,
+                strong_match_count=0,
+                round1_target_rank=0,
+                round2_target_rank=0,
+                round3_target_rank=0,
+                retry_favorable=False,
+                agent_success=False,
+                retry_rounds=0,
+                target_visible_rounds=0,
+                final_candidate_id=None,
+                hardness=0.0,
+            )
+            selection_priority = pair_selection_priority(source, target, query_type, value)
+            outcome_bucket = "direct_success"
         accepted_records.append(
             AcceptedQueryRecord(
                 selection_priority=selection_priority,
@@ -983,14 +1033,14 @@ def build_query_rows(
                 target=target,
                 value=value,
                 discriminability=discriminability,
-                outcome_bucket=classify_outcome_bucket(discriminability),
+                outcome_bucket=outcome_bucket,
             )
         )
         used_triplets.add(key)
 
     accepted_records.sort(key=lambda item: item.selection_priority, reverse=True)
 
-    if policy.balance_outcomes:
+    if policy.balance_outcomes and selection_mode == "target-aware":
         queries, selection_stats = select_balanced_query_rows(
             accepted_records=accepted_records,
             max_queries=max_queries,
@@ -1090,6 +1140,7 @@ def prepare_replay_pack(
     difficulty_preset: str | None,
     min_target_margin: float,
     max_strong_matches: int,
+    selection_mode: str = "target-aware",
 ) -> ReplayPack:
     output_dir = Path(output_dir)
     policy = resolve_filter_policy(
@@ -1107,6 +1158,7 @@ def prepare_replay_pack(
         max_queries=max_queries,
         seed=seed,
         policy=policy,
+        selection_mode=selection_mode,
     )
     retrieval_scores = build_retrieval_scores(candidates, queries)
     rollout_stats = summarize_selected_queries(candidates, queries, policy)
@@ -1125,6 +1177,7 @@ def prepare_replay_pack(
         "object_queries": sum(1 for item in queries if item.required_objects),
         "temporal_queries": sum(1 for item in queries if item.required_temporal),
         "filter_mode": policy.name,
+        "query_selection_mode": selection_mode,
         "min_target_margin": policy.min_target_margin,
         "max_strong_matches": policy.max_strong_matches,
         "generation_rank_cutoff": policy.generation_rank_cutoff,
@@ -1136,11 +1189,19 @@ def prepare_replay_pack(
         "max_target_uses": policy.max_target_uses,
         "prefer_retry_candidates": policy.prefer_retry_candidates,
         "prefer_agent_failure_candidates": policy.prefer_agent_failure_candidates,
-        "balance_outcomes": policy.balance_outcomes,
+        "balance_outcomes": policy.balance_outcomes if selection_mode == "target-aware" else False,
+        "uses_target_aware_filtering": selection_mode == "target-aware",
+        "uses_rollout_filtering": selection_mode == "target-aware",
+        "uses_heuristic_retrieval_scores": True,
+        "full_candidate_catalog": True,
         "discriminability_scorer": "generation_v2_decoupled",
         "retrieval_scorer": "heuristic_replay_full_catalog",
         "rollout_scorer": "scripted_controller_v1",
-        "selection_strategy": "balanced_outcome_mix" if policy.balance_outcomes else "priority_only",
+        "selection_strategy": (
+            "balanced_outcome_mix"
+            if policy.balance_outcomes and selection_mode == "target-aware"
+            else ("pair_similarity_only" if selection_mode == "unbiased" else "priority_only")
+        ),
         "expected_scored_candidates_per_query": max(0, len(candidates_payload) - 1),
         **rollout_stats,
         **filter_stats,
@@ -1178,6 +1239,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-target-margin", type=float, default=0.04)
     parser.add_argument("--max-strong-matches", type=int, default=1)
+    parser.add_argument(
+        "--selection-mode",
+        choices=SELECTION_MODES,
+        default="target-aware",
+        help="Whether query selection may use target-aware filtering or must avoid it entirely.",
+    )
     return parser.parse_args()
 
 
@@ -1193,6 +1260,7 @@ def main() -> None:
         difficulty_preset=args.difficulty_preset,
         min_target_margin=args.min_target_margin,
         max_strong_matches=args.max_strong_matches,
+        selection_mode=args.selection_mode,
     )
     print(json.dumps(pack.stats, ensure_ascii=False, indent=2))
     print(f"config={Path(args.output_dir) / 'real.yaml'}")

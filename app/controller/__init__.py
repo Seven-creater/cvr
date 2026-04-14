@@ -1,6 +1,6 @@
-from .scripted import ScriptedController
+from .scripted import ScriptedController, ScriptedPolicy, resolve_scripted_policy
 
-__all__ = ["OpenAIResponsesController", "ScriptedController"]
+__all__ = ["OpenAIResponsesController", "ScriptedController", "ScriptedPolicy", "resolve_scripted_policy"]
 
 
 def __getattr__(name: str):

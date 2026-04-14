@@ -62,6 +62,7 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
                 difficulty_preset=None,
                 min_target_margin=0.04,
                 max_strong_matches=1,
+                selection_mode="target-aware",
             )
 
             self.assertGreaterEqual(pack.stats["candidate_count"], 4)
@@ -79,6 +80,7 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
             self.assertIn("predicted_retry_queries", pack.stats)
             self.assertIn("predicted_retry_success_queries", pack.stats)
             self.assertIn("predicted_direct_success_queries", pack.stats)
+            self.assertTrue(pack.stats["uses_target_aware_filtering"])
 
             backend = FileRetrievalBackend(
                 candidates_path=out_dir / "candidates.json",
@@ -192,6 +194,55 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
         self.assertTrue(policy.prefer_retry_candidates)
         self.assertFalse(policy.prefer_agent_failure_candidates)
         self.assertTrue(policy.balance_outcomes)
+
+    def test_unbiased_selection_mode_disables_target_aware_filtering(self) -> None:
+        raw = {
+            "videos": [
+                {"video_id": "video1"},
+                {"video_id": "video2"},
+                {"video_id": "video3"},
+                {"video_id": "video4"},
+            ],
+            "sentences": [
+                {"video_id": "video1", "caption": "A band performs on a concert stage while people listen."},
+                {"video_id": "video2", "caption": "A band performs on a concert stage while the crowd cheers and applauds."},
+                {"video_id": "video3", "caption": "A dog runs in the park near trees."},
+                {"video_id": "video4", "caption": "A cat runs in the park near trees."},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_path = root / "MSRVTT_data.json"
+            split_path = root / "split.csv"
+            out_dir = root / "prepared"
+
+            raw_path.write_text(json.dumps(raw), encoding="utf-8")
+            with split_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["video_id"])
+                writer.writerow(["video1"])
+                writer.writerow(["video2"])
+                writer.writerow(["video3"])
+                writer.writerow(["video4"])
+
+            pack = prepare_replay_pack(
+                msrvtt_json_path=raw_path,
+                split_csv_path=split_path,
+                output_dir=out_dir,
+                max_candidates=None,
+                max_queries=3,
+                seed=7,
+                difficulty_preset="balanced-hard",
+                min_target_margin=0.04,
+                max_strong_matches=1,
+                selection_mode="unbiased",
+            )
+
+            self.assertEqual(pack.stats["query_selection_mode"], "unbiased")
+            self.assertFalse(pack.stats["uses_target_aware_filtering"])
+            self.assertFalse(pack.stats["uses_rollout_filtering"])
+            self.assertEqual(pack.stats["selection_strategy"], "pair_similarity_only")
+            self.assertFalse(pack.stats["balance_outcomes"])
 
     def test_scripted_rollout_detects_hidden_target_failure(self) -> None:
         source = CandidateMetadata(

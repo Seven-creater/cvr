@@ -1,7 +1,7 @@
 import unittest
 
 from app.backends import MockRetrievalBackend
-from app.controller import ScriptedController
+from app.controller import ScriptedController, resolve_scripted_policy
 
 
 class MockLoopTests(unittest.TestCase):
@@ -31,7 +31,36 @@ class MockLoopTests(unittest.TestCase):
         self.assertEqual(trace.rounds[1].retrieval_params.object_focus, "cat")
         self.assertEqual(trace.final_candidate_id, "cand_park_cat")
 
+    def test_fixed_profile_keeps_params_constant(self) -> None:
+        controller = ScriptedController(
+            self.backend,
+            policy=resolve_scripted_policy(
+                profile="fixed",
+                fixed_video_weight=0.7,
+                fixed_audio_weight=0.3,
+                fixed_object_focus="none",
+                fixed_temporal_focus="global",
+            ),
+        )
+        trace = controller.run("q_audio_cheer")
+        self.assertGreaterEqual(len(trace.rounds), 1)
+        first_params = trace.rounds[0].retrieval_params
+        self.assertAlmostEqual(first_params.video_weight, 0.7)
+        self.assertAlmostEqual(first_params.audio_weight, 0.3)
+        for round_row in trace.rounds[1:]:
+            self.assertEqual(round_row.retrieval_params.to_dict(), first_params.to_dict())
+        self.assertEqual(trace.planner_metadata["profile"], "fixed")
+        self.assertFalse(trace.planner_metadata["adaptive_params"])
+
+    def test_single_round_fixed_profile_stops_after_one_round(self) -> None:
+        controller = ScriptedController(
+            self.backend,
+            policy=resolve_scripted_policy(profile="single-round-fixed"),
+        )
+        trace = controller.run("q_audio_cheer")
+        self.assertEqual(len(trace.rounds), 1)
+        self.assertEqual(trace.planner_metadata["profile"], "single-round-fixed")
+
 
 if __name__ == "__main__":
     unittest.main()
-
