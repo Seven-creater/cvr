@@ -103,10 +103,17 @@ def build_comparison_payload(
         metrics = item["metrics"]
         profile = item["profile"]
         planner_name = item.get("planner_name")
-        for view_name, metric_prefix in (
-            ("Round-1", "first_round_recall"),
-            ("Any-round", "any_round_recall"),
-        ):
+        if "final_round_recall" in metrics:
+            view_pairs = (
+                ("Round-1", "first_round_recall"),
+                ("Final-round", "final_round_recall"),
+            )
+        else:
+            view_pairs = (
+                ("Round-1", "first_round_recall"),
+                ("Any-round", "any_round_recall"),
+            )
+        for view_name, metric_prefix in view_pairs:
             our_rows.append(
                 {
                     "name": f"{method_label} ({profile}, {view_name})",
@@ -133,7 +140,7 @@ def build_comparison_payload(
         "ours_rows": our_rows,
         "notes": [
             "Paper rows use standard MSR-VTT T2V retrieval metrics.",
-            "Our rows map replay recall to T2V-style columns for side-by-side reporting.",
+            "Our rows map agent-side recall to T2V-style columns for side-by-side reporting.",
             "V2T is intentionally left blank for our method because the current benchmark only evaluates query-to-video retrieval.",
         ],
     }

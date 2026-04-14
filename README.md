@@ -79,10 +79,16 @@ Run a strict MSR-VTT replay evaluation with T2V-style Recall@1/5/10:
 python -m app.alignment_suite --config data/msrvtt_pilot_replay_filtered/real.yaml --profiles adaptive,fixed,single-round-fixed --fixed-topk 10 --recall-k 1,5,10 --output-dir runs/msrvtt_t2v_alignment
 ```
 
+Run a fairer standard MSR-VTT text-to-video suite on the JSFUSION test split:
+
+```bash
+python -m app.msrvtt_t2v_suite --msrvtt-json /path/to/MSRVTT_data.json --split-csv /path/to/MSRVTT_JSFUSION_test.csv --profiles adaptive,fixed,single-round-fixed --fixed-topk 10 --output-dir runs/msrvtt_standard_t2v
+```
+
 Generate a Markdown/JSON comparison against AVIGATE paper results:
 
 ```bash
-python -m app.compare_msrvtt --summary runs/msrvtt_t2v_alignment/summary.json --profiles adaptive --paper-reference avigate_paper --include-reproduction --method-label "Ours" --output-md runs/msrvtt_t2v_alignment/compare.md --output-json runs/msrvtt_t2v_alignment/compare.json
+python -m app.compare_msrvtt --summary runs/msrvtt_standard_t2v/summary.json --profiles adaptive --paper-reference avigate_paper --include-reproduction --method-label "Ours" --output-md runs/msrvtt_standard_t2v/compare.md --output-json runs/msrvtt_standard_t2v/compare.json
 ```
 
 Artifacts are written to `runs/`.

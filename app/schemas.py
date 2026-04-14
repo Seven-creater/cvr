@@ -83,6 +83,21 @@ class QueryCase:
 
 
 @dataclass(slots=True)
+class TextQueryCase:
+    query_id: str
+    text: str
+    target_video_id: str
+    required_audio_tags: list[str] = field(default_factory=list)
+    required_objects: list[str] = field(default_factory=list)
+    required_temporal: str | None = None
+    scene_tags: list[str] = field(default_factory=list)
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class CandidateMetadata:
     video_id: str
     title: str
