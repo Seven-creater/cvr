@@ -60,13 +60,6 @@ TEMPORAL_LEXICON = {
     "late": ("late", "later", "end", "ending", "finally"),
 }
 
-FILTER_PRESETS: dict[str, dict[str, int | float]] = {
-    "loose": {"min_target_margin": 0.02, "max_strong_matches": 3},
-    "medium-hard": {"min_target_margin": 0.04, "max_strong_matches": 2},
-    "strict": {"min_target_margin": 0.06, "max_strong_matches": 1},
-}
-
-
 def tokenize(text: str) -> set[str]:
     cleaned = "".join(char.lower() if char.isalnum() else " " for char in text)
     return {token for token in cleaned.split() if token}
@@ -135,21 +128,109 @@ class QueryDiscriminability:
     second_score: float
     score_margin: float
     strong_match_count: int
+    round1_target_rank: int
+    round2_target_rank: int
+    retry_favorable: bool
+    hardness: float
+
+
+@dataclass(slots=True)
+class FilterPolicy:
+    name: str
+    min_target_margin: float
+    max_strong_matches: int
+    generation_rank_cutoff: int
+    max_target_deficit: float
+    round1_rank_cutoff: int
+    round2_rank_cutoff: int
+    max_source_uses: int
+    max_target_uses: int
+    prefer_retry_candidates: bool
+
+
+FILTER_PRESETS: dict[str, FilterPolicy] = {
+    "loose": FilterPolicy(
+        name="loose",
+        min_target_margin=0.02,
+        max_strong_matches=3,
+        generation_rank_cutoff=1,
+        max_target_deficit=0.0,
+        round1_rank_cutoff=1,
+        round2_rank_cutoff=1,
+        max_source_uses=8,
+        max_target_uses=8,
+        prefer_retry_candidates=False,
+    ),
+    "medium-hard": FilterPolicy(
+        name="medium-hard",
+        min_target_margin=0.04,
+        max_strong_matches=2,
+        generation_rank_cutoff=1,
+        max_target_deficit=0.0,
+        round1_rank_cutoff=1,
+        round2_rank_cutoff=1,
+        max_source_uses=5,
+        max_target_uses=5,
+        prefer_retry_candidates=False,
+    ),
+    "strict": FilterPolicy(
+        name="strict",
+        min_target_margin=0.06,
+        max_strong_matches=1,
+        generation_rank_cutoff=1,
+        max_target_deficit=0.0,
+        round1_rank_cutoff=1,
+        round2_rank_cutoff=1,
+        max_source_uses=4,
+        max_target_uses=4,
+        prefer_retry_candidates=False,
+    ),
+    "hard": FilterPolicy(
+        name="hard",
+        min_target_margin=0.01,
+        max_strong_matches=4,
+        generation_rank_cutoff=2,
+        max_target_deficit=0.03,
+        round1_rank_cutoff=2,
+        round2_rank_cutoff=1,
+        max_source_uses=3,
+        max_target_uses=3,
+        prefer_retry_candidates=True,
+    ),
+}
 
 
 def resolve_filter_policy(
     difficulty_preset: str | None,
     min_target_margin: float,
     max_strong_matches: int,
-) -> tuple[str, float, int]:
+) -> FilterPolicy:
     if difficulty_preset:
         preset = FILTER_PRESETS[difficulty_preset]
-        return (
-            difficulty_preset,
-            float(preset["min_target_margin"]),
-            int(preset["max_strong_matches"]),
+        return FilterPolicy(
+            name=preset.name,
+            min_target_margin=preset.min_target_margin,
+            max_strong_matches=preset.max_strong_matches,
+            generation_rank_cutoff=preset.generation_rank_cutoff,
+            max_target_deficit=preset.max_target_deficit,
+            round1_rank_cutoff=preset.round1_rank_cutoff,
+            round2_rank_cutoff=preset.round2_rank_cutoff,
+            max_source_uses=preset.max_source_uses,
+            max_target_uses=preset.max_target_uses,
+            prefer_retry_candidates=preset.prefer_retry_candidates,
         )
-    return ("custom", float(min_target_margin), int(max_strong_matches))
+    return FilterPolicy(
+        name="custom",
+        min_target_margin=float(min_target_margin),
+        max_strong_matches=int(max_strong_matches),
+        generation_rank_cutoff=1,
+        max_target_deficit=0.0,
+        round1_rank_cutoff=1,
+        round2_rank_cutoff=1,
+        max_source_uses=6,
+        max_target_uses=6,
+        prefer_retry_candidates=False,
+    )
 
 
 def build_candidate_rows(
@@ -327,13 +408,103 @@ def generation_priority_score(
     return round(score, 4), signals
 
 
+def score_candidate_for_query(
+    query: QueryCase,
+    source: CandidateMetadata,
+    candidate: CandidateMetadata,
+) -> dict[str, Any]:
+    instruction_tokens = tokenize(query.edit_instruction)
+    scene_overlap = len(set(query.preserve_tags) & set(candidate.scene_tags)) / max(1, len(query.preserve_tags) or 1)
+    source_scene_overlap = len(set(source.scene_tags) & set(candidate.scene_tags)) / max(1, len(source.scene_tags) or 1)
+    source_object_overlap = len(set(source.visual_objects) & set(candidate.visual_objects)) / max(1, len(source.visual_objects) or 1)
+    token_overlap = len(instruction_tokens & tokenize(candidate.summary + " " + candidate.caption)) / max(1, len(instruction_tokens))
+
+    required_audio = max(
+        [1.0 if tag in candidate.audio_tags else 0.0 for tag in query.required_audio_tags] or [0.0]
+    )
+    required_object = max(
+        [1.0 if tag in candidate.visual_objects else 0.0 for tag in query.required_objects] or [0.0]
+    )
+    required_temporal = (
+        1.0 if query.required_temporal and query.required_temporal in candidate.temporal_tags else 0.0
+    )
+
+    video_score = round(
+        0.35 * scene_overlap
+        + 0.25 * source_scene_overlap
+        + 0.20 * source_object_overlap
+        + 0.20 * token_overlap
+        + 0.20 * required_object
+        + 0.10 * required_temporal,
+        4,
+    )
+    audio_score = round(0.70 * required_audio + 0.30 * token_overlap, 4)
+
+    return {
+        "video_score": video_score,
+        "audio_score": audio_score,
+        "object_scores": {tag: float(tag in candidate.visual_objects) for tag in query.required_objects},
+        "temporal_scores": (
+            {query.required_temporal: required_temporal}
+            if query.required_temporal
+            else {}
+        ),
+    }
+
+
+def scripted_round_params(query: QueryCase, round_index: int) -> dict[str, Any]:
+    params = {
+        "video_weight": 0.7,
+        "audio_weight": 0.3,
+        "object_focus": "none",
+        "temporal_focus": "global",
+    }
+    if query.required_audio_tags:
+        if round_index == 1:
+            params["video_weight"] = 0.95
+            params["audio_weight"] = 0.05
+        else:
+            params["video_weight"] = 0.45
+            params["audio_weight"] = 0.55
+    if query.required_objects and round_index > 1:
+        params["object_focus"] = query.required_objects[0]
+    if query.required_temporal and round_index > 1:
+        params["temporal_focus"] = query.required_temporal
+    return params
+
+
+def rank_candidates_for_query(
+    query: QueryCase,
+    source: CandidateMetadata,
+    candidates: list[CandidateMetadata],
+    params: dict[str, Any],
+) -> list[tuple[float, str]]:
+    ranked: list[tuple[float, str]] = []
+    for candidate in candidates:
+        if candidate.video_id == source.video_id:
+            continue
+        score_payload = score_candidate_for_query(query, source, candidate)
+        video_score = float(score_payload["video_score"])
+        audio_score = float(score_payload["audio_score"])
+
+        if params["object_focus"] != "none":
+            video_score += float(score_payload["object_scores"].get(params["object_focus"], 0.0))
+        if params["temporal_focus"] != "global":
+            video_score += float(score_payload["temporal_scores"].get(params["temporal_focus"], 0.0))
+
+        combined = params["video_weight"] * video_score + params["audio_weight"] * audio_score
+        ranked.append((round(combined, 4), candidate.video_id))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
 def assess_query_discriminability(
     query: QueryCase,
     source: CandidateMetadata,
     target: CandidateMetadata,
     candidates: list[CandidateMetadata],
-    min_target_margin: float,
-    max_strong_matches: int,
+    policy: FilterPolicy,
 ) -> QueryDiscriminability:
     scored: list[tuple[float, str, dict[str, Any]]] = []
     strong_match_count = 0
@@ -355,6 +526,10 @@ def assess_query_discriminability(
             second_score=0.0,
             score_margin=0.0,
             strong_match_count=strong_match_count,
+            round1_target_rank=len(ranks) + 1,
+            round2_target_rank=len(ranks) + 1,
+            retry_favorable=False,
+            hardness=0.0,
         )
 
     target_rank = ranks.index(target.video_id) + 1
@@ -362,7 +537,38 @@ def assess_query_discriminability(
     second_score = scored[1][0] if len(scored) > 1 else 0.0
     top_score = scored[0][0] if scored else 0.0
     score_margin = round(target_score - second_score, 4) if target_rank == 1 else round(target_score - top_score, 4)
-    accepted = target_rank == 1 and (strong_match_count <= max_strong_matches or score_margin >= min_target_margin)
+    round1_ranked = rank_candidates_for_query(query, source, candidates, scripted_round_params(query, round_index=1))
+    round2_ranked = rank_candidates_for_query(query, source, candidates, scripted_round_params(query, round_index=2))
+    round1_order = [candidate_id for _, candidate_id in round1_ranked]
+    round2_order = [candidate_id for _, candidate_id in round2_ranked]
+    round1_target_rank = round1_order.index(target.video_id) + 1 if target.video_id in round1_order else len(round1_order) + 1
+    round2_target_rank = round2_order.index(target.video_id) + 1 if target.video_id in round2_order else len(round2_order) + 1
+    retry_favorable = (
+        round1_target_rank > 1
+        and round1_target_rank <= policy.round1_rank_cutoff
+        and round2_target_rank == 1
+    )
+
+    target_margin_ok = (
+        score_margin >= policy.min_target_margin
+        if target_rank == 1
+        else abs(score_margin) <= policy.max_target_deficit
+    )
+    accepted = (
+        target_rank <= policy.generation_rank_cutoff
+        and target_margin_ok
+        and strong_match_count <= policy.max_strong_matches
+        and round1_target_rank <= policy.round1_rank_cutoff
+        and round2_target_rank <= policy.round2_rank_cutoff
+    )
+
+    hardness = (
+        0.35 * float(retry_favorable)
+        + 0.20 * float(round1_target_rank > 1)
+        + 0.20 * min(1.0, strong_match_count / max(1, policy.max_strong_matches))
+        + 0.15 * max(0.0, 1.0 - min(1.0, max(score_margin, 0.0) / max(1e-6, policy.min_target_margin or 0.01)))
+        + 0.10 * (1.0 / max(1, target_rank))
+    )
     return QueryDiscriminability(
         accepted=accepted,
         target_rank=target_rank,
@@ -370,6 +576,10 @@ def assess_query_discriminability(
         second_score=second_score,
         score_margin=score_margin,
         strong_match_count=strong_match_count,
+        round1_target_rank=round1_target_rank,
+        round2_target_rank=round2_target_rank,
+        retry_favorable=retry_favorable,
+        hardness=round(hardness, 4),
     )
 
 
@@ -377,9 +587,9 @@ def build_query_rows(
     candidates: list[CandidateMetadata],
     max_queries: int = 100,
     seed: int = 13,
-    min_target_margin: float = 0.04,
-    max_strong_matches: int = 1,
+    policy: FilterPolicy | None = None,
 ) -> tuple[list[QueryCase], dict[str, int]]:
+    policy = policy or FILTER_PRESETS["medium-hard"]
     random.seed(seed)
     pairs: list[tuple[float, str, CandidateMetadata, CandidateMetadata, str]] = []
     for source in candidates:
@@ -407,7 +617,7 @@ def build_query_rows(
 
     pairs.sort(key=lambda item: item[0], reverse=True)
 
-    queries: list[QueryCase] = []
+    accepted_records: list[tuple[float, str, CandidateMetadata, CandidateMetadata, str]] = []
     used_triplets: set[tuple[str, str, str, str]] = set()
     type_counts = {"audio": 0, "object": 0, "temporal": 0}
     type_limits = {
@@ -419,36 +629,57 @@ def build_query_rows(
         "rejected_duplicate": 0,
         "rejected_type_quota": 0,
         "rejected_ambiguous": 0,
+        "rejected_source_quota": 0,
+        "rejected_target_quota": 0,
     }
 
     for _, query_type, source, target, value in pairs:
-        if len(queries) >= max_queries:
-            break
         key = (query_type, source.video_id, target.video_id, value)
         if key in used_triplets:
             filter_stats["rejected_duplicate"] += 1
             continue
-        if type_counts[query_type] >= type_limits[query_type]:
-            filter_stats["rejected_type_quota"] += 1
-            continue
 
-        query_id = f"msrvtt_{query_type}_{len(queries):05d}"
+        query_id = f"draft_{query_type}_{len(accepted_records):05d}"
         candidate_query = make_query(query_id, source, target, query_type, value)
         discriminability = assess_query_discriminability(
             query=candidate_query,
             source=source,
             target=target,
             candidates=candidates,
-            min_target_margin=min_target_margin,
-            max_strong_matches=max_strong_matches,
+            policy=policy,
         )
         if not discriminability.accepted:
             filter_stats["rejected_ambiguous"] += 1
             continue
 
-        queries.append(candidate_query)
+        retry_bonus = 0.5 if policy.prefer_retry_candidates and discriminability.retry_favorable else 0.0
+        selection_priority = retry_bonus + discriminability.hardness + (1.0 - min(1.0, similarity_score(source, target)))
+        accepted_records.append((selection_priority, query_type, source, target, value))
         used_triplets.add(key)
+
+    accepted_records.sort(key=lambda item: item[0], reverse=True)
+
+    queries: list[QueryCase] = []
+    source_counts: dict[str, int] = defaultdict(int)
+    target_counts: dict[str, int] = defaultdict(int)
+    for _, query_type, source, target, value in accepted_records:
+        if len(queries) >= max_queries:
+            break
+        if type_counts[query_type] >= type_limits[query_type]:
+            filter_stats["rejected_type_quota"] += 1
+            continue
+        if source_counts[source.video_id] >= policy.max_source_uses:
+            filter_stats["rejected_source_quota"] += 1
+            continue
+        if target_counts[target.video_id] >= policy.max_target_uses:
+            filter_stats["rejected_target_quota"] += 1
+            continue
+
+        query_id = f"msrvtt_{query_type}_{len(queries):05d}"
+        queries.append(make_query(query_id, source, target, query_type, value))
         type_counts[query_type] += 1
+        source_counts[source.video_id] += 1
+        target_counts[target.video_id] += 1
 
     return queries, filter_stats
 
@@ -463,49 +694,11 @@ def build_retrieval_scores(
     for query in queries:
         source = candidate_map[query.source_video_id]
         query_scores: dict[str, dict[str, Any]] = {}
-        source_scene = set(source.scene_tags)
-        source_objects = set(source.visual_objects)
-        instruction_tokens = tokenize(query.edit_instruction)
 
         for candidate in candidates:
             if candidate.video_id == query.source_video_id:
                 continue
-            scene_overlap = len(set(query.preserve_tags) & set(candidate.scene_tags)) / max(1, len(query.preserve_tags) or 1)
-            source_scene_overlap = len(source_scene & set(candidate.scene_tags)) / max(1, len(source_scene) or 1)
-            source_object_overlap = len(source_objects & set(candidate.visual_objects)) / max(1, len(source_objects) or 1)
-            token_overlap = len(instruction_tokens & tokenize(candidate.summary + " " + candidate.caption)) / max(1, len(instruction_tokens))
-
-            required_audio = max(
-                [1.0 if tag in candidate.audio_tags else 0.0 for tag in query.required_audio_tags] or [0.0]
-            )
-            required_object = max(
-                [1.0 if tag in candidate.visual_objects else 0.0 for tag in query.required_objects] or [0.0]
-            )
-            required_temporal = (
-                1.0 if query.required_temporal and query.required_temporal in candidate.temporal_tags else 0.0
-            )
-
-            video_score = round(
-                0.35 * scene_overlap
-                + 0.25 * source_scene_overlap
-                + 0.20 * source_object_overlap
-                + 0.20 * token_overlap
-                + 0.20 * required_object
-                + 0.10 * required_temporal,
-                4,
-            )
-            audio_score = round(0.70 * required_audio + 0.30 * token_overlap, 4)
-
-            query_scores[candidate.video_id] = {
-                "video_score": video_score,
-                "audio_score": audio_score,
-                "object_scores": {tag: float(tag in candidate.visual_objects) for tag in query.required_objects},
-                "temporal_scores": (
-                    {query.required_temporal: required_temporal}
-                    if query.required_temporal
-                    else {}
-                ),
-            }
+            query_scores[candidate.video_id] = score_candidate_for_query(query, source, candidate)
 
         scores[query.query_id] = query_scores
 
@@ -524,7 +717,7 @@ def prepare_replay_pack(
     max_strong_matches: int,
 ) -> ReplayPack:
     output_dir = Path(output_dir)
-    filter_mode, min_target_margin, max_strong_matches = resolve_filter_policy(
+    policy = resolve_filter_policy(
         difficulty_preset=difficulty_preset,
         min_target_margin=min_target_margin,
         max_strong_matches=max_strong_matches,
@@ -538,8 +731,7 @@ def prepare_replay_pack(
         candidates,
         max_queries=max_queries,
         seed=seed,
-        min_target_margin=min_target_margin,
-        max_strong_matches=max_strong_matches,
+        policy=policy,
     )
     retrieval_scores = build_retrieval_scores(candidates, queries)
 
@@ -556,9 +748,16 @@ def prepare_replay_pack(
         "audio_queries": sum(1 for item in queries if item.required_audio_tags),
         "object_queries": sum(1 for item in queries if item.required_objects),
         "temporal_queries": sum(1 for item in queries if item.required_temporal),
-        "filter_mode": filter_mode,
-        "min_target_margin": min_target_margin,
-        "max_strong_matches": max_strong_matches,
+        "filter_mode": policy.name,
+        "min_target_margin": policy.min_target_margin,
+        "max_strong_matches": policy.max_strong_matches,
+        "generation_rank_cutoff": policy.generation_rank_cutoff,
+        "max_target_deficit": policy.max_target_deficit,
+        "round1_rank_cutoff": policy.round1_rank_cutoff,
+        "round2_rank_cutoff": policy.round2_rank_cutoff,
+        "max_source_uses": policy.max_source_uses,
+        "max_target_uses": policy.max_target_uses,
+        "prefer_retry_candidates": policy.prefer_retry_candidates,
         "discriminability_scorer": "generation_v2_decoupled",
         "retrieval_scorer": "heuristic_replay_full_catalog",
         "expected_scored_candidates_per_query": max(0, len(candidates_payload) - 1),

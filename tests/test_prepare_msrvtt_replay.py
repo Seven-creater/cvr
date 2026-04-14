@@ -117,26 +117,44 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
             temporal_tags=["global"],
         )
         query = make_query("q1", source, target, "object", "cat")
+        policy = resolve_filter_policy(
+            difficulty_preset="strict",
+            min_target_margin=0.04,
+            max_strong_matches=1,
+        )
         result = assess_query_discriminability(
             query=query,
             source=source,
             target=target,
             candidates=[source, target, distractor],
-            min_target_margin=0.04,
-            max_strong_matches=1,
+            policy=policy,
         )
         self.assertFalse(result.accepted)
         self.assertGreaterEqual(result.strong_match_count, 2)
 
     def test_filter_policy_preset_overrides_manual_values(self) -> None:
-        mode, margin, strong = resolve_filter_policy(
+        policy = resolve_filter_policy(
             difficulty_preset="medium-hard",
             min_target_margin=0.99,
             max_strong_matches=99,
         )
-        self.assertEqual(mode, "medium-hard")
-        self.assertEqual(margin, 0.04)
-        self.assertEqual(strong, 2)
+        self.assertEqual(policy.name, "medium-hard")
+        self.assertEqual(policy.min_target_margin, 0.04)
+        self.assertEqual(policy.max_strong_matches, 2)
+        self.assertEqual(policy.max_source_uses, 5)
+        self.assertEqual(policy.max_target_uses, 5)
+
+    def test_hard_policy_prefers_retry_candidates(self) -> None:
+        policy = resolve_filter_policy(
+            difficulty_preset="hard",
+            min_target_margin=0.99,
+            max_strong_matches=99,
+        )
+        self.assertEqual(policy.name, "hard")
+        self.assertEqual(policy.generation_rank_cutoff, 2)
+        self.assertEqual(policy.round1_rank_cutoff, 2)
+        self.assertEqual(policy.round2_rank_cutoff, 1)
+        self.assertTrue(policy.prefer_retry_candidates)
 
 
 if __name__ == "__main__":

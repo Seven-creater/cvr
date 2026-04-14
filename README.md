@@ -34,6 +34,12 @@ For a more balanced filtered set, use the built-in preset:
 python -m app.prepare_msrvtt_replay --msrvtt-json /path/to/MSRVTT_data.json --split-csv /path/to/MSRVTT_train.9k.csv --output-dir data/msrvtt_pilot_medium --max-queries 90 --difficulty-preset medium-hard
 ```
 
+For a harder replay pack that favors retry-relevant and less repetitive cases:
+
+```bash
+python -m app.prepare_msrvtt_replay --msrvtt-json /path/to/MSRVTT_data.json --split-csv /path/to/MSRVTT_train.9k.csv --output-dir data/msrvtt_pilot_hard --max-queries 90 --difficulty-preset hard
+```
+
 The replay generator now uses a decoupled generation-time discriminability scorer for query filtering, while runtime comparison still uses the backend compare logic. This keeps filtered packs from being selected by the exact same comparison function used at evaluation time.
 
 Validate a file-backed dataset before replay:
