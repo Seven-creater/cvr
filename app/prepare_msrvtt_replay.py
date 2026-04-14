@@ -5,7 +5,7 @@ import csv
 import json
 import random
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -153,6 +153,18 @@ class FilterPolicy:
     max_target_uses: int
     prefer_retry_candidates: bool
     prefer_agent_failure_candidates: bool
+    balance_outcomes: bool
+
+
+@dataclass(slots=True)
+class AcceptedQueryRecord:
+    selection_priority: float
+    query_type: str
+    source: CandidateMetadata
+    target: CandidateMetadata
+    value: str
+    discriminability: QueryDiscriminability
+    outcome_bucket: str
 
 
 FILTER_PRESETS: dict[str, FilterPolicy] = {
@@ -169,6 +181,7 @@ FILTER_PRESETS: dict[str, FilterPolicy] = {
         max_target_uses=8,
         prefer_retry_candidates=False,
         prefer_agent_failure_candidates=False,
+        balance_outcomes=False,
     ),
     "medium-hard": FilterPolicy(
         name="medium-hard",
@@ -183,6 +196,7 @@ FILTER_PRESETS: dict[str, FilterPolicy] = {
         max_target_uses=5,
         prefer_retry_candidates=False,
         prefer_agent_failure_candidates=False,
+        balance_outcomes=False,
     ),
     "strict": FilterPolicy(
         name="strict",
@@ -197,6 +211,7 @@ FILTER_PRESETS: dict[str, FilterPolicy] = {
         max_target_uses=4,
         prefer_retry_candidates=False,
         prefer_agent_failure_candidates=False,
+        balance_outcomes=False,
     ),
     "hard": FilterPolicy(
         name="hard",
@@ -211,6 +226,22 @@ FILTER_PRESETS: dict[str, FilterPolicy] = {
         max_target_uses=3,
         prefer_retry_candidates=True,
         prefer_agent_failure_candidates=False,
+        balance_outcomes=False,
+    ),
+    "balanced-hard": FilterPolicy(
+        name="balanced-hard",
+        min_target_margin=0.0,
+        max_strong_matches=5,
+        generation_rank_cutoff=4,
+        max_target_deficit=0.12,
+        round1_rank_cutoff=5,
+        round2_rank_cutoff=5,
+        round3_rank_cutoff=5,
+        max_source_uses=4,
+        max_target_uses=4,
+        prefer_retry_candidates=True,
+        prefer_agent_failure_candidates=False,
+        balance_outcomes=True,
     ),
     "agent-hard": FilterPolicy(
         name="agent-hard",
@@ -225,6 +256,7 @@ FILTER_PRESETS: dict[str, FilterPolicy] = {
         max_target_uses=3,
         prefer_retry_candidates=True,
         prefer_agent_failure_candidates=True,
+        balance_outcomes=False,
     ),
 }
 
@@ -249,6 +281,7 @@ def resolve_filter_policy(
             max_target_uses=preset.max_target_uses,
             prefer_retry_candidates=preset.prefer_retry_candidates,
             prefer_agent_failure_candidates=preset.prefer_agent_failure_candidates,
+            balance_outcomes=preset.balance_outcomes,
         )
     return FilterPolicy(
         name="custom",
@@ -263,6 +296,7 @@ def resolve_filter_policy(
         max_target_uses=6,
         prefer_retry_candidates=False,
         prefer_agent_failure_candidates=False,
+        balance_outcomes=False,
     )
 
 
@@ -631,6 +665,14 @@ def simulate_scripted_rollout(
     }
 
 
+def classify_outcome_bucket(discriminability: QueryDiscriminability) -> str:
+    if not discriminability.agent_success:
+        return "failure"
+    if discriminability.retry_rounds > 0:
+        return "retry_success"
+    return "direct_success"
+
+
 def assess_query_discriminability(
     query: QueryCase,
     source: CandidateMetadata,
@@ -725,6 +767,136 @@ def assess_query_discriminability(
     )
 
 
+def append_query_record(
+    record: AcceptedQueryRecord,
+    policy: FilterPolicy,
+    queries: list[QueryCase],
+    type_counts: dict[str, int],
+    type_limits: dict[str, int],
+    source_counts: dict[str, int],
+    target_counts: dict[str, int],
+    filter_stats: dict[str, int],
+    selected_keys: set[tuple[str, str, str, str]],
+) -> bool:
+    record_key = (record.query_type, record.source.video_id, record.target.video_id, record.value)
+    if record_key in selected_keys:
+        return False
+    if type_counts[record.query_type] >= type_limits[record.query_type]:
+        filter_stats["rejected_type_quota"] += 1
+        return False
+    if source_counts[record.source.video_id] >= policy.max_source_uses:
+        filter_stats["rejected_source_quota"] += 1
+        return False
+    if target_counts[record.target.video_id] >= policy.max_target_uses:
+        filter_stats["rejected_target_quota"] += 1
+        return False
+
+    query_id = f"msrvtt_{record.query_type}_{len(queries):05d}"
+    queries.append(make_query(query_id, record.source, record.target, record.query_type, record.value))
+    type_counts[record.query_type] += 1
+    source_counts[record.source.video_id] += 1
+    target_counts[record.target.video_id] += 1
+    selected_keys.add(record_key)
+    return True
+
+
+def balanced_bucket_targets(type_limit: int) -> dict[str, int]:
+    failure_target = max(1, type_limit // 3)
+    retry_target = max(1, type_limit // 3)
+    direct_target = max(1, type_limit - failure_target - retry_target)
+    return {
+        "failure": failure_target,
+        "retry_success": retry_target,
+        "direct_success": direct_target,
+    }
+
+
+def select_balanced_query_rows(
+    accepted_records: list[AcceptedQueryRecord],
+    max_queries: int,
+    type_limits: dict[str, int],
+    filter_stats: dict[str, int],
+    policy: FilterPolicy,
+) -> tuple[list[QueryCase], dict[str, int]]:
+    queries: list[QueryCase] = []
+    type_counts = {"audio": 0, "object": 0, "temporal": 0}
+    source_counts: dict[str, int] = defaultdict(int)
+    target_counts: dict[str, int] = defaultdict(int)
+    selected_keys: set[tuple[str, str, str, str]] = set()
+    selection_stats = {
+        "selected_failure_queries": 0,
+        "selected_retry_success_queries": 0,
+        "selected_direct_success_queries": 0,
+    }
+    bucket_alias = {
+        "failure": "selected_failure_queries",
+        "retry_success": "selected_retry_success_queries",
+        "direct_success": "selected_direct_success_queries",
+    }
+    type_order = ("audio", "object", "temporal")
+    grouped: dict[str, dict[str, list[AcceptedQueryRecord]]] = {
+        query_type: {"failure": [], "retry_success": [], "direct_success": []}
+        for query_type in type_order
+    }
+    for record in accepted_records:
+        grouped[record.query_type][record.outcome_bucket].append(record)
+
+    for query_type in type_order:
+        for bucket in grouped[query_type]:
+            grouped[query_type][bucket].sort(key=lambda item: item.selection_priority, reverse=True)
+
+    for query_type in type_order:
+        targets = balanced_bucket_targets(type_limits[query_type])
+        for bucket in ("failure", "retry_success", "direct_success"):
+            added = 0
+            for record in grouped[query_type][bucket]:
+                if len(queries) >= max_queries or type_counts[query_type] >= type_limits[query_type]:
+                    break
+                if added >= targets[bucket]:
+                    break
+                if append_query_record(
+                    record=record,
+                    policy=policy,
+                    queries=queries,
+                    type_counts=type_counts,
+                    type_limits=type_limits,
+                    source_counts=source_counts,
+                    target_counts=target_counts,
+                    filter_stats=filter_stats,
+                    selected_keys=selected_keys,
+                ):
+                    added += 1
+                    selection_stats[bucket_alias[bucket]] += 1
+
+    for query_type in type_order:
+        merged = sorted(
+            (
+                record
+                for bucket in ("failure", "retry_success", "direct_success")
+                for record in grouped[query_type][bucket]
+            ),
+            key=lambda item: item.selection_priority,
+            reverse=True,
+        )
+        for record in merged:
+            if len(queries) >= max_queries or type_counts[query_type] >= type_limits[query_type]:
+                break
+            if append_query_record(
+                record=record,
+                policy=policy,
+                queries=queries,
+                type_counts=type_counts,
+                type_limits=type_limits,
+                source_counts=source_counts,
+                target_counts=target_counts,
+                filter_stats=filter_stats,
+                selected_keys=selected_keys,
+            ):
+                selection_stats[bucket_alias[record.outcome_bucket]] += 1
+
+    return queries, selection_stats
+
+
 def build_query_rows(
     candidates: list[CandidateMetadata],
     max_queries: int = 100,
@@ -759,9 +931,8 @@ def build_query_rows(
 
     pairs.sort(key=lambda item: item[0], reverse=True)
 
-    accepted_records: list[tuple[float, str, CandidateMetadata, CandidateMetadata, str]] = []
+    accepted_records: list[AcceptedQueryRecord] = []
     used_triplets: set[tuple[str, str, str, str]] = set()
-    type_counts = {"audio": 0, "object": 0, "temporal": 0}
     type_limits = {
         "audio": max(1, max_queries // 3),
         "object": max(1, max_queries // 3),
@@ -804,32 +975,50 @@ def build_query_rows(
             + discriminability.hardness
             + (1.0 - min(1.0, similarity_score(source, target)))
         )
-        accepted_records.append((selection_priority, query_type, source, target, value))
+        accepted_records.append(
+            AcceptedQueryRecord(
+                selection_priority=selection_priority,
+                query_type=query_type,
+                source=source,
+                target=target,
+                value=value,
+                discriminability=discriminability,
+                outcome_bucket=classify_outcome_bucket(discriminability),
+            )
+        )
         used_triplets.add(key)
 
-    accepted_records.sort(key=lambda item: item[0], reverse=True)
+    accepted_records.sort(key=lambda item: item.selection_priority, reverse=True)
+
+    if policy.balance_outcomes:
+        queries, selection_stats = select_balanced_query_rows(
+            accepted_records=accepted_records,
+            max_queries=max_queries,
+            type_limits=type_limits,
+            filter_stats=filter_stats,
+            policy=policy,
+        )
+        return queries, {**filter_stats, **selection_stats}
 
     queries: list[QueryCase] = []
+    type_counts = {"audio": 0, "object": 0, "temporal": 0}
     source_counts: dict[str, int] = defaultdict(int)
     target_counts: dict[str, int] = defaultdict(int)
-    for _, query_type, source, target, value in accepted_records:
+    selected_keys: set[tuple[str, str, str, str]] = set()
+    for record in accepted_records:
         if len(queries) >= max_queries:
             break
-        if type_counts[query_type] >= type_limits[query_type]:
-            filter_stats["rejected_type_quota"] += 1
-            continue
-        if source_counts[source.video_id] >= policy.max_source_uses:
-            filter_stats["rejected_source_quota"] += 1
-            continue
-        if target_counts[target.video_id] >= policy.max_target_uses:
-            filter_stats["rejected_target_quota"] += 1
-            continue
-
-        query_id = f"msrvtt_{query_type}_{len(queries):05d}"
-        queries.append(make_query(query_id, source, target, query_type, value))
-        type_counts[query_type] += 1
-        source_counts[source.video_id] += 1
-        target_counts[target.video_id] += 1
+        append_query_record(
+            record=record,
+            policy=policy,
+            queries=queries,
+            type_counts=type_counts,
+            type_limits=type_limits,
+            source_counts=source_counts,
+            target_counts=target_counts,
+            filter_stats=filter_stats,
+            selected_keys=selected_keys,
+        )
 
     return queries, filter_stats
 
@@ -873,6 +1062,8 @@ def summarize_selected_queries(
     ]
     total = len(discriminability_rows)
     failure_count = sum(1 for item in discriminability_rows if not item.agent_success)
+    retry_success_count = sum(1 for item in discriminability_rows if item.agent_success and item.retry_rounds > 0)
+    direct_success_count = sum(1 for item in discriminability_rows if item.agent_success and item.retry_rounds == 0)
     retry_count = sum(1 for item in discriminability_rows if item.retry_rounds > 0)
     avg_visible_rounds = (
         sum(item.target_visible_rounds for item in discriminability_rows) / total
@@ -882,6 +1073,8 @@ def summarize_selected_queries(
     return {
         "predicted_agent_failures": failure_count,
         "predicted_agent_successes": total - failure_count,
+        "predicted_retry_success_queries": retry_success_count,
+        "predicted_direct_success_queries": direct_success_count,
         "predicted_retry_queries": retry_count,
         "predicted_target_visible_rounds_avg": round(avg_visible_rounds, 2),
     }
@@ -943,9 +1136,11 @@ def prepare_replay_pack(
         "max_target_uses": policy.max_target_uses,
         "prefer_retry_candidates": policy.prefer_retry_candidates,
         "prefer_agent_failure_candidates": policy.prefer_agent_failure_candidates,
+        "balance_outcomes": policy.balance_outcomes,
         "discriminability_scorer": "generation_v2_decoupled",
         "retrieval_scorer": "heuristic_replay_full_catalog",
         "rollout_scorer": "scripted_controller_v1",
+        "selection_strategy": "balanced_outcome_mix" if policy.balance_outcomes else "priority_only",
         "expected_scored_candidates_per_query": max(0, len(candidates_payload) - 1),
         **rollout_stats,
         **filter_stats,

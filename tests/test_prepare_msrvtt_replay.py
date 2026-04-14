@@ -73,9 +73,12 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
             self.assertEqual(pack.config["candidates_path"], "candidates.json")
             self.assertEqual(pack.stats["discriminability_scorer"], "generation_v2_decoupled")
             self.assertEqual(pack.stats["rollout_scorer"], "scripted_controller_v1")
+            self.assertEqual(pack.stats["selection_strategy"], "priority_only")
             self.assertEqual(pack.stats["expected_scored_candidates_per_query"], pack.stats["candidate_count"] - 1)
             self.assertIn("predicted_agent_failures", pack.stats)
             self.assertIn("predicted_retry_queries", pack.stats)
+            self.assertIn("predicted_retry_success_queries", pack.stats)
+            self.assertIn("predicted_direct_success_queries", pack.stats)
 
             backend = FileRetrievalBackend(
                 candidates_path=out_dir / "candidates.json",
@@ -173,6 +176,22 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
         self.assertEqual(policy.round3_rank_cutoff, 5)
         self.assertTrue(policy.prefer_retry_candidates)
         self.assertTrue(policy.prefer_agent_failure_candidates)
+        self.assertFalse(policy.balance_outcomes)
+
+    def test_balanced_hard_policy_requests_mixed_outcomes(self) -> None:
+        policy = resolve_filter_policy(
+            difficulty_preset="balanced-hard",
+            min_target_margin=0.99,
+            max_strong_matches=99,
+        )
+        self.assertEqual(policy.name, "balanced-hard")
+        self.assertEqual(policy.generation_rank_cutoff, 4)
+        self.assertEqual(policy.round1_rank_cutoff, 5)
+        self.assertEqual(policy.round2_rank_cutoff, 5)
+        self.assertEqual(policy.round3_rank_cutoff, 5)
+        self.assertTrue(policy.prefer_retry_candidates)
+        self.assertFalse(policy.prefer_agent_failure_candidates)
+        self.assertTrue(policy.balance_outcomes)
 
     def test_scripted_rollout_detects_hidden_target_failure(self) -> None:
         source = CandidateMetadata(
