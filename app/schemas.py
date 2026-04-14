@@ -210,3 +210,49 @@ class RunTrace:
             "success": self.success,
             "created_at": self.created_at,
         }
+
+
+@dataclass(slots=True)
+class BanditActionRecord:
+    action_id: str
+    action_type: str
+    description: str
+    retrieval_params: dict[str, Any] | None = None
+    candidate_id: str | None = None
+    candidate_strategy: str | None = None
+    explanation: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class BanditSample:
+    query_id: str
+    source_video_id: str
+    round_index: int
+    planner_name: str
+    observation_text: str
+    state: dict[str, Any]
+    available_actions: list[dict[str, Any]]
+    action: BanditActionRecord
+    reward: float
+    reward_breakdown: dict[str, Any] = field(default_factory=dict)
+    done: bool = False
+    final_success: bool | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "query_id": self.query_id,
+            "source_video_id": self.source_video_id,
+            "round_index": self.round_index,
+            "planner_name": self.planner_name,
+            "observation_text": self.observation_text,
+            "state": dict(self.state),
+            "available_actions": [dict(item) for item in self.available_actions],
+            "action": self.action.to_dict(),
+            "reward": self.reward,
+            "reward_breakdown": dict(self.reward_breakdown),
+            "done": self.done,
+            "final_success": self.final_success,
+        }

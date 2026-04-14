@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,7 @@ from app.backends.file_backend import _normalize_retrieval_scores
 from app.config import load_yaml
 from app.controller import ScriptedController, resolve_scripted_policy
 from app.demo import resolve_config_path
-from app.eval import compute_recall_at_k, error_labels, parse_recall_ks, query_type
+from app.eval import parse_recall_ks, summarize_rows
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,58 +88,6 @@ def build_data_audit(backend: FileRetrievalBackend, retrieval_scores_path: str |
         "query_selection_mode": pack_stats.get("query_selection_mode"),
         "selection_strategy": pack_stats.get("selection_strategy"),
         "warnings": warnings,
-    }
-
-
-def summarize_rows(rows: list[dict[str, Any]], ks: list[int]) -> dict[str, Any]:
-    total = len(rows)
-    successes = sum(1 for row in rows if row.get("success") is True)
-    avg_rounds = sum(len(row.get("rounds", [])) for row in rows) / max(1, total)
-    avg_tool_calls = sum(len(row.get("tool_history", [])) for row in rows) / max(1, total)
-    first_round_recall, any_round_recall = compute_recall_at_k(rows, ks)
-
-    type_buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        type_buckets[query_type(row)].append(row)
-
-    type_summary = {
-        bucket: {
-            "count": len(items),
-            "success_rate": round(
-                sum(1 for item in items if item.get("success") is True) / max(1, len(items)),
-                3,
-            ),
-        }
-        for bucket, items in sorted(type_buckets.items())
-    }
-
-    failed_cases = []
-    error_counter: Counter[str] = Counter()
-    for row in rows:
-        labels = error_labels(row)
-        error_counter.update(labels)
-        if labels:
-            failed_cases.append(
-                {
-                    "query_id": row.get("query", {}).get("query_id"),
-                    "type": query_type(row),
-                    "target": row.get("query", {}).get("target_video_id"),
-                    "final": row.get("final_candidate_id"),
-                    "errors": labels,
-                }
-            )
-
-    return {
-        "runs": total,
-        "success_rate": round(successes / max(1, total), 3),
-        "avg_rounds": round(avg_rounds, 2),
-        "avg_tool_calls": round(avg_tool_calls, 2),
-        "first_round_top1": round(first_round_recall.get(1, 0.0), 3),
-        "first_round_recall": {f"R@{k}": round(v, 3) for k, v in first_round_recall.items()},
-        "any_round_recall": {f"R@{k}": round(v, 3) for k, v in any_round_recall.items()},
-        "type_breakdown": type_summary,
-        "error_breakdown": dict(error_counter),
-        "failed_cases": failed_cases,
     }
 
 

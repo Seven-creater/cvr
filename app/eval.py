@@ -16,6 +16,8 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated K values for Recall@K reporting (default: 1,3,5)",
     )
     parser.add_argument("--report-output", help="Optional text report output path")
+    parser.add_argument("--json-output", help="Optional JSON summary output path")
+    parser.add_argument("--markdown-output", help="Optional Markdown summary output path")
     return parser.parse_args()
 
 
@@ -165,50 +167,169 @@ def print_recall_block(title: str, values: dict[int, float]) -> list[str]:
     return lines
 
 
-def print_type_breakdown(rows: list[dict[str, Any]]) -> None:
+def summarize_rows(rows: list[dict[str, Any]], ks: list[int]) -> dict[str, Any]:
+    total = len(rows)
+    successes = sum(1 for row in rows if row.get("success") is True)
+    avg_rounds = sum(len(row.get("rounds", [])) for row in rows) / max(1, total)
+    avg_tool_calls = sum(len(row.get("tool_history", [])) for row in rows) / max(1, total)
+    first_round_recall, any_round_recall = compute_recall_at_k(rows, ks)
+
     buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         buckets[query_type(row)].append(row)
 
-    print("type_breakdown:")
-    for bucket in sorted(buckets):
-        items = buckets[bucket]
-        success = sum(1 for row in items if row.get("success") is True)
-        print(f"  {bucket}: count={len(items)} success_rate={success / max(1, len(items)):.3f}")
+    type_breakdown = {
+        bucket: {
+            "count": len(items),
+            "success_rate": round(
+                sum(1 for item in items if item.get("success") is True) / max(1, len(items)),
+                3,
+            ),
+        }
+        for bucket, items in sorted(buckets.items())
+    }
 
-
-def print_error_breakdown(rows: list[dict[str, Any]]) -> None:
     failed_rows = [row for row in rows if row.get("success") is not True]
-    counter: Counter[str] = Counter()
+    error_counter: Counter[str] = Counter()
+    failed_cases: list[dict[str, Any]] = []
     for row in failed_rows:
-        counter.update(error_labels(row))
+        labels = error_labels(row)
+        error_counter.update(labels)
+        failed_cases.append(
+            {
+                "query_id": row.get("query", {}).get("query_id"),
+                "type": query_type(row),
+                "target": row.get("query", {}).get("target_video_id"),
+                "final": row.get("final_candidate_id"),
+                "errors": labels,
+            }
+        )
 
+    return {
+        "runs": total,
+        "success_rate": round(successes / max(1, total), 3),
+        "avg_rounds": round(avg_rounds, 2),
+        "avg_tool_calls": round(avg_tool_calls, 2),
+        "first_round_top1": round(first_round_recall.get(1, 0.0), 3),
+        "first_round_recall": {f"R@{k}": round(v, 3) for k, v in first_round_recall.items()},
+        "any_round_recall": {f"R@{k}": round(v, 3) for k, v in any_round_recall.items()},
+        "type_breakdown": type_breakdown,
+        "error_breakdown": dict(error_counter),
+        "failed_cases": failed_cases,
+    }
+
+
+def print_type_breakdown(summary: dict[str, Any]) -> None:
+    buckets = summary.get("type_breakdown", {})
+    print("type_breakdown:")
+    if not buckets:
+        print("  none")
+        return
+    for bucket in sorted(buckets):
+        item = buckets[bucket]
+        print(f"  {bucket}: count={item['count']} success_rate={item['success_rate']:.3f}")
+
+
+def print_error_breakdown(summary: dict[str, Any]) -> None:
+    counter = summary.get("error_breakdown", {})
     print("error_breakdown:")
     if not counter:
         print("  none")
         return
 
-    for label, count in counter.most_common():
+    for label, count in sorted(counter.items(), key=lambda item: (-item[1], item[0])):
         print(f"  {label}: {count}")
 
 
-def print_failed_cases(rows: list[dict[str, Any]]) -> None:
-    failed_rows = [row for row in rows if row.get("success") is not True]
+def print_failed_cases(summary: dict[str, Any]) -> None:
+    failed_rows = summary.get("failed_cases", [])
     print("failed_cases:")
     if not failed_rows:
         print("  none")
         return
 
     for row in failed_rows:
-        labels = ",".join(error_labels(row))
+        labels = ",".join(row.get("errors", []))
         print(
             "  "
-            f"query={row.get('query', {}).get('query_id')} "
-            f"type={query_type(row)} "
-            f"target={row.get('query', {}).get('target_video_id')} "
-            f"final={row.get('final_candidate_id')} "
+            f"query={row.get('query_id')} "
+            f"type={row.get('type')} "
+            f"target={row.get('target')} "
+            f"final={row.get('final')} "
             f"errors={labels}"
         )
+
+
+def build_text_lines(input_paths: list[Path], summary: dict[str, Any]) -> tuple[list[str], list[str]]:
+    lines = [
+        f"inputs={len(input_paths)}",
+        f"runs={summary['runs']}",
+        f"success_rate={summary['success_rate']:.3f}",
+        f"avg_rounds={summary['avg_rounds']:.2f}",
+        f"avg_tool_calls={summary['avg_tool_calls']:.2f}",
+        f"first_round_top1={summary['first_round_top1']:.3f}",
+    ]
+    first_round_recall = {
+        int(key.split("@", 1)[1]): value
+        for key, value in summary["first_round_recall"].items()
+    }
+    any_round_recall = {
+        int(key.split("@", 1)[1]): value
+        for key, value in summary["any_round_recall"].items()
+    }
+    recall_lines = []
+    recall_lines.extend(print_recall_block("first_round_recall", first_round_recall))
+    recall_lines.extend(print_recall_block("any_round_recall", any_round_recall))
+    return lines, recall_lines
+
+
+def render_markdown_summary(input_paths: list[Path], summary: dict[str, Any]) -> str:
+    lines = [
+        "# Evaluation Summary",
+        "",
+        "## Headline Metrics",
+        "",
+        f"- inputs: `{len(input_paths)}`",
+        f"- runs: `{summary['runs']}`",
+        f"- success_rate: `{summary['success_rate']}`",
+        f"- avg_rounds: `{summary['avg_rounds']}`",
+        f"- avg_tool_calls: `{summary['avg_tool_calls']}`",
+        f"- first_round_top1: `{summary['first_round_top1']}`",
+        "",
+        "## Recall",
+        "",
+        f"- first_round_recall: `{summary['first_round_recall']}`",
+        f"- any_round_recall: `{summary['any_round_recall']}`",
+        "",
+        "## Type Breakdown",
+        "",
+    ]
+    if summary["type_breakdown"]:
+        for bucket, item in summary["type_breakdown"].items():
+            lines.append(
+                f"- {bucket}: `count={item['count']}` `success_rate={item['success_rate']}`"
+            )
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "## Error Breakdown", ""])
+    if summary["error_breakdown"]:
+        for label, count in summary["error_breakdown"].items():
+            lines.append(f"- {label}: `{count}`")
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "## Failed Cases", ""])
+    if summary["failed_cases"]:
+        for row in summary["failed_cases"]:
+            lines.append(
+                f"- query=`{row['query_id']}` type=`{row['type']}` "
+                f"target=`{row['target']}` final=`{row['final']}` "
+                f"errors=`{','.join(row['errors'])}`"
+            )
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -219,28 +340,31 @@ def main() -> None:
     for path in paths:
         rows.extend(load_rows(path))
 
-    total = len(rows)
-    successes = sum(1 for row in rows if row.get("success") is True)
-    avg_rounds = sum(len(row.get("rounds", [])) for row in rows) / max(1, total)
-    avg_tools = sum(len(row.get("tool_history", [])) for row in rows) / max(1, total)
-    first_round_recall, any_round_recall = compute_recall_at_k(rows, ks)
-
+    summary = summarize_rows(rows, ks)
     lines = [
         f"inputs={len(paths)}",
-        f"runs={total}",
-        f"success_rate={successes / max(1, total):.3f}",
-        f"avg_rounds={avg_rounds:.2f}",
-        f"avg_tool_calls={avg_tools:.2f}",
-        f"first_round_top1={first_round_recall.get(1, 0.0):.3f}",
+        f"runs={summary['runs']}",
+        f"success_rate={summary['success_rate']:.3f}",
+        f"avg_rounds={summary['avg_rounds']:.2f}",
+        f"avg_tool_calls={summary['avg_tool_calls']:.2f}",
+        f"first_round_top1={summary['first_round_top1']:.3f}",
     ]
     for line in lines:
         print(line)
+    first_round_recall = {
+        int(key.split("@", 1)[1]): value
+        for key, value in summary["first_round_recall"].items()
+    }
+    any_round_recall = {
+        int(key.split("@", 1)[1]): value
+        for key, value in summary["any_round_recall"].items()
+    }
     recall_lines = []
     recall_lines.extend(print_recall_block("first_round_recall", first_round_recall))
     recall_lines.extend(print_recall_block("any_round_recall", any_round_recall))
-    print_type_breakdown(rows)
-    print_error_breakdown(rows)
-    print_failed_cases(rows)
+    print_type_breakdown(summary)
+    print_error_breakdown(summary)
+    print_failed_cases(summary)
 
     if args.report_output:
         report_path = Path(args.report_output)
@@ -248,6 +372,18 @@ def main() -> None:
         with report_path.open("w", encoding="utf-8") as handle:
             for line in [*lines, *recall_lines]:
                 handle.write(line + "\n")
+    if args.json_output:
+        payload = {
+            "inputs": [str(path) for path in paths],
+            "metrics": summary,
+        }
+        output_path = Path(args.json_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.markdown_output:
+        output_path = Path(args.markdown_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(render_markdown_summary(paths, summary), encoding="utf-8")
 
 
 if __name__ == "__main__":
