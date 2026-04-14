@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from app.backends.base import heuristic_compare, overlap_score
+from app.backends.base import overlap_score
 from app.schemas import CandidateMetadata, QueryCase
 
 AUDIO_LEXICON = {
@@ -58,6 +58,12 @@ TEMPORAL_LEXICON = {
     "opening": ("opening", "start", "starts", "begin", "beginning", "first"),
     "middle": ("middle", "then", "afterward"),
     "late": ("late", "later", "end", "ending", "finally"),
+}
+
+FILTER_PRESETS: dict[str, dict[str, int | float]] = {
+    "loose": {"min_target_margin": 0.02, "max_strong_matches": 3},
+    "medium-hard": {"min_target_margin": 0.04, "max_strong_matches": 2},
+    "strict": {"min_target_margin": 0.06, "max_strong_matches": 1},
 }
 
 
@@ -129,6 +135,21 @@ class QueryDiscriminability:
     second_score: float
     score_margin: float
     strong_match_count: int
+
+
+def resolve_filter_policy(
+    difficulty_preset: str | None,
+    min_target_margin: float,
+    max_strong_matches: int,
+) -> tuple[str, float, int]:
+    if difficulty_preset:
+        preset = FILTER_PRESETS[difficulty_preset]
+        return (
+            difficulty_preset,
+            float(preset["min_target_margin"]),
+            int(preset["max_strong_matches"]),
+        )
+    return ("custom", float(min_target_margin), int(max_strong_matches))
 
 
 def build_candidate_rows(
@@ -249,13 +270,13 @@ def make_query(
     )
 
 
-def query_priority_score(
+def generation_priority_score(
     query: QueryCase,
     source: CandidateMetadata,
     candidate: CandidateMetadata,
 ) -> tuple[float, dict[str, Any]]:
-    comparison = heuristic_compare(query, source, candidate)
-    preserve_ratio = overlap_score(query.preserve_tags, [*candidate.scene_tags, *candidate.visual_objects]) if query.preserve_tags else 1.0
+    candidate_scene_values = [*candidate.scene_tags, *candidate.visual_objects]
+    preserve_ratio = overlap_score(query.preserve_tags, candidate_scene_values) if query.preserve_tags else 1.0
     object_ratio = overlap_score(query.required_objects, candidate.visual_objects) if query.required_objects else 0.0
     audio_ratio = overlap_score(query.required_audio_tags, candidate.audio_tags) if query.required_audio_tags else 0.0
     temporal_ratio = (
@@ -266,18 +287,44 @@ def query_priority_score(
     token_overlap = len(tokenize(query.edit_instruction) & tokenize(candidate.summary + " " + candidate.caption)) / max(
         1, len(tokenize(query.edit_instruction))
     )
-
     required_signal = max(audio_ratio, object_ratio, temporal_ratio)
-    score = (
-        0.45 * comparison.confidence
-        + 0.20 * preserve_ratio
-        + 0.20 * required_signal
-        + 0.10 * token_overlap
-        + 0.05 * (0.5 * source_scene_overlap + 0.5 * source_object_overlap)
+    source_required_signal = max(
+        overlap_score(query.required_audio_tags, source.audio_tags) if query.required_audio_tags else 0.0,
+        overlap_score(query.required_objects, source.visual_objects) if query.required_objects else 0.0,
+        (
+            1.0
+            if query.required_temporal and query.required_temporal in source.temporal_tags
+            else 0.0
+        ) if query.required_temporal else 0.0,
     )
-    if comparison.conflicts:
-        score -= 0.10 * len(comparison.conflicts)
-    return round(score, 4), comparison.to_dict()
+    novelty_gain = max(0.0, required_signal - source_required_signal)
+    source_alignment = 0.6 * source_scene_overlap + 0.4 * source_object_overlap
+    score = (
+        0.40 * required_signal
+        + 0.20 * preserve_ratio
+        + 0.10 * token_overlap
+        + 0.15 * novelty_gain
+        + 0.15 * source_alignment
+    )
+    if required_signal == 0.0:
+        score -= 0.20
+    if query.required_objects and any(item in source.visual_objects for item in query.required_objects):
+        score -= 0.10
+
+    strong_match = (
+        required_signal >= 1.0
+        and preserve_ratio >= 0.5
+        and token_overlap >= 0.10
+    )
+    signals = {
+        "preserve_ratio": round(preserve_ratio, 4),
+        "required_signal": round(required_signal, 4),
+        "token_overlap": round(token_overlap, 4),
+        "novelty_gain": round(novelty_gain, 4),
+        "source_alignment": round(source_alignment, 4),
+        "strong_match": strong_match,
+    }
+    return round(score, 4), signals
 
 
 def assess_query_discriminability(
@@ -293,9 +340,9 @@ def assess_query_discriminability(
     for candidate in candidates:
         if candidate.video_id == source.video_id:
             continue
-        score, comparison = query_priority_score(query, source, candidate)
-        scored.append((score, candidate.video_id, comparison))
-        if not comparison["missing"] and not comparison["conflicts"]:
+        score, signals = generation_priority_score(query, source, candidate)
+        scored.append((score, candidate.video_id, signals))
+        if signals["strong_match"]:
             strong_match_count += 1
 
     scored.sort(key=lambda item: item[0], reverse=True)
@@ -472,10 +519,16 @@ def prepare_replay_pack(
     max_candidates: int | None,
     max_queries: int,
     seed: int,
+    difficulty_preset: str | None,
     min_target_margin: float,
     max_strong_matches: int,
 ) -> ReplayPack:
     output_dir = Path(output_dir)
+    filter_mode, min_target_margin, max_strong_matches = resolve_filter_policy(
+        difficulty_preset=difficulty_preset,
+        min_target_margin=min_target_margin,
+        max_strong_matches=max_strong_matches,
+    )
     candidates = build_candidate_rows(
         msrvtt_json_path=msrvtt_json_path,
         split_csv_path=split_csv_path,
@@ -503,8 +556,12 @@ def prepare_replay_pack(
         "audio_queries": sum(1 for item in queries if item.required_audio_tags),
         "object_queries": sum(1 for item in queries if item.required_objects),
         "temporal_queries": sum(1 for item in queries if item.required_temporal),
+        "filter_mode": filter_mode,
         "min_target_margin": min_target_margin,
         "max_strong_matches": max_strong_matches,
+        "discriminability_scorer": "generation_v2_decoupled",
+        "retrieval_scorer": "heuristic_replay_full_catalog",
+        "expected_scored_candidates_per_query": max(0, len(candidates_payload) - 1),
         **filter_stats,
     }
 
@@ -533,6 +590,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-candidates", type=int, help="Optional cap on candidate videos")
     parser.add_argument("--max-queries", type=int, default=90, help="Number of auto-generated replay queries")
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument(
+        "--difficulty-preset",
+        choices=sorted(FILTER_PRESETS),
+        help="Optional preset for replay filtering difficulty",
+    )
     parser.add_argument("--min-target-margin", type=float, default=0.04)
     parser.add_argument("--max-strong-matches", type=int, default=1)
     return parser.parse_args()
@@ -547,6 +609,7 @@ def main() -> None:
         max_candidates=args.max_candidates,
         max_queries=args.max_queries,
         seed=args.seed,
+        difficulty_preset=args.difficulty_preset,
         min_target_margin=args.min_target_margin,
         max_strong_matches=args.max_strong_matches,
     )

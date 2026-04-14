@@ -10,6 +10,11 @@ from typing import Any
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate saved run traces")
     parser.add_argument("--input", required=True, help="Path or glob for run jsonl files")
+    parser.add_argument(
+        "--recall-k",
+        default="1,3,5",
+        help="Comma-separated K values for Recall@K reporting (default: 1,3,5)",
+    )
     parser.add_argument("--report-output", help="Optional text report output path")
     return parser.parse_args()
 
@@ -32,6 +37,22 @@ def resolve_input_paths(value: str) -> list[Path]:
     if matches:
         return [path for path in matches if path.is_file()]
     raise FileNotFoundError(f"no input matched: {value}")
+
+
+def parse_recall_ks(value: str) -> list[int]:
+    ks: list[int] = []
+    for chunk in value.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        k = int(item)
+        if k <= 0:
+            raise ValueError(f"Recall@K must use positive integers, got: {k}")
+        ks.append(k)
+
+    if not ks:
+        raise ValueError("At least one Recall@K value is required")
+    return sorted(set(ks))
 
 
 def query_type(row: dict[str, Any]) -> str:
@@ -101,6 +122,49 @@ def error_labels(row: dict[str, Any]) -> list[str]:
     return labels
 
 
+def compute_recall_at_k(
+    rows: list[dict[str, Any]],
+    ks: list[int],
+) -> tuple[dict[int, float], dict[int, float]]:
+    first_round_hits = {k: 0 for k in ks}
+    any_round_hits = {k: 0 for k in ks}
+    total = len(rows)
+
+    for row in rows:
+        target = row.get("query", {}).get("target_video_id")
+        rounds = row.get("rounds", [])
+        if not target or not rounds:
+            continue
+
+        first_round = rounds[0]
+        first_retrieved = first_round.get("retrieved_candidates", [])
+        for k in ks:
+            if target in first_retrieved[:k]:
+                first_round_hits[k] += 1
+            if any(target in round_row.get("retrieved_candidates", [])[:k] for round_row in rounds):
+                any_round_hits[k] += 1
+
+    first_round_recall = {
+        k: first_round_hits[k] / max(1, total)
+        for k in ks
+    }
+    any_round_recall = {
+        k: any_round_hits[k] / max(1, total)
+        for k in ks
+    }
+    return first_round_recall, any_round_recall
+
+
+def print_recall_block(title: str, values: dict[int, float]) -> list[str]:
+    lines = [f"{title}:"]
+    print(title + ":")
+    for k in sorted(values):
+        line = f"  R@{k}={values[k]:.3f}"
+        lines.append(line)
+        print(line)
+    return lines
+
+
 def print_type_breakdown(rows: list[dict[str, Any]]) -> None:
     buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -151,6 +215,7 @@ def main() -> None:
     args = parse_args()
     rows: list[dict[str, Any]] = []
     paths = resolve_input_paths(args.input)
+    ks = parse_recall_ks(args.recall_k)
     for path in paths:
         rows.extend(load_rows(path))
 
@@ -158,13 +223,7 @@ def main() -> None:
     successes = sum(1 for row in rows if row.get("success") is True)
     avg_rounds = sum(len(row.get("rounds", [])) for row in rows) / max(1, total)
     avg_tools = sum(len(row.get("tool_history", [])) for row in rows) / max(1, total)
-    first_round_hits = 0
-    for row in rows:
-        target = row.get("query", {}).get("target_video_id")
-        first_round = (row.get("rounds") or [{}])[0]
-        retrieved = first_round.get("retrieved_candidates", [])
-        if target and retrieved and retrieved[0] == target:
-            first_round_hits += 1
+    first_round_recall, any_round_recall = compute_recall_at_k(rows, ks)
 
     lines = [
         f"inputs={len(paths)}",
@@ -172,10 +231,13 @@ def main() -> None:
         f"success_rate={successes / max(1, total):.3f}",
         f"avg_rounds={avg_rounds:.2f}",
         f"avg_tool_calls={avg_tools:.2f}",
-        f"first_round_top1={first_round_hits / max(1, total):.3f}",
+        f"first_round_top1={first_round_recall.get(1, 0.0):.3f}",
     ]
     for line in lines:
         print(line)
+    recall_lines = []
+    recall_lines.extend(print_recall_block("first_round_recall", first_round_recall))
+    recall_lines.extend(print_recall_block("any_round_recall", any_round_recall))
     print_type_breakdown(rows)
     print_error_breakdown(rows)
     print_failed_cases(rows)
@@ -184,7 +246,7 @@ def main() -> None:
         report_path = Path(args.report_output)
         report_path.parent.mkdir(parents=True, exist_ok=True)
         with report_path.open("w", encoding="utf-8") as handle:
-            for line in lines:
+            for line in [*lines, *recall_lines]:
                 handle.write(line + "\n")
 
 

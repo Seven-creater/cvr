@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from app.backends import FileRetrievalBackend
-from app.eval import resolve_input_paths
+from app.eval import compute_recall_at_k, parse_recall_ks, resolve_input_paths
 from app.schemas import RetrievalParams
 
 
@@ -93,6 +93,33 @@ class FileBackendFormatTests(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
             self.assertEqual({path.name for path in paths}, {"a.jsonl", "b.jsonl"})
+
+    def test_eval_computes_recall_at_k(self) -> None:
+        rows = [
+            {
+                "query": {"target_video_id": "cand1"},
+                "rounds": [
+                    {"retrieved_candidates": ["cand1", "cand2", "cand3"]},
+                ],
+            },
+            {
+                "query": {"target_video_id": "cand4"},
+                "rounds": [
+                    {"retrieved_candidates": ["cand2", "cand3", "cand4"]},
+                    {"retrieved_candidates": ["cand4", "cand2", "cand3"]},
+                ],
+            },
+        ]
+
+        first_round, any_round = compute_recall_at_k(rows, [1, 3, 5])
+        self.assertEqual(first_round[1], 0.5)
+        self.assertEqual(first_round[3], 1.0)
+        self.assertEqual(any_round[1], 1.0)
+        self.assertEqual(any_round[3], 1.0)
+        self.assertEqual(any_round[5], 1.0)
+
+    def test_parse_recall_ks_normalizes_duplicates(self) -> None:
+        self.assertEqual(parse_recall_ks("5,1,3,3"), [1, 3, 5])
 
 
 if __name__ == "__main__":

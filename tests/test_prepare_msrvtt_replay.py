@@ -6,7 +6,12 @@ from pathlib import Path
 
 from app.backends import FileRetrievalBackend
 from app.demo import build_backend
-from app.prepare_msrvtt_replay import assess_query_discriminability, make_query, prepare_replay_pack
+from app.prepare_msrvtt_replay import (
+    assess_query_discriminability,
+    make_query,
+    prepare_replay_pack,
+    resolve_filter_policy,
+)
 from app.schemas import CandidateMetadata
 
 
@@ -53,6 +58,7 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
                 max_candidates=None,
                 max_queries=6,
                 seed=7,
+                difficulty_preset=None,
                 min_target_margin=0.04,
                 max_strong_matches=1,
             )
@@ -64,6 +70,8 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
             self.assertTrue((out_dir / "retrieval_scores.json").exists())
             self.assertTrue((out_dir / "real.yaml").exists())
             self.assertEqual(pack.config["candidates_path"], "candidates.json")
+            self.assertEqual(pack.stats["discriminability_scorer"], "generation_v2_decoupled")
+            self.assertEqual(pack.stats["expected_scored_candidates_per_query"], pack.stats["candidate_count"] - 1)
 
             backend = FileRetrievalBackend(
                 candidates_path=out_dir / "candidates.json",
@@ -119,6 +127,16 @@ class PrepareMsrvttReplayTests(unittest.TestCase):
         )
         self.assertFalse(result.accepted)
         self.assertGreaterEqual(result.strong_match_count, 2)
+
+    def test_filter_policy_preset_overrides_manual_values(self) -> None:
+        mode, margin, strong = resolve_filter_policy(
+            difficulty_preset="medium-hard",
+            min_target_margin=0.99,
+            max_strong_matches=99,
+        )
+        self.assertEqual(mode, "medium-hard")
+        self.assertEqual(margin, 0.04)
+        self.assertEqual(strong, 2)
 
 
 if __name__ == "__main__":

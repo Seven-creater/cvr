@@ -67,13 +67,25 @@ def main() -> None:
     normalized_scores = _normalize_retrieval_scores(raw_scores) if raw_scores else {}
     missing_score_queries = [query.query_id for query in queries if args.scores and query.query_id not in normalized_scores]
     dangling_score_candidates: list[str] = []
+    score_coverages: list[int] = []
+    expected_scored_candidates = max(0, len(backend._candidates) - 1)  # noqa: SLF001
+    full_coverage_queries: list[str] = []
     for query_id, ranked in normalized_scores.items():
+        score_coverages.append(len(ranked))
+        if len(ranked) == expected_scored_candidates:
+            full_coverage_queries.append(query_id)
         for candidate_id in ranked:
             if candidate_id not in backend._candidates:  # noqa: SLF001
                 dangling_score_candidates.append(f"{query_id}:{candidate_id}")
 
     print(f"candidate_catalog={len(backend._candidates)}")
     print(f"score_queries={len(normalized_scores)}")
+    if normalized_scores:
+        print(f"expected_scored_candidates_per_query={expected_scored_candidates}")
+        print(f"score_coverage_min={min(score_coverages)}")
+        print(f"score_coverage_max={max(score_coverages)}")
+        print(f"score_coverage_avg={sum(score_coverages) / max(1, len(score_coverages)):.2f}")
+        print(f"full_coverage_queries={len(full_coverage_queries)}/{len(normalized_scores)}")
     print(f"duplicate_query_ids={duplicate_query_ids or 'none'}")
     print(f"missing_target_rows={missing_targets or 'none'}")
     print(f"queries_without_scores={missing_score_queries or 'none'}")
