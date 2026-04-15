@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
-from app.omni_checker import CheckerResult, build_t2v_user_content, build_v2t_user_content
+from app.omni_checker import CheckerResult, _materialize_video_url, build_t2v_user_content, build_v2t_user_content
 from app.retriever import TextRow, VideoRow
 
 
@@ -14,10 +16,10 @@ class OmniCheckerTests(unittest.TestCase):
             rank=1,
             score=0.9,
         )
-        prompt = content[0]["text"]
+        prompt = content[1]["text"]
         self.assertNotIn("target_video_id", prompt)
         self.assertNotIn("ground truth", prompt.lower())
-        self.assertEqual(content[1]["video_url"]["url"], "/tmp/video1.mp4")
+        self.assertEqual(content[0]["video_url"]["url"], "/tmp/video1.mp4")
 
     def test_v2t_prompt_does_not_leak_labels(self) -> None:
         content = build_v2t_user_content(
@@ -26,7 +28,7 @@ class OmniCheckerTests(unittest.TestCase):
             rank=1,
             score=0.9,
         )
-        prompt = content[0]["text"]
+        prompt = content[1]["text"]
         self.assertNotIn("target", prompt.lower())
 
     def test_checker_result_round_trip(self) -> None:
@@ -43,3 +45,10 @@ class OmniCheckerTests(unittest.TestCase):
             }
         )
         self.assertTrue(result.to_dict()["is_match"])
+
+    def test_local_video_path_is_encoded_as_data_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "clip.mp4"
+            path.write_bytes(b"fake-mp4-bytes")
+            encoded = _materialize_video_url(str(path))
+        self.assertTrue(encoded.startswith("data:video/mp4;base64,"))

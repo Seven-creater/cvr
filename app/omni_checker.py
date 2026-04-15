@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
+from pathlib import Path
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Protocol
@@ -66,6 +70,27 @@ def _extract_json(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
+def _file_path_from_url(raw_url: str) -> Path | None:
+    if raw_url.startswith("file://"):
+        parsed = urllib.parse.urlparse(raw_url)
+        return Path(urllib.request.url2pathname(parsed.path))
+    if raw_url.startswith(("http://", "https://", "data:")):
+        return None
+    return Path(raw_url)
+
+
+def _materialize_video_url(raw_url: str) -> str:
+    file_path = _file_path_from_url(raw_url)
+    if file_path is None:
+        return raw_url
+    if not file_path.exists():
+        raise FileNotFoundError(f"video file not found: {file_path}")
+    mime_type, _ = mimetypes.guess_type(str(file_path))
+    mime_type = mime_type or "video/mp4"
+    content = base64.b64encode(file_path.read_bytes()).decode("utf-8")
+    return f"data:{mime_type};base64,{content}"
+
+
 def build_t2v_user_content(query_text: str, candidate_video: VideoRow, *, rank: int, score: float) -> list[dict]:
     if not candidate_video.video_path:
         raise ValueError("candidate_video.video_path is required")
@@ -78,8 +103,8 @@ def build_t2v_user_content(query_text: str, candidate_video: VideoRow, *, rank: 
         "Do not use any dataset labels."
     )
     return [
-        {"type": "text", "text": prompt},
         {"type": "video_url", "video_url": {"url": candidate_video.video_path}},
+        {"type": "text", "text": prompt},
     ]
 
 
@@ -95,8 +120,8 @@ def build_v2t_user_content(query_video: VideoRow, candidate_text: TextRow, *, ra
         "Do not use any dataset labels."
     )
     return [
-        {"type": "text", "text": prompt},
         {"type": "video_url", "video_url": {"url": query_video.video_path}},
+        {"type": "text", "text": prompt},
     ]
 
 
@@ -115,13 +140,22 @@ class OpenAIOmniChecker:
         self.timeout_seconds = timeout_seconds
 
     def _request(self, user_content: list[dict], system_prompt: str) -> CheckerResult:
+        request_content: list[dict] = []
+        for item in user_content:
+            if item.get("type") == "video_url":
+                video_url = dict(item["video_url"])
+                video_url["url"] = _materialize_video_url(str(video_url["url"]))
+                request_content.append({"type": "video_url", "video_url": video_url})
+            else:
+                request_content.append(item)
         payload = {
             "model": self.model,
             "modalities": ["text"],
+            "max_tokens": 256,
             "temperature": 0.0,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
+                {"role": "user", "content": request_content},
             ],
         }
         request = urllib.request.Request(
