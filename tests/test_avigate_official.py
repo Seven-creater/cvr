@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
+import uuid
 from unittest import mock
 
 import numpy as np
@@ -97,8 +98,11 @@ class AvigateOfficialTests(unittest.TestCase):
         self.assertEqual({"R@1": 1.0, "R@5": 1.0, "R@10": 1.0}, metrics["v2t"])
 
     def test_load_avigate_runtime_rejects_missing_paths_before_heavy_imports(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        root = temp_parent / f"tmp-avigate-official-{uuid.uuid4().hex}"
+        root.mkdir(parents=True, exist_ok=False)
+        try:
             config = AvigateRuntimeConfig(
                 model_dir=str(root / "model"),
                 checkpoint_path=str(root / "missing.bin"),
@@ -110,6 +114,8 @@ class AvigateOfficialTests(unittest.TestCase):
             )
             with self.assertRaises(FileNotFoundError):
                 load_avigate_runtime(config)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
     def test_load_audio_fbank_falls_back_to_librosa(self) -> None:
         fake_torch = mock.Mock()

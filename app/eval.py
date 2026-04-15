@@ -3,6 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 
+from app.avigate_agent import (
+    run_t2v_official_agent_case,
+    run_v2t_official_agent_case,
+)
 from app.avigate_official import (
     AvigateRuntimeConfig,
     evaluate_avigate_official,
@@ -10,6 +14,7 @@ from app.avigate_official import (
     retrieve_texts_from_video_official,
     retrieve_videos_from_text_official,
 )
+from app.omni_checker import OpenAIOmniChecker
 from app.retrieval_types import parse_topk_values
 
 
@@ -72,6 +77,44 @@ def command_avigate_v2t_case(args: argparse.Namespace) -> None:
     )
 
 
+def command_avigate_t2v_agent_case(args: argparse.Namespace) -> None:
+    runtime = build_avigate_runtime(args)
+    checker = OpenAIOmniChecker(
+        base_url=args.checker_base_url,
+        api_key=args.checker_api_key,
+        model=args.checker_model,
+        timeout_seconds=args.checker_timeout_seconds,
+    )
+    trace = run_t2v_official_agent_case(
+        query_text=args.query_text,
+        runtime=runtime,
+        checker=checker,
+        topk=args.topk_value,
+        max_iter=args.max_iter,
+        submit_threshold=args.submit_threshold,
+    )
+    print(json.dumps(trace, ensure_ascii=False, indent=2))
+
+
+def command_avigate_v2t_agent_case(args: argparse.Namespace) -> None:
+    runtime = build_avigate_runtime(args)
+    checker = OpenAIOmniChecker(
+        base_url=args.checker_base_url,
+        api_key=args.checker_api_key,
+        model=args.checker_model,
+        timeout_seconds=args.checker_timeout_seconds,
+    )
+    trace = run_v2t_official_agent_case(
+        query_video_id=args.query_video_id,
+        runtime=runtime,
+        checker=checker,
+        topk=args.topk_value,
+        max_iter=args.max_iter,
+        submit_threshold=args.submit_threshold,
+    )
+    print(json.dumps(trace, ensure_ascii=False, indent=2))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AVIGATE official retrieval evaluation")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -103,6 +146,21 @@ def build_parser() -> argparse.ArgumentParser:
     avigate_v2t_case = subparsers.add_parser("avigate-v2t-case", parents=[avigate_shared])
     avigate_v2t_case.add_argument("--query-video-id", required=True)
     avigate_v2t_case.add_argument("--topk-value", type=int, default=10)
+
+    agent_shared = argparse.ArgumentParser(add_help=False, parents=[avigate_shared])
+    agent_shared.add_argument("--topk-value", type=int, default=10)
+    agent_shared.add_argument("--max-iter", type=int, default=3)
+    agent_shared.add_argument("--submit-threshold", type=float, default=0.7)
+    agent_shared.add_argument("--checker-base-url", required=True)
+    agent_shared.add_argument("--checker-api-key", required=True)
+    agent_shared.add_argument("--checker-model", required=True)
+    agent_shared.add_argument("--checker-timeout-seconds", type=float, default=180.0)
+
+    avigate_t2v_agent_case = subparsers.add_parser("avigate-t2v-agent-case", parents=[agent_shared])
+    avigate_t2v_agent_case.add_argument("--query-text", required=True)
+
+    avigate_v2t_agent_case = subparsers.add_parser("avigate-v2t-agent-case", parents=[agent_shared])
+    avigate_v2t_agent_case.add_argument("--query-video-id", required=True)
     return parser
 
 
@@ -113,6 +171,12 @@ def main() -> None:
         return
     if args.command == "avigate-t2v-case":
         command_avigate_t2v_case(args)
+        return
+    if args.command == "avigate-t2v-agent-case":
+        command_avigate_t2v_agent_case(args)
+        return
+    if args.command == "avigate-v2t-agent-case":
+        command_avigate_v2t_agent_case(args)
         return
     command_avigate_v2t_case(args)
 

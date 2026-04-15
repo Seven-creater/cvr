@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
 from pathlib import Path
+import shutil
+import uuid
 
 from app.omni_checker import (
     CheckerResult,
@@ -87,8 +88,14 @@ class OmniCheckerTests(unittest.TestCase):
         self.assertIn("missing_field:rewrite_suggestion", result.missing_elements)
 
     def test_local_video_path_is_encoded_as_data_url(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "clip.mp4"
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-omni-checker-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            path = tmp_dir / "clip.mp4"
             path.write_bytes(b"fake-mp4-bytes")
             encoded = _materialize_video_url(str(path))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         self.assertTrue(encoded.startswith("data:video/mp4;base64,"))

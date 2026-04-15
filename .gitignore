@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 runs/
 tests/AVIGATE-CVPR2025/
+tmp*/

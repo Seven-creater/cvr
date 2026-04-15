@@ -72,6 +72,46 @@ python -m app.eval avigate-v2t-case \
   --topk-value 10
 ```
 
+Single text-to-video official-agent case:
+
+```bash
+python -m app.eval avigate-t2v-agent-case \
+  --model-dir /path/to/model_dir \
+  --checkpoint /path/to/checkpoint.bin \
+  --data-json /path/to/MSRVTT_data.json \
+  --split-csv /path/to/MSRVTT_JSFUSION_test.csv \
+  --video-root /path/to/videos \
+  --audio-root /path/to/audio \
+  --clip-weight /path/to/ViT-B-32.pt \
+  --device cuda \
+  --query-text "a person is cooking" \
+  --topk-value 10 \
+  --checker-base-url http://127.0.0.1:8092/v1 \
+  --checker-api-key EMPTY \
+  --checker-model /path/to/qwen2.5-omni \
+  --max-iter 3
+```
+
+Single video-to-text official-agent case:
+
+```bash
+python -m app.eval avigate-v2t-agent-case \
+  --model-dir /path/to/model_dir \
+  --checkpoint /path/to/checkpoint.bin \
+  --data-json /path/to/MSRVTT_data.json \
+  --split-csv /path/to/MSRVTT_JSFUSION_test.csv \
+  --video-root /path/to/videos \
+  --audio-root /path/to/audio \
+  --clip-weight /path/to/ViT-B-32.pt \
+  --device cuda \
+  --query-video-id video6513 \
+  --topk-value 10 \
+  --checker-base-url http://127.0.0.1:8092/v1 \
+  --checker-api-key EMPTY \
+  --checker-model /path/to/qwen2.5-omni \
+  --max-iter 3
+```
+
 ## Validation goal
 
 The acceptance standard for Step 1 is:
@@ -82,7 +122,6 @@ The acceptance standard for Step 1 is:
 ## What is intentionally not in Step 1
 
 - no exported `.npy` feature baseline
-- no agent loop entrypoint
 - no batch agent evaluation
 
-Those pieces can be added back later on top of the official retrieval wrapper, once the server-side metric alignment is confirmed.
+Step 2 now adds only the smallest possible single-case agent loop on top of the official retrieval wrapper. Batch evaluation and broader planner logic still stay out of scope until the single-case path is validated on the server.
