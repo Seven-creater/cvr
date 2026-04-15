@@ -26,11 +26,24 @@ class CheckerResult:
 
     @classmethod
     def from_dict(cls, payload: dict) -> "CheckerResult":
+        def _as_bool(value: object) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() in {"true", "1", "yes", "match"}
+            return bool(value)
+
+        def _as_float(value: object, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
         return cls(
-            is_match=bool(payload.get("is_match", False)),
-            confidence=float(payload.get("confidence", 0.0)),
-            visual_match=float(payload.get("visual_match", 0.0)),
-            audio_match=float(payload.get("audio_match", 0.0)),
+            is_match=_as_bool(payload.get("is_match", False)),
+            confidence=_as_float(payload.get("confidence", 0.0)),
+            visual_match=_as_float(payload.get("visual_match", 0.0)),
+            audio_match=_as_float(payload.get("audio_match", 0.0)),
             main_events=[str(item) for item in payload.get("main_events", [])],
             missing_elements=[str(item) for item in payload.get("missing_elements", [])],
             reason=str(payload.get("reason", "")),
@@ -68,6 +81,19 @@ def _extract_json(text: str) -> dict:
     if start == -1 or end == -1 or end < start:
         raise ValueError("response did not contain a JSON object")
     return json.loads(text[start : end + 1])
+
+
+def _fallback_payload(raw_text: str) -> dict:
+    return {
+        "is_match": False,
+        "confidence": 0.0,
+        "visual_match": 0.0,
+        "audio_match": 0.0,
+        "main_events": [],
+        "missing_elements": ["unstructured_response"],
+        "reason": raw_text.strip(),
+        "rewrite_suggestion": "",
+    }
 
 
 def _file_path_from_url(raw_url: str) -> Path | None:
@@ -152,6 +178,7 @@ class OpenAIOmniChecker:
             "model": self.model,
             "modalities": ["text"],
             "max_tokens": 256,
+            "response_format": {"type": "json_object"},
             "temperature": 0.0,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -174,23 +201,33 @@ class OpenAIOmniChecker:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"omni checker request failed: {detail}") from exc
         content = raw["choices"][0]["message"]["content"]
-        return CheckerResult.from_dict(_extract_json(content))
+        try:
+            parsed = _extract_json(content)
+        except ValueError:
+            parsed = _fallback_payload(str(content))
+        return CheckerResult.from_dict(parsed)
 
     def inspect_t2v(self, query_text: str, candidate_video: VideoRow, *, rank: int, score: float) -> CheckerResult:
         system_prompt = (
             "You are a video retrieval checker. "
-            "Return exactly one JSON object with fields: "
-            "is_match, confidence, visual_match, audio_match, main_events, "
-            "missing_elements, reason, rewrite_suggestion."
+            "Return exactly one JSON object and nothing else. "
+            'Schema: {"is_match": bool, "confidence": float, "visual_match": float, '
+            '"audio_match": float, "main_events": [string], "missing_elements": [string], '
+            '"reason": string, "rewrite_suggestion": string}. '
+            "The float fields must be numeric values between 0.0 and 1.0. "
+            "Do not put natural-language sentences in numeric fields."
         )
         return self._request(build_t2v_user_content(query_text, candidate_video, rank=rank, score=score), system_prompt)
 
     def inspect_v2t(self, query_video: VideoRow, candidate_text: TextRow, *, rank: int, score: float) -> CheckerResult:
         system_prompt = (
             "You are a text retrieval checker. "
-            "Return exactly one JSON object with fields: "
-            "is_match, confidence, visual_match, audio_match, main_events, "
-            "missing_elements, reason, rewrite_suggestion."
+            "Return exactly one JSON object and nothing else. "
+            'Schema: {"is_match": bool, "confidence": float, "visual_match": float, '
+            '"audio_match": float, "main_events": [string], "missing_elements": [string], '
+            '"reason": string, "rewrite_suggestion": string}. '
+            "The float fields must be numeric values between 0.0 and 1.0. "
+            "Do not put natural-language sentences in numeric fields."
         )
         return self._request(build_v2t_user_content(query_video, candidate_text, rank=rank, score=score), system_prompt)
 

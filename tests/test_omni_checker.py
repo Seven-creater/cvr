@@ -4,7 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.omni_checker import CheckerResult, _materialize_video_url, build_t2v_user_content, build_v2t_user_content
+from app.omni_checker import (
+    CheckerResult,
+    _fallback_payload,
+    _materialize_video_url,
+    build_t2v_user_content,
+    build_v2t_user_content,
+)
 from app.retriever import TextRow, VideoRow
 
 
@@ -45,6 +51,31 @@ class OmniCheckerTests(unittest.TestCase):
             }
         )
         self.assertTrue(result.to_dict()["is_match"])
+
+    def test_checker_result_tolerates_non_numeric_fields(self) -> None:
+        result = CheckerResult.from_dict(
+            {
+                "is_match": "true",
+                "confidence": "0.7",
+                "visual_match": "The person is cooking.",
+                "audio_match": None,
+                "main_events": ["cooking"],
+                "missing_elements": [],
+                "reason": "free text",
+                "rewrite_suggestion": "same",
+            }
+        )
+        self.assertTrue(result.is_match)
+        self.assertEqual(result.confidence, 0.7)
+        self.assertEqual(result.visual_match, 0.0)
+        self.assertEqual(result.audio_match, 0.0)
+
+    def test_fallback_payload_wraps_unstructured_text(self) -> None:
+        payload = _fallback_payload("plain answer")
+        result = CheckerResult.from_dict(payload)
+        self.assertFalse(result.is_match)
+        self.assertEqual(result.reason, "plain answer")
+        self.assertIn("unstructured_response", result.missing_elements)
 
     def test_local_video_path_is_encoded_as_data_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
