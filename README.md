@@ -57,6 +57,18 @@ python -m app.eval agent-batch \
 For real `T2V` rewrite on the server, replace `--text-encoder-kind hashing` with
 `--text-encoder-kind subprocess --text-encoder-command "..."` so the agent uses the frozen retriever's text encoder.
 
+Build a feature-dir from MSRVTT metadata plus external embeddings:
+
+```bash
+python -m app.build_feature_dir \
+  --msrvtt-json /path/to/MSRVTT_data.json \
+  --split-csv /path/to/MSRVTT_JSFUSION_test.csv \
+  --video-root /path/to/videos \
+  --output-dir /path/to/features \
+  --text-embeddings-in /path/to/text_embeddings.npy \
+  --video-visual-embeddings-in /path/to/video_visual_embeddings.npy
+```
+
 ## Feature Directory
 
 `feature-dir` should contain:
