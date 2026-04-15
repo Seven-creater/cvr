@@ -10,7 +10,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Protocol
 
-from app.retriever import TextRow, VideoRow
+from app.retrieval_types import TextRow, VideoRow
 
 REQUIRED_CHECKER_FIELDS = (
     "is_match",

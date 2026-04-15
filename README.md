@@ -1,80 +1,88 @@
-# Minimal MSRVTT Retriever + Agent
+# AVIGATE Step 1: Official Retrieval Wrapper
 
-This repository is intentionally rebuilt from scratch.
+This repository now focuses on one thing:
 
-Current scope:
+- reuse the **official AVIGATE retrieval path**
+- expose it as simple per-case functions
+- keep the CLI small enough to validate against the paper reproduction on the server
 
-- frozen feature-based retriever
-- `text -> top-k videos`
-- `video -> top-k texts`
-- loop agent for both `T2V` and `V2T`
-- standard `MSRVTT` retrieval metrics: `R@1 / R@5 / R@10`
+The old `feature_dir + exported embeddings + cosine` route has been removed from the main code path because it did not reproduce the paper method.
 
-## Commands
+## What is in the repo
 
-Frozen retriever baseline:
+- `app/avigate_official.py`
+  - loads the AVIGATE runtime
+  - caches the benchmark split
+  - exposes:
+    - `retrieve_videos_from_text_official(...)`
+    - `retrieve_texts_from_video_official(...)`
+    - `evaluate_avigate_official(...)`
+- `app/avigate_vendor/`
+  - the minimum vendored runtime pieces needed from the AVIGATE reproduction
+  - runtime no longer depends on `tests/AVIGATE-CVPR2025/`
+- `app/omni_checker.py`
+  - kept for the next step, where an agent will inspect official retrieval candidates with Qwen2.5-Omni
+
+## CLI
+
+Overall metrics:
 
 ```bash
-python -m app.eval baseline \
-  --feature-dir /path/to/features \
+python -m app.eval avigate-baseline \
+  --model-dir /path/to/model_dir \
+  --checkpoint /path/to/checkpoint.bin \
+  --data-json /path/to/MSRVTT_data.json \
   --split-csv /path/to/MSRVTT_JSFUSION_test.csv \
+  --video-root /path/to/videos \
+  --audio-root /path/to/audio \
+  --clip-weight /path/to/ViT-B-32.pt \
+  --device cuda \
   --topk 1,5,10
 ```
 
-Single T2V agent case:
+Single text-to-video case:
 
 ```bash
-python -m app.eval agent-case \
-  --mode t2v \
-  --feature-dir /path/to/features \
-  --query-text "a man is playing guitar on stage" \
-  --text-encoder-kind hashing \
-  --checker-kind mock
-```
-
-Single V2T agent case:
-
-```bash
-python -m app.eval agent-case \
-  --mode v2t \
-  --feature-dir /path/to/features \
-  --query-video-id video7010 \
-  --checker-kind mock
-```
-
-Batch agent evaluation:
-
-```bash
-python -m app.eval agent-batch \
-  --mode t2v \
-  --feature-dir /path/to/features \
-  --split-csv /path/to/MSRVTT_JSFUSION_test.csv \
-  --text-encoder-kind hashing \
-  --checker-kind mock \
-  --output-dir runs/t2v-agent
-```
-
-For real `T2V` rewrite on the server, replace `--text-encoder-kind hashing` with
-`--text-encoder-kind subprocess --text-encoder-command "..."` so the agent uses the frozen retriever's text encoder.
-
-Build a feature-dir from MSRVTT metadata plus external embeddings:
-
-```bash
-python -m app.build_feature_dir \
-  --msrvtt-json /path/to/MSRVTT_data.json \
+python -m app.eval avigate-t2v-case \
+  --model-dir /path/to/model_dir \
+  --checkpoint /path/to/checkpoint.bin \
+  --data-json /path/to/MSRVTT_data.json \
   --split-csv /path/to/MSRVTT_JSFUSION_test.csv \
   --video-root /path/to/videos \
-  --output-dir /path/to/features \
-  --text-embeddings-in /path/to/text_embeddings.npy \
-  --video-visual-embeddings-in /path/to/video_visual_embeddings.npy
+  --audio-root /path/to/audio \
+  --clip-weight /path/to/ViT-B-32.pt \
+  --device cuda \
+  --query-text "a man is talking" \
+  --topk-value 10
 ```
 
-## Feature Directory
+Single video-to-text case:
 
-`feature-dir` should contain:
+```bash
+python -m app.eval avigate-v2t-case \
+  --model-dir /path/to/model_dir \
+  --checkpoint /path/to/checkpoint.bin \
+  --data-json /path/to/MSRVTT_data.json \
+  --split-csv /path/to/MSRVTT_JSFUSION_test.csv \
+  --video-root /path/to/videos \
+  --audio-root /path/to/audio \
+  --clip-weight /path/to/ViT-B-32.pt \
+  --device cuda \
+  --query-video-id video6513 \
+  --topk-value 10
+```
 
-- `text_embeddings.npy`
-- `video_visual_embeddings.npy`
-- `video_audio_embeddings.npy` (optional)
-- `text_rows.jsonl`
-- `video_rows.jsonl`
+## Validation goal
+
+The acceptance standard for Step 1 is:
+
+- the per-case top-k results come from the same retrieval path as the paper reproduction
+- `avigate-baseline` matches the reproduction's `R@1 / R@5 / R@10` on the server, up to small floating-point differences
+
+## What is intentionally not in Step 1
+
+- no exported `.npy` feature baseline
+- no agent loop entrypoint
+- no batch agent evaluation
+
+Those pieces can be added back later on top of the official retrieval wrapper, once the server-side metric alignment is confirmed.

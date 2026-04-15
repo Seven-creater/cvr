@@ -12,7 +12,7 @@ from app.omni_checker import (
     build_t2v_user_content,
     build_v2t_user_content,
 )
-from app.retriever import TextRow, VideoRow
+from app.retrieval_types import TextRow, VideoRow
 
 
 class OmniCheckerTests(unittest.TestCase):

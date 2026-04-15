@@ -1,1 +1,1 @@
-"""Minimal MSRVTT retrieval package."""
+"""AVIGATE official retrieval wrapper and evaluation entrypoints."""
