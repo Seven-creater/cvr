@@ -12,6 +12,17 @@ from typing import Protocol
 
 from app.retriever import TextRow, VideoRow
 
+REQUIRED_CHECKER_FIELDS = (
+    "is_match",
+    "confidence",
+    "visual_match",
+    "audio_match",
+    "main_events",
+    "missing_elements",
+    "reason",
+    "rewrite_suggestion",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CheckerResult:
@@ -96,6 +107,45 @@ def _fallback_payload(raw_text: str) -> dict:
     }
 
 
+def _complete_payload(payload: dict) -> dict:
+    completed = {
+        "is_match": payload.get("is_match", False),
+        "confidence": payload.get("confidence", 0.0),
+        "visual_match": payload.get("visual_match", 0.0),
+        "audio_match": payload.get("audio_match", 0.0),
+        "main_events": payload.get("main_events", []),
+        "missing_elements": payload.get("missing_elements", []),
+        "reason": payload.get("reason", ""),
+        "rewrite_suggestion": payload.get("rewrite_suggestion", ""),
+    }
+    missing_fields = [field for field in REQUIRED_CHECKER_FIELDS if field not in payload]
+    if missing_fields:
+        missing_items = [str(item) for item in completed["missing_elements"]]
+        missing_items.extend([f"missing_field:{field}" for field in missing_fields])
+        completed["missing_elements"] = missing_items
+        if not completed["reason"]:
+            completed["reason"] = "incomplete_json_response"
+    return completed
+
+
+def _checker_system_prompt(kind: str) -> str:
+    subject = "video retrieval" if kind == "t2v" else "text retrieval"
+    return (
+        f"You are a {subject} checker. "
+        "Return exactly one JSON object and nothing else. "
+        "All 8 keys are mandatory. "
+        'Required schema: {"is_match": bool, "confidence": float, "visual_match": float, '
+        '"audio_match": float, "main_events": [string], "missing_elements": [string], '
+        '"reason": string, "rewrite_suggestion": string}. '
+        "The float fields must be numeric values between 0.0 and 1.0. "
+        'A reply like {"is_match": true} is invalid because keys are missing. '
+        'Example valid reply: {"is_match": true, "confidence": 0.82, "visual_match": 0.91, '
+        '"audio_match": 0.35, "main_events": ["person pours milk", "person cuts vanilla bean"], '
+        '"missing_elements": [], "reason": "The visible cooking actions match the query.", '
+        '"rewrite_suggestion": ""}.'
+    )
+
+
 def _file_path_from_url(raw_url: str) -> Path | None:
     if raw_url.startswith("file://"):
         parsed = urllib.parse.urlparse(raw_url)
@@ -126,7 +176,8 @@ def build_t2v_user_content(query_text: str, candidate_video: VideoRow, *, rank: 
         f"Candidate rank: {rank}\n"
         f"Retriever score: {score:.6f}\n"
         "Please inspect whether the candidate video truly matches the query. "
-        "Do not use any dataset labels."
+        "Do not use any dataset labels. "
+        "Your answer is invalid unless all 8 JSON fields are present."
     )
     return [
         {"type": "video_url", "video_url": {"url": candidate_video.video_path}},
@@ -143,7 +194,8 @@ def build_v2t_user_content(query_video: VideoRow, candidate_text: TextRow, *, ra
         f"Candidate rank: {rank}\n"
         f"Retriever score: {score:.6f}\n"
         "Please inspect whether the text truly describes the query video. "
-        "Do not use any dataset labels."
+        "Do not use any dataset labels. "
+        "Your answer is invalid unless all 8 JSON fields are present."
     )
     return [
         {"type": "video_url", "video_url": {"url": query_video.video_path}},
@@ -202,34 +254,22 @@ class OpenAIOmniChecker:
             raise RuntimeError(f"omni checker request failed: {detail}") from exc
         content = raw["choices"][0]["message"]["content"]
         try:
-            parsed = _extract_json(content)
+            parsed = _complete_payload(_extract_json(content))
         except ValueError:
             parsed = _fallback_payload(str(content))
         return CheckerResult.from_dict(parsed)
 
     def inspect_t2v(self, query_text: str, candidate_video: VideoRow, *, rank: int, score: float) -> CheckerResult:
-        system_prompt = (
-            "You are a video retrieval checker. "
-            "Return exactly one JSON object and nothing else. "
-            'Schema: {"is_match": bool, "confidence": float, "visual_match": float, '
-            '"audio_match": float, "main_events": [string], "missing_elements": [string], '
-            '"reason": string, "rewrite_suggestion": string}. '
-            "The float fields must be numeric values between 0.0 and 1.0. "
-            "Do not put natural-language sentences in numeric fields."
+        return self._request(
+            build_t2v_user_content(query_text, candidate_video, rank=rank, score=score),
+            _checker_system_prompt("t2v"),
         )
-        return self._request(build_t2v_user_content(query_text, candidate_video, rank=rank, score=score), system_prompt)
 
     def inspect_v2t(self, query_video: VideoRow, candidate_text: TextRow, *, rank: int, score: float) -> CheckerResult:
-        system_prompt = (
-            "You are a text retrieval checker. "
-            "Return exactly one JSON object and nothing else. "
-            'Schema: {"is_match": bool, "confidence": float, "visual_match": float, '
-            '"audio_match": float, "main_events": [string], "missing_elements": [string], '
-            '"reason": string, "rewrite_suggestion": string}. '
-            "The float fields must be numeric values between 0.0 and 1.0. "
-            "Do not put natural-language sentences in numeric fields."
+        return self._request(
+            build_v2t_user_content(query_video, candidate_text, rank=rank, score=score),
+            _checker_system_prompt("v2t"),
         )
-        return self._request(build_v2t_user_content(query_video, candidate_text, rank=rank, score=score), system_prompt)
 
 
 class MockOmniChecker:

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from app.omni_checker import (
     CheckerResult,
+    _complete_payload,
     _fallback_payload,
     _materialize_video_url,
     build_t2v_user_content,
@@ -76,6 +77,14 @@ class OmniCheckerTests(unittest.TestCase):
         self.assertFalse(result.is_match)
         self.assertEqual(result.reason, "plain answer")
         self.assertIn("unstructured_response", result.missing_elements)
+
+    def test_complete_payload_marks_missing_fields(self) -> None:
+        payload = _complete_payload({"is_match": True})
+        result = CheckerResult.from_dict(payload)
+        self.assertTrue(result.is_match)
+        self.assertEqual(result.reason, "incomplete_json_response")
+        self.assertIn("missing_field:confidence", result.missing_elements)
+        self.assertIn("missing_field:rewrite_suggestion", result.missing_elements)
 
     def test_local_video_path_is_encoded_as_data_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
