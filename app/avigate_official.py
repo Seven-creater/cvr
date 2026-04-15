@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from collections import defaultdict
 from dataclasses import dataclass, field
+import importlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -512,7 +513,8 @@ def _load_audio_batch(
     sample_rate: int = 16000,
 ) -> np.ndarray:
     torch = _torch()
-    torchaudio = _torchaudio()
+    torchaudio = _safe_import_torchaudio()
+    librosa_module: Any | None = None
 
     target_length = 1024
     norm_mean = -5.118
@@ -522,22 +524,18 @@ def _load_audio_batch(
         audio_path = Path(audio_root) / f"{video_id}{DEFAULT_AUDIO_SUFFIX}"
         if not audio_path.exists():
             continue
-        waveform, sr = torchaudio.load(str(audio_path))
-        if sample_rate != sr:
-            resample = torchaudio.transforms.Resample(sr, sample_rate)
-            waveform = resample(waveform)
-        waveform -= waveform.mean()
-        frame_shift = waveform.shape[1] * 1000 / (sample_rate * target_length)
-        fbank = torchaudio.compliance.kaldi.fbank(
-            waveform,
-            htk_compat=True,
-            sample_frequency=sample_rate,
-            use_energy=False,
-            window_type="hanning",
-            num_mel_bins=128,
-            dither=0.0,
-            frame_shift=frame_shift,
+        fbank = _load_audio_fbank(
+            audio_path=audio_path,
+            sample_rate=sample_rate,
+            target_length=target_length,
+            torch_module=torch,
+            torchaudio_module=torchaudio,
+            librosa_module=librosa_module,
         )
+        if isinstance(fbank, tuple):
+            fbank, librosa_module = fbank
+        if fbank is None:
+            continue
         frame_count = fbank.shape[0]
         padding = target_length - frame_count
         if padding > 0:
@@ -548,6 +546,60 @@ def _load_audio_batch(
         fbank = (fbank - norm_mean) / (norm_std * 2)
         fbanks[index, 0] = fbank
     return fbanks.numpy()
+
+
+def _load_audio_fbank(
+    *,
+    audio_path: Path,
+    sample_rate: int,
+    target_length: int,
+    torch_module: Any,
+    torchaudio_module: Any | None,
+    librosa_module: Any | None,
+) -> tuple[Any | None, Any | None]:
+    if torchaudio_module is not None:
+        try:
+            waveform, sr = torchaudio_module.load(str(audio_path))
+            if sample_rate != sr:
+                resample = torchaudio_module.transforms.Resample(sr, sample_rate)
+                waveform = resample(waveform)
+            waveform -= waveform.mean()
+            frame_shift = waveform.shape[1] * 1000 / (sample_rate * target_length)
+            fbank = torchaudio_module.compliance.kaldi.fbank(
+                waveform,
+                htk_compat=True,
+                sample_frequency=sample_rate,
+                use_energy=False,
+                window_type="hanning",
+                num_mel_bins=128,
+                dither=0.0,
+                frame_shift=frame_shift,
+            )
+            return fbank, librosa_module
+        except Exception:
+            pass
+
+    librosa_module = librosa_module or _safe_import_librosa()
+    if librosa_module is None:
+        return None, librosa_module
+    try:
+        waveform, _sr = librosa_module.load(str(audio_path), sr=sample_rate, mono=True)
+    except Exception:
+        return None, librosa_module
+    waveform = waveform - waveform.mean()
+    mel_spec = librosa_module.feature.melspectrogram(
+        y=waveform,
+        sr=sample_rate,
+        n_fft=512,
+        hop_length=int(sample_rate * 0.01),
+        n_mels=128,
+        window="hann",
+        center=True,
+        pad_mode="reflect",
+    )
+    mel_spec_db = librosa_module.power_to_db(mel_spec, ref=np.max)
+    fbank = torch_module.from_numpy(mel_spec_db.T).float()
+    return fbank, librosa_module
 
 
 def _import_avigate_vendor() -> tuple[Any, Any, Any]:
@@ -576,3 +628,17 @@ def _torchaudio():
     except Exception as exc:  # pragma: no cover - environment dependent
         raise RuntimeError("torchaudio is required to run AVIGATE official retrieval") from exc
     return torchaudio
+
+
+def _safe_import_torchaudio() -> Any | None:
+    try:
+        return _torchaudio()
+    except RuntimeError:
+        return None
+
+
+def _safe_import_librosa() -> Any | None:
+    try:
+        return importlib.import_module("librosa")
+    except Exception:  # pragma: no cover - environment dependent
+        return None

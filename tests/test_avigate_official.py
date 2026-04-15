@@ -4,11 +4,13 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 from app.avigate_official import (
     AvigateRuntimeConfig,
+    _load_audio_fbank,
     evaluate_avigate_official,
     load_avigate_runtime,
     retrieve_texts_from_video_official,
@@ -108,6 +110,32 @@ class AvigateOfficialTests(unittest.TestCase):
             )
             with self.assertRaises(FileNotFoundError):
                 load_avigate_runtime(config)
+
+    def test_load_audio_fbank_falls_back_to_librosa(self) -> None:
+        fake_torch = mock.Mock()
+        fake_tensor = mock.Mock()
+        fake_tensor.float.return_value = fake_tensor
+        fake_torch.from_numpy.return_value = fake_tensor
+
+        fake_librosa = mock.Mock()
+        fake_librosa.load.return_value = (np.asarray([0.1, -0.2, 0.3], dtype=np.float32), 16000)
+        fake_librosa.feature.melspectrogram.return_value = np.ones((128, 4), dtype=np.float32)
+        fake_librosa.power_to_db.return_value = np.ones((128, 4), dtype=np.float32)
+
+        fbank, returned_librosa = _load_audio_fbank(
+            audio_path=Path("/tmp/fake.wav"),
+            sample_rate=16000,
+            target_length=1024,
+            torch_module=fake_torch,
+            torchaudio_module=None,
+            librosa_module=fake_librosa,
+        )
+
+        self.assertIs(fake_tensor, fbank)
+        self.assertIs(fake_librosa, returned_librosa)
+        fake_librosa.load.assert_called_once()
+        fake_librosa.feature.melspectrogram.assert_called_once()
+        fake_librosa.power_to_db.assert_called_once()
 
 
 if __name__ == "__main__":
