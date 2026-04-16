@@ -4,6 +4,7 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
+import tempfile
 import uuid
 from unittest import mock
 
@@ -159,6 +160,89 @@ class AvigateOfficialTests(unittest.TestCase):
         fake_librosa.load.assert_called_once()
         fake_librosa.feature.melspectrogram.assert_called_once()
         fake_librosa.power_to_db.assert_called_once()
+
+    def test_load_avigate_runtime_reuses_cached_corpus_outputs(self) -> None:
+        import torch
+        original_torch_load = torch.load
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temp_parent) as temp_dir:
+            root = Path(temp_dir)
+            (root / "model").mkdir()
+            (root / "videos").mkdir()
+            (root / "audio").mkdir()
+            checkpoint = root / "checkpoint.bin"
+            data_json = root / "data.json"
+            split_csv = root / "split.csv"
+            clip_weight = root / "clip.pt"
+            checkpoint.write_bytes(b"x")
+            data_json.write_text("{}", encoding="utf-8")
+            split_csv.write_text("video_id,sentence\nvideo1,caption one\n", encoding="utf-8")
+            clip_weight.write_bytes(b"x")
+
+            fake_model = mock.Mock()
+            fake_model.to.return_value = fake_model
+            fake_model.eval.return_value = None
+            fake_model.loose_type = True
+            fake_tokenizer_cls = mock.Mock()
+            fake_tokenizer = fake_tokenizer_cls.return_value
+            fake_clip_cls = mock.Mock()
+            fake_clip_cls.from_pretrained.return_value = fake_model
+            fake_extractor_cls = mock.Mock()
+            rows = (
+                [TextRow(text_id="t1", video_id="video1", text="caption one")],
+                [VideoRow(video_id="video1", video_path=str(root / "videos" / "video1.mp4"), audio_path=str(root / "audio" / "video1.wav"))],
+            )
+            checkpoint_loader = lambda path, *args, **kwargs: {} if str(path) == str(checkpoint) else original_torch_load(path, *args, **kwargs)
+
+            with (
+                mock.patch("app.avigate_official._import_avigate_vendor", return_value=(fake_clip_cls, fake_tokenizer_cls, fake_extractor_cls)),
+                mock.patch("app.avigate_official._load_msrvtt_split_rows", return_value=rows),
+                mock.patch("app.avigate_official._encode_corpus_text_inputs", return_value=(
+                    np.asarray([[1, 2]], dtype=np.int64),
+                    np.asarray([[1, 1]], dtype=np.int64),
+                    np.asarray([[0, 0]], dtype=np.int64),
+                )),
+                mock.patch("app.avigate_official._encode_corpus_text_outputs", return_value=torch.ones((1, 2))),
+                mock.patch("app.avigate_official._encode_corpus_video_outputs", return_value=(
+                    torch.ones((1, 1, 2)),
+                    torch.ones((1, 1, 2)),
+                    torch.ones((1, 1, 2)),
+                )),
+                mock.patch("app.avigate_official._RUNTIME_CACHE", {}),
+                mock.patch("app.avigate_official._torch", return_value=torch),
+                mock.patch("torch.load", side_effect=checkpoint_loader),
+            ):
+                config = AvigateRuntimeConfig(
+                    model_dir=str(root / "model"),
+                    checkpoint_path=str(checkpoint),
+                    data_json_path=str(data_json),
+                    test_csv_path=str(split_csv),
+                    video_root=str(root / "videos"),
+                    audio_root=str(root / "audio"),
+                    clip_weight_path=str(clip_weight),
+                    cache_dir=str(root / "cache"),
+                    device="cpu",
+                )
+                runtime1 = load_avigate_runtime(config)
+                self.assertTrue(Path(runtime1.cache_path).exists())
+
+            with (
+                mock.patch("app.avigate_official._import_avigate_vendor", return_value=(fake_clip_cls, fake_tokenizer_cls, fake_extractor_cls)),
+                mock.patch("app.avigate_official._load_msrvtt_split_rows", return_value=rows),
+                mock.patch("app.avigate_official._encode_corpus_text_inputs") as encode_inputs,
+                mock.patch("app.avigate_official._encode_corpus_text_outputs") as encode_text,
+                mock.patch("app.avigate_official._encode_corpus_video_outputs") as encode_video,
+                mock.patch("app.avigate_official._RUNTIME_CACHE", {}),
+                mock.patch("app.avigate_official._torch", return_value=torch),
+                mock.patch("torch.load", side_effect=checkpoint_loader),
+            ):
+                runtime2 = load_avigate_runtime(config)
+                self.assertEqual(runtime1.cache_path, runtime2.cache_path)
+                encode_inputs.assert_not_called()
+                encode_text.assert_not_called()
+                encode_video.assert_not_called()
 
 
 if __name__ == "__main__":

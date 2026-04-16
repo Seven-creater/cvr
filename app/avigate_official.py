@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 from collections import defaultdict
 from dataclasses import dataclass, field
+import hashlib
 import importlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -15,6 +17,8 @@ from app.retrieval_types import RetrievalHit, TextRow, VideoRow
 
 VIDEO_SUFFIXES = (".mp4", ".webm")
 DEFAULT_AUDIO_SUFFIX = ".wav"
+RUNTIME_CACHE_VERSION = 1
+_RUNTIME_CACHE: dict[tuple[str, str], "AvigateRuntime"] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +43,7 @@ class AvigateRuntimeConfig:
     slice_framepos: int = 2
     beta: float = 0.2
     margin_bd: float = 0.1
+    cache_dir: str | None = None
 
 
 @dataclass(slots=True)
@@ -58,6 +63,7 @@ class AvigateRuntime:
     _text_index: dict[str, int] = field(default_factory=dict)
     _video_to_text_ids: dict[str, list[str]] = field(default_factory=dict)
     _sim_matrix: np.ndarray | None = None
+    cache_path: str | None = None
 
     def __post_init__(self) -> None:
         if not self._video_index:
@@ -168,9 +174,15 @@ def load_avigate_runtime(config: AvigateRuntimeConfig) -> AvigateRuntime:
         if not Path(raw_path).exists():
             raise FileNotFoundError(f"required AVIGATE path does not exist: {raw_path}")
 
+    text_rows, video_rows = _load_msrvtt_split_rows(config)
+    cache_key = _build_runtime_cache_key(config)
+    memory_key = (cache_key, config.device)
+    cached_runtime = _RUNTIME_CACHE.get(memory_key)
+    if cached_runtime is not None:
+        return cached_runtime
+
     torch = _torch()
     CLIP4Clip, SimpleTokenizer, RawVideoExtractor = _import_avigate_vendor()
-    text_rows, video_rows = _load_msrvtt_split_rows(config)
     tokenizer = SimpleTokenizer()
     task_config = _build_task_config(config)
 
@@ -179,41 +191,64 @@ def load_avigate_runtime(config: AvigateRuntimeConfig) -> AvigateRuntime:
     model = model.to(config.device)
     model.eval()
 
-    text_input_ids, text_input_mask, text_segment_ids = _encode_corpus_text_inputs(
-        tokenizer=tokenizer,
-        text_rows=text_rows,
-        max_words=config.max_words,
-    )
-    text_sequence_output = _encode_corpus_text_outputs(
-        model=model,
-        device=config.device,
-        text_input_ids=text_input_ids,
-        text_input_mask=text_input_mask,
-        text_segment_ids=text_segment_ids,
-        batch_size=config.batch_size_val,
-    )
-    video_mask, video_visual_output, video_audio_output = _encode_corpus_video_outputs(
-        model=model,
-        device=config.device,
-        video_rows=video_rows,
-        config=config,
-        raw_video_extractor=RawVideoExtractor(framerate=config.feature_framerate, size=224),
-        batch_size=config.batch_size_val,
-    )
+    cache_path = _resolve_runtime_cache_path(config, cache_key)
+    cached_payload = _load_cached_runtime_payload(cache_path)
+    if cached_payload is not None:
+        text_input_mask = cached_payload["text_input_mask"]
+        text_sequence_output = cached_payload["text_sequence_output"]
+        video_mask = cached_payload["video_mask"]
+        video_visual_output = cached_payload["video_visual_output"]
+        video_audio_output = cached_payload["video_audio_output"]
+    else:
+        text_input_ids, text_input_mask_np, text_segment_ids = _encode_corpus_text_inputs(
+            tokenizer=tokenizer,
+            text_rows=text_rows,
+            max_words=config.max_words,
+        )
+        text_sequence_output = _encode_corpus_text_outputs(
+            model=model,
+            device=config.device,
+            text_input_ids=text_input_ids,
+            text_input_mask=text_input_mask_np,
+            text_segment_ids=text_segment_ids,
+            batch_size=config.batch_size_val,
+        )
+        video_mask, video_visual_output, video_audio_output = _encode_corpus_video_outputs(
+            model=model,
+            device=config.device,
+            video_rows=video_rows,
+            config=config,
+            raw_video_extractor=RawVideoExtractor(framerate=config.feature_framerate, size=224),
+            batch_size=config.batch_size_val,
+        )
+        text_input_mask = torch.from_numpy(text_input_mask_np)
+        _save_cached_runtime_payload(
+            cache_path=cache_path,
+            payload={
+                "text_input_mask": text_input_mask,
+                "text_sequence_output": text_sequence_output,
+                "video_mask": video_mask,
+                "video_visual_output": video_visual_output,
+                "video_audio_output": video_audio_output,
+            },
+        )
 
-    return AvigateRuntime(
+    runtime = AvigateRuntime(
         config=config,
         model=model,
         tokenizer=tokenizer,
         device=config.device,
         text_rows=text_rows,
         video_rows=video_rows,
-        text_input_mask=torch.from_numpy(text_input_mask),
+        text_input_mask=text_input_mask,
         text_sequence_output=text_sequence_output,
         video_mask=video_mask,
         video_visual_output=video_visual_output,
         video_audio_output=video_audio_output,
+        cache_path=str(cache_path),
     )
+    _RUNTIME_CACHE[memory_key] = runtime
+    return runtime
 
 
 def retrieve_videos_from_text_official(
@@ -296,6 +331,75 @@ def evaluate_avigate_official(runtime: Any, ks: tuple[int, ...] = (1, 5, 10)) ->
         "audio_available": bool(runtime.audio_available),
         "t2v": {key: round(value / text_total, 4) for key, value in t2v.items()},
         "v2t": {key: round(value / video_total, 4) for key, value in v2t.items()},
+    }
+
+
+def _build_runtime_cache_key(config: AvigateRuntimeConfig) -> str:
+    payload = {
+        "version": RUNTIME_CACHE_VERSION,
+        "checkpoint_path": _path_fingerprint(config.checkpoint_path),
+        "data_json_path": _path_fingerprint(config.data_json_path),
+        "test_csv_path": _path_fingerprint(config.test_csv_path),
+        "video_root": _path_fingerprint(config.video_root),
+        "audio_root": _path_fingerprint(config.audio_root),
+        "clip_weight_path": _path_fingerprint(config.clip_weight_path),
+        "max_words": config.max_words,
+        "max_frames": config.max_frames,
+        "batch_size_val": config.batch_size_val,
+        "sim_header": config.sim_header,
+        "cross_num_hidden_layers": config.cross_num_hidden_layers,
+        "audio_query_layers": config.audio_query_layers,
+        "temperature": config.temperature,
+        "feature_framerate": config.feature_framerate,
+        "eval_frame_order": config.eval_frame_order,
+        "slice_framepos": config.slice_framepos,
+        "beta": config.beta,
+        "margin_bd": config.margin_bd,
+    }
+    encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _resolve_runtime_cache_path(config: AvigateRuntimeConfig, cache_key: str) -> Path:
+    cache_root = Path(config.cache_dir) if config.cache_dir else Path(config.model_dir) / ".avigate_runtime_cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    return cache_root / f"{cache_key}.pt"
+
+
+def _load_cached_runtime_payload(cache_path: Path) -> dict[str, Any] | None:
+    if not cache_path.exists():
+        return None
+    torch = _torch()
+    try:
+        payload = torch.load(str(cache_path), map_location="cpu")
+    except Exception:
+        return None
+    required = {
+        "text_input_mask",
+        "text_sequence_output",
+        "video_mask",
+        "video_visual_output",
+        "video_audio_output",
+    }
+    if not isinstance(payload, dict) or not required.issubset(payload):
+        return None
+    return payload
+
+
+def _save_cached_runtime_payload(*, cache_path: Path, payload: dict[str, Any]) -> None:
+    torch = _torch()
+    temp_path = cache_path.with_suffix(f"{cache_path.suffix}.tmp")
+    torch.save(payload, str(temp_path))
+    temp_path.replace(cache_path)
+
+
+def _path_fingerprint(raw_path: str) -> dict[str, Any]:
+    path = Path(raw_path)
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
     }
 
 

@@ -29,6 +29,7 @@ def build_avigate_runtime(args: argparse.Namespace):
         video_root=args.video_root,
         audio_root=args.audio_root,
         clip_weight_path=args.clip_weight,
+        cache_dir=args.cache_dir,
         device=args.device,
         batch_size_val=args.batch_size_val,
         max_words=args.max_words,
@@ -154,6 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     avigate_shared.add_argument("--video-root", required=True)
     avigate_shared.add_argument("--audio-root", required=True)
     avigate_shared.add_argument("--clip-weight", required=True)
+    avigate_shared.add_argument("--cache-dir")
     avigate_shared.add_argument("--device", default="cuda")
     avigate_shared.add_argument("--batch-size-val", type=int, default=100)
     avigate_shared.add_argument("--max-words", type=int, default=32)
