@@ -253,6 +253,7 @@ def run_v2t_official_agent_case(
     topk: int = 10,
     max_iter: int = 3,
     submit_threshold: float = 0.7,
+    min_inspected_before_submit: int = 6,
     progress: Callable[[str], None] | None = None,
 ) -> dict:
     inspected_by_rank: dict[int, CandidateInspection] = {}
@@ -261,6 +262,7 @@ def run_v2t_official_agent_case(
     for iter_index in range(1, max_iter + 1):
         _emit_progress(progress, f"[v2t] iter {iter_index}/{max_iter} video_id={query_video_id}")
         hits = retrieve_texts_from_video_official(query_video_id, runtime, topk=topk)
+        inspect_cap = min(max(1, min_inspected_before_submit), min(topk, len(hits)))
         pending_ranks = [rank for rank in range(1, min(topk, len(hits)) + 1) if rank not in inspected_by_rank]
         current_ranks = pending_ranks[:2] or [1]
         new_items = _inspect_v2t_hits(
@@ -277,11 +279,12 @@ def run_v2t_official_agent_case(
         inspected = [inspected_by_rank[rank] for rank in sorted(inspected_by_rank)]
         best = _choose_best_inspection(inspected)
         accepted = _choose_first_confident_match(inspected, submit_threshold)
+        inspected_enough = len(inspected_by_rank) >= inspect_cap
 
-        if accepted is not None:
+        if accepted is not None and inspected_enough:
             iterations_action = "submit"
             final_rank = accepted.rank
-        elif iter_index < max_iter and len(inspected_by_rank) < min(topk, len(hits)):
+        elif iter_index < max_iter and len(inspected_by_rank) < inspect_cap:
             iterations_action = "inspect_more"
             final_rank = None
         else:

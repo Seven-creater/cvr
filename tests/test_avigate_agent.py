@@ -213,6 +213,46 @@ class AvigateAgentTests(unittest.TestCase):
         self.assertEqual("t1", trace["final_result"]["text_id"])
         self.assertEqual(1, trace["final_result"]["rank_in_final_search"])
 
+    def test_v2t_agent_waits_until_minimum_inspected_before_submit(self) -> None:
+        text_rows = [
+            TextRow(text_id=f"t{i}", video_id=f"video{i}", text=f"text {i}")
+            for i in range(1, 7)
+        ]
+        video_rows = [VideoRow(video_id="video1", video_path="/tmp/video1.mp4")]
+        runtime = FakeRuntime(
+            text_rows=text_rows,
+            video_rows=video_rows,
+            text_score_map={},
+            video_score_map={
+                "video1": np.asarray([0.95, 0.8, 0.7, 0.6, 0.5, 0.4], dtype=np.float32),
+            },
+        )
+        checker = MockOmniChecker(
+            v2t_results={
+                "video1::t1": {
+                    "is_match": True,
+                    "confidence": 0.95,
+                    "visual_match": 0.9,
+                    "audio_match": 0.6,
+                    "main_events": ["event"],
+                    "missing_elements": [],
+                    "reason": "looks good",
+                    "rewrite_suggestion": "",
+                }
+            }
+        )
+
+        trace = run_v2t_official_agent_case(
+            query_video_id="video1",
+            runtime=runtime,
+            checker=checker,
+            topk=6,
+            max_iter=3,
+        )
+
+        self.assertEqual(["inspect_more", "inspect_more", "submit"], [step["action"] for step in trace["iterations"]])
+        self.assertEqual(6, sum(len(step["new_checked_candidates"]) for step in trace["iterations"]))
+
     def test_partial_eval_writes_t2v_summary_and_traces(self) -> None:
         runtime = FakeRuntime(
             text_rows=[
