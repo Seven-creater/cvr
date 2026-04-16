@@ -167,6 +167,52 @@ class AvigateAgentTests(unittest.TestCase):
         self.assertEqual("inspect_more", trace["iterations"][0]["action"])
         self.assertEqual("submit", trace["iterations"][1]["action"])
 
+    def test_v2t_agent_prefers_earlier_confident_match(self) -> None:
+        runtime = FakeRuntime(
+            text_rows=self.text_rows,
+            video_rows=self.video_rows,
+            text_score_map={},
+            video_score_map={
+                "video1": np.asarray([0.9, 0.8, 0.7], dtype=np.float32),
+            },
+        )
+        checker = MockOmniChecker(
+            v2t_results={
+                "video1::t1": {
+                    "is_match": True,
+                    "confidence": 0.82,
+                    "visual_match": 0.8,
+                    "audio_match": 0.5,
+                    "main_events": ["cooking"],
+                    "missing_elements": [],
+                    "reason": "correct enough",
+                    "rewrite_suggestion": "",
+                },
+                "video1::t2": {
+                    "is_match": True,
+                    "confidence": 0.97,
+                    "visual_match": 0.9,
+                    "audio_match": 0.7,
+                    "main_events": ["running"],
+                    "missing_elements": [],
+                    "reason": "overconfident false positive",
+                    "rewrite_suggestion": "",
+                },
+            }
+        )
+
+        trace = run_v2t_official_agent_case(
+            query_video_id="video1",
+            runtime=runtime,
+            checker=checker,
+            topk=3,
+            max_iter=3,
+        )
+
+        self.assertEqual("submit", trace["final_action"])
+        self.assertEqual("t1", trace["final_result"]["text_id"])
+        self.assertEqual(1, trace["final_result"]["rank_in_final_search"])
+
     def test_partial_eval_writes_t2v_summary_and_traces(self) -> None:
         runtime = FakeRuntime(
             text_rows=[
@@ -318,6 +364,7 @@ class AvigateAgentTests(unittest.TestCase):
         self.assertEqual(1.0, summary["retry_rate"])
         self.assertEqual(0.0, summary["submit_top1_rate"])
         self.assertEqual(0.0, summary["submit_top2_rate"])
+        self.assertEqual(3.0, summary["avg_checker_calls"])
 
 
 if __name__ == "__main__":

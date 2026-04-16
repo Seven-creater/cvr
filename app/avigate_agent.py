@@ -111,7 +111,7 @@ def run_official_agent_partial_eval(
             )
 
         total_rounds += len(trace["iterations"])
-        checker_calls = sum(len(iteration.get("checked_candidates", [])) for iteration in trace["iterations"])
+        checker_calls = sum(len(iteration.get("new_checked_candidates", [])) for iteration in trace["iterations"])
         total_checker_calls += checker_calls
         if any(iteration.get("action") != "submit" for iteration in trace["iterations"][:-1]):
             followup_runs += 1
@@ -188,6 +188,7 @@ def run_t2v_official_agent_case(
                     "query_text": current_query,
                     "retrieval_hits": [hit.to_dict() for hit in hits],
                     "checked_candidates": [item.to_dict() for item in inspected],
+                    "new_checked_candidates": [item.to_dict() for item in inspected],
                     "action": "submit",
                 }
             )
@@ -210,6 +211,7 @@ def run_t2v_official_agent_case(
                     "query_text": current_query,
                     "retrieval_hits": [hit.to_dict() for hit in hits],
                     "checked_candidates": [item.to_dict() for item in inspected],
+                    "new_checked_candidates": [item.to_dict() for item in inspected],
                     "action": "retry",
                     "next_query": rewritten_query,
                 }
@@ -224,6 +226,7 @@ def run_t2v_official_agent_case(
                 "query_text": current_query,
                 "retrieval_hits": [hit.to_dict() for hit in hits],
                 "checked_candidates": [item.to_dict() for item in inspected],
+                "new_checked_candidates": [item.to_dict() for item in inspected],
                 "action": "submit",
             }
         )
@@ -273,16 +276,17 @@ def run_v2t_official_agent_case(
 
         inspected = [inspected_by_rank[rank] for rank in sorted(inspected_by_rank)]
         best = _choose_best_inspection(inspected)
+        accepted = _choose_first_confident_match(inspected, submit_threshold)
 
-        if best and best.checker.is_match and best.checker.confidence >= submit_threshold:
+        if accepted is not None:
             iterations_action = "submit"
-            final_rank = best.rank
+            final_rank = accepted.rank
         elif iter_index < max_iter and len(inspected_by_rank) < min(topk, len(hits)):
             iterations_action = "inspect_more"
             final_rank = None
         else:
             iterations_action = "submit"
-            final_rank = (best or CandidateInspection(rank=1, candidate=hits[0], checker=_default_checker_result())).rank
+            final_rank = _fallback_v2t_rank(inspected_by_rank, hits)
 
         iteration_payload = {
             "iter": iter_index,
@@ -290,6 +294,7 @@ def run_v2t_official_agent_case(
             "query_video_path": runtime.video_rows[runtime._video_index[query_video_id]].video_path,
             "retrieval_hits": [hit.to_dict() for hit in hits],
             "checked_candidates": [item.to_dict() for item in inspected],
+            "new_checked_candidates": [item.to_dict() for item in new_items],
             "action": iterations_action,
         }
 
@@ -433,6 +438,28 @@ def _update_v2t_recall_counts(
 def _emit_progress(progress: Callable[[str], None] | None, message: str) -> None:
     if progress is not None:
         progress(message)
+
+
+def _fallback_v2t_rank(inspected_by_rank: dict[int, CandidateInspection], hits: list[RetrievalHit]) -> int:
+    if 1 in inspected_by_rank:
+        return 1
+    if inspected_by_rank:
+        return min(inspected_by_rank)
+    return 1 if hits else 0
+
+
+def _choose_first_confident_match(
+    inspections: list[CandidateInspection],
+    submit_threshold: float,
+) -> CandidateInspection | None:
+    qualified = [
+        item
+        for item in inspections
+        if item.checker.is_match and item.checker.confidence >= submit_threshold
+    ]
+    if not qualified:
+        return None
+    return min(qualified, key=lambda item: item.rank)
 
 
 def _choose_best_inspection(inspections: list[CandidateInspection]) -> CandidateInspection | None:
