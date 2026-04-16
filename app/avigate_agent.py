@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -9,22 +8,8 @@ from app.avigate_official import (
     retrieve_texts_from_video_official,
     retrieve_videos_from_text_official,
 )
-from app.omni_checker import CheckerResult, OmniChecker
+from app.omni_checker import OmniChecker, RetrievalHints
 from app.retrieval_types import RetrievalHit
-
-
-@dataclass(frozen=True, slots=True)
-class CandidateInspection:
-    rank: int
-    candidate: RetrievalHit
-    checker: CheckerResult
-
-    def to_dict(self) -> dict:
-        return {
-            "rank": self.rank,
-            "candidate": self.candidate.to_dict(),
-            "checker_result": self.checker.to_dict(),
-        }
 
 
 def run_official_agent_partial_eval(
@@ -36,10 +21,12 @@ def run_official_agent_partial_eval(
     topk: int = 10,
     max_iter: int = 3,
     submit_threshold: float = 0.7,
+    rerank_window: int = 5,
     recall_ks: tuple[int, ...] = (1, 5, 10),
     output_dir: str | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict:
+    _ = max_iter, submit_threshold
     if mode not in {"t2v", "v2t"}:
         raise ValueError("mode must be 't2v' or 'v2t'")
     if sample_size <= 0:
@@ -65,12 +52,13 @@ def run_official_agent_partial_eval(
 
     round1_hits = {k: 0 for k in recall_ks}
     final_hits = {k: 0 for k in recall_ks}
-    total_rounds = 0
-    total_checker_calls = 0
-    followup_runs = 0
-    submit_top1 = 0
-    submit_top2 = 0
+    final_top1_correct = 0
+    total_omni_calls = 0
+    audio_off_runs = 0
+    fallback_runs = 0
+    query_rewrite_runs = 0
 
+    summary: dict[str, Any] = {}
     for run_index, row in enumerate(rows[:total], start=1):
         label = row.text if mode == "t2v" else row.video_id
         _emit_progress(progress, f"[{mode}] start {run_index}/{total}: {label}")
@@ -81,10 +69,11 @@ def run_official_agent_partial_eval(
                 runtime=runtime,
                 checker=checker,
                 topk=topk,
-                max_iter=max_iter,
-                submit_threshold=submit_threshold,
+                rerank_window=rerank_window,
                 progress=progress,
             )
+            if trace["retrieval_hints"].get("query_text_override"):
+                query_rewrite_runs += 1
             _update_t2v_recall_counts(
                 trace=trace,
                 target_video_id=row.video_id,
@@ -92,14 +81,14 @@ def run_official_agent_partial_eval(
                 round1_hits=round1_hits,
                 final_hits=final_hits,
             )
+            if trace["final_result"].get("video_id") == row.video_id:
+                final_top1_correct += 1
         else:
             trace = run_v2t_official_agent_case(
                 query_video_id=row.video_id,
                 runtime=runtime,
                 checker=checker,
                 topk=topk,
-                max_iter=max_iter,
-                submit_threshold=submit_threshold,
                 progress=progress,
             )
             _update_v2t_recall_counts(
@@ -109,18 +98,14 @@ def run_official_agent_partial_eval(
                 round1_hits=round1_hits,
                 final_hits=final_hits,
             )
+            if trace["final_result"].get("text_id") in set(runtime.target_text_ids(row.video_id)):
+                final_top1_correct += 1
 
-        total_rounds += len(trace["iterations"])
-        checker_calls = sum(len(iteration.get("new_checked_candidates", [])) for iteration in trace["iterations"])
-        total_checker_calls += checker_calls
-        if any(iteration.get("action") != "submit" for iteration in trace["iterations"][:-1]):
-            followup_runs += 1
-
-        final_rank = int(trace["final_result"]["rank_in_final_search"])
-        if final_rank == 1:
-            submit_top1 += 1
-        elif final_rank == 2:
-            submit_top2 += 1
+        total_omni_calls += int(trace["omni_calls"])
+        if trace["retrieval_hints"].get("audio_mode") == "off":
+            audio_off_runs += 1
+        if trace.get("fallback_used"):
+            fallback_runs += 1
 
         if traces_path is not None:
             with traces_path.open("a", encoding="utf-8") as handle:
@@ -132,18 +117,18 @@ def run_official_agent_partial_eval(
             recall_ks=recall_ks,
             round1_hits=round1_hits,
             final_hits=final_hits,
-            total_rounds=total_rounds,
-            total_checker_calls=total_checker_calls,
-            followup_runs=followup_runs,
-            submit_top1=submit_top1,
-            submit_top2=submit_top2,
+            final_top1_correct=final_top1_correct,
+            total_omni_calls=total_omni_calls,
+            audio_off_runs=audio_off_runs,
+            fallback_runs=fallback_runs,
+            query_rewrite_runs=query_rewrite_runs,
         )
         if summary_path is not None:
             summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
         _emit_progress(
             progress,
-            f"[{mode}] done {run_index}/{total}: final_rank={final_rank} checker_calls={checker_calls}",
+            f"[{mode}] done {run_index}/{total}: top1={trace['final_result']['item_id']} omni_calls={trace['omni_calls']}",
         )
 
     result = {"summary": summary}
@@ -160,89 +145,86 @@ def run_t2v_official_agent_case(
     runtime: Any,
     checker: OmniChecker,
     topk: int = 10,
+    rerank_window: int = 5,
     max_iter: int = 3,
     submit_threshold: float = 0.7,
     progress: Callable[[str], None] | None = None,
 ) -> dict:
-    current_query = query_text
-    iterations: list[dict] = []
+    _ = max_iter, submit_threshold
+    _emit_progress(progress, f"[t2v] understand query={query_text}")
+    query_understanding = checker.understand_t2v_query(query_text)
+    retrieval_hints = RetrievalHints.from_query_understanding(query_text, query_understanding)
+    effective_query = retrieval_hints.query_text_override or query_text
+    initial_hits = retrieve_videos_from_text_official(
+        effective_query,
+        runtime,
+        topk=topk,
+        audio_mode=retrieval_hints.audio_mode,
+    )
 
-    for iter_index in range(1, max_iter + 1):
-        _emit_progress(progress, f"[t2v] iter {iter_index}/{max_iter} query={current_query}")
-        hits = retrieve_videos_from_text_official(current_query, runtime, topk=topk)
-        inspected = _inspect_t2v_hits(
-            query_text=current_query,
-            runtime=runtime,
-            checker=checker,
-            hits=hits,
-            ranks=[1, 2],
-            progress=progress,
-        )
-        best = _choose_best_inspection(inspected)
-        rewritten_query = best.checker.rewrite_suggestion.strip() if best else ""
+    omni_calls = 1
+    fallback_used = query_understanding.fallback_used
+    fallback_stage = "query_understanding" if fallback_used else None
+    candidate_video_descriptions: list[dict] = []
+    reranked_hits = _clone_hits(initial_hits)
 
-        if best and best.checker.is_match and best.checker.confidence >= submit_threshold:
-            iterations.append(
+    if not fallback_used:
+        window = min(max(1, int(rerank_window)), len(initial_hits))
+        for hit in initial_hits[:window]:
+            candidate_video = runtime.video_rows[runtime._video_index[hit.video_id or ""]]
+            _emit_progress(progress, f"[t2v] describe rank={hit.rank} video_id={candidate_video.video_id}")
+            description = checker.describe_video(candidate_video)
+            omni_calls += 1
+            candidate_video_descriptions.append(
                 {
-                    "iter": iter_index,
-                    "query_text": current_query,
-                    "retrieval_hits": [hit.to_dict() for hit in hits],
-                    "checked_candidates": [item.to_dict() for item in inspected],
-                    "new_checked_candidates": [item.to_dict() for item in inspected],
-                    "action": "submit",
+                    "rank": hit.rank,
+                    "candidate": hit.to_dict(),
+                    "video_description": description.to_dict(),
                 }
             )
-            return {
-                "mode": "t2v-agent",
-                "query_text": query_text,
-                "final_action": "submit",
-                "iterations": iterations,
-                "final_result": {
-                    "video_id": best.candidate.video_id,
-                    "rank_in_final_search": best.rank,
-                    "total_iters": iter_index,
-                },
-            }
+            if description.fallback_used:
+                fallback_used = True
+                fallback_stage = "candidate_video_description"
+                break
 
-        if iter_index < max_iter and rewritten_query and rewritten_query != current_query:
-            iterations.append(
+        if not fallback_used and candidate_video_descriptions:
+            candidate_payloads = [
                 {
-                    "iter": iter_index,
-                    "query_text": current_query,
-                    "retrieval_hits": [hit.to_dict() for hit in hits],
-                    "checked_candidates": [item.to_dict() for item in inspected],
-                    "new_checked_candidates": [item.to_dict() for item in inspected],
-                    "action": "retry",
-                    "next_query": rewritten_query,
+                    "video_id": item["candidate"]["video_id"],
+                    "original_rank": item["rank"],
+                    "original_score": item["candidate"]["score"],
+                    "video_description": item["video_description"],
                 }
+                for item in candidate_video_descriptions
+            ]
+            _emit_progress(progress, "[t2v] rerank candidate videos")
+            rerank_result = checker.rerank_t2v(query_understanding, candidate_payloads)
+            omni_calls += 1
+            reranked_hits, repair_used = _rerank_hits(
+                initial_hits,
+                rerank_result.ordered_video_ids,
+                key_name="video_id",
+                window=window,
             )
-            current_query = rewritten_query
-            continue
+            if rerank_result.fallback_used or repair_used:
+                fallback_used = True
+                fallback_stage = "t2v_rerank"
+                reranked_hits = _clone_hits(initial_hits)
 
-        chosen = best or CandidateInspection(rank=1, candidate=hits[0], checker=_default_checker_result())
-        iterations.append(
-            {
-                "iter": iter_index,
-                "query_text": current_query,
-                "retrieval_hits": [hit.to_dict() for hit in hits],
-                "checked_candidates": [item.to_dict() for item in inspected],
-                "new_checked_candidates": [item.to_dict() for item in inspected],
-                "action": "submit",
-            }
-        )
-        return {
-            "mode": "t2v-agent",
-            "query_text": query_text,
-            "final_action": "submit",
-            "iterations": iterations,
-            "final_result": {
-                "video_id": chosen.candidate.video_id,
-                "rank_in_final_search": chosen.rank,
-                "total_iters": iter_index,
-            },
-        }
-
-    raise RuntimeError("t2v official agent exhausted without submission")
+    final_result = _build_final_result(reranked_hits, initial_hits, key_name="video_id")
+    return {
+        "mode": "t2v-agent",
+        "query_text": query_text,
+        "query_understanding": query_understanding.to_dict(),
+        "retrieval_hints": retrieval_hints.to_dict(),
+        "initial_hits": [hit.to_dict() for hit in initial_hits],
+        "candidate_video_descriptions": candidate_video_descriptions,
+        "reranked_hits": [hit.to_dict() for hit in reranked_hits],
+        "final_result": final_result,
+        "omni_calls": omni_calls,
+        "fallback_used": fallback_used,
+        "fallback_stage": fallback_stage,
+    }
 
 
 def run_v2t_official_agent_case(
@@ -256,114 +238,56 @@ def run_v2t_official_agent_case(
     min_inspected_before_submit: int = 6,
     progress: Callable[[str], None] | None = None,
 ) -> dict:
-    inspected_by_rank: dict[int, CandidateInspection] = {}
-    iterations: list[dict] = []
-
-    for iter_index in range(1, max_iter + 1):
-        _emit_progress(progress, f"[v2t] iter {iter_index}/{max_iter} video_id={query_video_id}")
-        hits = retrieve_texts_from_video_official(query_video_id, runtime, topk=topk)
-        inspect_cap = min(max(1, min_inspected_before_submit), min(topk, len(hits)))
-        pending_ranks = [rank for rank in range(1, min(topk, len(hits)) + 1) if rank not in inspected_by_rank]
-        current_ranks = pending_ranks[:2] or [1]
-        new_items = _inspect_v2t_hits(
-            query_video_id=query_video_id,
-            runtime=runtime,
-            checker=checker,
-            hits=hits,
-            ranks=current_ranks,
-            progress=progress,
-        )
-        for item in new_items:
-            inspected_by_rank[item.rank] = item
-
-        inspected = [inspected_by_rank[rank] for rank in sorted(inspected_by_rank)]
-        best = _choose_best_inspection(inspected)
-        accepted = _choose_first_confident_match(inspected, submit_threshold)
-        inspected_enough = len(inspected_by_rank) >= inspect_cap
-
-        if accepted is not None and inspected_enough:
-            iterations_action = "submit"
-            final_rank = accepted.rank
-        elif iter_index < max_iter and len(inspected_by_rank) < inspect_cap:
-            iterations_action = "inspect_more"
-            final_rank = None
-        else:
-            iterations_action = "submit"
-            final_rank = _fallback_v2t_rank(inspected_by_rank, hits)
-
-        iteration_payload = {
-            "iter": iter_index,
-            "query_video_id": query_video_id,
-            "query_video_path": runtime.video_rows[runtime._video_index[query_video_id]].video_path,
-            "retrieval_hits": [hit.to_dict() for hit in hits],
-            "checked_candidates": [item.to_dict() for item in inspected],
-            "new_checked_candidates": [item.to_dict() for item in new_items],
-            "action": iterations_action,
-        }
-
-        if iterations_action == "inspect_more":
-            iterations.append(iteration_payload)
-            continue
-
-        iterations.append(iteration_payload)
-        chosen = inspected_by_rank.get(final_rank) or CandidateInspection(rank=1, candidate=hits[0], checker=_default_checker_result())
-        return {
-            "mode": "v2t-agent",
-            "query_video_id": query_video_id,
-            "query_video_path": runtime.video_rows[runtime._video_index[query_video_id]].video_path,
-            "final_action": "submit",
-            "iterations": iterations,
-            "final_result": {
-                "text_id": chosen.candidate.text_id,
-                "rank_in_final_search": chosen.rank,
-                "total_iters": iter_index,
-            },
-        }
-
-    raise RuntimeError("v2t official agent exhausted without submission")
-
-
-def _inspect_t2v_hits(
-    *,
-    query_text: str,
-    runtime: Any,
-    checker: OmniChecker,
-    hits: list[RetrievalHit],
-    ranks: list[int],
-    progress: Callable[[str], None] | None = None,
-) -> list[CandidateInspection]:
-    inspected: list[CandidateInspection] = []
-    for rank in ranks:
-        if rank < 1 or rank > len(hits):
-            continue
-        hit = hits[rank - 1]
-        candidate_video = runtime.video_rows[runtime._video_index[hit.video_id or ""]]
-        _emit_progress(progress, f"[t2v] inspect rank={rank} video_id={candidate_video.video_id}")
-        result = checker.inspect_t2v(query_text, candidate_video, rank=rank, score=hit.score)
-        inspected.append(CandidateInspection(rank=rank, candidate=hit, checker=result))
-    return inspected
-
-
-def _inspect_v2t_hits(
-    *,
-    query_video_id: str,
-    runtime: Any,
-    checker: OmniChecker,
-    hits: list[RetrievalHit],
-    ranks: list[int],
-    progress: Callable[[str], None] | None = None,
-) -> list[CandidateInspection]:
-    inspected: list[CandidateInspection] = []
+    _ = max_iter, submit_threshold, min_inspected_before_submit
     query_video = runtime.video_rows[runtime._video_index[query_video_id]]
-    for rank in ranks:
-        if rank < 1 or rank > len(hits):
-            continue
-        hit = hits[rank - 1]
-        candidate_text = runtime.text_rows[runtime._text_index[hit.text_id or ""]]
-        _emit_progress(progress, f"[v2t] inspect rank={rank} text_id={candidate_text.text_id}")
-        result = checker.inspect_v2t(query_video, candidate_text, rank=rank, score=hit.score)
-        inspected.append(CandidateInspection(rank=rank, candidate=hit, checker=result))
-    return inspected
+    _emit_progress(progress, f"[v2t] describe video_id={query_video_id}")
+    video_description = checker.describe_video(query_video)
+    retrieval_hints = RetrievalHints.from_video_description(video_description)
+    initial_hits = retrieve_texts_from_video_official(
+        query_video_id,
+        runtime,
+        topk=topk,
+        audio_mode=retrieval_hints.audio_mode,
+    )
+
+    omni_calls = 1
+    fallback_used = video_description.fallback_used
+    fallback_stage = "video_description" if fallback_used else None
+    reranked_hits = _clone_hits(initial_hits)
+
+    if not fallback_used and initial_hits:
+        candidate_payloads = [
+            {
+                "text_id": hit.text_id,
+                "original_rank": hit.rank,
+                "original_score": hit.score,
+                "text": hit.text,
+            }
+            for hit in initial_hits
+        ]
+        _emit_progress(progress, f"[v2t] rerank {len(candidate_payloads)} candidate texts")
+        rerank_result = checker.rerank_v2t(query_video, video_description, candidate_payloads)
+        omni_calls += 1
+        reranked_hits, repair_used = _rerank_hits(initial_hits, rerank_result.ordered_text_ids, key_name="text_id")
+        if rerank_result.fallback_used or repair_used:
+            fallback_used = True
+            fallback_stage = "v2t_rerank"
+            reranked_hits = _clone_hits(initial_hits)
+
+    final_result = _build_final_result(reranked_hits, initial_hits, key_name="text_id")
+    return {
+        "mode": "v2t-agent",
+        "query_video_id": query_video_id,
+        "query_video_path": query_video.video_path,
+        "video_description": video_description.to_dict(),
+        "retrieval_hints": retrieval_hints.to_dict(),
+        "initial_hits": [hit.to_dict() for hit in initial_hits],
+        "reranked_hits": [hit.to_dict() for hit in reranked_hits],
+        "final_result": final_result,
+        "omni_calls": omni_calls,
+        "fallback_used": fallback_used,
+        "fallback_stage": fallback_stage,
+    }
 
 
 def _build_partial_eval_summary(
@@ -373,23 +297,25 @@ def _build_partial_eval_summary(
     recall_ks: tuple[int, ...],
     round1_hits: dict[int, int],
     final_hits: dict[int, int],
-    total_rounds: int,
-    total_checker_calls: int,
-    followup_runs: int,
-    submit_top1: int,
-    submit_top2: int,
+    final_top1_correct: int,
+    total_omni_calls: int,
+    audio_off_runs: int,
+    fallback_runs: int,
+    query_rewrite_runs: int,
 ) -> dict:
-    return {
+    summary = {
         "runs": runs,
         "round1_recall": {f"R@{k}": round(round1_hits[k] / runs, 4) for k in recall_ks},
         "final_recall": {f"R@{k}": round(final_hits[k] / runs, 4) for k in recall_ks},
-        "avg_rounds": round(total_rounds / runs, 4),
-        "avg_checker_calls": round(total_checker_calls / runs, 4),
-        "retry_rate": round(followup_runs / runs, 4),
-        "submit_top1_rate": round(submit_top1 / runs, 4),
-        "submit_top2_rate": round(submit_top2 / runs, 4),
+        "final_top1_accuracy": round(final_top1_correct / runs, 4),
+        "avg_omni_calls": round(total_omni_calls / runs, 4),
+        "audio_off_rate": round(audio_off_runs / runs, 4),
+        "fallback_rate": round(fallback_runs / runs, 4),
         "mode": mode,
     }
+    if mode == "t2v":
+        summary["query_rewrite_rate"] = round(query_rewrite_runs / runs, 4)
+    return summary
 
 
 def _update_t2v_recall_counts(
@@ -400,19 +326,14 @@ def _update_t2v_recall_counts(
     round1_hits: dict[int, int],
     final_hits: dict[int, int],
 ) -> None:
-    retrieval_hits = trace["iterations"][0]["retrieval_hits"]
-    for k in ks:
-        top_hits = retrieval_hits[:k]
-        if any(hit.get("video_id") == target_video_id for hit in top_hits):
-            round1_hits[k] += 1
-
-    final_result = trace["final_result"]
-    if final_result.get("video_id") != target_video_id:
-        return
-    final_rank = int(final_result["rank_in_final_search"])
-    for k in ks:
-        if final_rank <= k:
-            final_hits[k] += 1
+    _update_recall_counts(
+        initial_hits=trace["initial_hits"],
+        reranked_hits=trace["reranked_hits"],
+        ks=ks,
+        round1_hits=round1_hits,
+        final_hits=final_hits,
+        predicate=lambda hit: hit.get("video_id") == target_video_id,
+    )
 
 
 def _update_v2t_recall_counts(
@@ -423,70 +344,114 @@ def _update_v2t_recall_counts(
     round1_hits: dict[int, int],
     final_hits: dict[int, int],
 ) -> None:
-    retrieval_hits = trace["iterations"][0]["retrieval_hits"]
-    for k in ks:
-        top_hits = retrieval_hits[:k]
-        if any(hit.get("text_id") in target_text_ids for hit in top_hits):
-            round1_hits[k] += 1
+    _update_recall_counts(
+        initial_hits=trace["initial_hits"],
+        reranked_hits=trace["reranked_hits"],
+        ks=ks,
+        round1_hits=round1_hits,
+        final_hits=final_hits,
+        predicate=lambda hit: hit.get("text_id") in target_text_ids,
+    )
 
-    final_result = trace["final_result"]
-    if final_result.get("text_id") not in target_text_ids:
-        return
-    final_rank = int(final_result["rank_in_final_search"])
+
+def _update_recall_counts(
+    *,
+    initial_hits: list[dict],
+    reranked_hits: list[dict],
+    ks: tuple[int, ...],
+    round1_hits: dict[int, int],
+    final_hits: dict[int, int],
+    predicate: Callable[[dict], bool],
+) -> None:
     for k in ks:
-        if final_rank <= k:
+        if any(predicate(hit) for hit in initial_hits[:k]):
+            round1_hits[k] += 1
+        if any(predicate(hit) for hit in reranked_hits[:k]):
             final_hits[k] += 1
+
+
+def _build_final_result(
+    reranked_hits: list[RetrievalHit],
+    initial_hits: list[RetrievalHit],
+    *,
+    key_name: str,
+) -> dict:
+    if not reranked_hits:
+        return {"item_id": None, "rank_in_final_search": 0, "original_rank": 0}
+    original_rank_by_id = {
+        getattr(hit, key_name): hit.rank
+        for hit in initial_hits
+        if getattr(hit, key_name) is not None
+    }
+    top_hit = reranked_hits[0]
+    key_value = getattr(top_hit, key_name)
+    payload = top_hit.to_dict()
+    payload["rank_in_final_search"] = 1
+    payload["original_rank"] = int(original_rank_by_id.get(key_value, top_hit.rank))
+    return payload
+
+
+def _rerank_hits(
+    hits: list[RetrievalHit],
+    ordered_ids: list[str],
+    *,
+    key_name: str,
+    window: int | None = None,
+) -> tuple[list[RetrievalHit], bool]:
+    if not hits:
+        return [], False
+    prefix = list(hits[:window]) if window is not None else list(hits)
+    suffix = list(hits[window:]) if window is not None else []
+    key_to_hit = {
+        str(getattr(hit, key_name)): hit
+        for hit in prefix
+        if getattr(hit, key_name) is not None
+    }
+    ordered: list[RetrievalHit] = []
+    seen: set[str] = set()
+    repair_used = False
+
+    for item_id in ordered_ids:
+        normalized_id = str(item_id).strip()
+        if normalized_id not in key_to_hit or normalized_id in seen:
+            repair_used = True
+            continue
+        ordered.append(key_to_hit[normalized_id])
+        seen.add(normalized_id)
+
+    if len(seen) != len(prefix):
+        repair_used = True
+    for hit in prefix:
+        key_value = str(getattr(hit, key_name))
+        if key_value not in seen:
+            ordered.append(hit)
+            seen.add(key_value)
+
+    reranked = ordered + suffix
+    return _with_ranks(reranked), repair_used
+
+
+def _clone_hits(hits: list[RetrievalHit]) -> list[RetrievalHit]:
+    return _with_ranks(list(hits))
+
+
+def _with_ranks(hits: list[RetrievalHit]) -> list[RetrievalHit]:
+    reranked: list[RetrievalHit] = []
+    for rank, hit in enumerate(hits, start=1):
+        reranked.append(
+            RetrievalHit(
+                rank=rank,
+                item_id=hit.item_id,
+                score=hit.score,
+                video_id=hit.video_id,
+                text_id=hit.text_id,
+                text=hit.text,
+                video_path=hit.video_path,
+            )
+        )
+    return reranked
 
 
 def _emit_progress(progress: Callable[[str], None] | None, message: str) -> None:
     if progress is not None:
         progress(message)
-
-
-def _fallback_v2t_rank(inspected_by_rank: dict[int, CandidateInspection], hits: list[RetrievalHit]) -> int:
-    if 1 in inspected_by_rank:
-        return 1
-    if inspected_by_rank:
-        return min(inspected_by_rank)
-    return 1 if hits else 0
-
-
-def _choose_first_confident_match(
-    inspections: list[CandidateInspection],
-    submit_threshold: float,
-) -> CandidateInspection | None:
-    qualified = [
-        item
-        for item in inspections
-        if item.checker.is_match and item.checker.confidence >= submit_threshold
-    ]
-    if not qualified:
-        return None
-    return min(qualified, key=lambda item: item.rank)
-
-
-def _choose_best_inspection(inspections: list[CandidateInspection]) -> CandidateInspection | None:
-    if not inspections:
-        return None
-    return max(
-        inspections,
-        key=lambda item: (
-            int(item.checker.is_match),
-            item.checker.confidence,
-            item.checker.visual_match + item.checker.audio_match,
-            -item.rank,
-        ),
-    )
-
-
-def _default_checker_result() -> CheckerResult:
-    return CheckerResult(
-        is_match=False,
-        confidence=0.0,
-        visual_match=0.0,
-        audio_match=0.0,
-        main_events=[],
-        missing_elements=["uninspected_candidate"],
-        reason="candidate was not inspected",
-        rewrite_suggestion="",
-    )

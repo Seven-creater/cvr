@@ -3,87 +3,74 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Protocol
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
-from typing import Protocol
 
 from app.retrieval_types import TextRow, VideoRow
 
-REQUIRED_CHECKER_FIELDS = (
-    "is_match",
-    "confidence",
-    "visual_match",
-    "audio_match",
+VALID_AUDIO_RELEVANCE = {"required", "helpful", "irrelevant", "unknown"}
+
+REQUIRED_T2V_QUERY_FIELDS = (
+    "retrieval_text",
+    "summary",
     "main_events",
-    "missing_elements",
+    "objects",
+    "scene",
+    "audio_cues",
+    "audio_relevance",
     "reason",
-    "rewrite_suggestion",
+)
+
+REQUIRED_VIDEO_DESCRIPTION_FIELDS = (
+    "summary",
+    "main_events",
+    "objects",
+    "scene",
+    "audio_cues",
+    "audio_relevance",
+)
+
+REQUIRED_T2V_RERANK_FIELDS = (
+    "ordered_video_ids",
+    "top_choice_video_id",
+    "confidence",
+    "reason",
+)
+
+REQUIRED_V2T_RERANK_FIELDS = (
+    "ordered_text_ids",
+    "top_choice_text_id",
+    "confidence",
+    "reason",
 )
 
 
-@dataclass(frozen=True, slots=True)
-class CheckerResult:
-    is_match: bool
-    confidence: float
-    visual_match: float
-    audio_match: float
-    main_events: list[str]
-    missing_elements: list[str]
-    reason: str
-    rewrite_suggestion: str
-
-    @classmethod
-    def from_dict(cls, payload: dict) -> "CheckerResult":
-        def _as_bool(value: object) -> bool:
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, str):
-                return value.strip().lower() in {"true", "1", "yes", "match"}
-            return bool(value)
-
-        def _as_float(value: object, default: float = 0.0) -> float:
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return default
-
-        return cls(
-            is_match=_as_bool(payload.get("is_match", False)),
-            confidence=_as_float(payload.get("confidence", 0.0)),
-            visual_match=_as_float(payload.get("visual_match", 0.0)),
-            audio_match=_as_float(payload.get("audio_match", 0.0)),
-            main_events=[str(item) for item in payload.get("main_events", [])],
-            missing_elements=[str(item) for item in payload.get("missing_elements", [])],
-            reason=str(payload.get("reason", "")),
-            rewrite_suggestion=str(payload.get("rewrite_suggestion", "")),
-        )
-
-    def to_dict(self) -> dict:
-        return {
-            "is_match": self.is_match,
-            "confidence": round(self.confidence, 4),
-            "visual_match": round(self.visual_match, 4),
-            "audio_match": round(self.audio_match, 4),
-            "main_events": list(self.main_events),
-            "missing_elements": list(self.missing_elements),
-            "reason": self.reason,
-            "rewrite_suggestion": self.rewrite_suggestion,
-        }
+def _as_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
-class OmniChecker(Protocol):
-    def inspect_t2v(self, query_text: str, candidate_video: VideoRow, *, rank: int, score: float) -> CheckerResult:
-        ...
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
-    def inspect_v2t(self, query_video: VideoRow, candidate_text: TextRow, *, rank: int, score: float) -> CheckerResult:
-        ...
+
+def _normalize_audio_relevance(value: object) -> str:
+    normalized = str(value).strip().lower()
+    if normalized in VALID_AUDIO_RELEVANCE:
+        return normalized
+    return "unknown"
 
 
 def _extract_json(text: str) -> dict:
-    text = text.strip()
+    text = str(text).strip()
     if text.startswith("```"):
         lines = [line for line in text.splitlines() if not line.startswith("```")]
         text = "\n".join(lines).strip()
@@ -94,56 +81,8 @@ def _extract_json(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
-def _fallback_payload(raw_text: str) -> dict:
-    return {
-        "is_match": False,
-        "confidence": 0.0,
-        "visual_match": 0.0,
-        "audio_match": 0.0,
-        "main_events": [],
-        "missing_elements": ["unstructured_response"],
-        "reason": raw_text.strip(),
-        "rewrite_suggestion": "",
-    }
-
-
-def _complete_payload(payload: dict) -> dict:
-    completed = {
-        "is_match": payload.get("is_match", False),
-        "confidence": payload.get("confidence", 0.0),
-        "visual_match": payload.get("visual_match", 0.0),
-        "audio_match": payload.get("audio_match", 0.0),
-        "main_events": payload.get("main_events", []),
-        "missing_elements": payload.get("missing_elements", []),
-        "reason": payload.get("reason", ""),
-        "rewrite_suggestion": payload.get("rewrite_suggestion", ""),
-    }
-    missing_fields = [field for field in REQUIRED_CHECKER_FIELDS if field not in payload]
-    if missing_fields:
-        missing_items = [str(item) for item in completed["missing_elements"]]
-        missing_items.extend([f"missing_field:{field}" for field in missing_fields])
-        completed["missing_elements"] = missing_items
-        if not completed["reason"]:
-            completed["reason"] = "incomplete_json_response"
-    return completed
-
-
-def _checker_system_prompt(kind: str) -> str:
-    subject = "video retrieval" if kind == "t2v" else "text retrieval"
-    return (
-        f"You are a {subject} checker. "
-        "Return exactly one JSON object and nothing else. "
-        "All 8 keys are mandatory. "
-        'Required schema: {"is_match": bool, "confidence": float, "visual_match": float, '
-        '"audio_match": float, "main_events": [string], "missing_elements": [string], '
-        '"reason": string, "rewrite_suggestion": string}. '
-        "The float fields must be numeric values between 0.0 and 1.0. "
-        'A reply like {"is_match": true} is invalid because keys are missing. '
-        'Example valid reply: {"is_match": true, "confidence": 0.82, "visual_match": 0.91, '
-        '"audio_match": 0.35, "main_events": ["person pours milk", "person cuts vanilla bean"], '
-        '"missing_elements": [], "reason": "The visible cooking actions match the query.", '
-        '"rewrite_suggestion": ""}.'
-    )
+def _missing_fields(payload: dict, required_fields: tuple[str, ...]) -> list[str]:
+    return [field for field in required_fields if field not in payload]
 
 
 def _file_path_from_url(raw_url: str) -> Path | None:
@@ -167,40 +106,335 @@ def _materialize_video_url(raw_url: str) -> str:
     return f"data:{mime_type};base64,{content}"
 
 
-def build_t2v_user_content(query_text: str, candidate_video: VideoRow, *, rank: int, score: float) -> list[dict]:
-    if not candidate_video.video_path:
-        raise ValueError("candidate_video.video_path is required")
+@dataclass(frozen=True, slots=True)
+class RetrievalHints:
+    query_text_override: str | None
+    audio_mode: str = "on"
+    fallback_used: bool = False
+
+    @classmethod
+    def from_query_understanding(
+        cls,
+        query_text: str,
+        understanding: "T2VQueryUnderstanding",
+    ) -> "RetrievalHints":
+        raw_override = understanding.retrieval_text.strip()
+        query_text_override = raw_override if raw_override and raw_override != query_text else None
+        audio_mode = "off" if not understanding.fallback_used and understanding.audio_relevance == "irrelevant" else "on"
+        return cls(
+            query_text_override=query_text_override,
+            audio_mode=audio_mode,
+            fallback_used=understanding.fallback_used,
+        )
+
+    @classmethod
+    def from_video_description(cls, description: "VideoDescription") -> "RetrievalHints":
+        audio_mode = "off" if not description.fallback_used and description.audio_relevance == "irrelevant" else "on"
+        return cls(query_text_override=None, audio_mode=audio_mode, fallback_used=description.fallback_used)
+
+    def to_dict(self) -> dict:
+        payload = {
+            "audio_mode": self.audio_mode,
+            "fallback_used": self.fallback_used,
+        }
+        if self.query_text_override is not None:
+            payload["query_text_override"] = self.query_text_override
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class T2VQueryUnderstanding:
+    retrieval_text: str
+    summary: str
+    main_events: list[str]
+    objects: list[str]
+    scene: str
+    audio_cues: list[str]
+    audio_relevance: str
+    reason: str
+    fallback_used: bool = False
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: dict,
+        *,
+        original_query_text: str,
+    ) -> "T2VQueryUnderstanding":
+        retrieval_text = str(payload.get("retrieval_text") or original_query_text).strip() or original_query_text
+        return cls(
+            retrieval_text=retrieval_text,
+            summary=str(payload.get("summary", "")).strip(),
+            main_events=_string_list(payload.get("main_events")),
+            objects=_string_list(payload.get("objects")),
+            scene=str(payload.get("scene", "")).strip(),
+            audio_cues=_string_list(payload.get("audio_cues")),
+            audio_relevance=_normalize_audio_relevance(payload.get("audio_relevance")),
+            reason=str(payload.get("reason", "")).strip(),
+            fallback_used=bool(payload.get("fallback_used", False)),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "retrieval_text": self.retrieval_text,
+            "summary": self.summary,
+            "main_events": list(self.main_events),
+            "objects": list(self.objects),
+            "scene": self.scene,
+            "audio_cues": list(self.audio_cues),
+            "audio_relevance": self.audio_relevance,
+            "reason": self.reason,
+            "fallback_used": self.fallback_used,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class VideoDescription:
+    summary: str
+    main_events: list[str]
+    objects: list[str]
+    scene: str
+    audio_cues: list[str]
+    audio_relevance: str
+    fallback_used: bool = False
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "VideoDescription":
+        return cls(
+            summary=str(payload.get("summary", "")).strip(),
+            main_events=_string_list(payload.get("main_events")),
+            objects=_string_list(payload.get("objects")),
+            scene=str(payload.get("scene", "")).strip(),
+            audio_cues=_string_list(payload.get("audio_cues")),
+            audio_relevance=_normalize_audio_relevance(payload.get("audio_relevance")),
+            fallback_used=bool(payload.get("fallback_used", False)),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "summary": self.summary,
+            "main_events": list(self.main_events),
+            "objects": list(self.objects),
+            "scene": self.scene,
+            "audio_cues": list(self.audio_cues),
+            "audio_relevance": self.audio_relevance,
+            "fallback_used": self.fallback_used,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class T2VRerankResult:
+    ordered_video_ids: list[str]
+    top_choice_video_id: str
+    confidence: float
+    reason: str
+    fallback_used: bool = False
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "T2VRerankResult":
+        ordered_video_ids = _string_list(payload.get("ordered_video_ids"))
+        top_choice = str(payload.get("top_choice_video_id", "")).strip()
+        if not top_choice and ordered_video_ids:
+            top_choice = ordered_video_ids[0]
+        return cls(
+            ordered_video_ids=ordered_video_ids,
+            top_choice_video_id=top_choice,
+            confidence=_as_float(payload.get("confidence", 0.0)),
+            reason=str(payload.get("reason", "")).strip(),
+            fallback_used=bool(payload.get("fallback_used", False)),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "ordered_video_ids": list(self.ordered_video_ids),
+            "top_choice_video_id": self.top_choice_video_id,
+            "confidence": round(self.confidence, 4),
+            "reason": self.reason,
+            "fallback_used": self.fallback_used,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class V2TRerankResult:
+    ordered_text_ids: list[str]
+    top_choice_text_id: str
+    confidence: float
+    reason: str
+    fallback_used: bool = False
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "V2TRerankResult":
+        ordered_text_ids = _string_list(payload.get("ordered_text_ids"))
+        top_choice = str(payload.get("top_choice_text_id", "")).strip()
+        if not top_choice and ordered_text_ids:
+            top_choice = ordered_text_ids[0]
+        return cls(
+            ordered_text_ids=ordered_text_ids,
+            top_choice_text_id=top_choice,
+            confidence=_as_float(payload.get("confidence", 0.0)),
+            reason=str(payload.get("reason", "")).strip(),
+            fallback_used=bool(payload.get("fallback_used", False)),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "ordered_text_ids": list(self.ordered_text_ids),
+            "top_choice_text_id": self.top_choice_text_id,
+            "confidence": round(self.confidence, 4),
+            "reason": self.reason,
+            "fallback_used": self.fallback_used,
+        }
+
+
+class OmniChecker(Protocol):
+    def understand_t2v_query(self, query_text: str) -> T2VQueryUnderstanding:
+        ...
+
+    def describe_video(self, video: VideoRow) -> VideoDescription:
+        ...
+
+    def rerank_t2v(self, query_understanding: T2VQueryUnderstanding, candidates: list[dict]) -> T2VRerankResult:
+        ...
+
+    def rerank_v2t(
+        self,
+        query_video: VideoRow,
+        video_description: VideoDescription,
+        candidates: list[dict],
+    ) -> V2TRerankResult:
+        ...
+
+
+def build_t2v_query_understanding_user_content(query_text: str) -> list[dict]:
     prompt = (
-        f"Task: text-to-video retrieval check\n"
-        f"Query text: {query_text}\n"
-        f"Candidate rank: {rank}\n"
-        f"Retriever score: {score:.6f}\n"
-        "Please inspect whether the candidate video truly matches the query. "
-        "Do not use any dataset labels. "
-        "Your answer is invalid unless all 8 JSON fields are present."
+        "Task: understand a text-to-video retrieval query.\n"
+        f"Original query: {query_text}\n"
+        "Return a retrieval-focused rewrite and structured cues. "
+        "Do not mention dataset labels."
+    )
+    return [{"type": "text", "text": prompt}]
+
+
+def build_video_description_user_content(video: VideoRow) -> list[dict]:
+    if not video.video_path:
+        raise ValueError("video.video_path is required")
+    prompt = (
+        "Task: describe this video for retrieval reranking.\n"
+        "Summarize the visible actions, important objects, scene, and useful audio cues. "
+        "Do not mention dataset labels."
     )
     return [
-        {"type": "video_url", "video_url": {"url": candidate_video.video_path}},
+        {"type": "video_url", "video_url": {"url": video.video_path}},
         {"type": "text", "text": prompt},
     ]
 
 
-def build_v2t_user_content(query_video: VideoRow, candidate_text: TextRow, *, rank: int, score: float) -> list[dict]:
-    if not query_video.video_path:
-        raise ValueError("query_video.video_path is required")
+def build_t2v_rerank_user_content(query_understanding: T2VQueryUnderstanding, candidates: list[dict]) -> list[dict]:
     prompt = (
-        f"Task: video-to-text retrieval check\n"
-        f"Candidate text: {candidate_text.text}\n"
-        f"Candidate rank: {rank}\n"
-        f"Retriever score: {score:.6f}\n"
-        "Please inspect whether the text truly describes the query video. "
-        "Do not use any dataset labels. "
-        "Your answer is invalid unless all 8 JSON fields are present."
+        "Task: rerank candidate videos for a text-to-video query.\n"
+        f"Query understanding JSON:\n{json.dumps(query_understanding.to_dict(), ensure_ascii=False)}\n"
+        f"Candidate videos JSON:\n{json.dumps(candidates, ensure_ascii=False)}\n"
+        "Rank only the provided candidate video_ids. Keep the full candidate set."
     )
-    return [
-        {"type": "video_url", "video_url": {"url": query_video.video_path}},
-        {"type": "text", "text": prompt},
-    ]
+    return [{"type": "text", "text": prompt}]
+
+
+def build_v2t_rerank_user_content(video_description: VideoDescription, candidates: list[dict]) -> list[dict]:
+    prompt = (
+        "Task: rerank candidate texts for a video-to-text query.\n"
+        f"Video description JSON:\n{json.dumps(video_description.to_dict(), ensure_ascii=False)}\n"
+        f"Candidate texts JSON:\n{json.dumps(candidates, ensure_ascii=False)}\n"
+        "Rank only the provided candidate text_ids. Keep the full candidate set."
+    )
+    return [{"type": "text", "text": prompt}]
+
+
+def _t2v_query_system_prompt() -> str:
+    return (
+        "You are a retrieval query understanding assistant. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"retrieval_text": string, "summary": string, "main_events": [string], '
+        '"objects": [string], "scene": string, "audio_cues": [string], '
+        '"audio_relevance": "required|helpful|irrelevant|unknown", "reason": string}. '
+        "All keys are mandatory."
+    )
+
+
+def _video_description_system_prompt() -> str:
+    return (
+        "You are a video description assistant for retrieval reranking. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"summary": string, "main_events": [string], "objects": [string], '
+        '"scene": string, "audio_cues": [string], '
+        '"audio_relevance": "required|helpful|irrelevant|unknown"}. '
+        "All keys are mandatory."
+    )
+
+
+def _t2v_rerank_system_prompt() -> str:
+    return (
+        "You are a text-to-video reranker. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"ordered_video_ids": [string], "top_choice_video_id": string, '
+        '"confidence": float, "reason": string}. '
+        "Use only candidate video_ids that appear in the input, include every candidate exactly once, and do not invent ids."
+    )
+
+
+def _v2t_rerank_system_prompt() -> str:
+    return (
+        "You are a video-to-text reranker. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"ordered_text_ids": [string], "top_choice_text_id": string, '
+        '"confidence": float, "reason": string}. '
+        "Use only candidate text_ids that appear in the input, include every candidate exactly once, and do not invent ids."
+    )
+
+
+def _fallback_query_understanding(query_text: str, *, reason: str) -> T2VQueryUnderstanding:
+    return T2VQueryUnderstanding(
+        retrieval_text=query_text,
+        summary=query_text,
+        main_events=[],
+        objects=[],
+        scene="",
+        audio_cues=[],
+        audio_relevance="unknown",
+        reason=reason,
+        fallback_used=True,
+    )
+
+
+def _fallback_video_description() -> VideoDescription:
+    return VideoDescription(
+        summary="",
+        main_events=[],
+        objects=[],
+        scene="",
+        audio_cues=[],
+        audio_relevance="unknown",
+        fallback_used=True,
+    )
+
+
+def _fallback_t2v_rerank(candidate_ids: list[str], *, reason: str) -> T2VRerankResult:
+    return T2VRerankResult(
+        ordered_video_ids=list(candidate_ids),
+        top_choice_video_id=candidate_ids[0] if candidate_ids else "",
+        confidence=0.0,
+        reason=reason,
+        fallback_used=True,
+    )
+
+
+def _fallback_v2t_rerank(candidate_ids: list[str], *, reason: str) -> V2TRerankResult:
+    return V2TRerankResult(
+        ordered_text_ids=list(candidate_ids),
+        top_choice_text_id=candidate_ids[0] if candidate_ids else "",
+        confidence=0.0,
+        reason=reason,
+        fallback_used=True,
+    )
 
 
 class OpenAIOmniChecker:
@@ -217,7 +451,7 @@ class OpenAIOmniChecker:
         self.model = model
         self.timeout_seconds = timeout_seconds
 
-    def _request(self, user_content: list[dict], system_prompt: str) -> CheckerResult:
+    def _request_payload(self, user_content: list[dict], system_prompt: str, *, max_tokens: int = 512) -> dict:
         request_content: list[dict] = []
         for item in user_content:
             if item.get("type") == "video_url":
@@ -229,7 +463,7 @@ class OpenAIOmniChecker:
         payload = {
             "model": self.model,
             "modalities": ["text"],
-            "max_tokens": 256,
+            "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
             "temperature": 0.0,
             "messages": [
@@ -249,70 +483,145 @@ class OpenAIOmniChecker:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 raw = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:  # pragma: no cover
+        except urllib.error.HTTPError as exc:  # pragma: no cover - depends on live service
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"omni checker request failed: {detail}") from exc
         content = raw["choices"][0]["message"]["content"]
+        return _extract_json(content)
+
+    def understand_t2v_query(self, query_text: str) -> T2VQueryUnderstanding:
         try:
-            parsed = _complete_payload(_extract_json(content))
-        except ValueError:
-            parsed = _fallback_payload(str(content))
-        return CheckerResult.from_dict(parsed)
+            payload = self._request_payload(
+                build_t2v_query_understanding_user_content(query_text),
+                _t2v_query_system_prompt(),
+            )
+        except Exception as exc:
+            return _fallback_query_understanding(query_text, reason=f"query_understanding_failed:{type(exc).__name__}")
+        if _missing_fields(payload, REQUIRED_T2V_QUERY_FIELDS):
+            return _fallback_query_understanding(query_text, reason="query_understanding_incomplete")
+        return T2VQueryUnderstanding.from_dict(payload, original_query_text=query_text)
 
-    def inspect_t2v(self, query_text: str, candidate_video: VideoRow, *, rank: int, score: float) -> CheckerResult:
-        return self._request(
-            build_t2v_user_content(query_text, candidate_video, rank=rank, score=score),
-            _checker_system_prompt("t2v"),
-        )
+    def describe_video(self, video: VideoRow) -> VideoDescription:
+        try:
+            payload = self._request_payload(
+                build_video_description_user_content(video),
+                _video_description_system_prompt(),
+            )
+        except Exception:
+            return _fallback_video_description()
+        if _missing_fields(payload, REQUIRED_VIDEO_DESCRIPTION_FIELDS):
+            return _fallback_video_description()
+        return VideoDescription.from_dict(payload)
 
-    def inspect_v2t(self, query_video: VideoRow, candidate_text: TextRow, *, rank: int, score: float) -> CheckerResult:
-        return self._request(
-            build_v2t_user_content(query_video, candidate_text, rank=rank, score=score),
-            _checker_system_prompt("v2t"),
-        )
+    def rerank_t2v(self, query_understanding: T2VQueryUnderstanding, candidates: list[dict]) -> T2VRerankResult:
+        candidate_ids = [str(item.get("video_id", "")).strip() for item in candidates if str(item.get("video_id", "")).strip()]
+        try:
+            payload = self._request_payload(
+                build_t2v_rerank_user_content(query_understanding, candidates),
+                _t2v_rerank_system_prompt(),
+            )
+        except Exception as exc:
+            return _fallback_t2v_rerank(candidate_ids, reason=f"t2v_rerank_failed:{type(exc).__name__}")
+        if _missing_fields(payload, REQUIRED_T2V_RERANK_FIELDS):
+            return _fallback_t2v_rerank(candidate_ids, reason="t2v_rerank_incomplete")
+        return T2VRerankResult.from_dict(payload)
+
+    def rerank_v2t(
+        self,
+        query_video: VideoRow,
+        video_description: VideoDescription,
+        candidates: list[dict],
+    ) -> V2TRerankResult:
+        _ = query_video
+        candidate_ids = [str(item.get("text_id", "")).strip() for item in candidates if str(item.get("text_id", "")).strip()]
+        try:
+            payload = self._request_payload(
+                build_v2t_rerank_user_content(video_description, candidates),
+                _v2t_rerank_system_prompt(),
+            )
+        except Exception as exc:
+            return _fallback_v2t_rerank(candidate_ids, reason=f"v2t_rerank_failed:{type(exc).__name__}")
+        if _missing_fields(payload, REQUIRED_V2T_RERANK_FIELDS):
+            return _fallback_v2t_rerank(candidate_ids, reason="v2t_rerank_incomplete")
+        return V2TRerankResult.from_dict(payload)
 
 
 class MockOmniChecker:
     def __init__(
         self,
         *,
-        t2v_results: dict[str, CheckerResult | dict] | None = None,
-        v2t_results: dict[str, CheckerResult | dict] | None = None,
+        t2v_understanding_results: dict[str, T2VQueryUnderstanding | dict] | None = None,
+        video_description_results: dict[str, VideoDescription | dict] | None = None,
+        t2v_rerank_results: dict[str, T2VRerankResult | dict] | None = None,
+        v2t_rerank_results: dict[str, V2TRerankResult | dict] | None = None,
     ) -> None:
-        self.t2v_results = {
-            key: value if isinstance(value, CheckerResult) else CheckerResult.from_dict(value)
-            for key, value in (t2v_results or {}).items()
-        }
-        self.v2t_results = {
-            key: value if isinstance(value, CheckerResult) else CheckerResult.from_dict(value)
-            for key, value in (v2t_results or {}).items()
-        }
+        self.t2v_understanding_results = dict(t2v_understanding_results or {})
+        self.video_description_results = dict(video_description_results or {})
+        self.t2v_rerank_results = dict(t2v_rerank_results or {})
+        self.v2t_rerank_results = dict(v2t_rerank_results or {})
 
-    def _resolve(self, store: dict, primary_key: str, secondary_key: str) -> CheckerResult | None:
-        return store.get(secondary_key) or store.get(primary_key)
-
-    def inspect_t2v(self, query_text: str, candidate_video: VideoRow, *, rank: int, score: float) -> CheckerResult:
-        resolved = self._resolve(self.t2v_results, candidate_video.video_id, f"{query_text}::{candidate_video.video_id}")
-        return resolved or CheckerResult(
-            is_match=False,
-            confidence=0.1,
-            visual_match=0.1,
-            audio_match=0.1,
+    def understand_t2v_query(self, query_text: str) -> T2VQueryUnderstanding:
+        resolved = self.t2v_understanding_results.get(query_text)
+        if isinstance(resolved, T2VQueryUnderstanding):
+            return resolved
+        if isinstance(resolved, dict):
+            return T2VQueryUnderstanding.from_dict(resolved, original_query_text=query_text)
+        return T2VQueryUnderstanding(
+            retrieval_text=query_text,
+            summary=query_text,
             main_events=[],
-            missing_elements=["unknown"],
-            reason="mock fallback",
-            rewrite_suggestion=query_text,
+            objects=[],
+            scene="",
+            audio_cues=[],
+            audio_relevance="unknown",
+            reason="mock default",
         )
 
-    def inspect_v2t(self, query_video: VideoRow, candidate_text: TextRow, *, rank: int, score: float) -> CheckerResult:
-        resolved = self._resolve(self.v2t_results, candidate_text.text_id, f"{query_video.video_id}::{candidate_text.text_id}")
-        return resolved or CheckerResult(
-            is_match=False,
-            confidence=0.1,
-            visual_match=0.1,
-            audio_match=0.1,
+    def describe_video(self, video: VideoRow) -> VideoDescription:
+        resolved = self.video_description_results.get(video.video_id)
+        if isinstance(resolved, VideoDescription):
+            return resolved
+        if isinstance(resolved, dict):
+            return VideoDescription.from_dict(resolved)
+        return VideoDescription(
+            summary=f"summary for {video.video_id}",
             main_events=[],
-            missing_elements=["unknown"],
-            reason="mock fallback",
-            rewrite_suggestion="",
+            objects=[],
+            scene="",
+            audio_cues=[],
+            audio_relevance="unknown",
+        )
+
+    def rerank_t2v(self, query_understanding: T2VQueryUnderstanding, candidates: list[dict]) -> T2VRerankResult:
+        resolved = self.t2v_rerank_results.get(query_understanding.retrieval_text)
+        if isinstance(resolved, T2VRerankResult):
+            return resolved
+        if isinstance(resolved, dict):
+            return T2VRerankResult.from_dict(resolved)
+        candidate_ids = [str(item.get("video_id", "")).strip() for item in candidates if str(item.get("video_id", "")).strip()]
+        return T2VRerankResult(
+            ordered_video_ids=candidate_ids,
+            top_choice_video_id=candidate_ids[0] if candidate_ids else "",
+            confidence=0.0,
+            reason="mock default",
+        )
+
+    def rerank_v2t(
+        self,
+        query_video: VideoRow,
+        video_description: VideoDescription,
+        candidates: list[dict],
+    ) -> V2TRerankResult:
+        _ = video_description
+        resolved = self.v2t_rerank_results.get(query_video.video_id)
+        if isinstance(resolved, V2TRerankResult):
+            return resolved
+        if isinstance(resolved, dict):
+            return V2TRerankResult.from_dict(resolved)
+        candidate_ids = [str(item.get("text_id", "")).strip() for item in candidates if str(item.get("text_id", "")).strip()]
+        return V2TRerankResult(
+            ordered_text_ids=candidate_ids,
+            top_choice_text_id=candidate_ids[0] if candidate_ids else "",
+            confidence=0.0,
+            reason="mock default",
         )

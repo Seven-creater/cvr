@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 import tempfile
 import unittest
-from dataclasses import dataclass
 
 import numpy as np
 
@@ -21,18 +21,22 @@ from app.retrieval_types import TextRow, VideoRow
 class FakeRuntime:
     text_rows: list[TextRow]
     video_rows: list[VideoRow]
-    text_score_map: dict[str, np.ndarray]
-    video_score_map: dict[str, np.ndarray]
+    text_score_map: dict[tuple[str, str], np.ndarray]
+    video_score_map: dict[tuple[str, str], np.ndarray]
+    text_calls: list[tuple[str, str]] = field(default_factory=list)
+    video_calls: list[tuple[str, str]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._video_index = {row.video_id: index for index, row in enumerate(self.video_rows)}
         self._text_index = {row.text_id: index for index, row in enumerate(self.text_rows)}
 
-    def score_text_query(self, query_text: str) -> np.ndarray:
-        return self.text_score_map[query_text]
+    def score_text_query(self, query_text: str, *, audio_mode: str = "on") -> np.ndarray:
+        self.text_calls.append((query_text, audio_mode))
+        return self.text_score_map[(query_text, audio_mode)]
 
-    def score_video_query(self, video_id: str) -> np.ndarray:
-        return self.video_score_map[video_id]
+    def score_video_query(self, video_id: str, *, audio_mode: str = "on") -> np.ndarray:
+        self.video_calls.append((video_id, audio_mode))
+        return self.video_score_map[(video_id, audio_mode)]
 
     def target_text_ids(self, video_id: str) -> list[str]:
         return [row.text_id for row in self.text_rows if row.video_id == video_id]
@@ -51,49 +55,55 @@ class AvigateAgentTests(unittest.TestCase):
             TextRow(text_id="t3", video_id="video3", text="a person fixes a computer"),
         ]
 
-    def test_t2v_agent_rewrites_then_submits(self) -> None:
+    def test_t2v_agent_uses_query_understanding_and_reranks_prefix(self) -> None:
         runtime = FakeRuntime(
             text_rows=self.text_rows,
             video_rows=self.video_rows,
             text_score_map={
-                "cook query": np.asarray([0.1, 0.9, 0.2], dtype=np.float32),
-                "better cook query": np.asarray([0.95, 0.2, 0.1], dtype=np.float32),
+                ("cook query", "on"): np.asarray([0.1, 0.9, 0.2], dtype=np.float32),
+                ("better cook query", "off"): np.asarray([0.8, 0.9, 0.1], dtype=np.float32),
             },
             video_score_map={},
         )
         checker = MockOmniChecker(
-            t2v_results={
-                "cook query::video2": {
-                    "is_match": False,
-                    "confidence": 0.2,
-                    "visual_match": 0.2,
-                    "audio_match": 0.1,
-                    "main_events": [],
-                    "missing_elements": ["cooking"],
-                    "reason": "wrong activity",
-                    "rewrite_suggestion": "better cook query",
-                },
-                "cook query::video3": {
-                    "is_match": False,
-                    "confidence": 0.1,
-                    "visual_match": 0.1,
-                    "audio_match": 0.1,
-                    "main_events": [],
-                    "missing_elements": ["cooking"],
-                    "reason": "still wrong",
-                    "rewrite_suggestion": "better cook query",
-                },
-                "better cook query::video1": {
-                    "is_match": True,
-                    "confidence": 0.91,
-                    "visual_match": 0.9,
-                    "audio_match": 0.7,
+            t2v_understanding_results={
+                "cook query": {
+                    "retrieval_text": "better cook query",
+                    "summary": "person cooks food",
                     "main_events": ["cooking"],
-                    "missing_elements": [],
-                    "reason": "matches well",
-                    "rewrite_suggestion": "",
+                    "objects": ["pan"],
+                    "scene": "kitchen",
+                    "audio_cues": [],
+                    "audio_relevance": "irrelevant",
+                    "reason": "visual signal is enough",
+                }
+            },
+            video_description_results={
+                "video2": {
+                    "summary": "a dog runs outdoors",
+                    "main_events": ["running"],
+                    "objects": ["dog"],
+                    "scene": "park",
+                    "audio_cues": [],
+                    "audio_relevance": "unknown",
                 },
-            }
+                "video1": {
+                    "summary": "a person cooks in a kitchen",
+                    "main_events": ["stirs food"],
+                    "objects": ["pot"],
+                    "scene": "kitchen",
+                    "audio_cues": ["sizzle"],
+                    "audio_relevance": "helpful",
+                },
+            },
+            t2v_rerank_results={
+                "better cook query": {
+                    "ordered_video_ids": ["video1", "video2"],
+                    "top_choice_video_id": "video1",
+                    "confidence": 0.91,
+                    "reason": "video1 matches cooking better",
+                }
+            },
         )
 
         trace = run_t2v_official_agent_case(
@@ -101,57 +111,47 @@ class AvigateAgentTests(unittest.TestCase):
             runtime=runtime,
             checker=checker,
             topk=3,
-            max_iter=3,
+            rerank_window=2,
         )
 
-        self.assertEqual("submit", trace["final_action"])
+        self.assertEqual([("better cook query", "off")], runtime.text_calls)
+        self.assertEqual("better cook query", trace["retrieval_hints"]["query_text_override"])
+        self.assertEqual("off", trace["retrieval_hints"]["audio_mode"])
+        self.assertEqual(["video2", "video1", "video3"], [hit["video_id"] for hit in trace["initial_hits"]])
+        self.assertEqual(["video1", "video2", "video3"], [hit["video_id"] for hit in trace["reranked_hits"]])
         self.assertEqual("video1", trace["final_result"]["video_id"])
-        self.assertEqual("retry", trace["iterations"][0]["action"])
-        self.assertEqual("better cook query", trace["iterations"][0]["next_query"])
-        self.assertEqual("submit", trace["iterations"][1]["action"])
+        self.assertEqual(2, trace["final_result"]["original_rank"])
+        self.assertEqual(4, trace["omni_calls"])
+        self.assertFalse(trace["fallback_used"])
 
-    def test_v2t_agent_inspects_more_then_submits(self) -> None:
+    def test_v2t_agent_describes_video_then_reranks(self) -> None:
         runtime = FakeRuntime(
             text_rows=self.text_rows,
             video_rows=self.video_rows,
             text_score_map={},
             video_score_map={
-                "video3": np.asarray([0.9, 0.8, 0.7], dtype=np.float32),
+                ("video3", "off"): np.asarray([0.9, 0.8, 0.7], dtype=np.float32),
             },
         )
         checker = MockOmniChecker(
-            v2t_results={
-                "video3::t1": {
-                    "is_match": False,
-                    "confidence": 0.1,
-                    "visual_match": 0.2,
-                    "audio_match": 0.1,
-                    "main_events": [],
-                    "missing_elements": ["computer"],
-                    "reason": "wrong text",
-                    "rewrite_suggestion": "",
-                },
-                "video3::t2": {
-                    "is_match": False,
-                    "confidence": 0.2,
-                    "visual_match": 0.2,
-                    "audio_match": 0.1,
-                    "main_events": [],
-                    "missing_elements": ["computer"],
-                    "reason": "still wrong",
-                    "rewrite_suggestion": "",
-                },
-                "video3::t3": {
-                    "is_match": True,
+            video_description_results={
+                "video3": {
+                    "summary": "a person repairs a computer",
+                    "main_events": ["opens computer case"],
+                    "objects": ["desktop computer"],
+                    "scene": "desk",
+                    "audio_cues": [],
+                    "audio_relevance": "irrelevant",
+                }
+            },
+            v2t_rerank_results={
+                "video3": {
+                    "ordered_text_ids": ["t3", "t1", "t2"],
+                    "top_choice_text_id": "t3",
                     "confidence": 0.88,
-                    "visual_match": 0.9,
-                    "audio_match": 0.6,
-                    "main_events": ["computer repair"],
-                    "missing_elements": [],
-                    "reason": "correct text",
-                    "rewrite_suggestion": "",
-                },
-            }
+                    "reason": "t3 best matches the repair scene",
+                }
+            },
         )
 
         trace = run_v2t_official_agent_case(
@@ -159,232 +159,110 @@ class AvigateAgentTests(unittest.TestCase):
             runtime=runtime,
             checker=checker,
             topk=3,
-            max_iter=3,
         )
 
-        self.assertEqual("submit", trace["final_action"])
+        self.assertEqual([("video3", "off")], runtime.video_calls)
+        self.assertEqual("off", trace["retrieval_hints"]["audio_mode"])
+        self.assertEqual(["t1", "t2", "t3"], [hit["text_id"] for hit in trace["initial_hits"]])
+        self.assertEqual(["t3", "t1", "t2"], [hit["text_id"] for hit in trace["reranked_hits"]])
         self.assertEqual("t3", trace["final_result"]["text_id"])
-        self.assertEqual("inspect_more", trace["iterations"][0]["action"])
-        self.assertEqual("submit", trace["iterations"][1]["action"])
+        self.assertEqual(3, trace["final_result"]["original_rank"])
+        self.assertEqual(2, trace["omni_calls"])
+        self.assertFalse(trace["fallback_used"])
 
-    def test_v2t_agent_prefers_earlier_confident_match(self) -> None:
+    def test_t2v_agent_falls_back_to_initial_hits_when_rerank_is_invalid(self) -> None:
         runtime = FakeRuntime(
             text_rows=self.text_rows,
             video_rows=self.video_rows,
-            text_score_map={},
-            video_score_map={
-                "video1": np.asarray([0.9, 0.8, 0.7], dtype=np.float32),
-            },
-        )
-        checker = MockOmniChecker(
-            v2t_results={
-                "video1::t1": {
-                    "is_match": True,
-                    "confidence": 0.82,
-                    "visual_match": 0.8,
-                    "audio_match": 0.5,
-                    "main_events": ["cooking"],
-                    "missing_elements": [],
-                    "reason": "correct enough",
-                    "rewrite_suggestion": "",
-                },
-                "video1::t2": {
-                    "is_match": True,
-                    "confidence": 0.97,
-                    "visual_match": 0.9,
-                    "audio_match": 0.7,
-                    "main_events": ["running"],
-                    "missing_elements": [],
-                    "reason": "overconfident false positive",
-                    "rewrite_suggestion": "",
-                },
-            }
-        )
-
-        trace = run_v2t_official_agent_case(
-            query_video_id="video1",
-            runtime=runtime,
-            checker=checker,
-            topk=3,
-            max_iter=3,
-        )
-
-        self.assertEqual("submit", trace["final_action"])
-        self.assertEqual("t1", trace["final_result"]["text_id"])
-        self.assertEqual(1, trace["final_result"]["rank_in_final_search"])
-
-    def test_v2t_agent_waits_until_minimum_inspected_before_submit(self) -> None:
-        text_rows = [
-            TextRow(text_id=f"t{i}", video_id=f"video{i}", text=f"text {i}")
-            for i in range(1, 7)
-        ]
-        video_rows = [VideoRow(video_id="video1", video_path="/tmp/video1.mp4")]
-        runtime = FakeRuntime(
-            text_rows=text_rows,
-            video_rows=video_rows,
-            text_score_map={},
-            video_score_map={
-                "video1": np.asarray([0.95, 0.8, 0.7, 0.6, 0.5, 0.4], dtype=np.float32),
-            },
-        )
-        checker = MockOmniChecker(
-            v2t_results={
-                "video1::t1": {
-                    "is_match": True,
-                    "confidence": 0.95,
-                    "visual_match": 0.9,
-                    "audio_match": 0.6,
-                    "main_events": ["event"],
-                    "missing_elements": [],
-                    "reason": "looks good",
-                    "rewrite_suggestion": "",
-                }
-            }
-        )
-
-        trace = run_v2t_official_agent_case(
-            query_video_id="video1",
-            runtime=runtime,
-            checker=checker,
-            topk=6,
-            max_iter=3,
-        )
-
-        self.assertEqual(["inspect_more", "inspect_more", "submit"], [step["action"] for step in trace["iterations"]])
-        self.assertEqual(6, sum(len(step["new_checked_candidates"]) for step in trace["iterations"]))
-
-    def test_partial_eval_writes_t2v_summary_and_traces(self) -> None:
-        runtime = FakeRuntime(
-            text_rows=[
-                TextRow(text_id="t1", video_id="video1", text="cook query"),
-                TextRow(text_id="t2", video_id="video2", text="run query"),
-            ],
-            video_rows=self.video_rows,
             text_score_map={
-                "cook query": np.asarray([0.9, 0.2, 0.1], dtype=np.float32),
-                "run query": np.asarray([0.6, 0.5, 0.4], dtype=np.float32),
+                ("cook query", "on"): np.asarray([0.9, 0.8, 0.7], dtype=np.float32),
             },
             video_score_map={},
         )
         checker = MockOmniChecker(
-            t2v_results={
-                "cook query::video1": {
-                    "is_match": True,
-                    "confidence": 0.91,
-                    "visual_match": 0.9,
-                    "audio_match": 0.6,
+            t2v_understanding_results={
+                "cook query": {
+                    "retrieval_text": "cook query",
+                    "summary": "person cooks",
                     "main_events": ["cooking"],
-                    "missing_elements": [],
-                    "reason": "correct",
-                    "rewrite_suggestion": "",
+                    "objects": ["pan"],
+                    "scene": "kitchen",
+                    "audio_cues": [],
+                    "audio_relevance": "helpful",
+                    "reason": "same query works",
+                }
+            },
+            video_description_results={
+                "video1": {
+                    "summary": "person cooks",
+                    "main_events": ["cooking"],
+                    "objects": ["pan"],
+                    "scene": "kitchen",
+                    "audio_cues": [],
+                    "audio_relevance": "helpful",
                 },
-                "cook query::video2": {
-                    "is_match": False,
-                    "confidence": 0.1,
-                    "visual_match": 0.1,
-                    "audio_match": 0.1,
-                    "main_events": [],
-                    "missing_elements": ["cooking"],
-                    "reason": "wrong",
-                    "rewrite_suggestion": "",
-                },
-                "run query::video1": {
-                    "is_match": False,
-                    "confidence": 0.2,
-                    "visual_match": 0.2,
-                    "audio_match": 0.1,
-                    "main_events": [],
-                    "missing_elements": ["running"],
-                    "reason": "wrong",
-                    "rewrite_suggestion": "",
-                },
-                "run query::video2": {
-                    "is_match": True,
-                    "confidence": 0.82,
-                    "visual_match": 0.8,
-                    "audio_match": 0.5,
+                "video2": {
+                    "summary": "dog runs",
                     "main_events": ["running"],
-                    "missing_elements": [],
-                    "reason": "correct",
-                    "rewrite_suggestion": "",
+                    "objects": ["dog"],
+                    "scene": "park",
+                    "audio_cues": [],
+                    "audio_relevance": "unknown",
                 },
-            }
+            },
+            t2v_rerank_results={
+                "cook query": {
+                    "ordered_video_ids": ["video999"],
+                    "top_choice_video_id": "video999",
+                    "confidence": 0.2,
+                    "reason": "invalid id should trigger repair fallback",
+                }
+            },
         )
-        progress_messages: list[str] = []
-        runs_dir = Path(__file__).resolve().parents[1] / "runs"
-        with tempfile.TemporaryDirectory(dir=runs_dir) as temp_dir:
-            result = run_official_agent_partial_eval(
-                mode="t2v",
-                runtime=runtime,
-                checker=checker,
-                sample_size=2,
-                topk=3,
-                max_iter=2,
-                submit_threshold=0.7,
-                recall_ks=(1, 2),
-                output_dir=temp_dir,
-                progress=progress_messages.append,
-            )
 
-            summary = result["summary"]
-            self.assertEqual(2, summary["runs"])
-            self.assertEqual({"R@1": 0.5, "R@2": 1.0}, summary["round1_recall"])
-            self.assertEqual({"R@1": 0.5, "R@2": 1.0}, summary["final_recall"])
-            self.assertEqual(0.0, summary["retry_rate"])
-            self.assertEqual(0.5, summary["submit_top1_rate"])
-            self.assertEqual(0.5, summary["submit_top2_rate"])
+        trace = run_t2v_official_agent_case(
+            query_text="cook query",
+            runtime=runtime,
+            checker=checker,
+            topk=3,
+            rerank_window=2,
+        )
 
-            summary_path = Path(result["summary_path"])
-            traces_path = Path(result["traces_path"])
-            self.assertTrue(summary_path.exists())
-            self.assertTrue(traces_path.exists())
-            self.assertEqual(summary, json.loads(summary_path.read_text(encoding="utf-8")))
-            self.assertEqual(2, len(traces_path.read_text(encoding="utf-8").strip().splitlines()))
-            self.assertTrue(any("start 1/2" in message for message in progress_messages))
-            self.assertTrue(any("done 2/2" in message for message in progress_messages))
+        self.assertTrue(trace["fallback_used"])
+        self.assertEqual("t2v_rerank", trace["fallback_stage"])
+        self.assertEqual(
+            [hit["video_id"] for hit in trace["initial_hits"]],
+            [hit["video_id"] for hit in trace["reranked_hits"]],
+        )
 
-    def test_partial_eval_counts_v2t_followup_runs(self) -> None:
+    def test_partial_eval_uses_reranked_hits_for_final_recall(self) -> None:
         runtime = FakeRuntime(
             text_rows=self.text_rows,
             video_rows=[self.video_rows[2]],
             text_score_map={},
             video_score_map={
-                "video3": np.asarray([0.9, 0.8, 0.7], dtype=np.float32),
+                ("video3", "on"): np.asarray([0.9, 0.8, 0.7], dtype=np.float32),
             },
         )
         checker = MockOmniChecker(
-            v2t_results={
-                "video3::t1": {
-                    "is_match": False,
-                    "confidence": 0.1,
-                    "visual_match": 0.1,
-                    "audio_match": 0.1,
-                    "main_events": [],
-                    "missing_elements": ["computer"],
-                    "reason": "wrong",
-                    "rewrite_suggestion": "",
-                },
-                "video3::t2": {
-                    "is_match": False,
-                    "confidence": 0.2,
-                    "visual_match": 0.1,
-                    "audio_match": 0.1,
-                    "main_events": [],
-                    "missing_elements": ["computer"],
-                    "reason": "still wrong",
-                    "rewrite_suggestion": "",
-                },
-                "video3::t3": {
-                    "is_match": True,
+            video_description_results={
+                "video3": {
+                    "summary": "a person repairs a computer",
+                    "main_events": ["opens computer case"],
+                    "objects": ["desktop computer"],
+                    "scene": "desk",
+                    "audio_cues": [],
+                    "audio_relevance": "helpful",
+                }
+            },
+            v2t_rerank_results={
+                "video3": {
+                    "ordered_text_ids": ["t3", "t1", "t2"],
+                    "top_choice_text_id": "t3",
                     "confidence": 0.88,
-                    "visual_match": 0.9,
-                    "audio_match": 0.6,
-                    "main_events": ["computer repair"],
-                    "missing_elements": [],
-                    "reason": "correct",
-                    "rewrite_suggestion": "",
-                },
-            }
+                    "reason": "t3 best matches the repair scene",
+                }
+            },
         )
 
         result = run_official_agent_partial_eval(
@@ -393,18 +271,96 @@ class AvigateAgentTests(unittest.TestCase):
             checker=checker,
             sample_size=1,
             topk=3,
-            max_iter=3,
-            submit_threshold=0.7,
             recall_ks=(1, 3),
         )
 
         summary = result["summary"]
         self.assertEqual({"R@1": 0.0, "R@3": 1.0}, summary["round1_recall"])
-        self.assertEqual({"R@1": 0.0, "R@3": 1.0}, summary["final_recall"])
-        self.assertEqual(1.0, summary["retry_rate"])
-        self.assertEqual(0.0, summary["submit_top1_rate"])
-        self.assertEqual(0.0, summary["submit_top2_rate"])
-        self.assertEqual(3.0, summary["avg_checker_calls"])
+        self.assertEqual({"R@1": 1.0, "R@3": 1.0}, summary["final_recall"])
+        self.assertEqual(1.0, summary["final_top1_accuracy"])
+        self.assertEqual(2.0, summary["avg_omni_calls"])
+        self.assertEqual(0.0, summary["audio_off_rate"])
+        self.assertEqual(0.0, summary["fallback_rate"])
+
+    def test_partial_eval_writes_summary_and_tracks_t2v_rewrite_rate(self) -> None:
+        runtime = FakeRuntime(
+            text_rows=[TextRow(text_id="t1", video_id="video1", text="cook query")],
+            video_rows=self.video_rows,
+            text_score_map={
+                ("better cook query", "off"): np.asarray([0.8, 0.9, 0.7], dtype=np.float32),
+            },
+            video_score_map={},
+        )
+        checker = MockOmniChecker(
+            t2v_understanding_results={
+                "cook query": {
+                    "retrieval_text": "better cook query",
+                    "summary": "person cooks",
+                    "main_events": ["cooking"],
+                    "objects": ["pan"],
+                    "scene": "kitchen",
+                    "audio_cues": [],
+                    "audio_relevance": "irrelevant",
+                    "reason": "visual signal is enough",
+                }
+            },
+            video_description_results={
+                "video2": {
+                    "summary": "a dog runs",
+                    "main_events": ["running"],
+                    "objects": ["dog"],
+                    "scene": "park",
+                    "audio_cues": [],
+                    "audio_relevance": "unknown",
+                },
+                "video1": {
+                    "summary": "a person cooks",
+                    "main_events": ["stirs food"],
+                    "objects": ["pan"],
+                    "scene": "kitchen",
+                    "audio_cues": [],
+                    "audio_relevance": "helpful",
+                },
+            },
+            t2v_rerank_results={
+                "better cook query": {
+                    "ordered_video_ids": ["video1", "video2"],
+                    "top_choice_video_id": "video1",
+                    "confidence": 0.91,
+                    "reason": "video1 matches cooking",
+                }
+            },
+        )
+        progress_messages: list[str] = []
+        runs_dir = Path(__file__).resolve().parents[1] / "runs"
+        with tempfile.TemporaryDirectory(dir=runs_dir) as temp_dir:
+            result = run_official_agent_partial_eval(
+                mode="t2v",
+                runtime=runtime,
+                checker=checker,
+                sample_size=1,
+                topk=3,
+                rerank_window=2,
+                recall_ks=(1, 2),
+                output_dir=temp_dir,
+                progress=progress_messages.append,
+            )
+
+            summary = result["summary"]
+            self.assertEqual({"R@1": 0.0, "R@2": 1.0}, summary["round1_recall"])
+            self.assertEqual({"R@1": 1.0, "R@2": 1.0}, summary["final_recall"])
+            self.assertEqual(1.0, summary["query_rewrite_rate"])
+            self.assertEqual(1.0, summary["audio_off_rate"])
+            self.assertEqual(4.0, summary["avg_omni_calls"])
+
+            summary_path = Path(result["summary_path"])
+            traces_path = Path(result["traces_path"])
+            self.assertTrue(summary_path.exists())
+            self.assertTrue(traces_path.exists())
+            self.assertEqual(summary, json.loads(summary_path.read_text(encoding="utf-8")))
+            self.assertEqual(1, len(traces_path.read_text(encoding="utf-8").strip().splitlines()))
+            self.assertTrue(any("start 1/1" in message for message in progress_messages))
+            self.assertTrue(any("done 1/1" in message for message in progress_messages))
 
 
 if __name__ == "__main__":

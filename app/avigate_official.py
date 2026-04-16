@@ -82,8 +82,15 @@ class AvigateRuntime:
             self._sim_matrix = _compute_similarity_matrix(self, batch_size=batch_size)
         return self._sim_matrix
 
-    def score_text_query(self, query_text: str, *, batch_size: int | None = None) -> np.ndarray:
+    def score_text_query(
+        self,
+        query_text: str,
+        *,
+        batch_size: int | None = None,
+        audio_mode: str = "on",
+    ) -> np.ndarray:
         torch = _torch()
+        audio_mode = _normalize_audio_mode(audio_mode)
         query_ids, query_mask, query_segment = _build_text_inputs(self.tokenizer, query_text, self.config.max_words)
         with torch.no_grad():
             query_sequence = self.model.get_sequence_output(
@@ -98,10 +105,13 @@ class AvigateRuntime:
         for start in range(0, video_total, chunk):
             end = min(start + chunk, video_total)
             with torch.no_grad():
+                audio_output = self.video_audio_output[start:end]
+                if audio_mode == "off":
+                    audio_output = torch.zeros_like(audio_output)
                 logits, *_rest = self.model.get_similarity_logits(
                     query_sequence,
                     self.video_visual_output[start:end].to(self.device),
-                    self.video_audio_output[start:end].to(self.device),
+                    audio_output.to(self.device),
                     torch.from_numpy(query_mask).to(self.device),
                     self.video_mask[start:end].to(self.device),
                     loose_type=self.model.loose_type,
@@ -109,14 +119,23 @@ class AvigateRuntime:
             scores.append(logits.squeeze(0).detach().cpu().numpy())
         return np.concatenate(scores, axis=0)
 
-    def score_video_query(self, video_id: str, *, batch_size: int | None = None) -> np.ndarray:
-        if self._sim_matrix is not None:
+    def score_video_query(
+        self,
+        video_id: str,
+        *,
+        batch_size: int | None = None,
+        audio_mode: str = "on",
+    ) -> np.ndarray:
+        audio_mode = _normalize_audio_mode(audio_mode)
+        if self._sim_matrix is not None and audio_mode == "on":
             return self._sim_matrix[:, self._video_index[video_id]]
 
         torch = _torch()
         index = self._video_index[video_id]
         visual_output = self.video_visual_output[index : index + 1].to(self.device)
         audio_output = self.video_audio_output[index : index + 1].to(self.device)
+        if audio_mode == "off":
+            audio_output = torch.zeros_like(audio_output)
         video_mask = self.video_mask[index : index + 1].to(self.device)
 
         scores: list[np.ndarray] = []
@@ -201,8 +220,10 @@ def retrieve_videos_from_text_official(
     query_text: str,
     runtime: Any,
     topk: int = 10,
+    *,
+    audio_mode: str = "on",
 ) -> list[RetrievalHit]:
-    scores = np.asarray(runtime.score_text_query(query_text), dtype=np.float32)
+    scores = np.asarray(runtime.score_text_query(query_text, audio_mode=audio_mode), dtype=np.float32)
     order = np.argsort(-scores, kind="stable")[: max(1, int(topk))]
     hits: list[RetrievalHit] = []
     for rank, index in enumerate(order, start=1):
@@ -223,8 +244,10 @@ def retrieve_texts_from_video_official(
     video_id: str,
     runtime: Any,
     topk: int = 10,
+    *,
+    audio_mode: str = "on",
 ) -> list[RetrievalHit]:
-    scores = np.asarray(runtime.score_video_query(video_id), dtype=np.float32)
+    scores = np.asarray(runtime.score_video_query(video_id, audio_mode=audio_mode), dtype=np.float32)
     order = np.argsort(-scores, kind="stable")[: max(1, int(topk))]
     hits: list[RetrievalHit] = []
     for rank, index in enumerate(order, start=1):
@@ -274,6 +297,13 @@ def evaluate_avigate_official(runtime: Any, ks: tuple[int, ...] = (1, 5, 10)) ->
         "t2v": {key: round(value / text_total, 4) for key, value in t2v.items()},
         "v2t": {key: round(value / video_total, 4) for key, value in v2t.items()},
     }
+
+
+def _normalize_audio_mode(audio_mode: str) -> str:
+    normalized = str(audio_mode).strip().lower()
+    if normalized not in {"on", "off"}:
+        raise ValueError("audio_mode must be 'on' or 'off'")
+    return normalized
 
 
 def _compute_similarity_matrix(runtime: AvigateRuntime, *, batch_size: int | None = None) -> np.ndarray:

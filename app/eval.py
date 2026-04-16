@@ -92,6 +92,7 @@ def command_avigate_t2v_agent_case(args: argparse.Namespace) -> None:
         runtime=runtime,
         checker=checker,
         topk=args.topk_value,
+        rerank_window=args.rerank_window,
         max_iter=args.max_iter,
         submit_threshold=args.submit_threshold,
     )
@@ -133,6 +134,7 @@ def command_avigate_agent_partial_eval(args: argparse.Namespace) -> None:
         topk=args.topk_value,
         max_iter=args.max_iter,
         submit_threshold=args.submit_threshold,
+        rerank_window=args.rerank_window,
         recall_ks=tuple(parse_topk_values(args.topk)),
         output_dir=args.output_dir,
         progress=lambda message: print(message, file=sys.stderr, flush=True),
@@ -174,6 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_shared = argparse.ArgumentParser(add_help=False, parents=[avigate_shared])
     agent_shared.add_argument("--topk-value", type=int, default=10)
+    agent_shared.add_argument("--rerank-window", type=int, default=5)
     agent_shared.add_argument("--max-iter", type=int, default=3)
     agent_shared.add_argument("--submit-threshold", type=float, default=0.7)
     agent_shared.add_argument("--checker-base-url", required=True)

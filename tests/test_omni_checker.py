@@ -1,91 +1,89 @@
 from __future__ import annotations
 
-import unittest
-from pathlib import Path
 import shutil
+import unittest
 import uuid
+from pathlib import Path
 
 from app.omni_checker import (
-    CheckerResult,
-    _complete_payload,
-    _fallback_payload,
+    RetrievalHints,
+    T2VQueryUnderstanding,
+    VideoDescription,
     _materialize_video_url,
-    build_t2v_user_content,
-    build_v2t_user_content,
+    build_t2v_query_understanding_user_content,
+    build_t2v_rerank_user_content,
+    build_v2t_rerank_user_content,
+    build_video_description_user_content,
 )
-from app.retrieval_types import TextRow, VideoRow
+from app.retrieval_types import VideoRow
 
 
 class OmniCheckerTests(unittest.TestCase):
-    def test_t2v_prompt_does_not_leak_labels(self) -> None:
-        content = build_t2v_user_content(
-            "a man plays guitar on stage",
-            VideoRow(video_id="video1", video_path="/tmp/video1.mp4"),
-            rank=1,
-            score=0.9,
-        )
-        prompt = content[1]["text"]
-        self.assertNotIn("target_video_id", prompt)
+    def test_t2v_query_prompt_uses_plain_text_only(self) -> None:
+        content = build_t2v_query_understanding_user_content("a man plays guitar on stage")
+        self.assertEqual("text", content[0]["type"])
+        prompt = content[0]["text"]
         self.assertNotIn("ground truth", prompt.lower())
-        self.assertEqual(content[0]["video_url"]["url"], "/tmp/video1.mp4")
+        self.assertIn("Original query", prompt)
 
-    def test_v2t_prompt_does_not_leak_labels(self) -> None:
-        content = build_v2t_user_content(
+    def test_video_description_prompt_keeps_video_url(self) -> None:
+        content = build_video_description_user_content(
             VideoRow(video_id="video1", video_path="/tmp/video1.mp4"),
-            TextRow(text_id="t1", video_id="video1", text="a man plays guitar on stage"),
-            rank=1,
-            score=0.9,
         )
-        prompt = content[1]["text"]
-        self.assertNotIn("target", prompt.lower())
+        self.assertEqual("/tmp/video1.mp4", content[0]["video_url"]["url"])
+        self.assertIn("describe this video", content[1]["text"].lower())
 
-    def test_checker_result_round_trip(self) -> None:
-        result = CheckerResult.from_dict(
+    def test_query_understanding_normalizes_audio_relevance(self) -> None:
+        result = T2VQueryUnderstanding.from_dict(
             {
-                "is_match": True,
-                "confidence": 0.7,
-                "visual_match": 0.8,
-                "audio_match": 0.3,
-                "main_events": ["guitar"],
-                "missing_elements": [],
-                "reason": "ok",
-                "rewrite_suggestion": "same",
-            }
-        )
-        self.assertTrue(result.to_dict()["is_match"])
-
-    def test_checker_result_tolerates_non_numeric_fields(self) -> None:
-        result = CheckerResult.from_dict(
-            {
-                "is_match": "true",
-                "confidence": "0.7",
-                "visual_match": "The person is cooking.",
-                "audio_match": None,
+                "retrieval_text": "better cooking scene",
+                "summary": "person cooks",
                 "main_events": ["cooking"],
-                "missing_elements": [],
-                "reason": "free text",
-                "rewrite_suggestion": "same",
-            }
+                "objects": ["pan"],
+                "scene": "kitchen",
+                "audio_cues": ["sizzling"],
+                "audio_relevance": "invalid-value",
+                "reason": "fallback to unknown",
+            },
+            original_query_text="person cooks food",
         )
-        self.assertTrue(result.is_match)
-        self.assertEqual(result.confidence, 0.7)
-        self.assertEqual(result.visual_match, 0.0)
-        self.assertEqual(result.audio_match, 0.0)
+        hints = RetrievalHints.from_query_understanding("person cooks food", result)
+        self.assertEqual("unknown", result.audio_relevance)
+        self.assertEqual("better cooking scene", hints.query_text_override)
+        self.assertEqual("on", hints.audio_mode)
 
-    def test_fallback_payload_wraps_unstructured_text(self) -> None:
-        payload = _fallback_payload("plain answer")
-        result = CheckerResult.from_dict(payload)
-        self.assertFalse(result.is_match)
-        self.assertEqual(result.reason, "plain answer")
-        self.assertIn("unstructured_response", result.missing_elements)
+    def test_rerank_prompts_embed_structured_context(self) -> None:
+        query_understanding = T2VQueryUnderstanding(
+            retrieval_text="cook in kitchen",
+            summary="person cooks",
+            main_events=["stirs food"],
+            objects=["pot"],
+            scene="kitchen",
+            audio_cues=["sizzling"],
+            audio_relevance="helpful",
+            reason="clear cooking intent",
+        )
+        t2v_content = build_t2v_rerank_user_content(
+            query_understanding,
+            [{"video_id": "video1", "original_rank": 1, "video_description": {"summary": "person cooks"}}],
+        )
+        self.assertIn("video1", t2v_content[0]["text"])
+        self.assertIn("cook in kitchen", t2v_content[0]["text"])
 
-    def test_complete_payload_marks_missing_fields(self) -> None:
-        payload = _complete_payload({"is_match": True})
-        result = CheckerResult.from_dict(payload)
-        self.assertTrue(result.is_match)
-        self.assertEqual(result.reason, "incomplete_json_response")
-        self.assertIn("missing_field:confidence", result.missing_elements)
-        self.assertIn("missing_field:rewrite_suggestion", result.missing_elements)
+        video_description = VideoDescription(
+            summary="person repairs a computer",
+            main_events=["opens computer case"],
+            objects=["desktop computer"],
+            scene="desk",
+            audio_cues=[],
+            audio_relevance="irrelevant",
+        )
+        v2t_content = build_v2t_rerank_user_content(
+            video_description,
+            [{"text_id": "t1", "text": "a person opens a computer"}],
+        )
+        self.assertIn("t1", v2t_content[0]["text"])
+        self.assertIn("person repairs a computer", v2t_content[0]["text"])
 
     def test_local_video_path_is_encoded_as_data_url(self) -> None:
         temp_parent = Path.cwd() / "runs"
@@ -99,3 +97,7 @@ class OmniCheckerTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         self.assertTrue(encoded.startswith("data:video/mp4;base64,"))
+
+
+if __name__ == "__main__":
+    unittest.main()

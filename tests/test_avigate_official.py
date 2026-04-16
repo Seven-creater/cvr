@@ -24,21 +24,27 @@ from app.retrieval_types import TextRow, VideoRow
 class FakeRuntime:
     text_rows: list[TextRow]
     video_rows: list[VideoRow]
-    text_score_map: dict[str, np.ndarray]
-    video_score_map: dict[str, np.ndarray]
+    text_score_map: dict[tuple[str, str], np.ndarray]
+    video_score_map: dict[tuple[str, str], np.ndarray]
     matrix: np.ndarray
     audio_available: bool = True
+    text_calls: list[tuple[str, str]] = None
+    video_calls: list[tuple[str, str]] = None
 
     def __post_init__(self) -> None:
         self._video_to_text: dict[str, list[str]] = {}
         for row in self.text_rows:
             self._video_to_text.setdefault(row.video_id, []).append(row.text_id)
+        self.text_calls = []
+        self.video_calls = []
 
-    def score_text_query(self, query_text: str) -> np.ndarray:
-        return self.text_score_map[query_text]
+    def score_text_query(self, query_text: str, *, audio_mode: str = "on") -> np.ndarray:
+        self.text_calls.append((query_text, audio_mode))
+        return self.text_score_map[(query_text, audio_mode)]
 
-    def score_video_query(self, video_id: str) -> np.ndarray:
-        return self.video_score_map[video_id]
+    def score_video_query(self, video_id: str, *, audio_mode: str = "on") -> np.ndarray:
+        self.video_calls.append((video_id, audio_mode))
+        return self.video_score_map[(video_id, audio_mode)]
 
     def target_text_ids(self, video_id: str) -> list[str]:
         return list(self._video_to_text[video_id])
@@ -63,10 +69,12 @@ class AvigateOfficialTests(unittest.TestCase):
             text_rows=self.text_rows,
             video_rows=self.video_rows,
             text_score_map={
-                "query one": np.asarray([0.9, 0.1], dtype=np.float32),
+                ("query one", "on"): np.asarray([0.9, 0.1], dtype=np.float32),
+                ("query one", "off"): np.asarray([0.1, 0.9], dtype=np.float32),
             },
             video_score_map={
-                "video2": np.asarray([0.2, 0.1, 0.9, 0.8], dtype=np.float32),
+                ("video2", "on"): np.asarray([0.2, 0.1, 0.9, 0.8], dtype=np.float32),
+                ("video2", "off"): np.asarray([0.9, 0.8, 0.2, 0.1], dtype=np.float32),
             },
             matrix=np.asarray(
                 [
@@ -88,6 +96,15 @@ class AvigateOfficialTests(unittest.TestCase):
         hits = retrieve_texts_from_video_official("video2", self.runtime, topk=3)
         self.assertEqual(["t3", "t4", "t1"], [hit.text_id for hit in hits])
         self.assertEqual("query two", hits[0].text)
+
+    def test_retrieve_official_passes_audio_mode(self) -> None:
+        video_hits = retrieve_videos_from_text_official("query one", self.runtime, topk=2, audio_mode="off")
+        text_hits = retrieve_texts_from_video_official("video2", self.runtime, topk=2, audio_mode="off")
+
+        self.assertEqual([("query one", "off")], self.runtime.text_calls)
+        self.assertEqual([("video2", "off")], self.runtime.video_calls)
+        self.assertEqual(["video2", "video1"], [hit.video_id for hit in video_hits])
+        self.assertEqual(["t1", "t2"], [hit.text_id for hit in text_hits])
 
     def test_evaluate_avigate_official_matches_baseline_shape(self) -> None:
         metrics = evaluate_avigate_official(self.runtime, ks=(1, 5, 10))
