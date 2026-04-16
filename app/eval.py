@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 from app.avigate_agent import (
+    run_official_agent_partial_eval,
     run_t2v_official_agent_case,
     run_v2t_official_agent_case,
 )
@@ -115,6 +117,29 @@ def command_avigate_v2t_agent_case(args: argparse.Namespace) -> None:
     print(json.dumps(trace, ensure_ascii=False, indent=2))
 
 
+def command_avigate_agent_partial_eval(args: argparse.Namespace) -> None:
+    runtime = build_avigate_runtime(args)
+    checker = OpenAIOmniChecker(
+        base_url=args.checker_base_url,
+        api_key=args.checker_api_key,
+        model=args.checker_model,
+        timeout_seconds=args.checker_timeout_seconds,
+    )
+    result = run_official_agent_partial_eval(
+        mode=args.mode,
+        runtime=runtime,
+        checker=checker,
+        sample_size=args.sample_size,
+        topk=args.topk_value,
+        max_iter=args.max_iter,
+        submit_threshold=args.submit_threshold,
+        recall_ks=tuple(parse_topk_values(args.topk)),
+        output_dir=args.output_dir,
+        progress=lambda message: print(message, file=sys.stderr, flush=True),
+    )
+    print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AVIGATE official retrieval evaluation")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -161,6 +186,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     avigate_v2t_agent_case = subparsers.add_parser("avigate-v2t-agent-case", parents=[agent_shared])
     avigate_v2t_agent_case.add_argument("--query-video-id", required=True)
+
+    avigate_agent_partial_eval = subparsers.add_parser("avigate-agent-partial-eval", parents=[agent_shared])
+    avigate_agent_partial_eval.add_argument("--mode", required=True, choices=("t2v", "v2t"))
+    avigate_agent_partial_eval.add_argument("--sample-size", type=int, required=True)
+    avigate_agent_partial_eval.add_argument("--output-dir", required=True)
+    avigate_agent_partial_eval.add_argument("--topk", default="1,5,10")
     return parser
 
 
@@ -177,6 +208,9 @@ def main() -> None:
         return
     if args.command == "avigate-v2t-agent-case":
         command_avigate_v2t_agent_case(args)
+        return
+    if args.command == "avigate-agent-partial-eval":
+        command_avigate_agent_partial_eval(args)
         return
     command_avigate_v2t_case(args)
 

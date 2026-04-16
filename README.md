@@ -125,3 +125,28 @@ The acceptance standard for Step 1 is:
 - no batch agent evaluation
 
 Step 2 now adds only the smallest possible single-case agent loop on top of the official retrieval wrapper. Batch evaluation and broader planner logic still stay out of scope until the single-case path is validated on the server.
+
+Small official-agent partial eval:
+
+```bash
+python -m app.eval avigate-agent-partial-eval \
+  --model-dir /path/to/model_dir \
+  --checkpoint /path/to/checkpoint.bin \
+  --data-json /path/to/MSRVTT_data.json \
+  --split-csv /path/to/MSRVTT_JSFUSION_test.csv \
+  --video-root /path/to/videos \
+  --audio-root /path/to/audio \
+  --clip-weight /path/to/ViT-B-32.pt \
+  --device cuda \
+  --mode v2t \
+  --sample-size 20 \
+  --topk-value 10 \
+  --topk 1,5,10 \
+  --checker-base-url http://127.0.0.1:8092/v1 \
+  --checker-api-key EMPTY \
+  --checker-model /path/to/qwen2.5-omni \
+  --max-iter 3 \
+  --output-dir /tmp/avigate_agent_partial_eval
+```
+
+The command appends one JSON trace per finished sample to `traces.jsonl`, rewrites `summary.json` after every sample, and prints progress lines while running.
