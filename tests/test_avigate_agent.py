@@ -110,11 +110,13 @@ class AvigateAgentTests(unittest.TestCase):
             query_text="cook query",
             runtime=runtime,
             checker=checker,
+            target_video_id="video1",
             topk=3,
             rerank_window=2,
         )
 
         self.assertEqual([("better cook query", "off")], runtime.text_calls)
+        self.assertEqual("video1", trace["target_video_id"])
         self.assertEqual("better cook query", trace["retrieval_hints"]["query_text_override"])
         self.assertEqual("off", trace["retrieval_hints"]["audio_mode"])
         self.assertEqual(["video2", "video1", "video3"], [hit["video_id"] for hit in trace["initial_hits"]])

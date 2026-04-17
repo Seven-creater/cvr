@@ -310,6 +310,8 @@ def build_t2v_query_understanding_user_content(query_text: str) -> list[dict]:
         "Task: understand a text-to-video retrieval query.\n"
         f"Original query: {query_text}\n"
         "Return a retrieval-focused rewrite and structured cues. "
+        "Keep the rewrite close to the original query, preserve concrete actors, actions, and scene details, "
+        "and do not broaden a specific query into a generic one. "
         "Do not mention dataset labels."
     )
     return [{"type": "text", "text": prompt}]
@@ -321,6 +323,8 @@ def build_video_description_user_content(video: VideoRow) -> list[dict]:
     prompt = (
         "Task: describe this video for retrieval reranking.\n"
         "Summarize the visible actions, important objects, scene, and useful audio cues. "
+        "Prefer concrete, distinguishing details over broad umbrella summaries. "
+        "Call out who is doing what and where when that is visible. "
         "Do not mention dataset labels."
     )
     return [
@@ -334,7 +338,8 @@ def build_t2v_rerank_user_content(query_understanding: T2VQueryUnderstanding, ca
         "Task: rerank candidate videos for a text-to-video query.\n"
         f"Query understanding JSON:\n{json.dumps(query_understanding.to_dict(), ensure_ascii=False)}\n"
         f"Candidate videos JSON:\n{json.dumps(candidates, ensure_ascii=False)}\n"
-        "Rank only the provided candidate video_ids. Keep the full candidate set."
+        "Rank only the provided candidate video_ids. Keep the full candidate set. "
+        "Pay extra attention to subject, action, and scene mismatches, and rank generic descriptions below specific matches."
     )
     return [{"type": "text", "text": prompt}]
 
@@ -356,7 +361,9 @@ def _t2v_query_system_prompt() -> str:
         'Required schema: {"retrieval_text": string, "summary": string, "main_events": [string], '
         '"objects": [string], "scene": string, "audio_cues": [string], '
         '"audio_relevance": "required|helpful|irrelevant|unknown", "reason": string}. '
-        "All keys are mandatory."
+        "All keys are mandatory. "
+        "The retrieval_text must stay close to the original query, keep concrete actors, actions, and scene details, "
+        "and must not broaden a specific request into a generic rewrite."
     )
 
 
@@ -367,7 +374,8 @@ def _video_description_system_prompt() -> str:
         'Required schema: {"summary": string, "main_events": [string], "objects": [string], '
         '"scene": string, "audio_cues": [string], '
         '"audio_relevance": "required|helpful|irrelevant|unknown"}. '
-        "All keys are mandatory."
+        "All keys are mandatory. "
+        "Prefer concrete and distinguishing details. Avoid broad summaries when a more specific action, subject, or scene is visible."
     )
 
 
@@ -377,7 +385,8 @@ def _t2v_rerank_system_prompt() -> str:
         "Return exactly one JSON object and nothing else. "
         'Required schema: {"ordered_video_ids": [string], "top_choice_video_id": string, '
         '"confidence": float, "reason": string}. '
-        "Use only candidate video_ids that appear in the input, include every candidate exactly once, and do not invent ids."
+        "Use only candidate video_ids that appear in the input, include every candidate exactly once, and do not invent ids. "
+        "Prefer candidates whose subject, action, and scene specifically match the query, and penalize broad but weakly related matches."
     )
 
 

@@ -72,6 +72,7 @@ def run_official_agent_partial_eval(
                 query_text=row.text,
                 runtime=runtime,
                 checker=checker,
+                target_video_id=row.video_id,
                 topk=topk,
                 rerank_window=rerank_window,
                 progress=progress,
@@ -148,6 +149,7 @@ def run_t2v_official_agent_case(
     query_text: str,
     runtime: Any,
     checker: OmniChecker,
+    target_video_id: str | None = None,
     topk: int = 10,
     rerank_window: int = 5,
     max_iter: int = 3,
@@ -219,6 +221,7 @@ def run_t2v_official_agent_case(
     return {
         "mode": "t2v-agent",
         "query_text": query_text,
+        "target_video_id": target_video_id,
         "query_understanding": query_understanding.to_dict(),
         "retrieval_hints": retrieval_hints.to_dict(),
         "initial_hits": [hit.to_dict() for hit in initial_hits],

@@ -25,6 +25,8 @@ class OmniCheckerTests(unittest.TestCase):
         prompt = content[0]["text"]
         self.assertNotIn("ground truth", prompt.lower())
         self.assertIn("Original query", prompt)
+        self.assertIn("Keep the rewrite close to the original query", prompt)
+        self.assertIn("do not broaden", prompt)
 
     def test_video_description_prompt_keeps_video_url(self) -> None:
         content = build_video_description_user_content(
