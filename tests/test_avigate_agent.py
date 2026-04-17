@@ -362,6 +362,62 @@ class AvigateAgentTests(unittest.TestCase):
             self.assertTrue(any("start 1/1" in message for message in progress_messages))
             self.assertTrue(any("done 1/1" in message for message in progress_messages))
 
+    def test_partial_eval_start_index_selects_later_rows(self) -> None:
+        runtime = FakeRuntime(
+            text_rows=self.text_rows,
+            video_rows=self.video_rows,
+            text_score_map={
+                ("a dog is running", "on"): np.asarray([0.2, 0.9, 0.1], dtype=np.float32),
+            },
+            video_score_map={},
+        )
+        checker = MockOmniChecker(
+            t2v_understanding_results={
+                "a dog is running": {
+                    "retrieval_text": "a dog is running",
+                    "summary": "dog runs",
+                    "main_events": ["running"],
+                    "objects": ["dog"],
+                    "scene": "park",
+                    "audio_cues": [],
+                    "audio_relevance": "helpful",
+                    "reason": "query is already specific",
+                }
+            },
+            video_description_results={
+                "video2": {
+                    "summary": "a dog runs outdoors",
+                    "main_events": ["running"],
+                    "objects": ["dog"],
+                    "scene": "park",
+                    "audio_cues": [],
+                    "audio_relevance": "helpful",
+                }
+            },
+            t2v_rerank_results={
+                "a dog is running": {
+                    "ordered_video_ids": ["video2"],
+                    "top_choice_video_id": "video2",
+                    "confidence": 0.95,
+                    "reason": "video2 is the only described candidate",
+                }
+            },
+        )
+
+        result = run_official_agent_partial_eval(
+            mode="t2v",
+            runtime=runtime,
+            checker=checker,
+            start_index=1,
+            sample_size=1,
+            topk=1,
+            rerank_window=1,
+            recall_ks=(1,),
+        )
+
+        self.assertEqual([("a dog is running", "on")], runtime.text_calls)
+        self.assertEqual({"R@1": 1.0}, result["summary"]["final_recall"])
+
 
 if __name__ == "__main__":
     unittest.main()

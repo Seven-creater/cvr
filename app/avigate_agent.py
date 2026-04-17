@@ -18,6 +18,7 @@ def run_official_agent_partial_eval(
     runtime: Any,
     checker: OmniChecker,
     sample_size: int,
+    start_index: int = 0,
     topk: int = 10,
     max_iter: int = 3,
     submit_threshold: float = 0.7,
@@ -31,13 +32,16 @@ def run_official_agent_partial_eval(
         raise ValueError("mode must be 't2v' or 'v2t'")
     if sample_size <= 0:
         raise ValueError("sample_size must be positive")
+    if start_index < 0:
+        raise ValueError("start_index must be non-negative")
 
     recall_ks = tuple(sorted({int(k) for k in recall_ks if int(k) > 0}))
     if not recall_ks:
         raise ValueError("recall_ks must contain at least one positive integer")
 
     rows = runtime.text_rows if mode == "t2v" else runtime.video_rows
-    total = min(sample_size, len(rows))
+    selected_rows = rows[start_index : start_index + sample_size]
+    total = len(selected_rows)
     if total <= 0:
         raise ValueError("no rows available for partial eval")
 
@@ -59,7 +63,7 @@ def run_official_agent_partial_eval(
     query_rewrite_runs = 0
 
     summary: dict[str, Any] = {}
-    for run_index, row in enumerate(rows[:total], start=1):
+    for run_index, row in enumerate(selected_rows, start=1):
         label = row.text if mode == "t2v" else row.video_id
         _emit_progress(progress, f"[{mode}] start {run_index}/{total}: {label}")
 

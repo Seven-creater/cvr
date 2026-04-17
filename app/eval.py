@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from app.avigate_agent import (
     run_official_agent_partial_eval,
@@ -132,6 +133,7 @@ def command_avigate_agent_partial_eval(args: argparse.Namespace) -> None:
         runtime=runtime,
         checker=checker,
         sample_size=args.sample_size,
+        start_index=args.start_index,
         topk=args.topk_value,
         max_iter=args.max_iter,
         submit_threshold=args.submit_threshold,
@@ -141,6 +143,78 @@ def command_avigate_agent_partial_eval(args: argparse.Namespace) -> None:
         progress=lambda message: print(message, file=sys.stderr, flush=True),
     )
     print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
+
+
+def command_avigate_agent_merge(args: argparse.Namespace) -> None:
+    input_dirs = [Path(raw_path) for raw_path in args.inputs]
+    summaries = []
+    trace_lines: list[str] = []
+    mode: str | None = None
+
+    for input_dir in input_dirs:
+        summary_path = input_dir / "summary.json"
+        if not summary_path.exists():
+            raise FileNotFoundError(f"summary.json not found under {input_dir}")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if mode is None:
+            mode = str(summary.get("mode"))
+        elif str(summary.get("mode")) != mode:
+            raise ValueError("all merged summaries must have the same mode")
+        summaries.append(summary)
+
+        traces_path = input_dir / "traces.jsonl"
+        if traces_path.exists():
+            lines = [line for line in traces_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            trace_lines.extend(lines)
+
+    if not summaries or mode is None:
+        raise ValueError("no summaries to merge")
+
+    total_runs = sum(int(summary["runs"]) for summary in summaries)
+    if total_runs <= 0:
+        raise ValueError("merged run count must be positive")
+
+    merged = {
+        "runs": total_runs,
+        "round1_recall": _merge_metric_dicts(summaries, "round1_recall", total_runs),
+        "final_recall": _merge_metric_dicts(summaries, "final_recall", total_runs),
+        "final_top1_accuracy": _merge_scalar_metric(summaries, "final_top1_accuracy", total_runs),
+        "avg_omni_calls": _merge_scalar_metric(summaries, "avg_omni_calls", total_runs),
+        "audio_off_rate": _merge_scalar_metric(summaries, "audio_off_rate", total_runs),
+        "fallback_rate": _merge_scalar_metric(summaries, "fallback_rate", total_runs),
+        "mode": mode,
+        "input_dirs": [str(path) for path in input_dirs],
+    }
+    if mode == "t2v":
+        merged["query_rewrite_rate"] = _merge_scalar_metric(summaries, "query_rewrite_rate", total_runs)
+
+    output_root = Path(args.output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "summary.json").write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    (output_root / "traces.jsonl").write_text("\n".join(trace_lines) + ("\n" if trace_lines else ""), encoding="utf-8")
+    print(json.dumps(merged, ensure_ascii=False, indent=2))
+
+
+def _merge_metric_dicts(summaries: list[dict], key: str, total_runs: int) -> dict:
+    metric_names = set()
+    for summary in summaries:
+        metric_names.update(summary.get(key, {}).keys())
+    merged = {}
+    for metric_name in sorted(metric_names):
+        weighted_total = 0.0
+        for summary in summaries:
+            runs = int(summary["runs"])
+            weighted_total += float(summary.get(key, {}).get(metric_name, 0.0)) * runs
+        merged[metric_name] = round(weighted_total / total_runs, 4)
+    return merged
+
+
+def _merge_scalar_metric(summaries: list[dict], key: str, total_runs: int) -> float:
+    weighted_total = 0.0
+    for summary in summaries:
+        runs = int(summary["runs"])
+        weighted_total += float(summary.get(key, 0.0)) * runs
+    return round(weighted_total / total_runs, 4)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -194,9 +268,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     avigate_agent_partial_eval = subparsers.add_parser("avigate-agent-partial-eval", parents=[agent_shared])
     avigate_agent_partial_eval.add_argument("--mode", required=True, choices=("t2v", "v2t"))
+    avigate_agent_partial_eval.add_argument("--start-index", type=int, default=0)
     avigate_agent_partial_eval.add_argument("--sample-size", type=int, required=True)
     avigate_agent_partial_eval.add_argument("--output-dir", required=True)
     avigate_agent_partial_eval.add_argument("--topk", default="1,5,10")
+
+    avigate_agent_merge = subparsers.add_parser("avigate-agent-merge")
+    avigate_agent_merge.add_argument("--output-dir", required=True)
+    avigate_agent_merge.add_argument("inputs", nargs="+")
     return parser
 
 
@@ -216,6 +295,9 @@ def main() -> None:
         return
     if args.command == "avigate-agent-partial-eval":
         command_avigate_agent_partial_eval(args)
+        return
+    if args.command == "avigate-agent-merge":
+        command_avigate_agent_merge(args)
         return
     command_avigate_v2t_case(args)
 
