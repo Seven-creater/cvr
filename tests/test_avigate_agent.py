@@ -237,6 +237,67 @@ class AvigateAgentTests(unittest.TestCase):
             [hit["video_id"] for hit in trace["reranked_hits"]],
         )
 
+    def test_t2v_agent_reuses_cached_video_descriptions_across_cases(self) -> None:
+        runtime = FakeRuntime(
+            text_rows=self.text_rows,
+            video_rows=self.video_rows,
+            text_score_map={
+                ("repeat query", "on"): np.asarray([0.9, 0.8, 0.1], dtype=np.float32),
+            },
+            video_score_map={},
+        )
+        checker = MockOmniChecker(
+            t2v_understanding_results={
+                "repeat query": {
+                    "retrieval_text": "repeat query",
+                    "summary": "person cooks",
+                    "main_events": ["cooking"],
+                    "objects": ["pan"],
+                    "scene": "kitchen",
+                    "audio_cues": [],
+                    "audio_relevance": "helpful",
+                    "reason": "same query works",
+                }
+            },
+            video_description_results={
+                "video1": {
+                    "summary": "person cooks",
+                    "main_events": ["cooking"],
+                    "objects": ["pan"],
+                    "scene": "kitchen",
+                    "audio_cues": [],
+                    "audio_relevance": "helpful",
+                }
+            },
+            t2v_rerank_results={
+                "repeat query": {
+                    "ordered_video_ids": ["video1"],
+                    "top_choice_video_id": "video1",
+                    "confidence": 0.9,
+                    "reason": "video1 is the only described candidate",
+                }
+            },
+        )
+
+        run_t2v_official_agent_case(
+            query_text="repeat query",
+            runtime=runtime,
+            checker=checker,
+            topk=1,
+            omni_concurrency=1,
+            rerank_window=1,
+        )
+        run_t2v_official_agent_case(
+            query_text="repeat query",
+            runtime=runtime,
+            checker=checker,
+            topk=1,
+            omni_concurrency=1,
+            rerank_window=1,
+        )
+
+        self.assertEqual(["video1"], checker.video_description_calls)
+
     def test_partial_eval_uses_reranked_hits_for_final_recall(self) -> None:
         runtime = FakeRuntime(
             text_rows=self.text_rows,

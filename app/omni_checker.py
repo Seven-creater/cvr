@@ -5,6 +5,7 @@ import json
 import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from typing import Any, Protocol
 import urllib.error
 import urllib.parse
@@ -459,6 +460,8 @@ class OpenAIOmniChecker:
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self._video_description_cache: dict[str, VideoDescription] = {}
+        self._video_description_cache_lock = threading.Lock()
 
     def _request_payload(self, user_content: list[dict], system_prompt: str, *, max_tokens: int = 512) -> dict:
         request_content: list[dict] = []
@@ -511,16 +514,28 @@ class OpenAIOmniChecker:
         return T2VQueryUnderstanding.from_dict(payload, original_query_text=query_text)
 
     def describe_video(self, video: VideoRow) -> VideoDescription:
+        cache_key = str(video.video_id or video.video_path or "").strip()
+        if cache_key:
+            with self._video_description_cache_lock:
+                cached = self._video_description_cache.get(cache_key)
+            if cached is not None:
+                return cached
         try:
             payload = self._request_payload(
                 build_video_description_user_content(video),
                 _video_description_system_prompt(),
             )
         except Exception:
-            return _fallback_video_description()
-        if _missing_fields(payload, REQUIRED_VIDEO_DESCRIPTION_FIELDS):
-            return _fallback_video_description()
-        return VideoDescription.from_dict(payload)
+            description = _fallback_video_description()
+        else:
+            if _missing_fields(payload, REQUIRED_VIDEO_DESCRIPTION_FIELDS):
+                description = _fallback_video_description()
+            else:
+                description = VideoDescription.from_dict(payload)
+        if cache_key:
+            with self._video_description_cache_lock:
+                self._video_description_cache.setdefault(cache_key, description)
+        return description
 
     def rerank_t2v(self, query_understanding: T2VQueryUnderstanding, candidates: list[dict]) -> T2VRerankResult:
         candidate_ids = [str(item.get("video_id", "")).strip() for item in candidates if str(item.get("video_id", "")).strip()]
@@ -568,6 +583,8 @@ class MockOmniChecker:
         self.video_description_results = dict(video_description_results or {})
         self.t2v_rerank_results = dict(t2v_rerank_results or {})
         self.v2t_rerank_results = dict(v2t_rerank_results or {})
+        self.video_description_calls: list[str] = []
+        self._video_description_cache: dict[str, VideoDescription] = {}
 
     def understand_t2v_query(self, query_text: str) -> T2VQueryUnderstanding:
         resolved = self.t2v_understanding_results.get(query_text)
@@ -587,19 +604,28 @@ class MockOmniChecker:
         )
 
     def describe_video(self, video: VideoRow) -> VideoDescription:
+        cache_key = str(video.video_id or video.video_path or "").strip()
+        cached = self._video_description_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        self.video_description_calls.append(video.video_id)
         resolved = self.video_description_results.get(video.video_id)
         if isinstance(resolved, VideoDescription):
-            return resolved
-        if isinstance(resolved, dict):
-            return VideoDescription.from_dict(resolved)
-        return VideoDescription(
-            summary=f"summary for {video.video_id}",
-            main_events=[],
-            objects=[],
-            scene="",
-            audio_cues=[],
-            audio_relevance="unknown",
-        )
+            description = resolved
+        elif isinstance(resolved, dict):
+            description = VideoDescription.from_dict(resolved)
+        else:
+            description = VideoDescription(
+                summary=f"summary for {video.video_id}",
+                main_events=[],
+                objects=[],
+                scene="",
+                audio_cues=[],
+                audio_relevance="unknown",
+            )
+        if cache_key:
+            self._video_description_cache.setdefault(cache_key, description)
+        return description
 
     def rerank_t2v(self, query_understanding: T2VQueryUnderstanding, candidates: list[dict]) -> T2VRerankResult:
         resolved = self.t2v_rerank_results.get(query_understanding.retrieval_text)

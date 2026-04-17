@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +21,7 @@ def run_official_agent_partial_eval(
     sample_size: int,
     start_index: int = 0,
     topk: int = 10,
+    omni_concurrency: int = 4,
     max_iter: int = 3,
     submit_threshold: float = 0.7,
     rerank_window: int = 5,
@@ -74,6 +76,7 @@ def run_official_agent_partial_eval(
                 checker=checker,
                 target_video_id=row.video_id,
                 topk=topk,
+                omni_concurrency=omni_concurrency,
                 rerank_window=rerank_window,
                 progress=progress,
             )
@@ -151,6 +154,7 @@ def run_t2v_official_agent_case(
     checker: OmniChecker,
     target_video_id: str | None = None,
     topk: int = 10,
+    omni_concurrency: int = 4,
     rerank_window: int = 5,
     max_iter: int = 3,
     submit_threshold: float = 0.7,
@@ -176,22 +180,17 @@ def run_t2v_official_agent_case(
 
     if not fallback_used:
         window = min(max(1, int(rerank_window)), len(initial_hits))
-        for hit in initial_hits[:window]:
-            candidate_video = runtime.video_rows[runtime._video_index[hit.video_id or ""]]
-            _emit_progress(progress, f"[t2v] describe rank={hit.rank} video_id={candidate_video.video_id}")
-            description = checker.describe_video(candidate_video)
-            omni_calls += 1
-            candidate_video_descriptions.append(
-                {
-                    "rank": hit.rank,
-                    "candidate": hit.to_dict(),
-                    "video_description": description.to_dict(),
-                }
-            )
-            if description.fallback_used:
-                fallback_used = True
-                fallback_stage = "candidate_video_description"
-                break
+        candidate_video_descriptions = _describe_candidate_videos(
+            hits=initial_hits[:window],
+            runtime=runtime,
+            checker=checker,
+            omni_concurrency=omni_concurrency,
+            progress=progress,
+        )
+        omni_calls += len(candidate_video_descriptions)
+        if any(item["video_description"].get("fallback_used") for item in candidate_video_descriptions):
+            fallback_used = True
+            fallback_stage = "candidate_video_description"
 
         if not fallback_used and candidate_video_descriptions:
             candidate_payloads = [
@@ -294,6 +293,55 @@ def run_v2t_official_agent_case(
         "omni_calls": omni_calls,
         "fallback_used": fallback_used,
         "fallback_stage": fallback_stage,
+    }
+
+
+def _describe_candidate_videos(
+    *,
+    hits: list[RetrievalHit],
+    runtime: Any,
+    checker: OmniChecker,
+    omni_concurrency: int,
+    progress: Callable[[str], None] | None = None,
+) -> list[dict]:
+    indexed_jobs = []
+    for index, hit in enumerate(hits):
+        candidate_video = runtime.video_rows[runtime._video_index[hit.video_id or ""]]
+        indexed_jobs.append((index, hit, candidate_video))
+
+    max_workers = max(1, min(int(omni_concurrency), len(indexed_jobs)))
+    if max_workers == 1:
+        described = [_describe_one_candidate(index, hit, video, checker, progress) for index, hit, video in indexed_jobs]
+        for item in described:
+            item.pop("_order", None)
+        return described
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_describe_one_candidate, index, hit, video, checker, progress)
+            for index, hit, video in indexed_jobs
+        ]
+    described = [future.result() for future in futures]
+    described.sort(key=lambda item: item["_order"])
+    for item in described:
+        item.pop("_order", None)
+    return described
+
+
+def _describe_one_candidate(
+    index: int,
+    hit: RetrievalHit,
+    candidate_video: Any,
+    checker: OmniChecker,
+    progress: Callable[[str], None] | None,
+) -> dict:
+    _emit_progress(progress, f"[t2v] describe rank={hit.rank} video_id={candidate_video.video_id}")
+    description = checker.describe_video(candidate_video)
+    return {
+        "_order": index,
+        "rank": hit.rank,
+        "candidate": hit.to_dict(),
+        "video_description": description.to_dict(),
     }
 
 
