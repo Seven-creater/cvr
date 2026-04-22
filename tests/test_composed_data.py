@@ -11,6 +11,7 @@ from app.composed_data import (
     _build_proposal_id,
     annotate_clips,
     build_ffmpeg_extract_command,
+    detective_annotate_clips,
     discover_raw_sources,
     ensure_layout,
     extract_clips,
@@ -289,6 +290,67 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("annotation_fallback", records_by_id["clip_a"]["fallback_reason"])
             self.assertEqual(["visual"], records_by_id["clip_a"]["modalities"])
             self.assertFalse(records_by_id["clip_b"]["fallback_used"])
+
+    def test_detective_annotate_clips_writes_trajectory_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "clip_a.mp4").write_bytes(b"a")
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [
+                    {
+                        "clip_id": "clip_a",
+                        "source_asset_id": "asset_a",
+                        "output_path": "clips/clip_a.mp4",
+                        "dataset": "daily_omni",
+                    }
+                ],
+            )
+
+            detective_output = (
+                {
+                    "summary": "a person plays guitar on a small stage",
+                    "subjects": ["person", "guitar"],
+                    "object_counts": {"person": 1, "guitar": 1},
+                    "actions": ["playing guitar"],
+                    "scene": "small stage",
+                    "attributes": ["indoor"],
+                    "on_screen_text": [],
+                    "speech": [],
+                    "audio_events": ["guitar music"],
+                    "modalities": ["visual", "audio"],
+                    "storyline": ["person sits with guitar", "person plays music"],
+                    "visible_text": [],
+                    "speakers_and_transcript": [],
+                    "detective_notes": ["audio confirms guitar performance"],
+                    "detective_trajectory": [{"stage": "observer"}, {"stage": "detective_final"}],
+                },
+                {"provider": "mock", "mode": "detective"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.annotate_clip_detective.return_value = detective_output
+                summary = detective_annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=root / "captions" / "clip_annotations_detective.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            records = [
+                json.loads(line)
+                for line in (root / "captions" / "clip_annotations_detective.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual("detective", summary["annotation_mode"])
+            self.assertEqual(1, summary["annotated_count"])
+            self.assertEqual(["person sits with guitar", "person plays music"], records[0]["storyline"])
+            self.assertEqual([{"stage": "observer"}, {"stage": "detective_final"}], records[0]["detective_trajectory"])
+            self.assertEqual("daily_omni", records[0]["dataset"])
 
     def test_propose_pairs_outputs_schema_compliant_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

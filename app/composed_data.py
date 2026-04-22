@@ -282,6 +282,55 @@ def annotate_clips(
     overwrite: bool = False,
     timeout_seconds: float = 180.0,
 ) -> dict[str, Any]:
+    return _annotate_clips_impl(
+        root=root,
+        clips_manifest_path=clips_manifest_path,
+        output_path=output_path,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        overwrite=overwrite,
+        detective=False,
+    )
+
+
+def detective_annotate_clips(
+    *,
+    root: str | Path,
+    clips_manifest_path: str | Path,
+    base_url: str,
+    api_key: str,
+    model: str,
+    output_path: str | Path | None = None,
+    overwrite: bool = False,
+    timeout_seconds: float = 180.0,
+) -> dict[str, Any]:
+    return _annotate_clips_impl(
+        root=root,
+        clips_manifest_path=clips_manifest_path,
+        output_path=output_path,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        overwrite=overwrite,
+        detective=True,
+    )
+
+
+def _annotate_clips_impl(
+    *,
+    root: str | Path,
+    clips_manifest_path: str | Path,
+    base_url: str,
+    api_key: str,
+    model: str,
+    output_path: str | Path | None,
+    overwrite: bool,
+    timeout_seconds: float,
+    detective: bool,
+) -> dict[str, Any]:
     layout = ensure_layout(root)
     manifest_path = Path(clips_manifest_path)
     clips = list(_load_jsonl(manifest_path))
@@ -317,7 +366,10 @@ def annotate_clips(
             fallback_reason = ""
             raw_model_output: dict[str, Any] = {}
             try:
-                normalized, raw_model_output = client.annotate_clip(clip_path=str(clip_path))
+                if detective:
+                    normalized, raw_model_output = client.annotate_clip_detective(clip_path=str(clip_path))
+                else:
+                    normalized, raw_model_output = client.annotate_clip(clip_path=str(clip_path))
                 fallback_used = False
             except Exception as exc:
                 normalized = _fallback_clip_annotation()
@@ -342,6 +394,16 @@ def annotate_clips(
                 "fallback_used": fallback_used,
                 "raw_model_output": raw_model_output,
             }
+            if detective:
+                record.update(
+                    {
+                        "storyline": list(normalized.get("storyline", [])),
+                        "visible_text": list(normalized.get("visible_text", [])),
+                        "speakers_and_transcript": list(normalized.get("speakers_and_transcript", [])),
+                        "detective_notes": list(normalized.get("detective_notes", [])),
+                        "detective_trajectory": list(normalized.get("detective_trajectory", [])),
+                    }
+                )
             record.update(_clip_manifest_metadata(item=item, root=layout["root"]))
             if fallback_reason:
                 record["fallback_reason"] = fallback_reason
@@ -359,6 +421,7 @@ def annotate_clips(
         "annotated_count": annotated_count,
         "reused_count": reused_count,
         "fallback_count": fallback_count,
+        "annotation_mode": "detective" if detective else "single_pass",
     }
 
 
@@ -1521,6 +1584,16 @@ def build_parser() -> argparse.ArgumentParser:
     annotate_clips_parser.add_argument("--timeout-seconds", type=float, default=180.0)
     annotate_clips_parser.add_argument("--overwrite", action="store_true")
 
+    detective_annotate_parser = subparsers.add_parser("detective-annotate-clips")
+    detective_annotate_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    detective_annotate_parser.add_argument("--clips-manifest-path", required=True)
+    detective_annotate_parser.add_argument("--output-path")
+    detective_annotate_parser.add_argument("--base-url", required=True)
+    detective_annotate_parser.add_argument("--api-key", required=True)
+    detective_annotate_parser.add_argument("--model", required=True)
+    detective_annotate_parser.add_argument("--timeout-seconds", type=float, default=180.0)
+    detective_annotate_parser.add_argument("--overwrite", action="store_true")
+
     propose_pairs_parser = subparsers.add_parser("propose-pairs")
     propose_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
     propose_pairs_parser.add_argument("--clip-annotations-path", required=True)
@@ -1570,6 +1643,20 @@ def main() -> None:
 
     if args.command == "annotate-clips":
         result = annotate_clips(
+            root=args.root,
+            clips_manifest_path=args.clips_manifest_path,
+            output_path=args.output_path,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            timeout_seconds=args.timeout_seconds,
+            overwrite=args.overwrite,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "detective-annotate-clips":
+        result = detective_annotate_clips(
             root=args.root,
             clips_manifest_path=args.clips_manifest_path,
             output_path=args.output_path,

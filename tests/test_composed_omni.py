@@ -169,6 +169,83 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertEqual("instruct-model", request_body["model"])
         self.assertEqual(22.0, request_holder["timeout"])
 
+    def test_detective_annotation_runs_observer_then_final_pass(self) -> None:
+        requests = []
+        observer_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "visual_observations": ["one person holds a guitar"],
+                                "audio_observations": ["guitar music"],
+                                "text_observations": [],
+                                "timeline": ["person sits", "person plays"],
+                                "uncertainties": [],
+                                "follow_up_questions": ["is there speech?"],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        final_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "summary": "a person plays guitar on a small stage",
+                                "subjects": ["person", "guitar"],
+                                "object_counts": {"person": 1, "guitar": 1},
+                                "actions": ["playing guitar"],
+                                "scene": "small stage",
+                                "attributes": ["indoor"],
+                                "on_screen_text": [],
+                                "speech": [],
+                                "audio_events": ["guitar music"],
+                                "modalities": ["visual", "audio"],
+                                "storyline": ["person sits with guitar", "person plays music"],
+                                "visible_text": [],
+                                "speakers_and_transcript": [],
+                                "detective_notes": ["audio confirms guitar performance"],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        responses = [_FakeHTTPResponse(observer_payload), _FakeHTTPResponse(final_payload)]
+
+        def fake_urlopen(request, timeout):
+            requests.append(json.loads(request.data.decode("utf-8")))
+            return responses.pop(0)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-detective-omni-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            clip_path = tmp_dir / "clip.mp4"
+            clip_path.write_bytes(b"fake-mp4-bytes")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, raw_payload = client.annotate_clip_detective(clip_path=str(clip_path))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual(2, len(requests))
+        self.assertIn("observer", requests[0]["messages"][0]["content"].lower())
+        self.assertIn("detective agent", requests[1]["messages"][0]["content"].lower())
+        self.assertEqual("a person plays guitar on a small stage", normalized["summary"])
+        self.assertEqual(["person sits with guitar", "person plays music"], normalized["storyline"])
+        self.assertEqual(["guitar music"], normalized["audio_events"])
+        self.assertEqual(["observer", "detective_final"], [item["stage"] for item in raw_payload["detective_trajectory"]])
+
     def test_propose_pair_normalizes_subject_difference_alias(self) -> None:
         response_payload = {
             "choices": [

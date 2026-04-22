@@ -22,7 +22,7 @@ echo "[pilot50] model=$MODEL"
 curl -fsS "$BASE_URL/models"
 echo
 
-python -m app.composed_data annotate-clips \
+python -m app.composed_data detective-annotate-clips \
   --root "$ROOT" \
   --clips-manifest-path "$ROOT/metadata/source_clips_pilot50.jsonl" \
   --output-path "$RUN_ROOT/clip_annotations_pilot50.jsonl" \

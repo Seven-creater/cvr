@@ -71,6 +71,24 @@ def _string_list(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _detail_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        item = value.strip()
+        return [item] if item else []
+    if not isinstance(value, list):
+        return []
+    normalized = []
+    for item in value:
+        if isinstance(item, dict):
+            parts = [str(part).strip() for part in item.values() if str(part).strip()]
+            text = " | ".join(parts)
+        else:
+            text = str(item).strip()
+        if text:
+            normalized.append(text)
+    return normalized
+
+
 def _normalize_modalities(value: Any) -> list[str]:
     normalized = []
     for item in _string_list(value):
@@ -134,6 +152,33 @@ def _clip_annotation_system_prompt() -> str:
     )
 
 
+def _detective_observation_system_prompt() -> str:
+    return (
+        "You are the observer in an Omni-Captioner style detective loop. "
+        "Inspect the video and return exactly one JSON object and nothing else. "
+        'Required schema: {"visual_observations": [string], "audio_observations": [string], '
+        '"text_observations": [string], "timeline": [string], "uncertainties": [string], '
+        '"follow_up_questions": [string]}. '
+        "Capture concrete details that distinguish this clip from similar clips. "
+        "Do not infer unsupported identities or events."
+    )
+
+
+def _detective_final_system_prompt() -> str:
+    return (
+        "You are the detective agent for composed video retrieval data construction. "
+        "Use the video and prior observations to produce a low-hallucination, fine-grained annotation. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"summary": string, "subjects": [string], "object_counts": {string: integer}, '
+        '"actions": [string], "scene": string, "attributes": [string], "on_screen_text": [string], '
+        '"speech": [string], "audio_events": [string], "modalities": ["visual"|"audio", ...], '
+        '"storyline": [string], "visible_text": [string], "speakers_and_transcript": [string], '
+        '"detective_notes": [string]}. '
+        "Keep the summary concise, but preserve discriminative subject, action, audio, OCR, and timeline details. "
+        "Use 'audio' in modalities only when audible information helps distinguish the clip."
+    )
+
+
 def _pair_proposal_system_prompt() -> str:
     difference_types = ", ".join(sorted(ALLOWED_DIFFERENCE_TYPES))
     return (
@@ -157,6 +202,31 @@ def _build_clip_annotation_user_content(clip_path: str) -> list[dict[str, Any]]:
         "Task: describe this clip for composed retrieval dataset construction.\n"
         "Focus on the main subject, object counts, actions, scene, attributes, visible text, speech, and audio events.\n"
         "Use details that help distinguish this clip from similar clips in the same series."
+    )
+    return [
+        {"type": "video_url", "video_url": {"url": clip_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
+def _build_detective_observation_user_content(clip_path: str) -> list[dict[str, Any]]:
+    prompt = (
+        "Observation pass: inspect the clip like an independent observer.\n"
+        "List visible subjects, object counts, actions, scene, visible text, speech, music, sound events, and timeline beats.\n"
+        "Also list any uncertainties that a later detective pass should be careful about."
+    )
+    return [
+        {"type": "video_url", "video_url": {"url": clip_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
+def _build_detective_final_user_content(*, clip_path: str, observations: dict[str, Any]) -> list[dict[str, Any]]:
+    prompt = (
+        "Final detective pass: synthesize a structured clip annotation for composed retrieval.\n"
+        f"Prior observer JSON:\n{json.dumps(observations, ensure_ascii=False)}\n"
+        "Prefer facts supported by the video or observer notes. "
+        "Make the annotation useful for later finding pairs that differ by one clear visual/audio/text change."
     )
     return [
         {"type": "video_url", "video_url": {"url": clip_path}},
@@ -205,6 +275,29 @@ class OpenAIComposedDataClient:
             max_tokens=1024,
         )
         return _normalize_clip_annotation_payload(raw_payload), raw_payload
+
+    def annotate_clip_detective(self, *, clip_path: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        observations = self._request_json(
+            user_content=_build_detective_observation_user_content(clip_path),
+            system_prompt=_detective_observation_system_prompt(),
+            max_tokens=1200,
+        )
+        final_payload = self._request_json(
+            user_content=_build_detective_final_user_content(clip_path=clip_path, observations=observations),
+            system_prompt=_detective_final_system_prompt(),
+            max_tokens=1800,
+        )
+        trajectory = [
+            {"stage": "observer", "payload": observations},
+            {"stage": "detective_final", "payload": final_payload},
+        ]
+        normalized = _normalize_detective_clip_annotation_payload(final_payload)
+        normalized["detective_trajectory"] = trajectory
+        return normalized, {
+            "observer": observations,
+            "detective_final": final_payload,
+            "detective_trajectory": trajectory,
+        }
 
     def propose_pair(
         self,
@@ -297,6 +390,25 @@ def _normalize_clip_annotation_payload(payload: dict[str, Any]) -> dict[str, Any
     }
     if not normalized["summary"]:
         raise ValueError("clip annotation summary is required")
+    return normalized
+
+
+def _normalize_detective_clip_annotation_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_clip_annotation_payload(payload)
+    visible_text = _detail_list(payload.get("visible_text"))
+    transcript = _detail_list(payload.get("speakers_and_transcript"))
+    if visible_text and not normalized["on_screen_text"]:
+        normalized["on_screen_text"] = visible_text
+    if transcript and not normalized["speech"]:
+        normalized["speech"] = transcript
+    normalized.update(
+        {
+            "storyline": _detail_list(payload.get("storyline")),
+            "visible_text": visible_text,
+            "speakers_and_transcript": transcript,
+            "detective_notes": _detail_list(payload.get("detective_notes")),
+        }
+    )
     return normalized
 
 
