@@ -1,0 +1,608 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from app.composed_data import (
+    annotate_clips,
+    build_ffmpeg_extract_command,
+    discover_raw_sources,
+    ensure_layout,
+    extract_clips,
+    index_raw_sources,
+    propose_pairs,
+    validate_pilot_dataset,
+)
+from app.composed_omni import ALLOWED_DIFFERENCE_TYPES
+
+
+class ComposedDataTests(unittest.TestCase):
+    def _write_jsonl(self, path: Path, records: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def test_ensure_layout_creates_expected_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = ensure_layout(temp_dir)
+            for name in ("raw", "clips", "metadata", "captions", "pairs", "splits", "reports", "caches"):
+                self.assertTrue(paths[name].exists(), name)
+                self.assertTrue(paths[name].is_dir(), name)
+
+    def test_discover_raw_sources_reads_raw_datasets_children(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "raw_datasets" / "daily_omni").mkdir(parents=True)
+            (root / "raw_datasets" / "worldsense").mkdir(parents=True)
+            discovered = discover_raw_sources(root)
+            self.assertEqual(
+                [("daily_omni", root / "raw_datasets" / "daily_omni"), ("worldsense", root / "raw_datasets" / "worldsense")],
+                discovered,
+            )
+
+    def test_index_raw_sources_writes_jsonl_and_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "raw_datasets" / "daily_omni"
+            source.mkdir(parents=True)
+            (source / "a.mp4").write_bytes(b"x")
+            (source / "nested").mkdir()
+            (source / "nested" / "b.webm").write_bytes(b"y")
+
+            summary = index_raw_sources(root=root, sources=[("daily_omni", source)])
+            raw_index = root / "metadata" / "raw_assets.jsonl"
+            report = root / "reports" / "raw_assets_summary.md"
+
+            self.assertEqual(2, summary["asset_count"])
+            self.assertTrue(raw_index.exists())
+            self.assertTrue(report.exists())
+            records = [json.loads(line) for line in raw_index.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(2, len(records))
+            self.assertEqual({"daily_omni"}, {record["dataset"] for record in records})
+
+    def test_build_ffmpeg_extract_command_preserves_audio_when_available(self) -> None:
+        command = build_ffmpeg_extract_command(
+            source_path="/tmp/input.mp4",
+            output_path="/tmp/output.mp4",
+            start_seconds=1.25,
+            end_seconds=5.0,
+            overwrite=True,
+        )
+        self.assertEqual("ffmpeg", command[0])
+        self.assertIn("0:a?", command)
+        self.assertEqual("/tmp/output.mp4", command[-1])
+
+    def test_extract_clips_resolves_source_asset_ids_and_writes_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "raw_datasets" / "daily_omni"
+            source.mkdir(parents=True)
+            video = source / "source.mp4"
+            video.write_bytes(b"x")
+            index_raw_sources(root=root, sources=[("daily_omni", source)])
+
+            raw_index = root / "metadata" / "raw_assets.jsonl"
+            asset = json.loads(raw_index.read_text(encoding="utf-8").splitlines()[0])
+            plan_path = root / "metadata" / "clip_plan.jsonl"
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "clip_id": "daily_omni_ref_0001",
+                        "source_asset_id": asset["asset_id"],
+                        "start_seconds": 0,
+                        "end_seconds": 4.5,
+                        "role": "reference",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch("app.composed_data.subprocess.run") as run_mock:
+                summary = extract_clips(root=root, plan_path=plan_path, overwrite=True)
+
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self.assertEqual(1, summary["clip_count"])
+            self.assertTrue(manifest_path.exists())
+            run_mock.assert_called_once()
+            record = json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual("daily_omni_ref_0001", record["clip_id"])
+            self.assertTrue(record["output_path"].endswith("clips/daily_omni_ref_0001.mp4"))
+
+    def test_annotate_clips_writes_complete_annotations_with_mock_client(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            clip_one = root / "clips" / "clip_a.mp4"
+            clip_two = root / "clips" / "clip_b.mp4"
+            clip_one.write_bytes(b"a")
+            clip_two.write_bytes(b"b")
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [
+                    {
+                        "clip_id": "clip_a",
+                        "source_asset_id": "asset_a",
+                        "output_path": "clips/clip_a.mp4",
+                        "start_seconds": 0.0,
+                        "end_seconds": 4.0,
+                        "duration_seconds": 4.0,
+                    },
+                    {
+                        "clip_id": "clip_b",
+                        "source_asset_id": "asset_b",
+                        "output_path": "clips/clip_b.mp4",
+                        "start_seconds": 2.0,
+                        "end_seconds": 6.0,
+                        "duration_seconds": 4.0,
+                    },
+                ],
+            )
+
+            annotation_outputs = [
+                (
+                    {
+                        "summary": "one orange cat resting on a sofa",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": 1},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                    {"provider": "mock", "clip_id": "clip_a"},
+                ),
+                (
+                    {
+                        "summary": "two orange cats resting on a sofa",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": 2},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["soft meow"],
+                        "modalities": ["visual", "audio"],
+                    },
+                    {"provider": "mock", "clip_id": "clip_b"},
+                ),
+            ]
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.annotate_clip.side_effect = annotation_outputs
+                summary = annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=root / "captions" / "clip_annotations.jsonl",
+                    base_url="http://127.0.0.1:8092/v1",
+                    api_key="EMPTY",
+                    model="captioner-model",
+                )
+
+            output_path = root / "captions" / "clip_annotations.jsonl"
+            records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(2, summary["clip_count"])
+            self.assertEqual(2, summary["annotated_count"])
+            self.assertEqual(0, summary["fallback_count"])
+            self.assertEqual(2, len(records))
+            self.assertEqual({"clip_a", "clip_b"}, {record["clip_id"] for record in records})
+            for record in records:
+                self.assertIn("summary", record)
+                self.assertIn("subjects", record)
+                self.assertIn("object_counts", record)
+                self.assertIn("actions", record)
+                self.assertIn("scene", record)
+                self.assertIn("attributes", record)
+                self.assertIn("on_screen_text", record)
+                self.assertIn("speech", record)
+                self.assertIn("audio_events", record)
+                self.assertIn("modalities", record)
+                self.assertIn("source_asset_id", record)
+                self.assertIn("fallback_used", record)
+                self.assertIn("raw_model_output", record)
+                self.assertFalse(record["fallback_used"])
+
+    def test_annotate_clips_marks_fallback_without_batch_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "clip_a.mp4").write_bytes(b"a")
+            (root / "clips" / "clip_b.mp4").write_bytes(b"b")
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [
+                    {
+                        "clip_id": "clip_a",
+                        "source_asset_id": "asset_a",
+                        "output_path": "clips/clip_a.mp4",
+                        "start_seconds": 0.0,
+                        "end_seconds": 4.0,
+                        "duration_seconds": 4.0,
+                    },
+                    {
+                        "clip_id": "clip_b",
+                        "source_asset_id": "asset_b",
+                        "output_path": "clips/clip_b.mp4",
+                        "start_seconds": 1.0,
+                        "end_seconds": 5.0,
+                        "duration_seconds": 4.0,
+                    },
+                ],
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.annotate_clip.side_effect = [
+                    ValueError("clip annotation missing fields: ['summary']"),
+                    (
+                        {
+                            "summary": "a person claps in a quiet room",
+                            "subjects": ["person"],
+                            "object_counts": {"person": 1},
+                            "actions": ["clapping"],
+                            "scene": "studio",
+                            "attributes": ["indoor"],
+                            "on_screen_text": [],
+                            "speech": [],
+                            "audio_events": ["clap"],
+                            "modalities": ["visual", "audio"],
+                        },
+                        {"provider": "mock", "clip_id": "clip_b"},
+                    ),
+                ]
+                summary = annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=root / "captions" / "clip_annotations.jsonl",
+                    base_url="http://127.0.0.1:8092/v1",
+                    api_key="EMPTY",
+                    model="captioner-model",
+                )
+
+            records = [
+                json.loads(line)
+                for line in (root / "captions" / "clip_annotations.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            records_by_id = {record["clip_id"]: record for record in records}
+            self.assertEqual(2, summary["clip_count"])
+            self.assertEqual(1, summary["fallback_count"])
+            self.assertTrue(records_by_id["clip_a"]["fallback_used"])
+            self.assertEqual("annotation_fallback", records_by_id["clip_a"]["fallback_reason"])
+            self.assertEqual(["visual"], records_by_id["clip_a"]["modalities"])
+            self.assertFalse(records_by_id["clip_b"]["fallback_used"])
+
+    def test_propose_pairs_outputs_schema_compliant_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("clip_ref.mp4", "clip_target.mp4", "clip_neg1.mp4", "clip_neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            raw_index_path = root / "metadata" / "raw_assets.jsonl"
+            self._write_jsonl(
+                raw_index_path,
+                [
+                    {
+                        "asset_id": "asset_ref",
+                        "dataset": "daily_omni",
+                        "path": str(root / "raw_datasets" / "daily_omni" / "ref.mp4"),
+                    },
+                    {
+                        "asset_id": "asset_target",
+                        "dataset": "daily_omni",
+                        "path": str(root / "raw_datasets" / "daily_omni" / "target.mp4"),
+                    },
+                    {
+                        "asset_id": "asset_neg1",
+                        "dataset": "worldsense",
+                        "path": str(root / "raw_datasets" / "worldsense" / "neg1.mp4"),
+                    },
+                    {
+                        "asset_id": "asset_neg2",
+                        "dataset": "worldsense",
+                        "path": str(root / "raw_datasets" / "worldsense" / "neg2.mp4"),
+                    },
+                ],
+            )
+
+            annotations_path = root / "captions" / "clip_annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "clip_ref",
+                        "output_path": "clips/clip_ref.mp4",
+                        "summary": "one orange cat resting on a sofa in a living room",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": 1},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "modalities": ["visual", "audio"],
+                        "source_asset_id": "asset_ref",
+                        "fallback_used": False,
+                        "raw_model_output": {"provider": "mock"},
+                    },
+                    {
+                        "clip_id": "clip_target",
+                        "output_path": "clips/clip_target.mp4",
+                        "summary": "two orange cats resting on a sofa in a living room",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": 2},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "modalities": ["visual", "audio"],
+                        "source_asset_id": "asset_target",
+                        "fallback_used": False,
+                        "raw_model_output": {"provider": "mock"},
+                    },
+                    {
+                        "clip_id": "clip_neg1",
+                        "output_path": "clips/clip_neg1.mp4",
+                        "summary": "one orange cat stretching on a sofa in a living room",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": 1},
+                        "actions": ["stretching"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "modalities": ["visual", "audio"],
+                        "source_asset_id": "asset_neg1",
+                        "fallback_used": False,
+                        "raw_model_output": {"provider": "mock"},
+                    },
+                    {
+                        "clip_id": "clip_neg2",
+                        "output_path": "clips/clip_neg2.mp4",
+                        "summary": "one orange cat resting on a sofa in a living room with a bell sound",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": 1},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["bell ringing"],
+                        "modalities": ["visual", "audio"],
+                        "source_asset_id": "asset_neg2",
+                        "fallback_used": False,
+                        "raw_model_output": {"provider": "mock"},
+                    },
+                ],
+            )
+
+            def fake_propose_pair(*, reference_annotation, target_annotation, hard_negative_candidates):
+                difference = {
+                    "type": "object_count",
+                    "from": f"{reference_annotation['object_counts'].get('cat', 0)} cat",
+                    "to": f"{target_annotation['object_counts'].get('cat', 0)} cat",
+                    "description": "the cat count changes while the scene stays the same",
+                }
+                return (
+                    {
+                        "edit_text": "change one orange cat into two orange cats",
+                        "modalities": ["visual", "audio"],
+                        "reference_caption": reference_annotation["summary"],
+                        "target_caption": target_annotation["summary"],
+                        "difference": difference,
+                        "proposal_reason": f"same context with {len(hard_negative_candidates)} nearby negatives",
+                    },
+                    {"provider": "mock"},
+                )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.propose_pair.side_effect = fake_propose_pair
+                summary = propose_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    raw_index_path=raw_index_path,
+                    output_path=root / "pairs" / "pilot_candidates.jsonl",
+                    base_url="http://127.0.0.1:8092/v1",
+                    api_key="EMPTY",
+                    model="instruct-model",
+                )
+
+            output_path = root / "pairs" / "pilot_candidates.jsonl"
+            records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertGreaterEqual(summary["proposal_count"], 1)
+            self.assertEqual(summary["proposal_count"], len(records))
+            self.assertEqual(0, summary["fallback_count"])
+            for record in records:
+                self.assertIn(record["difference"]["type"], ALLOWED_DIFFERENCE_TYPES)
+                self.assertNotEqual(record["reference_video"], record["target_video"])
+                self.assertNotIn(record["target_video"], record["hard_negatives"])
+                self.assertGreaterEqual(len(record["hard_negatives"]), 2)
+                self.assertIn("same_context_score", record["quality"])
+                self.assertIn("edit_match_score", record["quality"])
+                self.assertIn("target_uniqueness_score", record["quality"])
+                self.assertIn("platform", record["source"])
+                self.assertIn("url", record["source"])
+                self.assertIn("license_note", record["source"])
+
+    def test_propose_pairs_marks_fallback_when_model_call_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("clip_ref.mp4", "clip_target.mp4", "clip_neg1.mp4", "clip_neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            annotations_path = root / "captions" / "clip_annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "clip_ref",
+                        "output_path": "clips/clip_ref.mp4",
+                        "summary": "one dog running in a park",
+                        "subjects": ["dog"],
+                        "object_counts": {"dog": 1},
+                        "actions": ["running"],
+                        "scene": "park",
+                        "attributes": ["brown"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["barking"],
+                        "modalities": ["visual", "audio"],
+                        "source_asset_id": "asset_ref",
+                        "fallback_used": False,
+                        "raw_model_output": {"provider": "mock"},
+                    },
+                    {
+                        "clip_id": "clip_target",
+                        "output_path": "clips/clip_target.mp4",
+                        "summary": "one dog jumping in a park",
+                        "subjects": ["dog"],
+                        "object_counts": {"dog": 1},
+                        "actions": ["jumping"],
+                        "scene": "park",
+                        "attributes": ["brown"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["barking"],
+                        "modalities": ["visual", "audio"],
+                        "source_asset_id": "asset_target",
+                        "fallback_used": False,
+                        "raw_model_output": {"provider": "mock"},
+                    },
+                    {
+                        "clip_id": "clip_neg1",
+                        "output_path": "clips/clip_neg1.mp4",
+                        "summary": "one dog sitting in a park",
+                        "subjects": ["dog"],
+                        "object_counts": {"dog": 1},
+                        "actions": ["sitting"],
+                        "scene": "park",
+                        "attributes": ["brown"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["barking"],
+                        "modalities": ["visual", "audio"],
+                        "source_asset_id": "asset_neg1",
+                        "fallback_used": False,
+                        "raw_model_output": {"provider": "mock"},
+                    },
+                    {
+                        "clip_id": "clip_neg2",
+                        "output_path": "clips/clip_neg2.mp4",
+                        "summary": "one dog running in a park with loud music",
+                        "subjects": ["dog"],
+                        "object_counts": {"dog": 1},
+                        "actions": ["running"],
+                        "scene": "park",
+                        "attributes": ["brown"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["music"],
+                        "modalities": ["visual", "audio"],
+                        "source_asset_id": "asset_neg2",
+                        "fallback_used": False,
+                        "raw_model_output": {"provider": "mock"},
+                    },
+                ],
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.propose_pair.side_effect = RuntimeError("mock proposal failure")
+                summary = propose_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    output_path=root / "pairs" / "pilot_candidates.jsonl",
+                    base_url="http://127.0.0.1:8092/v1",
+                    api_key="EMPTY",
+                    model="instruct-model",
+                )
+
+            records = [
+                json.loads(line)
+                for line in (root / "pairs" / "pilot_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertGreaterEqual(summary["proposal_count"], 1)
+            self.assertEqual(summary["proposal_count"], summary["fallback_count"])
+            self.assertTrue(all(record["fallback_used"] for record in records))
+            self.assertTrue(all(record["difference"]["type"] in ALLOWED_DIFFERENCE_TYPES for record in records))
+            self.assertTrue(all(record["target_video"] not in record["hard_negatives"] for record in records))
+
+    def test_validate_pilot_dataset_builds_gallery_from_targets_and_negatives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            pilot_dir = root / "pilot_10"
+            reports_dir = pilot_dir / "reports"
+            reports_dir.mkdir(parents=True)
+            pilot_path = pilot_dir / "pilot_10.jsonl"
+            pilot_path.write_text(
+                json.dumps(
+                    {
+                        "sample_id": "covr_pilot_0001",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": "clips/target.mp4",
+                        "edit_text": "change one cat into two cats",
+                        "modalities": ["visual", "audio"],
+                        "reference_caption": "one cat on a sofa",
+                        "target_caption": "two cats on a sofa",
+                        "difference": {
+                            "type": "object_count",
+                            "from": "one cat",
+                            "to": "two cats",
+                        },
+                        "hard_negatives": ["clips/neg1.mp4", "clips/neg2.mp4"],
+                        "quality": {
+                            "same_context_score": 0.9,
+                            "edit_match_score": 0.8,
+                            "target_uniqueness_score": 0.7,
+                        },
+                        "source": {
+                            "platform": "bilibili",
+                            "url": "https://example.com/video",
+                            "license_note": "internal research pilot only",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            gallery_path = pilot_dir / "gallery.jsonl"
+            report_path = reports_dir / "pilot_review.md"
+            summary = validate_pilot_dataset(
+                root=root,
+                pilot_jsonl_path=pilot_path,
+                gallery_output_path=gallery_path,
+                report_output_path=report_path,
+            )
+
+            gallery_records = [json.loads(line) for line in gallery_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(3, len(gallery_records))
+            self.assertEqual(1, summary["sample_count"])
+            self.assertTrue(report_path.exists())
+            self.assertEqual(
+                {"clips/target.mp4", "clips/neg1.mp4", "clips/neg2.mp4"},
+                {record["video_path"] for record in gallery_records},
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
