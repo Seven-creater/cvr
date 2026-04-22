@@ -530,6 +530,8 @@ def validate_pilot_dataset(
     seen_pair_keys: set[tuple[str, str]] = set()
     difference_counter: Counter[str] = Counter()
     modality_counter: Counter[str] = Counter()
+    same_context_scores: list[float] = []
+    source_context_counter: Counter[str] = Counter()
     gallery_accumulator: dict[str, dict[str, Any]] = {}
 
     for index, record in enumerate(pilot_records, start=1):
@@ -562,6 +564,17 @@ def validate_pilot_dataset(
         difference_type = str(difference.get("type", "")).strip()
         if difference_type:
             difference_counter[difference_type] += 1
+
+        quality = record.get("quality", {})
+        if isinstance(quality, dict):
+            try:
+                same_context_scores.append(float(quality.get("same_context_score", 0.0)))
+            except (TypeError, ValueError):
+                pass
+
+        source_context = record.get("source_context", {})
+        if isinstance(source_context, dict):
+            source_context_counter[str(source_context.get("relation", "unknown"))] += 1
 
         target_video = str(record.get("target_video", "")).strip()
         if target_video:
@@ -600,6 +613,8 @@ def validate_pilot_dataset(
         "gallery_count": len(gallery_records),
         "modality_counts": dict(sorted(modality_counter.items())),
         "difference_type_counts": dict(sorted(difference_counter.items())),
+        "source_context_counts": dict(sorted(source_context_counter.items())),
+        "quality_summary": _quality_summary(same_context_scores),
         "automated_acceptance": {
             "sample_count_between_5_and_10": 5 <= len(pilot_records) <= 10,
             "audio_samples_at_least_2": modality_counter.get("audio", 0) >= 2,
@@ -613,6 +628,16 @@ def validate_pilot_dataset(
     summary["gallery_output_path"] = str(gallery_output_path)
     summary["report_output_path"] = str(report_output_path)
     return summary
+
+
+def _quality_summary(same_context_scores: list[float]) -> dict[str, float]:
+    if not same_context_scores:
+        return {"same_context_min": 0.0, "same_context_avg": 0.0, "same_context_max": 0.0}
+    return {
+        "same_context_min": round(min(same_context_scores), 3),
+        "same_context_avg": round(sum(same_context_scores) / len(same_context_scores), 3),
+        "same_context_max": round(max(same_context_scores), 3),
+    }
 
 
 def build_ffmpeg_extract_command(
@@ -712,6 +737,23 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
         lines.append(f"- `{key}`: `{value}`")
     if not summary["difference_type_counts"]:
         lines.append("- none")
+
+    lines.extend(["", "## Source Context Counts"])
+    for key, value in summary["source_context_counts"].items():
+        lines.append(f"- `{key}`: `{value}`")
+    if not summary["source_context_counts"]:
+        lines.append("- none")
+
+    quality = summary["quality_summary"]
+    lines.extend(
+        [
+            "",
+            "## Quality Summary",
+            f"- `same_context_min`: `{quality['same_context_min']}`",
+            f"- `same_context_avg`: `{quality['same_context_avg']}`",
+            f"- `same_context_max`: `{quality['same_context_max']}`",
+        ]
+    )
 
     lines.extend(["", "## Automated Acceptance Checks"])
     for key, value in acceptance.items():

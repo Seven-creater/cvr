@@ -716,6 +716,10 @@ class ComposedDataTests(unittest.TestCase):
                             "edit_match_score": 0.8,
                             "target_uniqueness_score": 0.7,
                         },
+                        "source_context": {
+                            "relation": "same_dataset",
+                            "score": 0.9,
+                        },
                         "source": {
                             "platform": "bilibili",
                             "url": "https://example.com/video",
@@ -739,6 +743,11 @@ class ComposedDataTests(unittest.TestCase):
             gallery_records = [json.loads(line) for line in gallery_path.read_text(encoding="utf-8").splitlines() if line.strip()]
             self.assertEqual(3, len(gallery_records))
             self.assertEqual(1, summary["sample_count"])
+            self.assertEqual({"same_dataset": 1}, summary["source_context_counts"])
+            self.assertEqual(
+                {"same_context_min": 0.9, "same_context_avg": 0.9, "same_context_max": 0.9},
+                summary["quality_summary"],
+            )
             self.assertTrue(report_path.exists())
             self.assertEqual(
                 {"clips/target.mp4", "clips/neg1.mp4", "clips/neg2.mp4"},

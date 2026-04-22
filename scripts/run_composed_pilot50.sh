@@ -50,16 +50,32 @@ python - <<'PY'
 import json
 from pathlib import Path
 
+MIN_SELECTION_CONTEXT_SCORE = 0.12
 run_root = Path("/data02/usr/wangqihao/Demo/test/cvr/runs/composed_pilot50_20260422")
 pairs_path = run_root / "pilot_pair_proposals.jsonl"
 pilot_path = run_root / "pilot_10.jsonl"
 records = [json.loads(line) for line in pairs_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def context_score(record):
+    try:
+        return float(record.get("quality", {}).get("same_context_score", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 non_cross_records = [
     record
     for record in records
     if record.get("source_context", {}).get("relation") != "cross_dataset"
 ]
-selection_records = non_cross_records if len(non_cross_records) >= 5 else records
+high_context_records = [
+    record
+    for record in non_cross_records
+    if context_score(record) >= MIN_SELECTION_CONTEXT_SCORE
+]
+selection_records = high_context_records if len(high_context_records) >= 5 else non_cross_records
+selection_records = selection_records if len(selection_records) >= 5 else records
 if len(records) < 5:
     raise SystemExit(f"need at least 5 pair proposals, got {len(records)}")
 
@@ -188,7 +204,10 @@ with pilot_path.open("w", encoding="utf-8") as handle:
         handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
 summary = {
     "proposal_count": len(records),
+    "non_cross_pool_count": len(non_cross_records),
+    "high_context_pool_count": len(high_context_records),
     "selection_pool_count": len(selection_records),
+    "min_selection_context_score": MIN_SELECTION_CONTEXT_SCORE,
     "pilot_count": len(selected),
     "audio_count": sum(1 for record in selected if is_audio(record)),
     "object_change_count": sum(1 for record in selected if is_object_change(record)),
@@ -198,6 +217,13 @@ summary = {
     "fallback_count": sum(1 for record in selected if record.get("fallback_used")),
     "pilot_path": str(pilot_path),
 }
+selected_context_scores = [context_score(record) for record in selected]
+if selected_context_scores:
+    summary["selected_context_score"] = {
+        "min": round(min(selected_context_scores), 3),
+        "avg": round(sum(selected_context_scores) / len(selected_context_scores), 3),
+        "max": round(max(selected_context_scores), 3),
+    }
 for record in selected:
     difference_type = str(record.get("difference", {}).get("type", "unknown"))
     summary["difference_type_counts"][difference_type] = summary["difference_type_counts"].get(difference_type, 0) + 1
