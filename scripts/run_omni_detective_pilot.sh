@@ -54,7 +54,6 @@ python -m app.composed_data detective-annotate-clips \
   --api-key EMPTY \
   --model "$MODEL" \
   --timeout-seconds 300 \
-  --max-accepted-pairs 10 \
   --overwrite
 
 echo "[omni-detective] annotation done $(date)"
@@ -69,6 +68,7 @@ python -m app.composed_data propose-group-pairs \
   --api-key EMPTY \
   --model "$MODEL" \
   --timeout-seconds 300 \
+  --max-accepted-pairs 10 \
   --overwrite
 
 echo "[omni-detective] group proposal and judge done $(date)"

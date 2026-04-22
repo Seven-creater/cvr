@@ -307,6 +307,7 @@ def plan_detective_event_clips(
     plan_records: list[dict[str, Any]] = []
     group_records: list[dict[str, Any]] = []
     used_source_keys: set[str] = set()
+    used_clip_ids: set[str] = set()
     single_segment_records: list[dict[str, Any]] = []
     skipped_count = 0
     probed_count = 0
@@ -340,6 +341,9 @@ def plan_detective_event_clips(
         candidate_clip_ids: list[str] = []
         for segment_index, (start_seconds, end_seconds) in enumerate(segments, start=1):
             clip_id = f"{_safe_id(source_clip_id)}__seg_{segment_index:03d}"
+            if clip_id in used_clip_ids:
+                continue
+            used_clip_ids.add(clip_id)
             group_id = f"group_{dataset}_{_stable_hash(source_key)}"
             output_path = f"clips/detective/{dataset}/{clip_id}.mp4"
             record = {
