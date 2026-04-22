@@ -661,3 +661,48 @@ edit text 是否只描述一个变化
 ```text
 我们已经证明 pipeline 能跑；下一步要证明方法能产生高质量 composed retrieval 数据。
 ```
+
+## 11. Omni-Detective 新链路实现入口
+
+新的实现不再复用旧的 `run_composed_pilot50.sh` 做重复实验，而是新增一条更接近 Omni-Captioner 的链路：
+
+```text
+source_clips_all.jsonl
+-> clip_plan_detective.jsonl
+-> clip_groups.jsonl
+-> extracted_event_clips.jsonl
+-> detective_annotations.jsonl
+-> judged_pair_proposals.jsonl
+-> accepted_pairs.jsonl
+-> gallery.jsonl / pilot_review.md
+```
+
+服务器入口脚本：
+
+```text
+scripts/run_omni_detective_pilot.sh
+```
+
+默认行为：
+
+- 对 50-100 个 source videos 做 4-12 秒事件切片，硬上限 15 秒。
+- 只在同源或同数据集语义组内配对，不再跨数据集随机配对。
+- detective annotation 会写入 tool-box trajectory，包括 `media_probe`、`frame_sampler`、`audio_observer`、`ocr_asr_observer`。
+- group-level pair 会经过 pair judge，只有满足阈值的样本进入 `accepted_pairs.jsonl`。
+
+服务器可用命令：
+
+```bash
+cd /data02/usr/wangqihao/Demo/test/cvr
+mkdir -p /data02/usr/wangqihao/Demo/test/cvr/runs/omni_detective_pilot_20260422
+nohup bash scripts/run_omni_detective_pilot.sh \
+  > /data02/usr/wangqihao/Demo/test/cvr/runs/omni_detective_pilot_20260422/omni_detective_pilot.log 2>&1 &
+```
+
+第一轮只看：
+
+```text
+accepted_pairs.jsonl 是否至少 5 条
+pilot_review.md 中 same_context_avg 是否明显高于 0.141
+人工 review 后是否能保留 60% 以上
+```

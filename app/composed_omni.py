@@ -17,6 +17,7 @@ ALLOWED_DIFFERENCE_TYPES = {
     "scene",
     "audio_event",
     "speech",
+    "visible_text",
 }
 DIFFERENCE_TYPE_ALIASES = {
     "subject": "object_presence",
@@ -34,6 +35,10 @@ DIFFERENCE_TYPE_ALIASES = {
     "music": "audio_event",
     "voice": "speech",
     "spoken": "speech",
+    "ocr": "visible_text",
+    "screen_text": "visible_text",
+    "text": "visible_text",
+    "visible_text_change": "visible_text",
     "background": "scene",
     "location": "scene",
     "color": "attribute",
@@ -59,6 +64,19 @@ REQUIRED_PAIR_PROPOSAL_FIELDS = (
     "target_caption",
     "difference",
     "proposal_reason",
+)
+
+REQUIRED_PAIR_JUDGE_FIELDS = (
+    "reference_satisfies_edit",
+    "target_satisfies_edit",
+    "single_main_difference",
+    "same_context_score",
+    "edit_match_score",
+    "target_uniqueness_score",
+    "audio_required",
+    "hard_negative_quality",
+    "accept",
+    "reject_reason",
 )
 
 
@@ -164,6 +182,19 @@ def _detective_observation_system_prompt() -> str:
     )
 
 
+def _detective_toolbox_system_prompt() -> str:
+    return (
+        "You are an independent observer inside an Omni-Captioner style Tool Box. "
+        "Use the supplied tool observations plus the video to answer concrete questions about the clip. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"visual_observations": [string], "audio_observations": [string], '
+        '"text_observations": [string], "timeline": [string], "uncertainties": [string], '
+        '"follow_up_questions": [string]}. '
+        "Prefer timestamped facts when possible. Separate visual, audio, visible text, and speech evidence. "
+        "Do not hide uncertainty."
+    )
+
+
 def _detective_final_system_prompt() -> str:
     return (
         "You are the detective agent for composed video retrieval data construction. "
@@ -197,6 +228,20 @@ def _pair_proposal_system_prompt() -> str:
     )
 
 
+def _pair_judge_system_prompt() -> str:
+    return (
+        "You are a strict judge for composed video retrieval dataset construction. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"reference_satisfies_edit": boolean, "target_satisfies_edit": boolean, '
+        '"single_main_difference": boolean, "same_context_score": number, "edit_match_score": number, '
+        '"target_uniqueness_score": number, "audio_required": boolean, '
+        '"hard_negative_quality": "good"|"weak"|"bad", "accept": boolean, "reject_reason": string}. '
+        "Accept only when the reference does not satisfy the edit, the target does satisfy it, "
+        "there is one main difference, the context is similar, and negatives are close but wrong. "
+        "Use scores from 0.0 to 1.0."
+    )
+
+
 def _build_clip_annotation_user_content(clip_path: str) -> list[dict[str, Any]]:
     prompt = (
         "Task: describe this clip for composed retrieval dataset construction.\n"
@@ -221,9 +266,35 @@ def _build_detective_observation_user_content(clip_path: str) -> list[dict[str, 
     ]
 
 
-def _build_detective_final_user_content(*, clip_path: str, observations: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_detective_toolbox_user_content(
+    *,
+    clip_path: str,
+    tool_observations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Tool-box observation pass: inspect the clip using the structured tool observations below.\n"
+        f"Tool observations JSON:\n{json.dumps(tool_observations, ensure_ascii=False)}\n"
+        "Return concrete evidence for visual events, audio events, visible text, speech/transcript, timeline beats, "
+        "and remaining uncertainties."
+    )
+    return [
+        {"type": "video_url", "video_url": {"url": clip_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
+def _build_detective_final_user_content(
+    *,
+    clip_path: str,
+    observations: dict[str, Any],
+    tool_observations: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    tool_text = ""
+    if tool_observations:
+        tool_text = f"Tool observations JSON:\n{json.dumps(tool_observations, ensure_ascii=False)}\n"
     prompt = (
         "Final detective pass: synthesize a structured clip annotation for composed retrieval.\n"
+        f"{tool_text}"
         f"Prior observer JSON:\n{json.dumps(observations, ensure_ascii=False)}\n"
         "Prefer facts supported by the video or observer notes. "
         "Make the annotation useful for later finding pairs that differ by one clear visual/audio/text change."
@@ -254,6 +325,25 @@ def _build_pair_proposal_user_content(
     return [{"type": "text", "text": prompt}]
 
 
+def _build_pair_judge_user_content(
+    *,
+    proposal: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    hard_negative_candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: judge whether this candidate is a high-quality composed retrieval sample.\n"
+        f"Pair proposal JSON:\n{json.dumps(proposal, ensure_ascii=False)}\n"
+        f"Reference annotation JSON:\n{json.dumps(reference_annotation, ensure_ascii=False)}\n"
+        f"Target annotation JSON:\n{json.dumps(target_annotation, ensure_ascii=False)}\n"
+        f"Hard negative annotations JSON:\n{json.dumps(hard_negative_candidates, ensure_ascii=False)}\n"
+        "The edit_text must describe the change only. The reference should not satisfy the edit; "
+        "the target should satisfy it. Reject broad scene-only changes unless the context remains clearly related."
+    )
+    return [{"type": "text", "text": prompt}]
+
+
 class OpenAIComposedDataClient:
     def __init__(
         self,
@@ -276,18 +366,37 @@ class OpenAIComposedDataClient:
         )
         return _normalize_clip_annotation_payload(raw_payload), raw_payload
 
-    def annotate_clip_detective(self, *, clip_path: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        observations = self._request_json(
-            user_content=_build_detective_observation_user_content(clip_path),
-            system_prompt=_detective_observation_system_prompt(),
-            max_tokens=1200,
-        )
+    def annotate_clip_detective(
+        self,
+        *,
+        clip_path: str,
+        tool_observations: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if tool_observations:
+            observations = self._request_json(
+                user_content=_build_detective_toolbox_user_content(
+                    clip_path=clip_path,
+                    tool_observations=tool_observations,
+                ),
+                system_prompt=_detective_toolbox_system_prompt(),
+                max_tokens=1400,
+            )
+        else:
+            observations = self._request_json(
+                user_content=_build_detective_observation_user_content(clip_path),
+                system_prompt=_detective_observation_system_prompt(),
+                max_tokens=1200,
+            )
         final_payload = self._request_json(
-            user_content=_build_detective_final_user_content(clip_path=clip_path, observations=observations),
+            user_content=_build_detective_final_user_content(
+                clip_path=clip_path,
+                observations=observations,
+                tool_observations=tool_observations,
+            ),
             system_prompt=_detective_final_system_prompt(),
             max_tokens=1800,
         )
-        trajectory = [
+        trajectory = list(tool_observations or []) + [
             {"stage": "observer", "payload": observations},
             {"stage": "detective_final", "payload": final_payload},
         ]
@@ -316,6 +425,26 @@ class OpenAIComposedDataClient:
             max_tokens=1200,
         )
         return _normalize_pair_proposal_payload(raw_payload), raw_payload
+
+    def judge_pair(
+        self,
+        *,
+        proposal: dict[str, Any],
+        reference_annotation: dict[str, Any],
+        target_annotation: dict[str, Any],
+        hard_negative_candidates: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_pair_judge_user_content(
+                proposal=proposal,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                hard_negative_candidates=hard_negative_candidates,
+            ),
+            system_prompt=_pair_judge_system_prompt(),
+            max_tokens=900,
+        )
+        return _normalize_pair_judge_payload(raw_payload), raw_payload
 
     def _request_json(
         self,
@@ -407,6 +536,7 @@ def _normalize_detective_clip_annotation_payload(payload: dict[str, Any]) -> dic
             "visible_text": visible_text,
             "speakers_and_transcript": transcript,
             "detective_notes": _detail_list(payload.get("detective_notes")),
+            "uncertainties": _detail_list(payload.get("uncertainties")),
         }
     )
     return normalized
@@ -433,3 +563,43 @@ def _normalize_pair_proposal_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if not normalized[field_name]:
             raise ValueError(f"pair proposal {field_name} is required")
     return normalized
+
+
+def _normalize_pair_judge_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_PAIR_JUDGE_FIELDS)
+    if missing_fields:
+        raise ValueError(f"pair judge missing fields: {missing_fields}")
+
+    hard_negative_quality = str(payload.get("hard_negative_quality", "")).strip().lower()
+    if hard_negative_quality not in {"good", "weak", "bad"}:
+        hard_negative_quality = "weak"
+
+    return {
+        "reference_satisfies_edit": _bool_value(payload.get("reference_satisfies_edit")),
+        "target_satisfies_edit": _bool_value(payload.get("target_satisfies_edit")),
+        "single_main_difference": _bool_value(payload.get("single_main_difference")),
+        "same_context_score": _score_value(payload.get("same_context_score")),
+        "edit_match_score": _score_value(payload.get("edit_match_score")),
+        "target_uniqueness_score": _score_value(payload.get("target_uniqueness_score")),
+        "audio_required": _bool_value(payload.get("audio_required")),
+        "hard_negative_quality": hard_negative_quality,
+        "accept": _bool_value(payload.get("accept")),
+        "reject_reason": str(payload.get("reject_reason", "")).strip(),
+    }
+
+
+def _score_value(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, parsed))
+
+
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    return normalized in {"1", "true", "yes", "y", "pass", "accept", "accepted"}

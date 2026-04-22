@@ -286,6 +286,55 @@ class ComposedOmniClientTests(unittest.TestCase):
 
         self.assertEqual("object_presence", normalized["difference"]["type"])
 
+    def test_judge_pair_normalizes_scores_and_booleans(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "reference_satisfies_edit": False,
+                                "target_satisfies_edit": True,
+                                "single_main_difference": True,
+                                "same_context_score": 1.2,
+                                "edit_match_score": 0.86,
+                                "target_uniqueness_score": 0.78,
+                                "audio_required": "yes",
+                                "hard_negative_quality": "good",
+                                "accept": "true",
+                                "reject_reason": "",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8093/v1",
+            api_key="EMPTY",
+            model="qwen3-omni",
+        )
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            normalized, _raw_payload = client.judge_pair(
+                proposal={"edit_text": "change one cat into two cats"},
+                reference_annotation={"clip_id": "ref", "summary": "one cat"},
+                target_annotation={"clip_id": "target", "summary": "two cats"},
+                hard_negative_candidates=[],
+            )
+
+        self.assertTrue(normalized["accept"])
+        self.assertTrue(normalized["audio_required"])
+        self.assertEqual(1.0, normalized["same_context_score"])
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        self.assertEqual({"type": "json_object"}, request_body["response_format"])
+
 
 if __name__ == "__main__":
     unittest.main()

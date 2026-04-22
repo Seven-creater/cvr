@@ -16,6 +16,8 @@ from app.composed_data import (
     ensure_layout,
     extract_clips,
     index_raw_sources,
+    plan_detective_event_clips,
+    propose_group_pairs,
     propose_pairs,
     validate_pilot_dataset,
 )
@@ -115,6 +117,56 @@ class ComposedDataTests(unittest.TestCase):
             record = json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual("daily_omni_ref_0001", record["clip_id"])
             self.assertTrue(record["output_path"].endswith("clips/daily_omni_ref_0001.mp4"))
+
+    def test_plan_detective_event_clips_writes_clip_plan_and_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            video = root / "raw_datasets" / "worldsense" / "source.mp4"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"x")
+            source_clips_path = root / "metadata" / "source_clips_all.jsonl"
+            self._write_jsonl(
+                source_clips_path,
+                [
+                    {
+                        "clip_id": "worldsense_source",
+                        "source_path": str(video),
+                        "output_path": "raw_datasets/worldsense/source.mp4",
+                        "dataset": "worldsense",
+                        "source_row_ids": ["row_a"],
+                        "text_fields": {"video_caption": "a jazz band performs on stage"},
+                    }
+                ],
+            )
+
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={
+                    "duration_seconds": 22.0,
+                    "has_audio": True,
+                    "has_video": True,
+                    "width": 640,
+                    "height": 360,
+                    "fps": 25.0,
+                },
+            ):
+                summary = plan_detective_event_clips(
+                    root=root,
+                    source_clips_path=source_clips_path,
+                    max_source_videos=1,
+                    segment_seconds=8.0,
+                )
+
+            plan_path = Path(summary["clip_plan_output_path"])
+            groups_path = Path(summary["clip_groups_output_path"])
+            plan_records = [json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            group_records = [json.loads(line) for line in groups_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(3, summary["planned_clip_count"])
+            self.assertEqual(1, summary["group_count"])
+            self.assertEqual(3, len(plan_records))
+            self.assertEqual("same_source_video", group_records[0]["group_reason"])
+            self.assertEqual([record["clip_id"] for record in plan_records], group_records[0]["candidate_clip_ids"])
 
     def test_annotate_clips_writes_complete_annotations_with_mock_client(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -402,7 +454,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(records[0]["detective_fallback_used"])
             self.assertEqual("detective_to_single_pass", records[0]["detective_fallback_reason"])
             self.assertEqual("a person claps in a studio", records[0]["summary"])
-            self.assertEqual("single_pass_fallback", records[0]["detective_trajectory"][1]["stage"])
+            self.assertIn("single_pass_fallback", [item.get("stage") for item in records[0]["detective_trajectory"]])
 
     def test_propose_pairs_outputs_schema_compliant_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -560,6 +612,155 @@ class ComposedDataTests(unittest.TestCase):
                 self.assertIn("platform", record["source"])
                 self.assertIn("url", record["source"])
                 self.assertIn("license_note", record["source"])
+
+    def test_propose_group_pairs_accepts_only_judged_group_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("clip_ref.mp4", "clip_target.mp4", "clip_neg1.mp4", "clip_neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+            annotations_path = root / "captions" / "detective_annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "clip_ref",
+                        "output_path": "clips/clip_ref.mp4",
+                        "summary": "one orange cat resting on a sofa in a living room",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": 1},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "modalities": ["visual", "audio"],
+                        "storyline": ["one cat rests on the sofa"],
+                        "visible_text": [],
+                        "speakers_and_transcript": [],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "clip_target",
+                        "output_path": "clips/clip_target.mp4",
+                        "summary": "two orange cats resting on a sofa in a living room",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": 2},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "modalities": ["visual", "audio"],
+                        "storyline": ["two cats rest on the sofa"],
+                        "visible_text": [],
+                        "speakers_and_transcript": [],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "clip_neg1",
+                        "output_path": "clips/clip_neg1.mp4",
+                        "summary": "one orange cat stretching on a sofa in a living room",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": 1},
+                        "actions": ["stretching"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "modalities": ["visual", "audio"],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "clip_neg2",
+                        "output_path": "clips/clip_neg2.mp4",
+                        "summary": "one orange cat resting on a sofa with a bell sound",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": 1},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": ["bell ringing"],
+                        "modalities": ["visual", "audio"],
+                        "fallback_used": False,
+                    },
+                ],
+            )
+            groups_path = root / "metadata" / "clip_groups.jsonl"
+            self._write_jsonl(
+                groups_path,
+                [
+                    {
+                        "group_id": "group_cat_room",
+                        "dataset": "daily_omni",
+                        "group_reason": "same_source_video",
+                        "source_clip_ids": ["source_cat"],
+                        "candidate_clip_ids": ["clip_ref", "clip_target", "clip_neg1", "clip_neg2"],
+                        "group_tags": ["cat", "sofa"],
+                    }
+                ],
+            )
+
+            def fake_propose_pair(*, reference_annotation, target_annotation, hard_negative_candidates):
+                return (
+                    {
+                        "edit_text": "change one orange cat into two orange cats",
+                        "modalities": ["visual", "audio"],
+                        "reference_caption": reference_annotation["summary"],
+                        "target_caption": target_annotation["summary"],
+                        "difference": {
+                            "type": "object_count",
+                            "from": "one cat",
+                            "to": "two cats",
+                            "description": "the cat count changes",
+                        },
+                        "proposal_reason": "same room and same action with a count change",
+                    },
+                    {"provider": "mock"},
+                )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.propose_pair.side_effect = fake_propose_pair
+                client_cls.return_value.judge_pair.return_value = (
+                    {
+                        "reference_satisfies_edit": False,
+                        "target_satisfies_edit": True,
+                        "single_main_difference": True,
+                        "same_context_score": 0.82,
+                        "edit_match_score": 0.91,
+                        "target_uniqueness_score": 0.86,
+                        "audio_required": False,
+                        "hard_negative_quality": "good",
+                        "accept": True,
+                        "reject_reason": "",
+                    },
+                    {"provider": "mock-judge"},
+                )
+                summary = propose_group_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    clip_groups_path=groups_path,
+                    output_path=root / "pairs" / "judged_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            accepted_records = [
+                json.loads(line)
+                for line in (root / "pairs" / "accepted_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertGreaterEqual(summary["accepted_count"], 1)
+            self.assertEqual(summary["accepted_count"], len(accepted_records))
+            self.assertTrue(all(record["judge"]["target_satisfies_edit"] for record in accepted_records))
+            self.assertTrue(all(record["group_id"] == "group_cat_room" for record in accepted_records))
 
     def test_pair_candidates_keep_low_context_pairs_with_available_negatives(self) -> None:
         annotations = [

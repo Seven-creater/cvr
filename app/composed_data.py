@@ -19,6 +19,10 @@ DEFAULT_RAW_INDEX_NAME = "raw_assets.jsonl"
 DEFAULT_CLIP_MANIFEST_NAME = "clips.jsonl"
 DEFAULT_CLIP_ANNOTATIONS_NAME = "clip_annotations.jsonl"
 DEFAULT_PAIR_PROPOSALS_NAME = "pilot_candidates.jsonl"
+DEFAULT_CLIP_GROUPS_NAME = "clip_groups.jsonl"
+DEFAULT_DETECTIVE_CLIP_PLAN_NAME = "clip_plan_detective.jsonl"
+DEFAULT_EVENT_CLIP_MANIFEST_NAME = "extracted_event_clips.jsonl"
+DEFAULT_ACCEPTED_PAIRS_NAME = "accepted_pairs.jsonl"
 DEFAULT_LICENSE_NOTE = "internal research pilot only"
 VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
 ALLOWED_MODALITIES = {"visual", "audio"}
@@ -34,7 +38,11 @@ PAIR_PRIORITY = (
     "attribute",
     "scene",
     "speech",
+    "visible_text",
 )
+MIN_ACCEPT_SAME_CONTEXT_SCORE = 0.55
+MIN_ACCEPT_EDIT_MATCH_SCORE = 0.75
+MIN_ACCEPT_TARGET_UNIQUENESS_SCORE = 0.70
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 STOPWORDS = {
     "a",
@@ -271,6 +279,132 @@ def extract_clips(
     }
 
 
+def plan_detective_event_clips(
+    *,
+    root: str | Path,
+    source_clips_path: str | Path,
+    clip_plan_output_path: str | Path | None = None,
+    clip_groups_output_path: str | Path | None = None,
+    max_source_videos: int = 100,
+    segment_seconds: float = 8.0,
+    min_clip_seconds: float = 3.0,
+    max_clip_seconds: float = 15.0,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    source_clips = list(_load_jsonl(Path(source_clips_path)))
+    if not source_clips:
+        raise ValueError("source clip manifest is empty")
+    if min_clip_seconds <= 0:
+        raise ValueError("min_clip_seconds must be positive")
+    if max_clip_seconds < min_clip_seconds:
+        raise ValueError("max_clip_seconds must be >= min_clip_seconds")
+    if segment_seconds < min_clip_seconds or segment_seconds > max_clip_seconds:
+        raise ValueError("segment_seconds must stay within min/max clip seconds")
+
+    clip_plan_output = Path(clip_plan_output_path) if clip_plan_output_path else layout["metadata"] / DEFAULT_DETECTIVE_CLIP_PLAN_NAME
+    clip_groups_output = Path(clip_groups_output_path) if clip_groups_output_path else layout["metadata"] / DEFAULT_CLIP_GROUPS_NAME
+
+    plan_records: list[dict[str, Any]] = []
+    group_records: list[dict[str, Any]] = []
+    used_source_keys: set[str] = set()
+    single_segment_records: list[dict[str, Any]] = []
+    skipped_count = 0
+    probed_count = 0
+
+    for item in source_clips:
+        if len(used_source_keys) >= max_source_videos:
+            break
+        source_path = _source_clip_video_path(layout["root"], item)
+        if not source_path.exists():
+            skipped_count += 1
+            continue
+        source_key = str(source_path.resolve())
+        if source_key in used_source_keys:
+            continue
+        used_source_keys.add(source_key)
+        media = probe_media(source_path)
+        probed_count += 1
+        duration = _source_clip_duration_seconds(item, media)
+        if duration < min_clip_seconds:
+            skipped_count += 1
+            continue
+
+        source_clip_id = str(item.get("clip_id", "")).strip() or _stable_hash(source_key)
+        dataset = str(item.get("dataset", "unknown")).strip() or "unknown"
+        segments = _event_segments(
+            duration_seconds=duration,
+            segment_seconds=segment_seconds,
+            min_clip_seconds=min_clip_seconds,
+            max_clip_seconds=max_clip_seconds,
+        )
+        candidate_clip_ids: list[str] = []
+        for segment_index, (start_seconds, end_seconds) in enumerate(segments, start=1):
+            clip_id = f"{_safe_id(source_clip_id)}__seg_{segment_index:03d}"
+            group_id = f"group_{dataset}_{_stable_hash(source_key)}"
+            output_path = f"clips/detective/{dataset}/{clip_id}.mp4"
+            record = {
+                "clip_id": clip_id,
+                "source_path": str(source_path),
+                "output_path": output_path,
+                "start_seconds": round(start_seconds, 3),
+                "end_seconds": round(end_seconds, 3),
+                "duration_seconds": round(end_seconds - start_seconds, 3),
+                "role": "event_clip",
+                "notes": "planned by Omni-Detective event segmentation",
+                "dataset": dataset,
+                "source_clip_id": source_clip_id,
+                "group_id": group_id,
+                "source_row_ids": list(item.get("source_row_ids", [])),
+                "text_fields": item.get("text_fields", {}),
+                "media_probe": media,
+            }
+            source_asset_id = str(item.get("source_asset_id", "")).strip()
+            if source_asset_id:
+                record["source_asset_id"] = source_asset_id
+            plan_records.append(record)
+            candidate_clip_ids.append(clip_id)
+
+        if len(candidate_clip_ids) >= 2:
+            group_records.append(
+                {
+                    "group_id": f"group_{dataset}_{_stable_hash(source_key)}",
+                    "dataset": dataset,
+                    "group_reason": "same_source_video",
+                    "source_clip_ids": [source_clip_id],
+                    "candidate_clip_ids": candidate_clip_ids,
+                    "group_tags": _group_tags_from_clip(item),
+                    "source_path": _display_source_path(layout["root"], str(source_path)),
+                    "media_probe": media,
+                }
+            )
+        elif candidate_clip_ids:
+            single_segment_records.append(
+                {
+                    "dataset": dataset,
+                    "clip_id": candidate_clip_ids[0],
+                    "source_clip_id": source_clip_id,
+                    "tokens": sorted(_group_tokens_from_clip(item)),
+                }
+            )
+
+    group_records.extend(_semantic_singleton_groups(single_segment_records))
+    _write_jsonl(clip_plan_output, plan_records)
+    _write_jsonl(clip_groups_output, group_records)
+    return {
+        "source_clips_path": str(source_clips_path),
+        "clip_plan_output_path": str(clip_plan_output),
+        "clip_groups_output_path": str(clip_groups_output),
+        "source_video_count": len(used_source_keys),
+        "probed_count": probed_count,
+        "skipped_count": skipped_count,
+        "planned_clip_count": len(plan_records),
+        "group_count": len(group_records),
+        "segment_seconds": segment_seconds,
+        "min_clip_seconds": min_clip_seconds,
+        "max_clip_seconds": max_clip_seconds,
+    }
+
+
 def annotate_clips(
     *,
     root: str | Path,
@@ -369,8 +503,12 @@ def _annotate_clips_impl(
             detective_fallback_used = False
             raw_model_output: dict[str, Any] = {}
             if detective:
+                tool_observations = _build_toolbox_observations(clip_path)
                 try:
-                    normalized, raw_model_output = client.annotate_clip_detective(clip_path=str(clip_path))
+                    normalized, raw_model_output = client.annotate_clip_detective(
+                        clip_path=str(clip_path),
+                        tool_observations=tool_observations,
+                    )
                     fallback_used = False
                 except Exception as detective_exc:
                     detective_fallback_used = True
@@ -386,9 +524,11 @@ def _annotate_clips_impl(
                         normalized["speakers_and_transcript"] = []
                         normalized["detective_notes"] = ["detective annotation failed; used single-pass annotation"]
                         normalized["detective_trajectory"] = [
+                            *tool_observations,
                             {"stage": "detective_error", "error": raw_model_output["detective_error"]},
                             {"stage": "single_pass_fallback", "payload": single_pass_output},
                         ]
+                        normalized["uncertainties"] = ["detective annotation failed; used single-pass annotation"]
                         fallback_used = False
                         detective_to_single_pass_count += 1
                     except Exception as single_pass_exc:
@@ -435,6 +575,7 @@ def _annotate_clips_impl(
                         "speakers_and_transcript": list(normalized.get("speakers_and_transcript", [])),
                         "detective_notes": list(normalized.get("detective_notes", [])),
                         "detective_trajectory": list(normalized.get("detective_trajectory", [])),
+                        "uncertainties": list(normalized.get("uncertainties", [])),
                         "detective_fallback_used": detective_fallback_used,
                     }
                 )
@@ -612,6 +753,191 @@ def propose_pairs(
     }
 
 
+def propose_group_pairs(
+    *,
+    root: str | Path,
+    clip_annotations_path: str | Path,
+    clip_groups_path: str | Path,
+    base_url: str,
+    api_key: str,
+    model: str,
+    output_path: str | Path | None = None,
+    accepted_output_path: str | Path | None = None,
+    raw_index_path: str | Path | None = None,
+    overwrite: bool = False,
+    timeout_seconds: float = 180.0,
+    max_accepted_pairs: int = 10,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    annotations_path = Path(clip_annotations_path)
+    groups_path = Path(clip_groups_path)
+    annotations = list(_load_jsonl(annotations_path))
+    groups = list(_load_jsonl(groups_path))
+    if not annotations:
+        raise ValueError("clip annotations are empty")
+    if not groups:
+        raise ValueError("clip groups are empty")
+
+    output = Path(output_path) if output_path else layout["pairs"] / "judged_pair_proposals.jsonl"
+    accepted_output = Path(accepted_output_path) if accepted_output_path else layout["pairs"] / DEFAULT_ACCEPTED_PAIRS_NAME
+    existing_records = {} if overwrite else _load_records_by_key(output, "proposal_id")
+    raw_index = _load_raw_asset_index(Path(raw_index_path) if raw_index_path else layout["metadata"] / DEFAULT_RAW_INDEX_NAME)
+    annotations_by_id = {str(item.get("clip_id", "")).strip(): item for item in annotations if str(item.get("clip_id", "")).strip()}
+    client = OpenAIComposedDataClient(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout_seconds=timeout_seconds,
+    )
+
+    output_records: list[dict[str, Any]] = []
+    accepted_records: list[dict[str, Any]] = []
+    candidate_count = 0
+    proposed_count = 0
+    reused_count = 0
+    fallback_count = 0
+    rejected_count = 0
+    accepted_total_count = 0
+    seen_proposal_ids: set[str] = set()
+
+    for group in groups:
+        group_id = str(group.get("group_id", "")).strip()
+        candidate_clip_ids = [str(value).strip() for value in group.get("candidate_clip_ids", []) if str(value).strip()]
+        group_annotations = [
+            annotations_by_id[clip_id]
+            for clip_id in candidate_clip_ids
+            if clip_id in annotations_by_id and not bool(annotations_by_id[clip_id].get("fallback_used"))
+        ]
+        if len(group_annotations) < 4:
+            continue
+        candidates = _build_pair_candidates(root=layout["root"], annotations=group_annotations)
+        candidate_count += len(candidates)
+        for candidate in candidates:
+            proposal_id = candidate["proposal_id"]
+            if proposal_id in seen_proposal_ids:
+                continue
+            seen_proposal_ids.add(proposal_id)
+            if proposal_id in existing_records:
+                record = existing_records[proposal_id]
+                reused_count += 1
+            else:
+                reference_annotation = candidate["reference_annotation"]
+                target_annotation = candidate["target_annotation"]
+                raw_model_output: dict[str, Any] = {}
+                judge_raw_output: dict[str, Any] = {}
+                try:
+                    model_fields, raw_model_output = client.propose_pair(
+                        reference_annotation=_annotation_prompt_view(reference_annotation),
+                        target_annotation=_annotation_prompt_view(target_annotation),
+                        hard_negative_candidates=[
+                            _annotation_prompt_view(annotation) for annotation in candidate["hard_negative_annotations"]
+                        ],
+                    )
+                    proposal_fallback_used = False
+                except Exception as exc:
+                    model_fields = _fallback_pair_model_fields(
+                        reference_annotation=reference_annotation,
+                        target_annotation=target_annotation,
+                        primary_difference=candidate["primary_difference"],
+                    )
+                    raw_model_output = {"error": f"{type(exc).__name__}: {exc}"}
+                    proposal_fallback_used = True
+
+                source = _build_source_metadata(
+                    root=layout["root"],
+                    target_annotation=target_annotation,
+                    raw_index=raw_index,
+                )
+                proposal_view = {
+                    "proposal_id": proposal_id,
+                    "edit_text": model_fields["edit_text"],
+                    "modalities": list(model_fields["modalities"]),
+                    "reference_caption": model_fields["reference_caption"],
+                    "target_caption": model_fields["target_caption"],
+                    "difference": model_fields["difference"],
+                    "quality": dict(candidate["quality"]),
+                }
+                try:
+                    judge, judge_raw_output = client.judge_pair(
+                        proposal=proposal_view,
+                        reference_annotation=_annotation_prompt_view(reference_annotation),
+                        target_annotation=_annotation_prompt_view(target_annotation),
+                        hard_negative_candidates=[
+                            _annotation_prompt_view(annotation) for annotation in candidate["hard_negative_annotations"]
+                        ],
+                    )
+                    judge_fallback_used = False
+                except Exception as exc:
+                    judge = _fallback_pair_judge(candidate["quality"], reason=f"{type(exc).__name__}: {exc}")
+                    judge_raw_output = {"error": f"{type(exc).__name__}: {exc}"}
+                    judge_fallback_used = True
+
+                fallback_used = proposal_fallback_used or judge_fallback_used
+                accepted = _judge_accepts(judge)
+                record = {
+                    "proposal_id": proposal_id,
+                    "group_id": group_id,
+                    "group_reason": str(group.get("group_reason", "")).strip(),
+                    "reference_video": reference_annotation["output_path"],
+                    "target_video": target_annotation["output_path"],
+                    "edit_text": model_fields["edit_text"],
+                    "modalities": list(model_fields["modalities"]),
+                    "reference_caption": model_fields["reference_caption"],
+                    "target_caption": model_fields["target_caption"],
+                    "difference": model_fields["difference"],
+                    "hard_negatives": list(candidate["hard_negative_paths"]),
+                    "quality": {
+                        "same_context_score": judge["same_context_score"],
+                        "edit_match_score": judge["edit_match_score"],
+                        "target_uniqueness_score": judge["target_uniqueness_score"],
+                    },
+                    "heuristic_quality": dict(candidate["quality"]),
+                    "source_context": dict(candidate["source_context"]),
+                    "source": source,
+                    "proposal_reason": model_fields["proposal_reason"],
+                    "evidence": _evidence_from_annotations(reference_annotation, target_annotation),
+                    "judge": judge,
+                    "accepted": accepted,
+                    "fallback_used": fallback_used,
+                    "raw_model_output": raw_model_output,
+                    "raw_judge_output": judge_raw_output,
+                }
+                proposed_count += 1
+
+            if bool(record.get("fallback_used")):
+                fallback_count += 1
+            if bool(record.get("accepted")):
+                accepted_total_count += 1
+                if len(accepted_records) < max_accepted_pairs:
+                    accepted_records.append(_accepted_sample_from_record(record, len(accepted_records) + 1))
+            else:
+                rejected_count += 1
+            output_records.append(record)
+
+    _write_jsonl(output, output_records)
+    _write_jsonl(accepted_output, accepted_records)
+    return {
+        "clip_annotations_path": str(annotations_path),
+        "clip_groups_path": str(groups_path),
+        "output_path": str(output),
+        "accepted_output_path": str(accepted_output),
+        "group_count": len(groups),
+        "candidate_count": candidate_count,
+        "proposal_count": len(output_records),
+        "accepted_count": len(accepted_records),
+        "accepted_total_count": accepted_total_count,
+        "rejected_count": rejected_count,
+        "proposed_count": proposed_count,
+        "reused_count": reused_count,
+        "fallback_count": fallback_count,
+        "thresholds": {
+            "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
+            "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
+            "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
+        },
+    }
+
+
 def validate_pilot_dataset(
     *,
     root: str | Path,
@@ -747,6 +1073,223 @@ def _quality_summary(same_context_scores: list[float]) -> dict[str, float]:
     }
 
 
+def probe_media(source_path: str | Path) -> dict[str, Any]:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        str(source_path),
+    ]
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        payload = json.loads(completed.stdout or "{}")
+    except Exception as exc:
+        return {
+            "duration_seconds": 0.0,
+            "has_audio": False,
+            "has_video": False,
+            "width": 0,
+            "height": 0,
+            "fps": 0.0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    streams = payload.get("streams", []) if isinstance(payload, dict) else []
+    video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+    audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), {})
+    duration = _media_duration(payload, video_stream)
+    return {
+        "duration_seconds": round(duration, 3),
+        "has_audio": bool(audio_stream),
+        "has_video": bool(video_stream),
+        "width": int(video_stream.get("width") or 0),
+        "height": int(video_stream.get("height") or 0),
+        "fps": round(_parse_fraction(str(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "")), 3),
+    }
+
+
+def _build_toolbox_observations(clip_path: Path) -> list[dict[str, Any]]:
+    media = probe_media(clip_path)
+    duration = float(media.get("duration_seconds") or 0.0)
+    frame_times = _sample_frame_times(duration)
+    audio_note = (
+        "audio track present; inspect speech, music, acoustic events, and audio-visual synchronization"
+        if media.get("has_audio")
+        else "no audio stream detected by ffprobe"
+    )
+    return [
+        {
+            "tool": "media_probe",
+            "observation": media,
+        },
+        {
+            "tool": "frame_sampler",
+            "observation": {
+                "sample_times": frame_times,
+                "instruction": "use these timestamps as key visual moments for subjects, actions, scene, and visible text",
+            },
+        },
+        {
+            "tool": "audio_observer",
+            "observation": {
+                "note": audio_note,
+                "max_audio_window_seconds": 30.0,
+            },
+        },
+        {
+            "tool": "ocr_asr_observer",
+            "observation": {
+                "instruction": "extract visible text and spoken content when present; leave uncertainty if unreadable or inaudible",
+            },
+        },
+    ]
+
+
+def _sample_frame_times(duration_seconds: float) -> list[float]:
+    if duration_seconds <= 0:
+        return []
+    count = 3 if duration_seconds <= 6 else 6
+    if count == 1:
+        return [round(duration_seconds / 2, 3)]
+    step = duration_seconds / (count + 1)
+    return [round(step * index, 3) for index in range(1, count + 1)]
+
+
+def _media_duration(payload: dict[str, Any], video_stream: dict[str, Any]) -> float:
+    for raw_value in (
+        payload.get("format", {}).get("duration") if isinstance(payload.get("format"), dict) else None,
+        video_stream.get("duration"),
+    ):
+        try:
+            duration = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if duration > 0:
+            return duration
+    return 0.0
+
+
+def _parse_fraction(value: str) -> float:
+    if "/" in value:
+        numerator, denominator = value.split("/", 1)
+        try:
+            denominator_value = float(denominator)
+            return float(numerator) / denominator_value if denominator_value else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _source_clip_video_path(root: Path, item: dict[str, Any]) -> Path:
+    source_path = str(item.get("source_path", "")).strip()
+    if source_path:
+        path = Path(source_path)
+        return path if path.is_absolute() else root / path
+    output_path = str(item.get("output_path", "")).strip()
+    if output_path:
+        return _resolve_under_root(root, output_path)
+    return root / "__missing_source_clip__"
+
+
+def _source_clip_duration_seconds(item: dict[str, Any], media: dict[str, Any]) -> float:
+    for value in (
+        media.get("duration_seconds"),
+        item.get("duration_seconds"),
+    ):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    start = _optional_float(item.get("start_seconds"))
+    end = _optional_float(item.get("end_seconds"))
+    if start is not None and end is not None and end > start:
+        return end - start
+    return 0.0
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _event_segments(
+    *,
+    duration_seconds: float,
+    segment_seconds: float,
+    min_clip_seconds: float,
+    max_clip_seconds: float,
+) -> list[tuple[float, float]]:
+    if duration_seconds < min_clip_seconds:
+        return []
+    if duration_seconds <= max_clip_seconds:
+        return [(0.0, duration_seconds)]
+    segment_length = min(max(segment_seconds, min_clip_seconds), max_clip_seconds)
+    segments: list[tuple[float, float]] = []
+    start = 0.0
+    while start < duration_seconds:
+        end = min(start + segment_length, duration_seconds)
+        if end - start >= min_clip_seconds:
+            segments.append((start, end))
+        elif segments:
+            previous_start, _previous_end = segments[-1]
+            segments[-1] = (previous_start, duration_seconds)
+        start += segment_length
+    return segments
+
+
+def _group_tags_from_clip(item: dict[str, Any]) -> list[str]:
+    tokens = _group_tokens_from_clip(item)
+    return sorted(tokens)[:8]
+
+
+def _group_tokens_from_clip(item: dict[str, Any]) -> set[str]:
+    tokens = set()
+    tokens.update(_text_field_tokens(item.get("text_fields", {})))
+    tokens.update(_tokenize_text(str(item.get("dataset", ""))))
+    tokens.update(_tokenize_text(str(item.get("clip_id", ""))))
+    return tokens
+
+
+def _semantic_singleton_groups(items: list[dict[str, Any]], *, group_size: int = 8) -> list[dict[str, Any]]:
+    by_dataset: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        by_dataset.setdefault(str(item.get("dataset", "unknown")), []).append(item)
+
+    groups: list[dict[str, Any]] = []
+    for dataset, dataset_items in sorted(by_dataset.items()):
+        dataset_items.sort(key=lambda item: (item.get("tokens", []), item["clip_id"]))
+        for group_index, start in enumerate(range(0, len(dataset_items), group_size), start=1):
+            chunk = dataset_items[start : start + group_size]
+            if len(chunk) < 2:
+                continue
+            clip_ids = [str(item["clip_id"]) for item in chunk]
+            token_counter: Counter[str] = Counter()
+            for item in chunk:
+                token_counter.update(item.get("tokens", []))
+            group_tags = [token for token, _count in token_counter.most_common(8)]
+            groups.append(
+                {
+                    "group_id": f"group_{dataset}_semantic_{group_index:03d}",
+                    "dataset": dataset,
+                    "group_reason": "semantic_cluster",
+                    "source_clip_ids": [str(item.get("source_clip_id", "")) for item in chunk],
+                    "candidate_clip_ids": clip_ids,
+                    "group_tags": group_tags,
+                }
+            )
+    return groups
+
+
 def build_ffmpeg_extract_command(
     *,
     source_path: str | Path,
@@ -786,6 +1329,14 @@ def _build_asset_id(dataset_name: str, relative_path: str) -> str:
     slug = slug[:32]
     digest = hashlib.sha1(relative_path.encode("utf-8")).hexdigest()[:12]
     return f"{dataset_name}__{slug}__{digest}"
+
+
+def _stable_hash(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _safe_id(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_]+", "_", value).strip("_")[:80] or "clip"
 
 
 def _build_gallery_id(video_path: str) -> str:
@@ -1264,6 +1815,18 @@ def _detect_primary_difference(reference: dict[str, Any], target: dict[str, Any]
             "description": "the spoken content changes between the clips",
         }
 
+    reference_text = _normalize_list(reference.get("visible_text") or reference.get("on_screen_text", []))
+    target_text = _normalize_list(target.get("visible_text") or target.get("on_screen_text", []))
+    added_text = _first_unique(target_text, reference_text)
+    removed_text = _first_unique(reference_text, target_text)
+    if added_text or removed_text:
+        differences["visible_text"] = {
+            "type": "visible_text",
+            "from": removed_text or _first_item(reference_text) or "no visible text",
+            "to": added_text or _first_item(target_text) or "new visible text",
+            "description": "the visible on-screen text changes between the clips",
+        }
+
     changed_types = [difference_type for difference_type in PAIR_PRIORITY if difference_type in differences]
     if not changed_types:
         return None
@@ -1281,7 +1844,7 @@ def _edit_match_score(
     if primary_difference_type not in PAIR_PRIORITY:
         return 0.0
     base_score = 0.5 + same_context_score * 0.35
-    if primary_difference_type in {"object_count", "object_presence", "action", "audio_event"}:
+    if primary_difference_type in {"object_count", "object_presence", "action", "audio_event", "visible_text"}:
         base_score += 0.1
     penalty = max(0, len(changed_types) - 1) * 0.10
     return max(0.0, min(1.0, base_score - penalty))
@@ -1346,6 +1909,10 @@ def _annotation_prompt_view(annotation: dict[str, Any]) -> dict[str, Any]:
         "speech": list(annotation.get("speech", [])),
         "audio_events": list(annotation.get("audio_events", [])),
         "modalities": list(annotation.get("modalities", [])),
+        "storyline": list(annotation.get("storyline", [])),
+        "visible_text": list(annotation.get("visible_text", [])),
+        "speakers_and_transcript": list(annotation.get("speakers_and_transcript", [])),
+        "uncertainties": list(annotation.get("uncertainties", [])),
     }
 
 
@@ -1398,6 +1965,8 @@ def _build_fallback_edit_text(primary_difference: dict[str, Any]) -> str:
         return f"change the scene from {from_value} to {to_value}"
     if difference_type == "speech":
         return f"change the speech from {from_value} to {to_value}"
+    if difference_type == "visible_text":
+        return f"change the visible text from {from_value} to {to_value}"
     return str(primary_difference.get("description", "")).strip() or f"change {from_value} to {to_value}"
 
 
@@ -1416,6 +1985,84 @@ def _infer_pair_modalities(
     if "visual" not in modalities:
         modalities.insert(0, "visual")
     return modalities
+
+
+def _fallback_pair_judge(quality: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    return {
+        "reference_satisfies_edit": False,
+        "target_satisfies_edit": False,
+        "single_main_difference": False,
+        "same_context_score": _score_float(quality.get("same_context_score")),
+        "edit_match_score": _score_float(quality.get("edit_match_score")),
+        "target_uniqueness_score": _score_float(quality.get("target_uniqueness_score")),
+        "audio_required": False,
+        "hard_negative_quality": "weak",
+        "accept": False,
+        "reject_reason": f"pair judge fallback: {reason}",
+    }
+
+
+def _judge_accepts(judge: dict[str, Any]) -> bool:
+    return bool(
+        judge.get("accept")
+        and not judge.get("reference_satisfies_edit")
+        and judge.get("target_satisfies_edit")
+        and judge.get("single_main_difference")
+        and judge.get("hard_negative_quality") in {"good", "weak"}
+        and _score_float(judge.get("same_context_score")) >= MIN_ACCEPT_SAME_CONTEXT_SCORE
+        and _score_float(judge.get("edit_match_score")) >= MIN_ACCEPT_EDIT_MATCH_SCORE
+        and _score_float(judge.get("target_uniqueness_score")) >= MIN_ACCEPT_TARGET_UNIQUENESS_SCORE
+    )
+
+
+def _score_float(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, parsed))
+
+
+def _evidence_from_annotations(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "reference_storyline": list(reference_annotation.get("storyline", [])),
+        "target_storyline": list(target_annotation.get("storyline", [])),
+        "audio_change": _change_text(reference_annotation.get("audio_events", []), target_annotation.get("audio_events", [])),
+        "visible_text_change": _change_text(
+            reference_annotation.get("visible_text") or reference_annotation.get("on_screen_text", []),
+            target_annotation.get("visible_text") or target_annotation.get("on_screen_text", []),
+        ),
+    }
+
+
+def _change_text(left: Any, right: Any) -> str:
+    left_values = _normalize_list(left)
+    right_values = _normalize_list(right)
+    if left_values == right_values:
+        return ""
+    return f"{'; '.join(left_values) or 'none'} -> { '; '.join(right_values) or 'none'}"
+
+
+def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str, Any]:
+    return {
+        "sample_id": f"covr_omni_pilot_{index:04d}",
+        "proposal_id": record["proposal_id"],
+        "reference_video": record["reference_video"],
+        "target_video": record["target_video"],
+        "edit_text": record["edit_text"],
+        "modalities": list(record["modalities"]),
+        "reference_caption": record["reference_caption"],
+        "target_caption": record["target_caption"],
+        "difference": dict(record["difference"]),
+        "hard_negatives": list(record["hard_negatives"]),
+        "quality": dict(record["quality"]),
+        "source": dict(record["source"]),
+        "source_context": dict(record.get("source_context", {})),
+        "evidence": dict(record.get("evidence", {})),
+        "judge": dict(record.get("judge", {})),
+        "group_id": record.get("group_id", ""),
+        "group_reason": record.get("group_reason", ""),
+    }
 
 
 def _build_source_metadata(
@@ -1615,6 +2262,16 @@ def build_parser() -> argparse.ArgumentParser:
     extract_clips_parser.add_argument("--dry-run", action="store_true")
     extract_clips_parser.add_argument("--overwrite", action="store_true")
 
+    plan_detective_parser = subparsers.add_parser("plan-detective-clips")
+    plan_detective_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    plan_detective_parser.add_argument("--source-clips-path", required=True)
+    plan_detective_parser.add_argument("--clip-plan-output-path")
+    plan_detective_parser.add_argument("--clip-groups-output-path")
+    plan_detective_parser.add_argument("--max-source-videos", type=int, default=100)
+    plan_detective_parser.add_argument("--segment-seconds", type=float, default=8.0)
+    plan_detective_parser.add_argument("--min-clip-seconds", type=float, default=3.0)
+    plan_detective_parser.add_argument("--max-clip-seconds", type=float, default=15.0)
+
     annotate_clips_parser = subparsers.add_parser("annotate-clips")
     annotate_clips_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
     annotate_clips_parser.add_argument("--clips-manifest-path", required=True)
@@ -1645,6 +2302,20 @@ def build_parser() -> argparse.ArgumentParser:
     propose_pairs_parser.add_argument("--model", required=True)
     propose_pairs_parser.add_argument("--timeout-seconds", type=float, default=180.0)
     propose_pairs_parser.add_argument("--overwrite", action="store_true")
+
+    propose_group_pairs_parser = subparsers.add_parser("propose-group-pairs")
+    propose_group_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    propose_group_pairs_parser.add_argument("--clip-annotations-path", required=True)
+    propose_group_pairs_parser.add_argument("--clip-groups-path", required=True)
+    propose_group_pairs_parser.add_argument("--output-path")
+    propose_group_pairs_parser.add_argument("--accepted-output-path")
+    propose_group_pairs_parser.add_argument("--raw-index-path")
+    propose_group_pairs_parser.add_argument("--base-url", required=True)
+    propose_group_pairs_parser.add_argument("--api-key", required=True)
+    propose_group_pairs_parser.add_argument("--model", required=True)
+    propose_group_pairs_parser.add_argument("--timeout-seconds", type=float, default=180.0)
+    propose_group_pairs_parser.add_argument("--max-accepted-pairs", type=int, default=10)
+    propose_group_pairs_parser.add_argument("--overwrite", action="store_true")
 
     validate_pilot_parser = subparsers.add_parser("validate-pilot")
     validate_pilot_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -1696,6 +2367,20 @@ def main() -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
+    if args.command == "plan-detective-clips":
+        result = plan_detective_event_clips(
+            root=args.root,
+            source_clips_path=args.source_clips_path,
+            clip_plan_output_path=args.clip_plan_output_path,
+            clip_groups_output_path=args.clip_groups_output_path,
+            max_source_videos=args.max_source_videos,
+            segment_seconds=args.segment_seconds,
+            min_clip_seconds=args.min_clip_seconds,
+            max_clip_seconds=args.max_clip_seconds,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
     if args.command == "detective-annotate-clips":
         result = detective_annotate_clips(
             root=args.root,
@@ -1705,6 +2390,7 @@ def main() -> None:
             api_key=args.api_key,
             model=args.model,
             timeout_seconds=args.timeout_seconds,
+            max_accepted_pairs=args.max_accepted_pairs,
             overwrite=args.overwrite,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -1715,6 +2401,23 @@ def main() -> None:
             root=args.root,
             clip_annotations_path=args.clip_annotations_path,
             output_path=args.output_path,
+            raw_index_path=args.raw_index_path,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            timeout_seconds=args.timeout_seconds,
+            overwrite=args.overwrite,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "propose-group-pairs":
+        result = propose_group_pairs(
+            root=args.root,
+            clip_annotations_path=args.clip_annotations_path,
+            clip_groups_path=args.clip_groups_path,
+            output_path=args.output_path,
+            accepted_output_path=args.accepted_output_path,
             raw_index_path=args.raw_index_path,
             base_url=args.base_url,
             api_key=args.api_key,
