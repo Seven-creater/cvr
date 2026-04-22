@@ -706,3 +706,169 @@ accepted_pairs.jsonl 是否至少 5 条
 pilot_review.md 中 same_context_avg 是否明显高于 0.141
 人工 review 后是否能保留 60% 以上
 ```
+
+## 12. 2026-04-22 晚间结果更新
+
+基于 Omni-Detective 新链路，服务器已经实际跑出一版更可信的 pilot：
+
+```text
+git HEAD (server workspace at run time): 8b4dd8d55ae37b3e84bcc7fe9177eca314ecd131
+detective annotation clip_count: 160
+annotated_count: 160
+fallback_count: 1
+detective_to_single_pass_count: 2
+
+judged proposals: 47
+accepted pairs: 5
+rejected pairs: 42
+
+pilot sample_count: 5
+gallery_count: 13
+same_context_min: 0.80
+same_context_avg: 0.84
+same_context_max: 0.90
+```
+
+这是一个重要分水岭。
+
+前面 single-pass / early detective 版本的核心问题一直是：
+
+```text
+same_context 太低
+reference 和 target 虽然“像是能改写”，但上下文并不真的近
+```
+
+这次新链路下，accepted 样本全部来自：
+
+```text
+same_source_video
+```
+
+也就是说，**同上下文约束已经真正起作用了**。  
+从数据质量角度看，这比前面单纯刷更多 pilot50 更有意义。
+
+### 12.1 当前 accepted 样本结构
+
+当前 accepted 的 5 条样本中：
+
+```text
+difference_type:
+- object_presence: 3
+- action: 1
+- attribute: 1
+
+modalities:
+- visual: 5
+- audio: 1
+```
+
+当前自动验收：
+
+```text
+sample_count_between_5_and_10: PASS
+object_change_samples_at_least_2: PASS
+action_samples_at_least_1: PASS
+audio_samples_at_least_2: FAIL
+```
+
+这说明我们已经解决了“配不出高上下文 pair”的主问题，但还没有解决“音频相关样本进入 accepted 集合的比例太低”这个新问题。
+
+### 12.2 当前瓶颈从 context 转移到了 audio / speech / visible_text
+
+服务器分析结果显示：
+
+```text
+total judged rows: 47
+accepted rows: 5
+rejected rows: 42
+
+difference_type all:
+- object_presence: 15
+- action: 12
+- attribute: 8
+- scene: 7
+- speech: 4
+- audio_event: 1
+
+judge.audio_required = True: 28
+audio-related rejected_count: 29
+```
+
+而且过去很烦人的一个问题也暴露得很清楚：
+
+```text
+很多 rejected rows 的 reject_reason 是空字符串
+```
+
+这会让后续分析非常低效，因为我们只能看到“被拒了”，但不知道是：
+
+- same_context 不够
+- edit_match 不够
+- uniqueness 不够
+- reference/target 判定不对
+- 还是 judge 自己虽然拒绝了，但没把原因写出来
+
+### 12.3 今天本地代码补的两类修复
+
+为了让下一轮结果更可解释，也更贴近 Omni-Captioner 的“证据驱动 pair 构造”，今天本地代码补了两类修复：
+
+#### A. Judge 诊断补强
+
+即使模型本身返回空的 `reject_reason`，代码现在也会在最终写盘前补上结构化失败原因，例如：
+
+```text
+same_context_score 0.211 is below 0.55
+edit_match_score 0.405 is below 0.75
+target_uniqueness_score 0.603 is below 0.70
+the model judge did not accept the pair
+```
+
+这意味着下一轮再看 `judged_pair_proposals.jsonl`，可以直接按失败门槛做分桶分析，而不是再人工猜。
+
+#### B. Proposal / Judge 的单差异约束补强
+
+本地 prompt 现在更明确要求：
+
+- `difference.type`
+- `edit_text`
+- `modalities`
+- `difference.from / difference.to`
+
+必须共同指向 **同一个主差异**。
+
+同时新增了更贴近本任务的偏好：
+
+- 如果 pair 来自 `same_source_video` 或高度相似上下文，
+- 且主变化是 `speech / audio_event / visible_text`，
+- 就优先把它当成真正的 composed edit，
+- 不要再被泛化成 `attribute`、`scene` 或带次要变化的混合 edit。
+
+#### C. 高上下文 pair 的差异优先级微调
+
+在高上下文 pair 中，本地启发式排序会更优先考虑：
+
+```text
+speech
+audio_event
+visible_text
+```
+
+避免它们总是被 `object_presence / action / attribute` 这些更泛的差异压掉。
+
+### 12.4 当前阶段的结论
+
+截至 2026-04-22 晚间，项目的判断可以更新成：
+
+```text
+1. “高上下文 pair 难以构造” 这个问题，已经基本被同源切片 + 组内配对解决。
+2. 当前真正的短板，已经收缩成 audio/speech/visible_text 类型进入 accepted 集的比例不够高。
+3. 所以下一步不应该回头继续刷旧 pilot50，而应该继续沿 Omni-Detective 方向，把 audio observer / speech / visible text 这条证据链做扎实。
+```
+
+换句话说：
+
+```text
+我们现在已经从“链路通不通”阶段，进入到“accepted 样本的模态覆盖够不够好”阶段了。
+```
+
+这其实是进展，不是原地踏步。

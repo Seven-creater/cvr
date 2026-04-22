@@ -40,6 +40,16 @@ PAIR_PRIORITY = (
     "speech",
     "visible_text",
 )
+HIGH_CONTEXT_PAIR_PRIORITY = (
+    "object_count",
+    "speech",
+    "audio_event",
+    "visible_text",
+    "object_presence",
+    "action",
+    "attribute",
+    "scene",
+)
 MIN_ACCEPT_SAME_CONTEXT_SCORE = 0.55
 MIN_ACCEPT_EDIT_MATCH_SCORE = 0.75
 MIN_ACCEPT_TARGET_UNIQUENESS_SCORE = 0.70
@@ -836,6 +846,12 @@ def propose_group_pairs(
                         hard_negative_candidates=[
                             _annotation_prompt_view(annotation) for annotation in candidate["hard_negative_annotations"]
                         ],
+                        heuristic_pair={
+                            "primary_difference": dict(candidate["primary_difference"]),
+                            "changed_difference_types": list(candidate["changed_difference_types"]),
+                            "heuristic_quality": dict(candidate["quality"]),
+                            "source_context": dict(candidate["source_context"]),
+                        },
                     )
                     proposal_fallback_used = False
                 except Exception as exc:
@@ -860,6 +876,14 @@ def propose_group_pairs(
                     "target_caption": model_fields["target_caption"],
                     "difference": model_fields["difference"],
                     "quality": dict(candidate["quality"]),
+                    "heuristic_primary_difference": dict(candidate["primary_difference"]),
+                    "changed_difference_types": list(candidate["changed_difference_types"]),
+                    "source_context": dict(candidate["source_context"]),
+                    "acceptance_thresholds": {
+                        "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
+                        "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
+                        "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
+                    },
                 }
                 try:
                     judge, judge_raw_output = client.judge_pair(
@@ -876,6 +900,7 @@ def propose_group_pairs(
                     judge_raw_output = {"error": f"{type(exc).__name__}: {exc}"}
                     judge_fallback_used = True
 
+                judge = _finalize_pair_judge(judge)
                 fallback_used = proposal_fallback_used or judge_fallback_used
                 accepted = _judge_accepts(judge)
                 record = {
@@ -1542,7 +1567,12 @@ def _score_ordered_pair(
     source_context = _source_context(reference_annotation, target_annotation)
     if source_context["relation"] == "cross_dataset":
         return None
-    primary_difference = _detect_primary_difference(reference_annotation, target_annotation)
+    priority_order = _difference_priority_order(same_context_score=same_context_score)
+    primary_difference = _detect_primary_difference(
+        reference_annotation,
+        target_annotation,
+        priority_order=priority_order,
+    )
     if primary_difference is None:
         return None
     changed_types = primary_difference.pop("changed_types")
@@ -1603,6 +1633,7 @@ def _score_ordered_pair(
         "reference_annotation": _sanitize_annotation_for_output(reference_annotation, root),
         "target_annotation": _sanitize_annotation_for_output(target_annotation, root),
         "primary_difference": primary_difference,
+        "changed_difference_types": list(changed_types),
         "quality": quality,
         "composite_score": composite_score,
         "source_context": source_context,
@@ -1715,6 +1746,12 @@ def _same_context_score(left: dict[str, Any], right: dict[str, Any]) -> float:
     return max(0.0, min(1.0, score))
 
 
+def _difference_priority_order(*, same_context_score: float) -> tuple[str, ...]:
+    if same_context_score >= 0.70:
+        return HIGH_CONTEXT_PAIR_PRIORITY
+    return PAIR_PRIORITY
+
+
 def _scene_similarity(left: str, right: str) -> float:
     left_value = left.strip().lower()
     right_value = right.strip().lower()
@@ -1725,7 +1762,12 @@ def _scene_similarity(left: str, right: str) -> float:
     return _jaccard(_tokenize_text(left_value), _tokenize_text(right_value))
 
 
-def _detect_primary_difference(reference: dict[str, Any], target: dict[str, Any]) -> dict[str, Any] | None:
+def _detect_primary_difference(
+    reference: dict[str, Any],
+    target: dict[str, Any],
+    *,
+    priority_order: tuple[str, ...] = PAIR_PRIORITY,
+) -> dict[str, Any] | None:
     differences: dict[str, dict[str, Any]] = {}
 
     reference_counts = _normalize_object_counts(reference.get("object_counts", {}))
@@ -1831,7 +1873,7 @@ def _detect_primary_difference(reference: dict[str, Any], target: dict[str, Any]
             "description": "the visible on-screen text changes between the clips",
         }
 
-    changed_types = [difference_type for difference_type in PAIR_PRIORITY if difference_type in differences]
+    changed_types = [difference_type for difference_type in priority_order if difference_type in differences]
     if not changed_types:
         return None
     primary = dict(differences[changed_types[0]])
@@ -1848,8 +1890,10 @@ def _edit_match_score(
     if primary_difference_type not in PAIR_PRIORITY:
         return 0.0
     base_score = 0.5 + same_context_score * 0.35
-    if primary_difference_type in {"object_count", "object_presence", "action", "audio_event", "visible_text"}:
+    if primary_difference_type in {"object_count", "object_presence", "action", "audio_event", "speech", "visible_text"}:
         base_score += 0.1
+    if primary_difference_type in {"audio_event", "speech", "visible_text"} and same_context_score >= 0.70:
+        base_score += 0.08
     penalty = max(0, len(changed_types) - 1) * 0.10
     return max(0.0, min(1.0, base_score - penalty))
 
@@ -2004,6 +2048,60 @@ def _fallback_pair_judge(quality: dict[str, Any], *, reason: str) -> dict[str, A
         "accept": False,
         "reject_reason": f"pair judge fallback: {reason}",
     }
+
+
+def _finalize_pair_judge(judge: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(judge)
+    accepted = _judge_accepts(normalized)
+    if accepted:
+        normalized["reject_reason"] = ""
+        return normalized
+    normalized["reject_reason"] = _compose_reject_reason(normalized)
+    return normalized
+
+
+def _compose_reject_reason(judge: dict[str, Any]) -> str:
+    original_reason = str(judge.get("reject_reason", "")).strip()
+    failures: list[str] = []
+    if judge.get("reference_satisfies_edit"):
+        failures.append("reference already satisfies the edit")
+    if not judge.get("target_satisfies_edit"):
+        failures.append("target does not satisfy the edit")
+    if not judge.get("single_main_difference"):
+        failures.append("the pair does not contain a single main difference")
+    hard_negative_quality = str(judge.get("hard_negative_quality", "")).strip().lower()
+    if hard_negative_quality not in {"good", "weak"}:
+        failures.append(f"hard_negative_quality is {hard_negative_quality or 'bad'}")
+
+    same_context_score = _score_float(judge.get("same_context_score"))
+    if same_context_score < MIN_ACCEPT_SAME_CONTEXT_SCORE:
+        failures.append(
+            f"same_context_score {same_context_score:.3f} is below {MIN_ACCEPT_SAME_CONTEXT_SCORE:.2f}"
+        )
+    edit_match_score = _score_float(judge.get("edit_match_score"))
+    if edit_match_score < MIN_ACCEPT_EDIT_MATCH_SCORE:
+        failures.append(
+            f"edit_match_score {edit_match_score:.3f} is below {MIN_ACCEPT_EDIT_MATCH_SCORE:.2f}"
+        )
+    target_uniqueness_score = _score_float(judge.get("target_uniqueness_score"))
+    if target_uniqueness_score < MIN_ACCEPT_TARGET_UNIQUENESS_SCORE:
+        failures.append(
+            f"target_uniqueness_score {target_uniqueness_score:.3f} is below {MIN_ACCEPT_TARGET_UNIQUENESS_SCORE:.2f}"
+        )
+    if not judge.get("accept"):
+        failures.append("the model judge did not accept the pair")
+
+    unique_failures: list[str] = []
+    for failure in failures:
+        if failure not in unique_failures:
+            unique_failures.append(failure)
+    if original_reason and unique_failures:
+        return f"{original_reason} Final gate check: {'; '.join(unique_failures)}."
+    if original_reason:
+        return original_reason
+    if unique_failures:
+        return "; ".join(unique_failures)
+    return "the pair was rejected without a structured reason from the judge"
 
 
 def _judge_accepts(judge: dict[str, Any]) -> bool:

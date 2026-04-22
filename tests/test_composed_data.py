@@ -7,6 +7,8 @@ from pathlib import Path
 from unittest import mock
 
 from app.composed_data import (
+    _compose_reject_reason,
+    _detect_primary_difference,
     _build_pair_candidates,
     _build_proposal_id,
     annotate_clips,
@@ -590,7 +592,7 @@ class ComposedDataTests(unittest.TestCase):
                 ],
             )
 
-            def fake_propose_pair(*, reference_annotation, target_annotation, hard_negative_candidates):
+            def fake_propose_pair(*, reference_annotation, target_annotation, hard_negative_candidates, heuristic_pair=None):
                 difference = {
                     "type": "object_count",
                     "from": f"{reference_annotation['object_counts'].get('cat', 0)} cat",
@@ -731,7 +733,7 @@ class ComposedDataTests(unittest.TestCase):
                 ],
             )
 
-            def fake_propose_pair(*, reference_annotation, target_annotation, hard_negative_candidates):
+            def fake_propose_pair(*, reference_annotation, target_annotation, hard_negative_candidates, heuristic_pair=None):
                 return (
                     {
                         "edit_text": "change one orange cat into two orange cats",
@@ -813,6 +815,55 @@ class ComposedDataTests(unittest.TestCase):
             composed_data_main()
 
         self.assertEqual(7, propose_mock.call_args.kwargs["max_accepted_pairs"])
+
+    def test_compose_reject_reason_includes_threshold_failures(self) -> None:
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.81,
+            "edit_match_score": 0.62,
+            "target_uniqueness_score": 0.58,
+            "audio_required": True,
+            "hard_negative_quality": "good",
+            "accept": False,
+            "reject_reason": "",
+        }
+
+        reason = _compose_reject_reason(judge)
+
+        self.assertIn("edit_match_score 0.620 is below 0.75", reason)
+        self.assertIn("target_uniqueness_score 0.580 is below 0.70", reason)
+        self.assertIn("the model judge did not accept the pair", reason)
+
+    def test_detect_primary_difference_prefers_speech_in_high_context_order(self) -> None:
+        reference = {
+            "object_counts": {"person": 1},
+            "actions": ["speaking"],
+            "audio_events": ["speech"],
+            "attributes": ["studio"],
+            "scene": "studio desk shot",
+            "speech": ["welcome to the show"],
+            "visible_text": ["episode 1"],
+        }
+        target = {
+            "object_counts": {"person": 1},
+            "actions": ["speaking"],
+            "audio_events": ["speech"],
+            "attributes": ["studio"],
+            "scene": "studio desk shot",
+            "speech": ["today we review the camera"],
+            "visible_text": ["episode 1"],
+        }
+
+        difference = _detect_primary_difference(
+            reference,
+            target,
+            priority_order=("object_count", "speech", "audio_event", "visible_text", "object_presence", "action"),
+        )
+
+        self.assertIsNotNone(difference)
+        self.assertEqual("speech", difference["type"])
 
     def test_pair_candidates_keep_low_context_pairs_with_available_negatives(self) -> None:
         annotations = [

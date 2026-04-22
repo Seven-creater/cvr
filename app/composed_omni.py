@@ -310,16 +310,25 @@ def _build_pair_proposal_user_content(
     reference_annotation: dict[str, Any],
     target_annotation: dict[str, Any],
     hard_negative_candidates: list[dict[str, Any]],
+    heuristic_pair: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    heuristic_text = ""
+    if heuristic_pair:
+        heuristic_text = f"Heuristic pair hint JSON:\n{json.dumps(heuristic_pair, ensure_ascii=False)}\n"
     prompt = (
         "Task: draft a composed retrieval pair proposal.\n"
         f"Reference annotation JSON:\n{json.dumps(reference_annotation, ensure_ascii=False)}\n"
         f"Target annotation JSON:\n{json.dumps(target_annotation, ensure_ascii=False)}\n"
         f"Related negative candidate annotations JSON:\n{json.dumps(hard_negative_candidates, ensure_ascii=False)}\n"
+        f"{heuristic_text}"
         "Write a short edit_text that changes the reference into the target. "
         "Use one primary difference type only. "
+        "The chosen difference.type, edit_text, modalities, and difference.from/to must all describe the same main change. "
         "Prefer action/audio/object differences over broad scene differences if they are visible or audible. "
-        "If audio is important, include it in modalities. "
+        "If the clips come from the same source context and the main localized change is in speech, audio, or visible text, "
+        "prefer speech/audio_event/visible_text over attribute or scene. "
+        "Only include audio in modalities when the edit actually requires listening. "
+        "Do not mention secondary audio, speech, or visible-text details in edit_text unless they are the chosen primary difference. "
         "Keep captions factual and concise."
     )
     return [{"type": "text", "text": prompt}]
@@ -339,7 +348,10 @@ def _build_pair_judge_user_content(
         f"Target annotation JSON:\n{json.dumps(target_annotation, ensure_ascii=False)}\n"
         f"Hard negative annotations JSON:\n{json.dumps(hard_negative_candidates, ensure_ascii=False)}\n"
         "The edit_text must describe the change only. The reference should not satisfy the edit; "
-        "the target should satisfy it. Reject broad scene-only changes unless the context remains clearly related."
+        "the target should satisfy it. Reject broad scene-only changes unless the context remains clearly related. "
+        "If the pair proposal JSON says the clips share the same source context, treat localized speech/audio/visible-text changes "
+        "as valid composed edits when the rest of the scene stays aligned. "
+        "If you reject the pair, reject_reason must be a non-empty sentence naming the main failed gate or threshold."
     )
     return [{"type": "text", "text": prompt}]
 
@@ -414,12 +426,14 @@ class OpenAIComposedDataClient:
         reference_annotation: dict[str, Any],
         target_annotation: dict[str, Any],
         hard_negative_candidates: list[dict[str, Any]],
+        heuristic_pair: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         raw_payload = self._request_json(
             user_content=_build_pair_proposal_user_content(
                 reference_annotation=reference_annotation,
                 target_annotation=target_annotation,
                 hard_negative_candidates=hard_negative_candidates,
+                heuristic_pair=heuristic_pair,
             ),
             system_prompt=_pair_proposal_system_prompt(),
             max_tokens=1200,
