@@ -16,6 +16,7 @@ from app.composed_data import (
     ensure_layout,
     extract_clips,
     index_raw_sources,
+    main as composed_data_main,
     plan_detective_event_clips,
     propose_group_pairs,
     propose_pairs,
@@ -456,6 +457,30 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("a person claps in a studio", records[0]["summary"])
             self.assertIn("single_pass_fallback", [item.get("stage") for item in records[0]["detective_trajectory"]])
 
+    def test_detective_annotate_cli_does_not_read_group_pair_options(self) -> None:
+        argv = [
+            "composed_data.py",
+            "detective-annotate-clips",
+            "--root",
+            "/tmp/root",
+            "--clips-manifest-path",
+            "/tmp/clips.jsonl",
+            "--base-url",
+            "http://127.0.0.1:8093/v1",
+            "--api-key",
+            "EMPTY",
+            "--model",
+            "qwen3-omni",
+        ]
+        with mock.patch("sys.argv", argv), mock.patch("builtins.print"), mock.patch(
+            "app.composed_data.detective_annotate_clips",
+            return_value={"ok": True},
+        ) as detective_mock:
+            composed_data_main()
+
+        self.assertNotIn("max_accepted_pairs", detective_mock.call_args.kwargs)
+        self.assertEqual(180.0, detective_mock.call_args.kwargs["timeout_seconds"])
+
     def test_propose_pairs_outputs_schema_compliant_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -761,6 +786,33 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(summary["accepted_count"], len(accepted_records))
             self.assertTrue(all(record["judge"]["target_satisfies_edit"] for record in accepted_records))
             self.assertTrue(all(record["group_id"] == "group_cat_room" for record in accepted_records))
+
+    def test_propose_group_pairs_cli_passes_max_accepted_pairs(self) -> None:
+        argv = [
+            "composed_data.py",
+            "propose-group-pairs",
+            "--root",
+            "/tmp/root",
+            "--clip-annotations-path",
+            "/tmp/annotations.jsonl",
+            "--clip-groups-path",
+            "/tmp/groups.jsonl",
+            "--base-url",
+            "http://127.0.0.1:8093/v1",
+            "--api-key",
+            "EMPTY",
+            "--model",
+            "qwen3-omni",
+            "--max-accepted-pairs",
+            "7",
+        ]
+        with mock.patch("sys.argv", argv), mock.patch("builtins.print"), mock.patch(
+            "app.composed_data.propose_group_pairs",
+            return_value={"ok": True},
+        ) as propose_mock:
+            composed_data_main()
+
+        self.assertEqual(7, propose_mock.call_args.kwargs["max_accepted_pairs"])
 
     def test_pair_candidates_keep_low_context_pairs_with_available_negatives(self) -> None:
         annotations = [

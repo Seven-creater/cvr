@@ -2390,7 +2390,6 @@ def main() -> None:
             api_key=args.api_key,
             model=args.model,
             timeout_seconds=args.timeout_seconds,
-            max_accepted_pairs=args.max_accepted_pairs,
             overwrite=args.overwrite,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -2423,6 +2422,7 @@ def main() -> None:
             api_key=args.api_key,
             model=args.model,
             timeout_seconds=args.timeout_seconds,
+            max_accepted_pairs=args.max_accepted_pairs,
             overwrite=args.overwrite,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
