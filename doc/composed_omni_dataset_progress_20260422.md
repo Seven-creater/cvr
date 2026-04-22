@@ -1,18 +1,18 @@
-# Omni Composed Video Retrieval 数据构造阶段总结
+# Omni Composed Video Retrieval 数据构造进展
 
 Last updated: 2026-04-22
 
-## 1. 项目目标
+## 1. 当前目标
 
-当前项目的目标不是继续把 MSRVTT 当作主要评测集，而是构造一个更适合 **Omni 全模态组合视频检索** 的新数据集。
+本项目现在的核心目标已经从 MSRVTT 常规 video-text retrieval，转向构造一个更适合 **Omni 全模态组合视频检索** 的新数据集。
 
-我们真正需要的数据形式是：
+目标任务形式是：
 
 ```text
 reference video + edit text + visual/audio cues -> target video
 ```
 
-也就是说，模型或 agent 看到一个参考视频，再看到一段编辑文本，比如：
+也就是说，系统输入一个参考视频和一段编辑文本，例如：
 
 ```text
 change one cat into two cats
@@ -20,42 +20,90 @@ replace quiet background with dog barking
 change the person from standing still to dancing
 ```
 
-然后需要从候选视频库里找出符合编辑要求的 target video。
+然后需要从候选视频库中找出满足该编辑要求的 target video。
 
-这个任务包含三类信息：
+这个任务需要同时覆盖：
 
-- 视频模态：人物、物体、场景、动作、数量、颜色、文字等。
-- 音频模态：音乐、说话声、掌声、动物叫声、机器声等。
-- 编辑文本：描述 reference 到 target 的变化。
+- 视觉信息：主体、数量、动作、场景、属性、颜色、可见文字。
+- 音频信息：音乐、说话声、掌声、动物叫声、机器声、环境声。
+- 编辑文本：描述 reference 到 target 的关键变化。
 
-我们前面已经确认：MSRVTT 更适合普通 video-text retrieval，不适合天然构造 `reference-target-edit` 三元组。因此这一步开始转向新数据构造。
+我们前面已经确认，MSRVTT 更适合普通 video-text retrieval，不适合天然构造 `reference-target-edit` 三元组。因此现在的重点是构造新数据，而不是继续在 MSRVTT 上堆 agent 逻辑。
 
-## 2. 已经做了什么
+## 2. 参考方法：Omni-Captioner / Omni-Detective
 
-### 2.1 准备 Qwen3-Omni 模型
+参考仓库：
 
-服务器上已经从 ModelScope 下载并准备了 Qwen3-Omni 模型：
+```text
+https://github.com/ddlBoJack/Omni-Captioner
+```
+
+该项目的关键思想不是简单做一次视频 caption，而是用 **Omni-Detective** 做 agentic data generation。
+
+Omni-Detective 的方法要点：
+
+- 通过多轮 `Query-Observation` 迭代获取细粒度音视频信息。
+- Detective Agent 主动规划需要观察什么。
+- Tool Box 提供多种工具，用于从音频、视频、文字等模态提取证据。
+- Independent Observers 面向原始音视频流回答局部问题。
+- 最终综合成低幻觉、细粒度的 audio-visual annotation。
+
+Omni-Captioner 推荐的结构化音视频描述至少包含三块：
+
+```text
+Storyline
+Visible Text
+Speakers and Transcript
+```
+
+这对我们非常重要，因为 composed retrieval 数据构造依赖的不是泛泛 summary，而是：
+
+- 某个时间段发生了什么。
+- 屏幕上出现了什么文字。
+- 谁说了什么，语气和时间位置如何。
+- 哪些音频事件和画面同步发生。
+- reference 和 target 之间是否只有一个主要差异。
+
+当前我们的代码已经开始模拟这个方向，但还没有真正完全复刻 Omni-Detective。现在只是一个早期的两步版本：
+
+```text
+observer pass -> detective final pass
+```
+
+它比单轮 caption 多了 `detective_trajectory / storyline / visible_text / speakers_and_transcript`，但还缺少真正的多工具、多观察者、多轮决策。
+
+## 3. 服务器模型与数据状态
+
+### 3.1 已准备模型
+
+服务器已有模型目录：
 
 ```text
 /data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-instruct
 /data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-captioner
 ```
 
-当前实际跑通数据构造链路的是 Instruct 服务：
+当前跑通数据构造链路的是 Instruct 服务：
 
 ```text
 http://127.0.0.1:8093/v1
 ```
 
-服务返回的模型 id：
+另一个 Thinking 模型已经安排从 ModelScope 下载：
 
 ```text
-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-instruct
+Qwen/Qwen3-Omni-30B-A3B-Thinking
 ```
 
-### 2.2 下载并整理原始数据集
+计划用途：
 
-目前使用两个原始数据源：
+- Instruct：数据构造总控、pair proposal、judge。
+- Captioner：偏音频细粒度 caption，可用于补充 audio events / speech / acoustic scene。
+- Thinking：更适合做 Detective Agent、pair judge、失败样本分析。
+
+### 3.2 已准备原始数据
+
+当前使用两个原始数据源：
 
 ```text
 Daily-Omni
@@ -68,16 +116,27 @@ WorldSense
 /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval
 ```
 
-原始数据放在：
+归一化后的统计：
 
 ```text
-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/raw_datasets/daily_omni
-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/raw_datasets/worldsense
+source rows: 4368
+unique clips: 2858
+pilot clips: 50
+Daily-Omni: 1196 rows / 1196 clips
+WorldSense: 3172 rows / 1662 clips
+WorldSense archives extracted: 13
 ```
 
-### 2.3 写了数据归一化代码
+`source_clips_pilot50.jsonl` 已做数据源平衡：
 
-新增的数据处理代码主要包括：
+```text
+Daily-Omni: 25
+WorldSense: 25
+```
+
+## 4. 已完成工程链路
+
+已经新增并跑通的数据处理代码：
 
 ```text
 app/composed_sources.py
@@ -87,100 +146,205 @@ scripts/prepare_composed_sources.sh
 scripts/run_composed_pilot50.sh
 ```
 
-其中：
+主要功能：
 
-- `composed_sources.py` 负责把 Daily-Omni 和 WorldSense 归一化成统一 manifest。
-- `composed_data.py` 负责 annotation、pair proposal、pilot validation。
-- `composed_omni.py` 负责调用 OpenAI-compatible vLLM/Qwen3-Omni 服务。
-- `prepare_composed_sources.sh` 是服务器 source prepare 脚本。
-- `run_composed_pilot50.sh` 是服务器 pilot50 一键脚本。
+- `composed_sources.py`
+  - 解析 Daily-Omni parquet。
+  - 物化 Daily-Omni 内嵌视频和音频。
+  - 解压 WorldSense zip。
+  - 生成统一 source row 和 clip manifest。
 
-### 2.4 当前测试情况
+- `composed_omni.py`
+  - 调用 OpenAI-compatible Qwen3-Omni 服务。
+  - 支持 single-pass clip annotation。
+  - 支持 detective-style clip annotation。
+  - 支持 pair proposal。
+  - 对模型不稳定字段做归一化。
 
-最新相关提交：
+- `composed_data.py`
+  - `annotate-clips`
+  - `detective-annotate-clips`
+  - `propose-pairs`
+  - `validate-pilot`
+  - gallery 构建和质量统计。
+
+- `run_composed_pilot50.sh`
+  - 一键跑 pilot50 标注、pair proposal、pilot 选择、校验和报告。
+
+最近一次相关提交：
 
 ```text
-ed52cd9498fc02a65d9afdd02aec936d5ee9d008
+b4e38e321cdc26546da1f5c1ce0e9236bb38d0e9
 ```
 
-本地和服务器单元测试都通过：
+单元测试状态：
 
 ```text
-Ran 37 tests
+Ran 43 tests
 OK
 ```
 
-## 3. 原始数据集长什么样
+## 5. 当前实验结果
 
-### 3.1 Daily-Omni 原始形态
+### 5.1 single-pass / min-context 版本
 
-Daily-Omni 是 parquet 数据。每一行大致包含：
-
-```json
-{
-  "video_id": "...",
-  "video": "...",
-  "audio": "...",
-  "question": "...",
-  "candidates": ["A. ...", "B. ...", "C. ...", "D. ..."],
-  "answer": "..."
-}
-```
-
-它本来更像视频问答数据。特点是：
-
-- 视频和音频可能嵌在 parquet 里。
-- 有 question / candidates / answer。
-- 视频通常是完整短视频，不一定天然是 reference-target pair。
-- 一些问题关注音画同步，比如“某段音频出现时画面是什么”。
-
-处理时，我们把 parquet 里的视频和音频物化出来，写到：
+早期单轮标注版本跑通后，主要结果是：
 
 ```text
-raw/daily_omni/video/*.mp4
-raw/daily_omni/audio/*.wav
+clip_count: 50
+annotated_count: 50
+fallback_count: 1
+proposal_count: 40
+high_context_pool_count: 12
+pilot_count: 10
+same_context_min: 0.128
+same_context_avg: 0.168
+same_context_max: 0.233
 ```
 
-### 3.2 WorldSense 原始形态
+优点：
 
-WorldSense 也是多模态视频数据。它的特点是：
+- fallback 很少。
+- proposal 数量较多。
+- 上下文分数比后续 detective 初版更高。
 
-- 视频文件分布在压缩包里。
-- 有 `video_caption`、`question`、`candidates`、`answer`、`subtitle_path` 等字段。
-- 很多样本包含较细的视频描述和问答信息。
+问题：
 
-原始 zip 解压后的视频路径类似：
+- 标注偏单轮 summary，不够 Omni-Captioner。
+- 缺少 trajectory、timeline、visible text、transcript 等证据链。
+- pair 仍有不少只是“同数据集但语义不够相近”。
+
+### 5.2 detective 初版
+
+切到 `detective-annotate-clips` 后，标注明显更细：
 
 ```text
-raw_datasets/worldsense/_extracted/videos_chunk_003/videos/ALfOUzDH.mp4
+annotation_mode: detective
+clip_annotations size: 605K
+detective_trajectory: present
+storyline: present
+visible_text: present
+speakers_and_transcript: present
 ```
 
-WorldSense 更适合提供一些带字幕、音乐、表演、教学、游戏等场景的视频片段。
-
-## 4. 原始数据如何变成当前数据
-
-整体流程如下：
-
-```mermaid
-flowchart LR
-  A["Daily-Omni parquet / WorldSense parquet+zip"] --> B["source_rows.jsonl"]
-  A --> C["source_clips_all.jsonl"]
-  C --> D["balanced source_clips_pilot50.jsonl"]
-  D --> E["Qwen3-Omni clip annotations"]
-  E --> F["pair proposals"]
-  F --> G["pilot_10.jsonl"]
-  G --> H["gallery.jsonl + pilot_review.md"]
-```
-
-### 4.1 source rows
-
-归一化后生成：
+但初版有明显失败：
 
 ```text
-metadata/source_rows.jsonl
+fallback_count: 9
+proposal_count: 23
+high_context_pool_count: 2
+same_context_avg: 0.108
 ```
 
-每一行表示原始数据集的一条 row，统一字段类似：
+结论：
+
+```text
+detective 方向是对的，但两步 JSON 更容易失败，一失败就掉到空 fallback，导致候选池变小。
+```
+
+### 5.3 detective fallback 修复版
+
+之后加入了 fallback 机制：
+
+```text
+detective failed -> single-pass annotation fallback
+```
+
+结果：
+
+```text
+fallback_count: 0
+detective_to_single_pass_count: 9
+proposal_count: 33
+same_context_avg: 0.118
+```
+
+改进：
+
+- 原本 9 条失败样本被 single-pass 救回来。
+- 候选数从 23 回升到 33。
+
+仍然不足：
+
+- same_context_avg 仍然偏低。
+- 真正高上下文候选不够。
+
+### 5.4 high-context 选择版
+
+最近一次高上下文筛选结果：
+
+```text
+git HEAD: b4e38e321cdc26546da1f5c1ce0e9236bb38d0e9
+annotation_mode: detective
+fallback_count: 0
+detective_to_single_pass_count: 9
+proposal_count: 33
+high_context_pool_count: 9
+selected_context_threshold: 0.1
+pilot_count: 9
+audio_count: 9
+object_change_count: 4
+action_count: 2
+scene_count: 3
+same_context_min: 0.109
+same_context_avg: 0.141
+same_context_max: 0.295
+```
+
+自动验收：
+
+```text
+sample_count_between_5_and_10: PASS
+audio_samples_at_least_2: PASS
+object_change_samples_at_least_2: PASS
+action_samples_at_least_1: PASS
+```
+
+这说明工程链路已经比较稳，但效果仍然没有本质进展。
+
+## 6. 当前判断
+
+现在不建议继续重复跑 pilot50。
+
+原因：
+
+```text
+同一批 50 条 pilot clips 的上限已经暴露出来。
+重复跑只会在 0.11-0.17 的 same_context_avg 附近波动。
+它不能解决数据构造方法本身的问题。
+继续跑只是在浪费 Qwen3-Omni 服务时间和 GPU 资源。
+```
+
+当前真正的问题不是：
+
+```text
+模型没跑通
+数据没读出来
+schema 没写好
+```
+
+而是：
+
+```text
+我们还没有完全按 Omni-Captioner / Omni-Detective 的方式构造数据。
+```
+
+更具体地说，现在的不足是：
+
+- clip 还是 whole source video，很多太长，事件混杂。
+- pair 仍然主要来自全局候选筛选，不是同一上下文内局部差异。
+- detective 只是两步 prompt，不是真正多轮 Query-Observation。
+- 没有把 audio captioner、OCR、ASR、frame sampler、scene splitter 做成 Tool Box。
+- 没有先做 temporal segmentation。
+- 没有严格做 pair judge：reference 不满足 edit，target 满足 edit，hard negatives 接近但不满足。
+
+所以接下来应该停止“重复跑 pilot50”，转向方法重构。
+
+## 7. 当前数据结构
+
+### 7.1 source_rows.jsonl
+
+表示原始数据集中的一行：
 
 ```json
 {
@@ -201,18 +365,9 @@ metadata/source_rows.jsonl
 }
 ```
 
-这一步的意义是：不管原始数据集字段多乱，先统一成“这一条原始数据来自哪里、对应视频在哪里、文本字段是什么”。
+### 7.2 source_clips_all.jsonl / source_clips_pilot50.jsonl
 
-### 4.2 source clips
-
-归一化后生成：
-
-```text
-metadata/source_clips_all.jsonl
-metadata/source_clips_pilot50.jsonl
-```
-
-当前还没有大规模做人工切片，所以大部分 clip 暂时是 whole source video：
+表示可用 clip。当前多数还是 whole source video：
 
 ```json
 {
@@ -230,340 +385,80 @@ metadata/source_clips_pilot50.jsonl
 }
 ```
 
-当前 source prepare 结果：
+### 7.3 clip_annotations_pilot50.jsonl
 
-```text
-source rows: 4368
-unique clips: 2858
-pilot clips: 50
-Daily-Omni: 1196 rows / 1196 clips
-WorldSense: 3172 rows / 1662 clips
-WorldSense archives extracted: 13
-```
-
-`source_clips_pilot50.jsonl` 已经做了数据源平衡：
-
-```text
-Daily-Omni: 25
-WorldSense: 25
-```
-
-## 5. 当前数据集长什么样
-
-当前已经完成的是一个 **pilot50 数据构造流程**，它不是最终数据集，而是验证链路的中间结果。
-
-输出目录：
-
-```text
-/data02/usr/wangqihao/Demo/test/cvr/runs/composed_pilot50_20260422
-```
-
-### 5.1 clip annotations
-
-文件：
-
-```text
-clip_annotations_pilot50.jsonl
-```
-
-每条视频经过 Qwen3-Omni 标注后，变成结构化描述：
+detective 版本的 annotation 大致是：
 
 ```json
 {
-  "clip_id": "daily_omni_-gnfUTPmnNU",
-  "output_path": "raw/daily_omni/video/test-00005-of-00010_103_video.mp4",
-  "summary": "A person holds up a small, decorated bookmark with a tassel...",
-  "subjects": ["person", "bookmark", "tassel"],
-  "object_counts": {"person": 1, "bookmark": 5, "tassel": 1},
-  "actions": ["holding", "displaying"],
-  "scene": "indoor setting with a table",
-  "attributes": ["decorative", "colorful"],
-  "on_screen_text": ["50 Handmade Business Ideas", "..."],
-  "speech": ["A female voice narrates the introduction..."],
-  "audio_events": ["speech"],
-  "modalities": ["visual", "audio"]
+  "clip_id": "...",
+  "summary": "...",
+  "subjects": ["..."],
+  "object_counts": {"person": 1},
+  "actions": ["..."],
+  "scene": "...",
+  "attributes": ["..."],
+  "on_screen_text": ["..."],
+  "speech": ["..."],
+  "audio_events": ["..."],
+  "modalities": ["visual", "audio"],
+  "storyline": ["..."],
+  "visible_text": ["..."],
+  "speakers_and_transcript": ["..."],
+  "detective_notes": ["..."],
+  "detective_trajectory": [
+    {"stage": "observer", "payload": "..."},
+    {"stage": "detective_final", "payload": "..."}
+  ],
+  "detective_fallback_used": false
 }
 ```
 
-pilot50 标注结果：
+这一步已经开始接近 Omni-Captioner，但还不够。
 
-```text
-clip_count: 50
-annotated_count: 50
-fallback_count: 1
-```
+### 7.4 pilot_10.jsonl
 
-这说明：Qwen3-Omni 标注链路基本跑通，50 条里只有 1 条 fallback。
-
-### 5.2 pair proposals
-
-文件：
-
-```text
-pilot_pair_proposals.jsonl
-```
-
-每条 proposal 表示一个候选 `reference -> edit -> target` 样本：
+当前 pilot 样本格式：
 
 ```json
 {
-  "proposal_id": "proposal__edde96e36dd389c1",
-  "reference_video": ".../BnseaLEM.mp4",
-  "target_video": ".../test-00003-of-00010_56_video.mp4",
-  "edit_text": "Change the musician from a young man playing violin to a man playing clarinet, and replace the piano with a trombone.",
+  "sample_id": "covr_pilot_0001",
+  "reference_video": "...",
+  "target_video": "...",
+  "edit_text": "...",
   "modalities": ["visual", "audio"],
-  "reference_caption": "A young man plays the violin...",
-  "target_caption": "A man in a black shirt plays a clarinet...",
+  "reference_caption": "...",
+  "target_caption": "...",
   "difference": {
     "type": "object_presence",
-    "from": "piano",
-    "to": "trombone",
-    "description": "The piano in the background is replaced by a trombone on the table."
+    "from": "...",
+    "to": "...",
+    "description": "..."
   },
   "hard_negatives": ["...", "...", "..."],
   "quality": {
-    "same_context_score": 0.18,
-    "edit_match_score": 0.263,
-    "target_uniqueness_score": 0.878
+    "same_context_score": 0.17,
+    "edit_match_score": 0.259,
+    "target_uniqueness_score": 0.891
   },
-  "fallback_used": false
+  "source_context": {
+    "relation": "same_dataset",
+    "score": 0.289
+  }
 }
 ```
 
-当前 proposal 结果：
+当前它适合作为 smoke test，不适合作为正式训练集或 benchmark。
 
-```text
-candidate_count: 40
-proposal_count: 40
-fallback_count: 0
-```
+## 8. 与目标数据集的差距
 
-这说明：修复 pair candidate 过严的问题后，已经能从 pilot50 中生成足够多的 proposal。
-
-### 5.3 pilot_10
-
-文件：
-
-```text
-pilot_10.jsonl
-```
-
-从 40 条 proposal 中自动选出 10 条，作为第一版小样本 composed retrieval 数据。
-
-当前结果：
-
-```text
-pilot_count: 10
-audio_count: 6
-object_change_count: 4
-action_count: 0
-difference_type_counts:
-  object_presence: 4
-  scene: 6
-fallback_count: 0
-```
-
-自动验收：
-
-```text
-sample_count_between_5_and_10: PASS
-audio_samples_at_least_2: PASS
-object_change_samples_at_least_2: PASS
-action_samples_at_least_1: FAIL
-```
-
-这说明：当前 pilot_10 已经满足数量、音频样本、对象变化样本要求，但还缺少动作变化样本。
-
-### 5.4 gallery
-
-文件：
-
-```text
-gallery.jsonl
-```
-
-gallery 是检索候选库，包含 target 和 hard negatives：
-
-```json
-{
-  "gallery_id": "gallery__300f2b64c0696b1d",
-  "video_path": "raw/daily_omni/video/test-00003-of-00010_56_video.mp4",
-  "sample_ids": ["covr_pilot_0005"],
-  "roles": ["target"]
-}
-```
-
-当前 gallery 结果：
-
-```text
-gallery_count: 21
-```
-
-## 6. 我们遇到的难题，以及怎么解决
-
-### 6.1 WorldSense 视频在 zip 里，路径对不上
-
-问题：
-
-WorldSense 的 parquet 里有相对视频路径，但实际视频在 zip 包中。第一次跑 annotation 时，WorldSense 视频路径不存在。
-
-解决：
-
-在 `app/composed_sources.py` 里加入自动解压逻辑：
-
-```text
-raw_datasets/worldsense/*.zip -> raw_datasets/worldsense/_extracted/
-```
-
-并优先解析真实存在的视频路径。
-
-结果：
-
-```text
-WorldSense archives: 13
-extracted_archives: 13
-missing_root: 0
-```
-
-### 6.2 Daily-Omni 的视频/音频嵌在 parquet 里
-
-问题：
-
-Daily-Omni 不一定直接给普通视频文件路径，而是 parquet 行里包含 video/audio 数据。
-
-解决：
-
-在 source prepare 阶段把 embedded video/audio 物化到磁盘：
-
-```text
-raw/daily_omni/video/*.mp4
-raw/daily_omni/audio/*.wav
-```
-
-并在 `source_rows.jsonl` 中记录 `video_path` 和 `audio_path`。
-
-### 6.3 Qwen3-Omni 返回字段类型不稳定
-
-问题：
-
-模型有时会把 `speech` 返回成字符串，而不是数组；有时把 difference type 写成 `subject`，而我们只允许：
-
-```text
-object_count
-object_presence
-attribute
-action
-scene
-audio_event
-speech
-```
-
-解决：
-
-在 `app/composed_omni.py` 中加入归一化：
-
-- 字符串形式的 `speech` 自动转成数组。
-- `subject/person/object/entity` 映射到 `object_presence`。
-- `sound/audio/music` 映射到 `audio_event`。
-- `activity/movement` 映射到 `action`。
-- `location/background` 映射到 `scene`。
-
-这样避免模型因为一个近义字段名导致整条 proposal fallback。
-
-### 6.4 pair candidate 过滤太严格
-
-问题：
-
-第一次跑 pilot50 时，50 条视频只生成了 1 条 pair proposal。
-
-原因：
-
-当前 pilot50 来自 Daily-Omni 和 WorldSense 的混合来源，视频之间普遍比较分散。旧逻辑要求较高的 same context score 和较少 changed types，导致大部分候选 pair 被过滤掉。
-
-解决：
-
-在 `app/composed_data.py` 中做了保守放宽：
-
-- 最多保留 40 个 pair candidates。
-- 降低最小 context 分数。
-- 允许更多 changed types。
-- hard negatives 不再要求一定有正 context score。
-
-结果：
-
-```text
-candidate_count: 40
-proposal_count: 40
-fallback_count: 0
-```
-
-### 6.5 当前 pair 质量还不够像最终任务
-
-问题：
-
-虽然 pilot50 流程跑通了，但自动生成的 pilot_10 里有不少是大场景切换，例如：
-
-```text
-podium speech -> blue background speech
-pixel art game -> astronomy compilation
-indoor white background -> stadium
-```
-
-这类样本更像普通视频检索，不够像我们真正想要的 composed retrieval。
-
-理想样本应该更像：
-
-```text
-same room, one cat -> same room, two cats
-same stage, violin -> same stage, clarinet
-same kitchen, chopping -> same kitchen, frying
-same video style, no barking -> dog barking
-```
-
-结论：
-
-当前流程证明“能构造”，但还没证明“能稳定构造高质量 composed retrieval 样本”。
-
-## 7. 当前数据集和目标数据集的差距
-
-### 7.1 当前数据集
-
-当前 pilot_10 的特点：
-
-- 数量够：10 条。
-- 有音频样本：6 条。
-- 有对象变化：4 条。
-- 有 scene 变化：6 条。
-- 没有 action 主类型样本。
-- same_context_score 普遍偏低，大多在 0.13-0.19 左右。
-- 一些 edit text 包含多个变化，不够单一。
-
-所以它适合作为：
-
-```text
-pipeline smoke test
-模型调用链路验证
-schema 验证
-初步人工 review 样本
-```
-
-但还不适合作为：
-
-```text
-正式训练集
-正式 benchmark
-论文里展示的高质量代表样本
-```
-
-### 7.2 我们真正需要的数据集
-
-目标数据集每条样本应该长这样：
+目标数据应该长这样：
 
 ```json
 {
   "sample_id": "covr_000001",
-  "reference_video": "clips/source_xxx_ref.mp4",
-  "target_video": "clips/source_xxx_target.mp4",
+  "reference_video": "clips/group_x/ref.mp4",
+  "target_video": "clips/group_x/target.mp4",
   "edit_text": "change one cat into two cats",
   "modalities": ["visual"],
   "reference_caption": "A mouse stands beside one cat in the same cartoon room.",
@@ -575,185 +470,194 @@ schema 验证
     "description": "the number of cats increases from one to two"
   },
   "hard_negatives": [
-    "clips/source_xxx_one_cat_wrong_action.mp4",
-    "clips/source_xxx_two_dogs.mp4",
-    "clips/source_xxx_two_cats_different_scene.mp4"
+    "clips/group_x/one_cat_wrong_action.mp4",
+    "clips/group_x/two_dogs_same_room.mp4",
+    "clips/group_x/two_cats_different_scene.mp4"
   ],
   "quality": {
     "same_context_score": 0.85,
     "edit_match_score": 0.9,
     "target_uniqueness_score": 0.8
   },
-  "source": {
-    "platform": "internal_source_or_open_dataset",
-    "url": "...",
-    "license_note": "internal research pilot only"
+  "evidence": {
+    "reference_storyline": ["..."],
+    "target_storyline": ["..."],
+    "visible_text_change": "...",
+    "audio_change": "..."
   }
 }
 ```
 
 关键要求：
 
-- reference 和 target 背景尽量相似。
+- reference 和 target 背景相似。
 - 变化尽量单一。
 - edit text 只描述变化，不重写完整视频。
 - target 在 gallery 中唯一满足 edit。
-- hard negatives 要难，而不是随机视频。
-- 至少覆盖视觉、音频、语音/音乐、动作等不同类型。
+- hard negatives 是近邻干扰项，而不是随机视频。
+- 至少覆盖视觉、音频、语音/音乐、动作等类型。
 
-## 8. 原始数据到目标数据的推荐路径
+## 9. 下一步不再重复跑，而是改方法
 
-### 8.1 不要直接从全局 2858 clips 里随机配对
+### 9.1 第一阶段：Omni-Detective annotation 重构
 
-这次 pilot50 的问题说明：随机混合 Daily-Omni 和 WorldSense 后，候选之间往往太不相似。
-
-更好的策略是：
+当前两步 detective：
 
 ```text
-先聚类/分组，再组内配对
+observer -> detective_final
 ```
 
-分组方式可以是：
-
-- 同一 `video_id`
-- 同一原始视频切出来的不同片段
-- 同一系列/同一账号视频
-- 相似 `video_caption`
-- 相似 `subjects`
-- 相似 `scene`
-- 相似 `audio_events`
-
-### 8.2 先做 clip segmentation
-
-当前很多 clip 还是 whole source video。下一步应该对长视频切成短片段：
+需要升级为更接近 Omni-Captioner 的多轮流程：
 
 ```text
-3-15 秒一个 clip
+Detective Agent
+  -> plan questions
+  -> call observers/tools
+  -> collect evidence
+  -> ask follow-up questions
+  -> synthesize structured caption
+```
+
+建议输出字段：
+
+```json
+{
+  "storyline": [
+    {
+      "start": 0.0,
+      "end": 3.2,
+      "visual": "...",
+      "audio": "...",
+      "actions": ["..."],
+      "objects": ["..."]
+    }
+  ],
+  "visible_text": [
+    {
+      "start": 0.0,
+      "end": 1.5,
+      "text": "...",
+      "appearance": "..."
+    }
+  ],
+  "speakers_and_transcript": [
+    {
+      "start": 1.0,
+      "end": 3.0,
+      "speaker": "narrator",
+      "content": "...",
+      "state": "calm female voice"
+    }
+  ],
+  "audio_events": [
+    {
+      "start": 2.0,
+      "end": 4.0,
+      "event": "applause"
+    }
+  ],
+  "uncertainties": ["..."],
+  "detective_trajectory": ["..."]
+}
+```
+
+### 9.2 第二阶段：Tool Box
+
+需要逐步加入工具，而不是只靠一个大模型一次看完整视频。
+
+建议工具：
+
+- `ffprobe`：获取时长、分辨率、音轨。
+- `ffmpeg`：切片、抽帧、抽音频。
+- scene split：按视觉变化切成短片段。
+- audio captioner：用 Qwen3-Omni Captioner 或 Qwen2-Audio 做音频细粒度描述。
+- OCR：提取可见文字。
+- ASR：提取语音文字。
+- frame observer：对关键帧做视觉主体、动作、场景描述。
+
+这些工具输出证据，Detective Agent 只负责规划和综合。
+
+### 9.3 第三阶段：先切片，再配对
+
+当前最大的结构性问题是 whole source video 太长。
+
+下一步应该先切成：
+
+```text
+3-15 秒短 clip
 每个 clip 尽量只有一个主要事件
 保留音频
 ```
 
-这一步很关键。比如一个 60 秒视频里可能包含：
+然后只在同一上下文组内配对：
 
 ```text
-clip 1: one person speaking
-clip 2: two people speaking
-clip 3: music starts
-clip 4: applause
+same source video
+same video_id
+same source_row
+same series / same account
+same scene cluster
+same subject cluster
 ```
 
-这些片段天然适合组成 reference-target-edit。
+不要再从全局 2858 clips 随机配对。
 
-### 8.3 组内构造 pair
+### 9.4 第四阶段：Pair Judge
 
-推荐优先构造这些类型：
+对每个候选 pair，要增加 judge：
 
 ```text
-object_count:
-  one cat -> two cats
-  one person -> three people
-
-object_presence:
-  no dog -> dog appears
-  no instrument -> guitar appears
-
-action:
-  standing -> dancing
-  sitting -> jumping
-  preparing -> performing
-
-audio_event:
-  no music -> music starts
-  quiet -> applause
-  speech -> singing
-
-speech:
-  no speech -> narrator speaking
-  one speaker -> multiple speakers
+reference 是否不满足 edit
+target 是否满足 edit
+hard negatives 是否接近但不满足 edit
+edit text 是否只描述一个变化
+是否必须依赖音频
+是否存在明显幻觉
 ```
 
-### 8.4 再做人工 review
+这一步应该优先用 Thinking 模型或 Instruct 模型做。
 
-自动流程只能筛候选，最终高质量 pilot 必须人工过一遍：
+## 10. 当前结论
 
-- reference 是否真的不满足 edit。
-- target 是否真的满足 edit。
-- hard negatives 是否真的难。
-- edit_text 是否只描述一个变化。
-- 音频样本是否必须听音频才能判断。
+这阶段已经完成：
 
-## 9. 当前结论
+- 原始数据准备。
+- Daily-Omni 媒体物化。
+- WorldSense 解压。
+- Qwen3-Omni 服务接入。
+- single-pass 标注。
+- detective-style 标注。
+- pair proposal。
+- pilot validation。
+- 多轮 smoke test。
 
-这阶段已经完成了三件重要的事：
+也发现了核心问题：
 
-1. **工程链路打通**
-   - 原始数据下载。
-   - 数据归一化。
-   - WorldSense 解压。
-   - Daily-Omni 媒体物化。
-   - Qwen3-Omni 标注。
-   - pair proposal。
-   - pilot_10 和 gallery 生成。
+```text
+工程链路已经跑通，但当前自动 pair 质量没有明显进展。
+继续重复跑 pilot50 没有意义。
+```
 
-2. **发现了真实瓶颈**
-   - 不是模型跑不动。
-   - 不是数据读不出来。
-   - 而是高质量 composed retrieval pair 不能靠随机跨数据集配对获得。
+现在最重要的结论是：
 
-3. **明确了下一步方向**
-   - 先做同视频/同系列/同场景内配对。
-   - 先切短 clip，再构造 pair。
-   - 提高 same_context_score。
-   - 增加 action/audio_event 类型样本。
-   - 减少大场景切换样本。
+```text
+不要继续刷同一批 pilot50。
+要把方法转向 Omni-Captioner / Omni-Detective：
+多工具观察、时间线证据、短片段切分、组内配对、pair judge。
+```
+
+下一步建议：
+
+```text
+1. 暂停重复 pilot50 实验。
+2. 实现 clip segmentation + grouped manifests。
+3. 实现真正的 detective tool box。
+4. 在 5-10 个同上下文视频组上构造少量高质量样本。
+5. 人工 review 后再决定是否扩大规模。
+```
 
 一句话总结：
 
 ```text
-现在的数据构造 pipeline 已经跑通；下一步的重点不是继续盲目扩大数量，而是把 pair 生成从“全局宽松配对”改成“同上下文细粒度配对”。
+我们已经证明 pipeline 能跑；下一步要证明方法能产生高质量 composed retrieval 数据。
 ```
-
-## 10. 建议的下一步任务
-
-### 10.1 短期
-
-先不要跑更大规模。优先做：
-
-```text
-从 source_clips_all.jsonl 中按 source/video_id/series 聚类
-挑选 5-10 个同上下文视频组
-每组切 3-15 秒短 clip
-用 Qwen3-Omni 标注短 clip
-只在组内 propose pairs
-人工 review 10 条高质量样本
-```
-
-### 10.2 中期
-
-把数据构造代码升级为：
-
-```text
-group source clips
-extract temporal clips
-annotate grouped clips
-propose intra-group pairs
-rank by same_context_score and edit clarity
-balance difference types
-export pilot/dev/test
-```
-
-### 10.3 长期
-
-正式数据集应该包含：
-
-```text
-视觉编辑样本
-音频编辑样本
-语音编辑样本
-视觉+音频联合编辑样本
-hard negative gallery
-人工 review 标签
-agent retrieval benchmark
-```
-
-这样才能真正支撑“Omni 全模态组合视频检索 + agentic retrieval”的论文叙事。
