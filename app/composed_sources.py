@@ -48,7 +48,7 @@ def prepare_source_datasets(
         }
 
     clips_all = _build_clip_records(all_rows, root_path)
-    clips_pilot = clips_all[: max(0, int(clip_limit))]
+    clips_pilot = _select_balanced_pilot_clips(clips_all, max(0, int(clip_limit)))
 
     rows_path = layout["metadata"] / "source_rows.jsonl"
     clips_all_path = layout["metadata"] / "source_clips_all.jsonl"
@@ -339,6 +339,52 @@ def _build_clip_records(rows: list[dict[str, Any]], root: Path) -> list[dict[str
         for key, value in row.get("text_fields", {}).items():
             by_video_path[video_path]["text_fields"].setdefault(key, value)
     return list(by_video_path.values())
+
+
+def _select_balanced_pilot_clips(clips: list[dict[str, Any]], clip_limit: int) -> list[dict[str, Any]]:
+    if clip_limit <= 0 or not clips:
+        return []
+    by_dataset: dict[str, list[dict[str, Any]]] = {}
+    for clip in clips:
+        dataset = str(clip.get("dataset") or "unknown")
+        by_dataset.setdefault(dataset, []).append(clip)
+
+    for dataset_clips in by_dataset.values():
+        dataset_clips.sort(key=_pilot_priority_key)
+
+    selected: list[dict[str, Any]] = []
+    seen_clip_ids: set[str] = set()
+    dataset_names = sorted(by_dataset)
+    while len(selected) < clip_limit:
+        added_this_round = False
+        for dataset_name in dataset_names:
+            dataset_clips = by_dataset[dataset_name]
+            while dataset_clips:
+                candidate = dataset_clips.pop(0)
+                clip_id = str(candidate.get("clip_id", "")).strip()
+                if clip_id in seen_clip_ids:
+                    continue
+                selected.append(candidate)
+                seen_clip_ids.add(clip_id)
+                added_this_round = True
+                break
+            if len(selected) >= clip_limit:
+                break
+        if not added_this_round:
+            break
+    return selected
+
+
+def _pilot_priority_key(clip: dict[str, Any]) -> tuple[int, str]:
+    text_fields = clip.get("text_fields", {})
+    if not isinstance(text_fields, dict):
+        text_fields = {}
+    has_audio_or_sync_question = any(
+        keyword in json.dumps(text_fields, ensure_ascii=False).lower()
+        for keyword in ("audio", "sound", "speech", "music", "voice", "synchronized", "simultaneously")
+    )
+    has_text = bool(text_fields)
+    return (0 if has_audio_or_sync_question else 1, 0 if has_text else 1, str(clip.get("clip_id", "")))
 
 
 def _first_string(row: dict[str, Any], names: list[str]) -> str:

@@ -32,6 +32,24 @@ class ComposedSourcesTests(unittest.TestCase):
             rows = [json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual({"daily_omni", "worldsense"}, {row["dataset"] for row in rows})
 
+    def test_prepare_source_datasets_selects_balanced_pilot_clips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            daily = root / "raw_datasets" / "daily_omni"
+            world = root / "raw_datasets" / "worldsense"
+            daily.mkdir(parents=True)
+            world.mkdir(parents=True)
+            for index in range(4):
+                (daily / f"daily_{index}.mp4").write_bytes(b"video")
+                (world / f"world_{index}.mp4").write_bytes(b"video")
+
+            result = prepare_source_datasets(root=root, clip_limit=4)
+
+            pilot_path = Path(result["source_clips_pilot_path"])
+            clips = [json.loads(line) for line in pilot_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(4, len(clips))
+            self.assertEqual({"daily_omni": 2, "worldsense": 2}, _count_by_dataset(clips))
+
     def test_prepare_source_datasets_materializes_embedded_media_from_parquet_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -76,3 +94,11 @@ class ComposedSourcesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _count_by_dataset(records: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in records:
+        dataset = record["dataset"]
+        counts[dataset] = counts.get(dataset, 0) + 1
+    return counts
