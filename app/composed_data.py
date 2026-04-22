@@ -24,6 +24,7 @@ VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"
 ALLOWED_MODALITIES = {"visual", "audio"}
 MAX_PAIR_CANDIDATES = 40
 MIN_PAIR_CONTEXT_SCORE = 0.03
+MIN_CROSS_DATASET_CONTEXT_SCORE = 0.30
 MAX_PAIR_CHANGED_TYPES = 5
 MIN_PAIR_EDIT_MATCH_SCORE = 0.15
 PAIR_PRIORITY = (
@@ -342,6 +343,7 @@ def annotate_clips(
                 "fallback_used": fallback_used,
                 "raw_model_output": raw_model_output,
             }
+            record.update(_clip_manifest_metadata(item=item, root=layout["root"]))
             if fallback_reason:
                 record["fallback_reason"] = fallback_reason
             annotated_count += 1
@@ -359,6 +361,52 @@ def annotate_clips(
         "reused_count": reused_count,
         "fallback_count": fallback_count,
     }
+
+
+def _clip_manifest_metadata(*, item: dict[str, Any], root: Path) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    dataset = str(item.get("dataset", "")).strip()
+    if dataset:
+        metadata["dataset"] = dataset
+
+    source_row_ids = [str(value).strip() for value in item.get("source_row_ids", []) if str(value).strip()]
+    if source_row_ids:
+        metadata["source_row_ids"] = source_row_ids
+
+    text_fields = item.get("text_fields")
+    if isinstance(text_fields, dict) and text_fields:
+        metadata["text_fields"] = text_fields
+
+    source_path = str(item.get("source_path", "")).strip()
+    if source_path:
+        metadata["source_path"] = _display_source_path(root, source_path)
+
+    clip_timing: dict[str, Any] = {}
+    for field_name in ("start_seconds", "end_seconds", "duration_seconds"):
+        if field_name in item:
+            try:
+                clip_timing[field_name] = round(float(item[field_name]), 3)
+            except (TypeError, ValueError):
+                continue
+    role = str(item.get("role", "")).strip()
+    notes = str(item.get("notes", "")).strip()
+    if role:
+        clip_timing["role"] = role
+    if notes:
+        clip_timing["notes"] = notes
+    if clip_timing:
+        metadata["source_clip"] = clip_timing
+    return metadata
+
+
+def _display_source_path(root: Path, raw_path: str) -> str:
+    path = Path(raw_path)
+    if path.is_absolute():
+        try:
+            return path.relative_to(root).as_posix()
+        except ValueError:
+            return str(path)
+    return raw_path
 
 
 def propose_pairs(
@@ -441,6 +489,7 @@ def propose_pairs(
                     "edit_match_score": candidate["quality"]["edit_match_score"],
                     "target_uniqueness_score": candidate["quality"]["target_uniqueness_score"],
                 },
+                "source_context": dict(candidate["source_context"]),
                 "source": source,
                 "proposal_reason": model_fields["proposal_reason"],
                 "fallback_used": fallback_used,
@@ -769,6 +818,9 @@ def _score_ordered_pair(
         return None
 
     same_context_score = _same_context_score(reference_annotation, target_annotation)
+    source_context = _source_context(reference_annotation, target_annotation)
+    if source_context["relation"] == "cross_dataset" and same_context_score < MIN_CROSS_DATASET_CONTEXT_SCORE:
+        return None
     primary_difference = _detect_primary_difference(reference_annotation, target_annotation)
     if primary_difference is None:
         return None
@@ -822,6 +874,7 @@ def _score_ordered_pair(
         + quality["target_uniqueness_score"] * 0.20,
         4,
     )
+    composite_score = round(composite_score + source_context["score"] * 0.08, 4)
     return {
         "proposal_id": _build_proposal_id(reference_path, target_path),
         "reference_annotation": _sanitize_annotation_for_output(reference_annotation, root),
@@ -829,6 +882,7 @@ def _score_ordered_pair(
         "primary_difference": primary_difference,
         "quality": quality,
         "composite_score": composite_score,
+        "source_context": source_context,
         "hard_negative_annotations": [_sanitize_annotation_for_output(annotation, root) for annotation in hard_negative_annotations[:3]],
         "hard_negative_paths": hard_negative_paths,
     }
@@ -871,6 +925,52 @@ def _annotation_has_signal(annotation: dict[str, Any]) -> bool:
         or annotation.get("audio_events")
         or annotation.get("speech")
     )
+
+
+def _source_context(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    left_rows = {str(value).strip() for value in left.get("source_row_ids", []) if str(value).strip()}
+    right_rows = {str(value).strip() for value in right.get("source_row_ids", []) if str(value).strip()}
+    shared_rows = sorted(left_rows & right_rows)
+    if shared_rows:
+        return {"relation": "shared_source_row", "score": 1.0, "shared_source_row_ids": shared_rows}
+
+    left_source_path = str(left.get("source_path", "")).strip()
+    right_source_path = str(right.get("source_path", "")).strip()
+    if left_source_path and left_source_path == right_source_path:
+        return {"relation": "same_source_video", "score": 0.9}
+
+    left_dataset = str(left.get("dataset", "")).strip()
+    right_dataset = str(right.get("dataset", "")).strip()
+    if left_dataset and right_dataset:
+        if left_dataset == right_dataset:
+            text_score = _source_text_similarity(left, right)
+            return {
+                "relation": "same_dataset",
+                "score": round(0.25 + text_score * 0.35, 3),
+                "dataset": left_dataset,
+                "text_similarity": round(text_score, 3),
+            }
+        return {"relation": "cross_dataset", "score": 0.0, "datasets": [left_dataset, right_dataset]}
+
+    text_score = _source_text_similarity(left, right)
+    return {"relation": "unknown", "score": round(text_score * 0.2, 3), "text_similarity": round(text_score, 3)}
+
+
+def _source_text_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
+    return _jaccard(_text_field_tokens(left.get("text_fields", {})), _text_field_tokens(right.get("text_fields", {})))
+
+
+def _text_field_tokens(text_fields: Any) -> set[str]:
+    if not isinstance(text_fields, dict):
+        return set()
+    tokens: set[str] = set()
+    for value in text_fields.values():
+        if isinstance(value, list):
+            for item in value:
+                tokens.update(_tokenize_text(str(item)))
+        else:
+            tokens.update(_tokenize_text(str(value)))
+    return tokens
 
 
 def _same_context_score(left: dict[str, Any], right: dict[str, Any]) -> float:

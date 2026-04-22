@@ -70,15 +70,17 @@ def quality_score(record):
 def sort_key(record):
     difference_type = str(record.get("difference", {}).get("type", ""))
     priority_bonus = {
-        "object_count": 0.06,
-        "object_presence": 0.05,
-        "action": 0.04,
-        "audio_event": 0.04,
+        "action": 0.10,
+        "audio_event": 0.09,
+        "object_count": 0.08,
+        "object_presence": 0.07,
         "speech": 0.03,
+        "scene": -0.04,
     }.get(difference_type, 0.0)
     audio_bonus = 0.03 if "audio" in record.get("modalities", []) else 0.0
+    source_bonus = float(record.get("source_context", {}).get("score", 0.0)) * 0.05
     fallback_penalty = 0.15 if record.get("fallback_used") else 0.0
-    return quality_score(record) + priority_bonus + audio_bonus - fallback_penalty
+    return quality_score(record) + priority_bonus + audio_bonus + source_bonus - fallback_penalty
 
 
 def is_audio(record):
@@ -91,6 +93,10 @@ def is_object_change(record):
 
 def is_action(record):
     return str(record.get("difference", {}).get("type", "")) == "action"
+
+
+def is_non_scene(record):
+    return str(record.get("difference", {}).get("type", "")) != "scene"
 
 
 ranked = sorted(records, key=sort_key, reverse=True)
@@ -115,6 +121,7 @@ def take(predicate, target_count):
 take(is_audio, 2)
 take(is_object_change, 2)
 take(is_action, 1)
+take(is_non_scene, 5)
 
 difference_counts = {}
 for record in selected:
@@ -156,6 +163,7 @@ with pilot_path.open("w", encoding="utf-8") as handle:
             "hard_negatives": record["hard_negatives"],
             "quality": record["quality"],
             "source": record["source"],
+            "source_context": record.get("source_context", {}),
             "proposal_id": record["proposal_id"],
             "proposal_reason": record.get("proposal_reason", ""),
             "fallback_used": record.get("fallback_used", False),
@@ -168,12 +176,15 @@ summary = {
     "object_change_count": sum(1 for record in selected if is_object_change(record)),
     "action_count": sum(1 for record in selected if is_action(record)),
     "difference_type_counts": {},
+    "source_context_counts": {},
     "fallback_count": sum(1 for record in selected if record.get("fallback_used")),
     "pilot_path": str(pilot_path),
 }
 for record in selected:
     difference_type = str(record.get("difference", {}).get("type", "unknown"))
     summary["difference_type_counts"][difference_type] = summary["difference_type_counts"].get(difference_type, 0) + 1
+    relation = str(record.get("source_context", {}).get("relation", "unknown"))
+    summary["source_context_counts"][relation] = summary["source_context_counts"].get(relation, 0) + 1
 print(json.dumps(summary, ensure_ascii=False, indent=2))
 PY
 

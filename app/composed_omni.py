@@ -145,6 +145,8 @@ def _pair_proposal_system_prompt() -> str:
         '"proposal_reason": string}. '
         f"Allowed difference.type values: {difference_types}. "
         "If the main subject/person/object appears or disappears, use object_presence rather than subject. "
+        "Prefer fine-grained action, audio_event, object_count, or object_presence changes over broad scene changes when both apply. "
+        "Use scene only when the location or background is the primary edit. "
         "Keep edit_text short and only describe the change from reference to target. "
         "Prefer a single key difference instead of multiple simultaneous changes."
     )
@@ -175,6 +177,7 @@ def _build_pair_proposal_user_content(
         f"Related negative candidate annotations JSON:\n{json.dumps(hard_negative_candidates, ensure_ascii=False)}\n"
         "Write a short edit_text that changes the reference into the target. "
         "Use one primary difference type only. "
+        "Prefer action/audio/object differences over broad scene differences if they are visible or audible. "
         "If audio is important, include it in modalities. "
         "Keep captions factual and concise."
     )

@@ -130,6 +130,9 @@ class ComposedDataTests(unittest.TestCase):
                         "clip_id": "clip_a",
                         "source_asset_id": "asset_a",
                         "output_path": "clips/clip_a.mp4",
+                        "dataset": "daily_omni",
+                        "source_row_ids": ["row_a"],
+                        "text_fields": {"question": "What is the cat doing?"},
                         "start_seconds": 0.0,
                         "end_seconds": 4.0,
                         "duration_seconds": 4.0,
@@ -211,6 +214,10 @@ class ComposedDataTests(unittest.TestCase):
                 self.assertIn("fallback_used", record)
                 self.assertIn("raw_model_output", record)
                 self.assertFalse(record["fallback_used"])
+            records_by_id = {record["clip_id"]: record for record in records}
+            self.assertEqual("daily_omni", records_by_id["clip_a"]["dataset"])
+            self.assertEqual(["row_a"], records_by_id["clip_a"]["source_row_ids"])
+            self.assertEqual({"question": "What is the cat doing?"}, records_by_id["clip_a"]["text_fields"])
 
     def test_annotate_clips_marks_fallback_without_batch_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -503,6 +510,75 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(candidates), 1)
         self.assertGreaterEqual(len(candidates[0]["hard_negative_paths"]), 2)
+
+    def test_pair_candidates_filter_low_context_cross_dataset_pairs(self) -> None:
+        annotations = [
+            {
+                "clip_id": "daily_a",
+                "dataset": "daily_omni",
+                "output_path": "clips/daily_a.mp4",
+                "summary": "a person holds a handmade bookmark at a table",
+                "subjects": ["person", "bookmark"],
+                "object_counts": {"person": 1, "bookmark": 1},
+                "actions": ["holding"],
+                "scene": "craft table",
+                "attributes": ["decorative"],
+                "on_screen_text": [],
+                "speech": [],
+                "audio_events": ["speech"],
+                "modalities": ["visual", "audio"],
+            },
+            {
+                "clip_id": "world_a",
+                "dataset": "worldsense",
+                "output_path": "clips/world_a.mp4",
+                "summary": "a jazz band performs on a wooden stage",
+                "subjects": ["band"],
+                "object_counts": {"band": 1, "tuba": 1},
+                "actions": ["performing"],
+                "scene": "stage",
+                "attributes": ["musical"],
+                "on_screen_text": [],
+                "speech": [],
+                "audio_events": ["music"],
+                "modalities": ["visual", "audio"],
+            },
+            {
+                "clip_id": "daily_b",
+                "dataset": "daily_omni",
+                "output_path": "clips/daily_b.mp4",
+                "summary": "a person displays several handmade bookmarks at a table",
+                "subjects": ["person", "bookmark"],
+                "object_counts": {"person": 1, "bookmark": 4},
+                "actions": ["displaying"],
+                "scene": "craft table",
+                "attributes": ["decorative"],
+                "on_screen_text": [],
+                "speech": [],
+                "audio_events": ["speech"],
+                "modalities": ["visual", "audio"],
+            },
+            {
+                "clip_id": "daily_c",
+                "dataset": "daily_omni",
+                "output_path": "clips/daily_c.mp4",
+                "summary": "a person shows colorful keychains at a craft table",
+                "subjects": ["person", "keychain"],
+                "object_counts": {"person": 1, "keychain": 3},
+                "actions": ["showing"],
+                "scene": "craft table",
+                "attributes": ["colorful"],
+                "on_screen_text": [],
+                "speech": [],
+                "audio_events": ["speech"],
+                "modalities": ["visual", "audio"],
+            },
+        ]
+
+        candidates = _build_pair_candidates(root=Path("/tmp/composed"), annotations=annotations)
+
+        self.assertGreaterEqual(len(candidates), 1)
+        self.assertTrue(all(candidate["source_context"]["relation"] != "cross_dataset" for candidate in candidates))
 
     def test_propose_pairs_marks_fallback_when_model_call_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
