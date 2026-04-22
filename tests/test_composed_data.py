@@ -8,6 +8,7 @@ from unittest import mock
 
 from app.composed_data import (
     _build_pair_candidates,
+    _build_proposal_id,
     annotate_clips,
     build_ffmpeg_extract_command,
     discover_raw_sources,
@@ -699,6 +700,7 @@ class ComposedDataTests(unittest.TestCase):
                 json.dumps(
                     {
                         "sample_id": "covr_pilot_0001",
+                        "proposal_id": _build_proposal_id("clips/ref.mp4", "clips/target.mp4"),
                         "reference_video": "clips/ref.mp4",
                         "target_video": "clips/target.mp4",
                         "edit_text": "change one cat into two cats",
@@ -763,11 +765,12 @@ class ComposedDataTests(unittest.TestCase):
 
             pilot_path = root / "pilot.jsonl"
             records = []
+            duplicated_proposal_id = _build_proposal_id("clips/ref.mp4", "clips/target.mp4")
             for index, target in enumerate(("target.mp4", "other_target.mp4"), start=1):
                 records.append(
                     {
                         "sample_id": f"covr_pilot_{index:04d}",
-                        "proposal_id": "proposal__duplicate",
+                        "proposal_id": duplicated_proposal_id,
                         "reference_video": "clips/ref.mp4",
                         "target_video": f"clips/{target}",
                         "edit_text": "change one cat into two cats",

@@ -48,6 +48,7 @@ echo "[pilot50] proposal done $(date)"
 
 python - <<'PY'
 import json
+import hashlib
 from pathlib import Path
 
 MIN_SELECTION_CONTEXT_SCORE = 0.12
@@ -62,6 +63,13 @@ def context_score(record):
         return float(record.get("quality", {}).get("same_context_score", 0.0))
     except (TypeError, ValueError):
         return 0.0
+
+
+def proposal_id_for(record):
+    reference = str(record.get("reference_video", "")).strip()
+    target = str(record.get("target_video", "")).strip()
+    digest = hashlib.sha1(f"{reference}::{target}".encode("utf-8")).hexdigest()[:16]
+    return f"proposal__{digest}"
 
 
 non_cross_records = [
@@ -133,7 +141,7 @@ def take(predicate, target_count):
             return
         if len([item for item in selected if predicate(item)]) >= target_count:
             return
-        proposal_id = record.get("proposal_id")
+        proposal_id = proposal_id_for(record)
         if proposal_id in selected_ids:
             continue
         pair_key = (record.get("reference_video"), record.get("target_video"))
@@ -158,7 +166,7 @@ for record in selected:
 for record in ranked:
     if len(selected) >= 10:
         break
-    proposal_id = record.get("proposal_id")
+    proposal_id = proposal_id_for(record)
     if proposal_id in selected_ids:
         continue
     pair_key = (record.get("reference_video"), record.get("target_video"))
@@ -175,7 +183,7 @@ for record in ranked:
 for record in ranked:
     if len(selected) >= 10:
         break
-    proposal_id = record.get("proposal_id")
+    proposal_id = proposal_id_for(record)
     pair_key = (record.get("reference_video"), record.get("target_video"))
     if proposal_id not in selected_ids and pair_key not in selected_pair_keys:
         selected.append(record)
@@ -197,7 +205,7 @@ with pilot_path.open("w", encoding="utf-8") as handle:
             "quality": record["quality"],
             "source": record["source"],
             "source_context": record.get("source_context", {}),
-            "proposal_id": record["proposal_id"],
+            "proposal_id": proposal_id_for(record),
             "proposal_reason": record.get("proposal_reason", ""),
             "fallback_used": record.get("fallback_used", False),
         }

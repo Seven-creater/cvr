@@ -544,14 +544,21 @@ def validate_pilot_dataset(
             seen_sample_ids.add(sample_id)
 
         proposal_id = str(record.get("proposal_id", "")).strip()
-        if proposal_id:
-            if proposal_id in seen_proposal_ids:
-                errors.append(f"pilot line {index}: duplicate proposal_id={proposal_id}")
+        if not proposal_id:
+            errors.append(f"pilot line {index}: proposal_id is required")
+        elif proposal_id in seen_proposal_ids:
+            errors.append(f"pilot line {index}: duplicate proposal_id={proposal_id}")
+        else:
             seen_proposal_ids.add(proposal_id)
 
         reference_video = str(record.get("reference_video", "")).strip()
         target_video = str(record.get("target_video", "")).strip()
         if reference_video and target_video:
+            expected_proposal_id = _build_proposal_id(reference_video, target_video)
+            if proposal_id and proposal_id != expected_proposal_id:
+                errors.append(
+                    f"pilot line {index}: proposal_id={proposal_id} does not match expected {expected_proposal_id}"
+                )
             pair_key = (reference_video, target_video)
             if pair_key in seen_pair_keys:
                 errors.append(f"pilot line {index}: duplicate reference-target pair={pair_key}")
