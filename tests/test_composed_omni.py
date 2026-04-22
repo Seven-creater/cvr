@@ -42,7 +42,7 @@ class ComposedOmniClientTests(unittest.TestCase):
                                 "scene": "living room",
                                 "attributes": ["orange"],
                                 "on_screen_text": [],
-                                "speech": [],
+                                "speech": "soft narration",
                                 "audio_events": [],
                                 "modalities": ["visual"],
                             }
@@ -77,6 +77,7 @@ class ComposedOmniClientTests(unittest.TestCase):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         self.assertEqual("two cats on a sofa", normalized["summary"])
+        self.assertEqual(["soft narration"], normalized["speech"])
         request = request_holder["request"]
         request_body = json.loads(request.data.decode("utf-8"))
         self.assertEqual({"type": "json_object"}, request_body["response_format"])
@@ -167,6 +168,46 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertEqual({"type": "json_object"}, request_body["response_format"])
         self.assertEqual("instruct-model", request_body["model"])
         self.assertEqual(22.0, request_holder["timeout"])
+
+    def test_propose_pair_normalizes_subject_difference_alias(self) -> None:
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "edit_text": "change the woman into a man",
+                                "modalities": ["visual"],
+                                "reference_caption": "a woman speaks at a podium",
+                                "target_caption": "a man speaks to the camera",
+                                "difference": {
+                                    "type": "subject",
+                                    "from": "woman",
+                                    "to": "man",
+                                    "description": "the main subject changes",
+                                },
+                                "proposal_reason": "the main visible person changes",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8092/v1",
+            api_key="EMPTY",
+            model="instruct-model",
+        )
+
+        with mock.patch("urllib.request.urlopen", return_value=_FakeHTTPResponse(response_payload)):
+            normalized, _raw_payload = client.propose_pair(
+                reference_annotation={"clip_id": "ref", "summary": "a woman speaks at a podium"},
+                target_annotation={"clip_id": "target", "summary": "a man speaks to the camera"},
+                hard_negative_candidates=[],
+            )
+
+        self.assertEqual("object_presence", normalized["difference"]["type"])
 
 
 if __name__ == "__main__":

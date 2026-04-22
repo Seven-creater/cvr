@@ -18,6 +18,26 @@ ALLOWED_DIFFERENCE_TYPES = {
     "audio_event",
     "speech",
 }
+DIFFERENCE_TYPE_ALIASES = {
+    "subject": "object_presence",
+    "person": "object_presence",
+    "people": "object_presence",
+    "object": "object_presence",
+    "entity": "object_presence",
+    "count": "object_count",
+    "number": "object_count",
+    "object_number": "object_count",
+    "activity": "action",
+    "movement": "action",
+    "sound": "audio_event",
+    "audio": "audio_event",
+    "music": "audio_event",
+    "voice": "speech",
+    "spoken": "speech",
+    "background": "scene",
+    "location": "scene",
+    "color": "attribute",
+}
 
 REQUIRED_CLIP_ANNOTATION_FIELDS = (
     "summary",
@@ -43,6 +63,9 @@ REQUIRED_PAIR_PROPOSAL_FIELDS = (
 
 
 def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        item = value.strip()
+        return [item] if item else []
     if not isinstance(value, list):
         return []
     return [str(item).strip() for item in value if str(item).strip()]
@@ -78,7 +101,8 @@ def _normalize_object_counts(value: Any) -> dict[str, int]:
 def _validate_difference(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("difference must be an object")
-    difference_type = str(value.get("type", "")).strip()
+    difference_type = str(value.get("type", "")).strip().lower().replace("-", "_").replace(" ", "_")
+    difference_type = DIFFERENCE_TYPE_ALIASES.get(difference_type, difference_type)
     if difference_type not in ALLOWED_DIFFERENCE_TYPES:
         raise ValueError(f"unsupported difference.type={difference_type!r}")
     result = {
@@ -120,6 +144,7 @@ def _pair_proposal_system_prompt() -> str:
         '"difference": {"type": string, "from": string, "to": string, "description": string}, '
         '"proposal_reason": string}. '
         f"Allowed difference.type values: {difference_types}. "
+        "If the main subject/person/object appears or disappears, use object_presence rather than subject. "
         "Keep edit_text short and only describe the change from reference to target. "
         "Prefer a single key difference instead of multiple simultaneous changes."
     )

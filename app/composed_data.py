@@ -22,6 +22,10 @@ DEFAULT_PAIR_PROPOSALS_NAME = "pilot_candidates.jsonl"
 DEFAULT_LICENSE_NOTE = "internal research pilot only"
 VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
 ALLOWED_MODALITIES = {"visual", "audio"}
+MAX_PAIR_CANDIDATES = 40
+MIN_PAIR_CONTEXT_SCORE = 0.03
+MAX_PAIR_CHANGED_TYPES = 5
+MIN_PAIR_EDIT_MATCH_SCORE = 0.15
 PAIR_PRIORITY = (
     "object_count",
     "object_presence",
@@ -751,7 +755,7 @@ def _build_pair_candidates(*, root: Path, annotations: list[dict[str, Any]]) -> 
             if chosen is not None:
                 candidates.append(chosen)
     candidates.sort(key=lambda item: (-item["composite_score"], item["proposal_id"]))
-    return candidates
+    return candidates[:MAX_PAIR_CANDIDATES]
 
 
 def _score_ordered_pair(
@@ -769,9 +773,9 @@ def _score_ordered_pair(
     if primary_difference is None:
         return None
     changed_types = primary_difference.pop("changed_types")
-    if same_context_score < 0.2:
+    if same_context_score < MIN_PAIR_CONTEXT_SCORE:
         return None
-    if len(changed_types) > 3:
+    if len(changed_types) > MAX_PAIR_CHANGED_TYPES:
         return None
 
     edit_match_score = _edit_match_score(
@@ -779,7 +783,7 @@ def _score_ordered_pair(
         primary_difference_type=primary_difference["type"],
         changed_types=changed_types,
     )
-    if edit_match_score < 0.35:
+    if edit_match_score < MIN_PAIR_EDIT_MATCH_SCORE:
         return None
 
     hard_negative_annotations = _select_hard_negative_annotations(
@@ -1011,7 +1015,7 @@ def _edit_match_score(
     base_score = 0.5 + same_context_score * 0.35
     if primary_difference_type in {"object_count", "object_presence", "action", "audio_event"}:
         base_score += 0.1
-    penalty = max(0, len(changed_types) - 1) * 0.15
+    penalty = max(0, len(changed_types) - 1) * 0.10
     return max(0.0, min(1.0, base_score - penalty))
 
 
@@ -1031,9 +1035,6 @@ def _select_hard_negative_annotations(
             _same_context_score(reference_annotation, other),
             _same_context_score(target_annotation, other),
         )
-        if context_score <= 0:
-            continue
-
         score = context_score
         other_difference = _detect_primary_difference(reference_annotation, other)
         if other_difference is not None and other_difference["type"] == primary_difference["type"]:
@@ -1253,6 +1254,8 @@ def _parse_sources(raw_sources: list[str]) -> list[tuple[str, Path]]:
 
 
 def _normalize_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
     if not isinstance(value, list):
         return []
     normalized: list[str] = []

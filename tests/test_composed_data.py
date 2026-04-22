@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from app.composed_data import (
+    _build_pair_candidates,
     annotate_clips,
     build_ffmpeg_extract_command,
     discover_raw_sources,
@@ -437,6 +438,71 @@ class ComposedDataTests(unittest.TestCase):
                 self.assertIn("platform", record["source"])
                 self.assertIn("url", record["source"])
                 self.assertIn("license_note", record["source"])
+
+    def test_pair_candidates_keep_low_context_pairs_with_available_negatives(self) -> None:
+        annotations = [
+            {
+                "clip_id": "ref",
+                "output_path": "clips/ref.mp4",
+                "summary": "a woman speaks at a podium",
+                "subjects": ["woman"],
+                "object_counts": {"woman": 1, "podium": 1},
+                "actions": ["speaking"],
+                "scene": "formal hall",
+                "attributes": ["formal"],
+                "on_screen_text": [],
+                "speech": [],
+                "audio_events": ["speech"],
+                "modalities": ["visual", "audio"],
+            },
+            {
+                "clip_id": "target",
+                "output_path": "clips/target.mp4",
+                "summary": "a man speaks in a blue studio",
+                "subjects": ["man"],
+                "object_counts": {"man": 1},
+                "actions": ["speaking"],
+                "scene": "blue studio",
+                "attributes": ["blue"],
+                "on_screen_text": [],
+                "speech": [],
+                "audio_events": ["speech"],
+                "modalities": ["visual", "audio"],
+            },
+            {
+                "clip_id": "neg1",
+                "output_path": "clips/neg1.mp4",
+                "summary": "a beaker is heated in a laboratory",
+                "subjects": ["beaker"],
+                "object_counts": {"beaker": 1},
+                "actions": ["heating"],
+                "scene": "laboratory",
+                "attributes": ["transparent"],
+                "on_screen_text": [],
+                "speech": [],
+                "audio_events": [],
+                "modalities": ["visual"],
+            },
+            {
+                "clip_id": "neg2",
+                "output_path": "clips/neg2.mp4",
+                "summary": "a musician plays a tuba on stage",
+                "subjects": ["musician"],
+                "object_counts": {"musician": 1, "tuba": 1},
+                "actions": ["playing"],
+                "scene": "stage",
+                "attributes": ["musical"],
+                "on_screen_text": [],
+                "speech": [],
+                "audio_events": ["music"],
+                "modalities": ["visual", "audio"],
+            },
+        ]
+
+        candidates = _build_pair_candidates(root=Path("/tmp/composed"), annotations=annotations)
+
+        self.assertGreaterEqual(len(candidates), 1)
+        self.assertGreaterEqual(len(candidates[0]["hard_negative_paths"]), 2)
 
     def test_propose_pairs_marks_fallback_when_model_call_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
