@@ -797,6 +797,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(summary["proposal_count"], summary["fallback_count"])
             self.assertTrue(all(record["fallback_used"] for record in records))
             self.assertTrue(all(record["difference"]["type"] in ALLOWED_DIFFERENCE_TYPES for record in records))
+            self.assertTrue(all(record["reference_video"] not in record["hard_negatives"] for record in records))
             self.assertTrue(all(record["target_video"] not in record["hard_negatives"] for record in records))
 
     def test_validate_pilot_dataset_builds_gallery_from_targets_and_negatives(self) -> None:
@@ -908,6 +909,46 @@ class ComposedDataTests(unittest.TestCase):
             self._write_jsonl(pilot_path, records)
 
             with self.assertRaisesRegex(ValueError, "duplicate proposal_id"):
+                validate_pilot_dataset(
+                    root=root,
+                    pilot_jsonl_path=pilot_path,
+                    gallery_output_path=root / "gallery.jsonl",
+                    report_output_path=root / "pilot_review.md",
+                )
+
+    def test_validate_pilot_dataset_rejects_reference_in_hard_negatives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            pilot_path = root / "pilot.jsonl"
+            record = {
+                "sample_id": "covr_pilot_0001",
+                "proposal_id": _build_proposal_id("clips/ref.mp4", "clips/target.mp4"),
+                "reference_video": "clips/ref.mp4",
+                "target_video": "clips/target.mp4",
+                "edit_text": "change one cat into two cats",
+                "modalities": ["visual", "audio"],
+                "reference_caption": "one cat on a sofa",
+                "target_caption": "two cats on a sofa",
+                "difference": {"type": "object_count", "from": "one cat", "to": "two cats"},
+                "hard_negatives": ["clips/ref.mp4", "clips/neg1.mp4"],
+                "quality": {
+                    "same_context_score": 0.9,
+                    "edit_match_score": 0.8,
+                    "target_uniqueness_score": 0.7,
+                },
+                "source": {
+                    "platform": "daily_omni",
+                    "url": "file:///tmp/video.mp4",
+                    "license_note": "internal research pilot only",
+                },
+            }
+            self._write_jsonl(pilot_path, [record])
+
+            with self.assertRaisesRegex(ValueError, "reference_video cannot appear in hard_negatives"):
                 validate_pilot_dataset(
                     root=root,
                     pilot_jsonl_path=pilot_path,

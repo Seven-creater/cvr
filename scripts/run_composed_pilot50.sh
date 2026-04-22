@@ -51,7 +51,7 @@ import json
 import hashlib
 from pathlib import Path
 
-MIN_SELECTION_CONTEXT_SCORE = 0.12
+MIN_SELECTION_CONTEXT_SCORES = [0.12, 0.10, 0.08]
 run_root = Path("/data02/usr/wangqihao/Demo/test/cvr/runs/composed_pilot50_20260422")
 pairs_path = run_root / "pilot_pair_proposals.jsonl"
 pilot_path = run_root / "pilot_10.jsonl"
@@ -77,15 +77,26 @@ non_cross_records = [
     for record in records
     if record.get("source_context", {}).get("relation") != "cross_dataset"
 ]
-high_context_records = [
-    record
-    for record in non_cross_records
-    if context_score(record) >= MIN_SELECTION_CONTEXT_SCORE
-]
+selection_threshold = None
+high_context_records = []
+for threshold in MIN_SELECTION_CONTEXT_SCORES:
+    threshold_records = [record for record in non_cross_records if context_score(record) >= threshold]
+    if len(threshold_records) >= 5:
+        selection_threshold = threshold
+        high_context_records = threshold_records
+        break
+if not high_context_records:
+    selection_threshold = MIN_SELECTION_CONTEXT_SCORES[-1]
+    high_context_records = [
+        record
+        for record in non_cross_records
+        if context_score(record) >= selection_threshold
+    ]
 selection_records = high_context_records if len(high_context_records) >= 5 else non_cross_records
 selection_records = selection_records if len(selection_records) >= 5 else records
 if len(records) < 5:
     raise SystemExit(f"need at least 5 pair proposals, got {len(records)}")
+pilot_target_count = min(10, len(selection_records))
 
 
 def quality_score(record):
@@ -137,7 +148,7 @@ selected_pair_keys = set()
 
 def take(predicate, target_count):
     for record in ranked:
-        if len(selected) >= 10:
+        if len(selected) >= pilot_target_count:
             return
         if len([item for item in selected if predicate(item)]) >= target_count:
             return
@@ -164,7 +175,7 @@ for record in selected:
     difference_counts[difference_type] = difference_counts.get(difference_type, 0) + 1
 
 for record in ranked:
-    if len(selected) >= 10:
+    if len(selected) >= pilot_target_count:
         break
     proposal_id = proposal_id_for(record)
     if proposal_id in selected_ids:
@@ -181,7 +192,7 @@ for record in ranked:
     difference_counts[difference_type] = difference_counts.get(difference_type, 0) + 1
 
 for record in ranked:
-    if len(selected) >= 10:
+    if len(selected) >= pilot_target_count:
         break
     proposal_id = proposal_id_for(record)
     pair_key = (record.get("reference_video"), record.get("target_video"))
@@ -215,7 +226,8 @@ summary = {
     "non_cross_pool_count": len(non_cross_records),
     "high_context_pool_count": len(high_context_records),
     "selection_pool_count": len(selection_records),
-    "min_selection_context_score": MIN_SELECTION_CONTEXT_SCORE,
+    "min_selection_context_scores": MIN_SELECTION_CONTEXT_SCORES,
+    "selected_context_threshold": selection_threshold,
     "pilot_count": len(selected),
     "audio_count": sum(1 for record in selected if is_audio(record)),
     "object_change_count": sum(1 for record in selected if is_object_change(record)),

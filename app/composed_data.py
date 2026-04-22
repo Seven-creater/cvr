@@ -926,6 +926,8 @@ def _validate_pilot_record(root: Path, record: dict[str, Any], line_number: int)
         normalized_negatives = [str(item).strip() for item in hard_negatives if str(item).strip()]
         if len(normalized_negatives) != len(hard_negatives):
             errors.append(f"pilot line {line_number}: hard_negatives must only contain non-empty strings")
+        if reference_video and reference_video in normalized_negatives:
+            errors.append(f"pilot line {line_number}: reference_video cannot appear in hard_negatives")
         if target_video and target_video in normalized_negatives:
             errors.append(f"pilot line {line_number}: target_video cannot appear in hard_negatives")
         for negative_path in normalized_negatives:
@@ -1024,6 +1026,8 @@ def _score_ordered_pair(
 
     reference_path = _display_path(root, _resolve_under_root(root, reference_annotation["output_path"]))
     target_path = _display_path(root, _resolve_under_root(root, target_annotation["output_path"]))
+    if reference_path in hard_negative_paths:
+        return None
     if target_path in hard_negative_paths:
         return None
 
