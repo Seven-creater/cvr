@@ -350,6 +350,7 @@ def _annotate_clips_impl(
     annotated_count = 0
     reused_count = 0
     fallback_count = 0
+    detective_to_single_pass_count = 0
     for item in clips:
         clip_id = str(item.get("clip_id", "")).strip()
         if not clip_id:
@@ -364,18 +365,50 @@ def _annotate_clips_impl(
                 raise FileNotFoundError(f"clip output does not exist: {clip_path}")
 
             fallback_reason = ""
+            detective_fallback_reason = ""
+            detective_fallback_used = False
             raw_model_output: dict[str, Any] = {}
-            try:
-                if detective:
+            if detective:
+                try:
                     normalized, raw_model_output = client.annotate_clip_detective(clip_path=str(clip_path))
-                else:
+                    fallback_used = False
+                except Exception as detective_exc:
+                    detective_fallback_used = True
+                    detective_fallback_reason = "detective_to_single_pass"
+                    try:
+                        normalized, single_pass_output = client.annotate_clip(clip_path=str(clip_path))
+                        raw_model_output = {
+                            "detective_error": f"{type(detective_exc).__name__}: {detective_exc}",
+                            "single_pass_fallback": single_pass_output,
+                        }
+                        normalized["storyline"] = []
+                        normalized["visible_text"] = []
+                        normalized["speakers_and_transcript"] = []
+                        normalized["detective_notes"] = ["detective annotation failed; used single-pass annotation"]
+                        normalized["detective_trajectory"] = [
+                            {"stage": "detective_error", "error": raw_model_output["detective_error"]},
+                            {"stage": "single_pass_fallback", "payload": single_pass_output},
+                        ]
+                        fallback_used = False
+                        detective_to_single_pass_count += 1
+                    except Exception as single_pass_exc:
+                        normalized = _fallback_clip_annotation()
+                        raw_model_output = {
+                            "detective_error": f"{type(detective_exc).__name__}: {detective_exc}",
+                            "single_pass_error": f"{type(single_pass_exc).__name__}: {single_pass_exc}",
+                        }
+                        fallback_used = True
+                        fallback_reason = "annotation_fallback"
+                        detective_fallback_reason = "detective_and_single_pass_failed"
+            else:
+                try:
                     normalized, raw_model_output = client.annotate_clip(clip_path=str(clip_path))
-                fallback_used = False
-            except Exception as exc:
-                normalized = _fallback_clip_annotation()
-                raw_model_output = {"error": f"{type(exc).__name__}: {exc}"}
-                fallback_used = True
-                fallback_reason = "annotation_fallback"
+                    fallback_used = False
+                except Exception as exc:
+                    normalized = _fallback_clip_annotation()
+                    raw_model_output = {"error": f"{type(exc).__name__}: {exc}"}
+                    fallback_used = True
+                    fallback_reason = "annotation_fallback"
 
             record = {
                 "clip_id": clip_id,
@@ -402,8 +435,11 @@ def _annotate_clips_impl(
                         "speakers_and_transcript": list(normalized.get("speakers_and_transcript", [])),
                         "detective_notes": list(normalized.get("detective_notes", [])),
                         "detective_trajectory": list(normalized.get("detective_trajectory", [])),
+                        "detective_fallback_used": detective_fallback_used,
                     }
                 )
+                if detective_fallback_reason:
+                    record["detective_fallback_reason"] = detective_fallback_reason
             record.update(_clip_manifest_metadata(item=item, root=layout["root"]))
             if fallback_reason:
                 record["fallback_reason"] = fallback_reason
@@ -422,6 +458,7 @@ def _annotate_clips_impl(
         "reused_count": reused_count,
         "fallback_count": fallback_count,
         "annotation_mode": "detective" if detective else "single_pass",
+        "detective_to_single_pass_count": detective_to_single_pass_count if detective else 0,
     }
 
 

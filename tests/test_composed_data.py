@@ -352,6 +352,58 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual([{"stage": "observer"}, {"stage": "detective_final"}], records[0]["detective_trajectory"])
             self.assertEqual("daily_omni", records[0]["dataset"])
 
+    def test_detective_annotate_clips_falls_back_to_single_pass_annotation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "clip_a.mp4").write_bytes(b"a")
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [{"clip_id": "clip_a", "source_asset_id": "asset_a", "output_path": "clips/clip_a.mp4"}],
+            )
+
+            single_pass_output = (
+                {
+                    "summary": "a person claps in a studio",
+                    "subjects": ["person"],
+                    "object_counts": {"person": 1},
+                    "actions": ["clapping"],
+                    "scene": "studio",
+                    "attributes": ["indoor"],
+                    "on_screen_text": [],
+                    "speech": [],
+                    "audio_events": ["clap"],
+                    "modalities": ["visual", "audio"],
+                },
+                {"provider": "mock", "mode": "single_pass"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.annotate_clip_detective.side_effect = ValueError("bad detective json")
+                client_cls.return_value.annotate_clip.return_value = single_pass_output
+                summary = detective_annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=root / "captions" / "clip_annotations_detective.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            records = [
+                json.loads(line)
+                for line in (root / "captions" / "clip_annotations_detective.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(0, summary["fallback_count"])
+            self.assertEqual(1, summary["detective_to_single_pass_count"])
+            self.assertFalse(records[0]["fallback_used"])
+            self.assertTrue(records[0]["detective_fallback_used"])
+            self.assertEqual("detective_to_single_pass", records[0]["detective_fallback_reason"])
+            self.assertEqual("a person claps in a studio", records[0]["summary"])
+            self.assertEqual("single_pass_fallback", records[0]["detective_trajectory"][1]["stage"])
+
     def test_propose_pairs_outputs_schema_compliant_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
