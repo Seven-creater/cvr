@@ -253,3 +253,38 @@ nohup bash /data02/usr/wangqihao/Demo/test/cvr/scripts/download_qwen3_omni_model
 
 不要使用 Hugging Face，不要重启任何 vLLM/Omni 服务。
 ```
+
+## 9. 下载完成后的数据归一化任务
+
+Daily-Omni 和 WorldSense 下载完成后，先不要直接大规模调用 Qwen3-Omni。先把两个原始数据源统一整理成 source rows 和 source clips。
+
+服务器 AI 可直接运行：
+
+```text
+不要改代码。现在只做 Daily-Omni 和 WorldSense 的数据归一化，不调用 Qwen3-Omni 推理。
+
+1. 进入仓库并同步：
+cd /data02/usr/wangqihao/Demo/test/cvr
+git pull
+git rev-parse HEAD
+
+2. 安装 parquet 读取依赖：
+source /data02/usr/wangqihao/miniconda3/etc/profile.d/conda.sh
+conda activate omni_src
+python -m pip install -U pyarrow
+
+3. 用 nohup 运行 source prepare：
+mkdir -p /data02/usr/wangqihao/Demo/test/cvr/runs/composed_source_prepare_20260422
+nohup bash /data02/usr/wangqihao/Demo/test/cvr/scripts/prepare_composed_sources.sh \
+  > /data02/usr/wangqihao/Demo/test/cvr/runs/composed_source_prepare_20260422/source_prepare.log 2>&1 &
+```
+
+完成后回传：
+
+- `source_prepare.log` 最后 120 行
+- `source_dataset_prepare_summary.md` 全文
+- `source_rows.jsonl` 前 5 行
+- `source_clips_all.jsonl` 前 5 行
+- `source_clips_pilot*.jsonl` 前 10 行
+
+这一步的输出是后续 `annotate-clips -> propose-pairs -> validate-pilot` 的输入。

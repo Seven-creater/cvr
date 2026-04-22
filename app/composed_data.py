@@ -243,7 +243,7 @@ def extract_clips(
                 clip_id=clip_id,
                 source_asset_id=source_asset_id,
                 source_path=str(source),
-                output_path=str(output_path),
+                output_path=_display_path(layout["root"], output_path),
                 start_seconds=start_seconds,
                 end_seconds=end_seconds,
                 duration_seconds=end_seconds - start_seconds,
