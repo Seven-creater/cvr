@@ -54,6 +54,12 @@ run_root = Path("/data02/usr/wangqihao/Demo/test/cvr/runs/composed_pilot50_20260
 pairs_path = run_root / "pilot_pair_proposals.jsonl"
 pilot_path = run_root / "pilot_10.jsonl"
 records = [json.loads(line) for line in pairs_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+non_cross_records = [
+    record
+    for record in records
+    if record.get("source_context", {}).get("relation") != "cross_dataset"
+]
+selection_records = non_cross_records if len(non_cross_records) >= 5 else records
 if len(records) < 5:
     raise SystemExit(f"need at least 5 pair proposals, got {len(records)}")
 
@@ -99,9 +105,10 @@ def is_non_scene(record):
     return str(record.get("difference", {}).get("type", "")) != "scene"
 
 
-ranked = sorted(records, key=sort_key, reverse=True)
+ranked = sorted(selection_records, key=sort_key, reverse=True)
 selected = []
 selected_ids = set()
+selected_pair_keys = set()
 
 
 def take(predicate, target_count):
@@ -113,9 +120,13 @@ def take(predicate, target_count):
         proposal_id = record.get("proposal_id")
         if proposal_id in selected_ids:
             continue
+        pair_key = (record.get("reference_video"), record.get("target_video"))
+        if pair_key in selected_pair_keys:
+            continue
         if predicate(record):
             selected.append(record)
             selected_ids.add(proposal_id)
+            selected_pair_keys.add(pair_key)
 
 
 take(is_audio, 2)
@@ -134,20 +145,26 @@ for record in ranked:
     proposal_id = record.get("proposal_id")
     if proposal_id in selected_ids:
         continue
+    pair_key = (record.get("reference_video"), record.get("target_video"))
+    if pair_key in selected_pair_keys:
+        continue
     difference_type = str(record.get("difference", {}).get("type", "unknown"))
     if difference_counts.get(difference_type, 0) >= 4 and len(selected) < 8:
         continue
     selected.append(record)
     selected_ids.add(proposal_id)
+    selected_pair_keys.add(pair_key)
     difference_counts[difference_type] = difference_counts.get(difference_type, 0) + 1
 
 for record in ranked:
     if len(selected) >= 10:
         break
     proposal_id = record.get("proposal_id")
-    if proposal_id not in selected_ids:
+    pair_key = (record.get("reference_video"), record.get("target_video"))
+    if proposal_id not in selected_ids and pair_key not in selected_pair_keys:
         selected.append(record)
         selected_ids.add(proposal_id)
+        selected_pair_keys.add(pair_key)
 
 with pilot_path.open("w", encoding="utf-8") as handle:
     for index, record in enumerate(selected, start=1):
@@ -171,6 +188,7 @@ with pilot_path.open("w", encoding="utf-8") as handle:
         handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
 summary = {
     "proposal_count": len(records),
+    "selection_pool_count": len(selection_records),
     "pilot_count": len(selected),
     "audio_count": sum(1 for record in selected if is_audio(record)),
     "object_change_count": sum(1 for record in selected if is_object_change(record)),

@@ -745,6 +745,50 @@ class ComposedDataTests(unittest.TestCase):
                 {record["video_path"] for record in gallery_records},
             )
 
+    def test_validate_pilot_dataset_rejects_duplicate_proposals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4", "other_target.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            pilot_path = root / "pilot.jsonl"
+            records = []
+            for index, target in enumerate(("target.mp4", "other_target.mp4"), start=1):
+                records.append(
+                    {
+                        "sample_id": f"covr_pilot_{index:04d}",
+                        "proposal_id": "proposal__duplicate",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": f"clips/{target}",
+                        "edit_text": "change one cat into two cats",
+                        "modalities": ["visual", "audio"],
+                        "reference_caption": "one cat on a sofa",
+                        "target_caption": "two cats on a sofa",
+                        "difference": {"type": "object_count", "from": "one cat", "to": "two cats"},
+                        "hard_negatives": ["clips/neg1.mp4", "clips/neg2.mp4"],
+                        "quality": {
+                            "same_context_score": 0.9,
+                            "edit_match_score": 0.8,
+                            "target_uniqueness_score": 0.7,
+                        },
+                        "source": {
+                            "platform": "daily_omni",
+                            "url": "file:///tmp/video.mp4",
+                            "license_note": "internal research pilot only",
+                        },
+                    }
+                )
+            self._write_jsonl(pilot_path, records)
+
+            with self.assertRaisesRegex(ValueError, "duplicate proposal_id"):
+                validate_pilot_dataset(
+                    root=root,
+                    pilot_jsonl_path=pilot_path,
+                    gallery_output_path=root / "gallery.jsonl",
+                    report_output_path=root / "pilot_review.md",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,7 +24,6 @@ VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"
 ALLOWED_MODALITIES = {"visual", "audio"}
 MAX_PAIR_CANDIDATES = 40
 MIN_PAIR_CONTEXT_SCORE = 0.03
-MIN_CROSS_DATASET_CONTEXT_SCORE = 0.30
 MAX_PAIR_CHANGED_TYPES = 5
 MIN_PAIR_EDIT_MATCH_SCORE = 0.15
 PAIR_PRIORITY = (
@@ -527,6 +526,8 @@ def validate_pilot_dataset(
 
     errors: list[str] = []
     seen_sample_ids: set[str] = set()
+    seen_proposal_ids: set[str] = set()
+    seen_pair_keys: set[tuple[str, str]] = set()
     difference_counter: Counter[str] = Counter()
     modality_counter: Counter[str] = Counter()
     gallery_accumulator: dict[str, dict[str, Any]] = {}
@@ -539,6 +540,20 @@ def validate_pilot_dataset(
             if sample_id in seen_sample_ids:
                 errors.append(f"pilot line {index}: duplicate sample_id={sample_id}")
             seen_sample_ids.add(sample_id)
+
+        proposal_id = str(record.get("proposal_id", "")).strip()
+        if proposal_id:
+            if proposal_id in seen_proposal_ids:
+                errors.append(f"pilot line {index}: duplicate proposal_id={proposal_id}")
+            seen_proposal_ids.add(proposal_id)
+
+        reference_video = str(record.get("reference_video", "")).strip()
+        target_video = str(record.get("target_video", "")).strip()
+        if reference_video and target_video:
+            pair_key = (reference_video, target_video)
+            if pair_key in seen_pair_keys:
+                errors.append(f"pilot line {index}: duplicate reference-target pair={pair_key}")
+            seen_pair_keys.add(pair_key)
 
         modalities = [str(item).strip() for item in record.get("modalities", []) if str(item).strip()]
         modality_counter.update(modalities)
@@ -819,7 +834,7 @@ def _score_ordered_pair(
 
     same_context_score = _same_context_score(reference_annotation, target_annotation)
     source_context = _source_context(reference_annotation, target_annotation)
-    if source_context["relation"] == "cross_dataset" and same_context_score < MIN_CROSS_DATASET_CONTEXT_SCORE:
+    if source_context["relation"] == "cross_dataset":
         return None
     primary_difference = _detect_primary_difference(reference_annotation, target_annotation)
     if primary_difference is None:
