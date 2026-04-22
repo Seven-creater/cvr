@@ -256,7 +256,7 @@ nohup bash /data02/usr/wangqihao/Demo/test/cvr/scripts/download_qwen3_omni_model
 
 ## 9. 下载完成后的数据归一化任务
 
-Daily-Omni 和 WorldSense 下载完成后，先不要直接大规模调用 Qwen3-Omni。先把两个原始数据源统一整理成 source rows 和 source clips。
+Daily-Omni 和 WorldSense 下载完成后，先不要直接大规模调用 Qwen3-Omni。先把两个原始数据源统一整理成 source rows 和 source clips。脚本会自动解压 `raw_datasets/worldsense` 下的 `.zip` 文件到 `_extracted/`，并优先解析真实存在的视频路径。
 
 服务器 AI 可直接运行：
 

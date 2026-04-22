@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -90,6 +91,33 @@ class ComposedSourcesTests(unittest.TestCase):
             ]
             self.assertEqual(1, len(clips))
             self.assertEqual(["daily_omni"], [clip["dataset"] for clip in clips])
+
+    def test_prepare_source_datasets_extracts_zips_and_resolves_relative_media(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            daily = root / "raw_datasets" / "daily_omni"
+            world = root / "raw_datasets" / "worldsense"
+            daily.mkdir(parents=True)
+            world.mkdir(parents=True)
+            archive_path = world / "videos.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("videos/sample.mp4", b"video")
+            parquet_path = world / "data.parquet"
+            parquet_path.write_bytes(b"placeholder")
+            fake_rows = [{"video_id": "sample", "video": "./videos/sample.mp4", "question": "What is shown?"}]
+
+            with mock.patch("app.composed_sources._read_parquet_rows", return_value=fake_rows):
+                result = prepare_source_datasets(root=root, clip_limit=5)
+
+            rows = [
+                json.loads(line)
+                for line in Path(result["source_rows_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, len(rows))
+            self.assertTrue(Path(rows[0]["video_path"]).exists())
+            self.assertIn("_extracted", rows[0]["video_path"])
+            self.assertEqual(1, result["dataset_counts"]["worldsense"]["archives"])
 
 
 if __name__ == "__main__":

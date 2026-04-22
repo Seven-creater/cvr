@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import re
+import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -37,6 +38,7 @@ def prepare_source_datasets(
         if not source_root.exists():
             dataset_counts[dataset_name] = {"rows": 0, "clips": 0, "missing_root": 1}
             continue
+        extraction_summary = extract_archives(source_root)
         rows = list(_load_dataset_rows(dataset_name=dataset_name, source_root=source_root, output_root=root_path))
         if not rows:
             rows = list(_rows_from_media_files(dataset_name=dataset_name, source_root=source_root))
@@ -45,6 +47,8 @@ def prepare_source_datasets(
             "rows": len(rows),
             "clips": len({row["video_path"] for row in rows if row.get("video_path")}),
             "missing_root": 0,
+            "archives": extraction_summary["archive_count"],
+            "extracted_archives": extraction_summary["extracted_count"],
         }
 
     clips_all = _build_clip_records(all_rows, root_path)
@@ -82,6 +86,26 @@ def prepare_source_datasets(
         "pilot_clip_count": len(clips_pilot),
         "dataset_counts": dataset_counts,
     }
+
+
+def extract_archives(source_root: Path) -> dict[str, int]:
+    extracted_root = source_root / "_extracted"
+    archive_count = 0
+    extracted_count = 0
+    for archive_path in sorted(source_root.rglob("*.zip")):
+        if "_extracted" in archive_path.parts:
+            continue
+        archive_count += 1
+        destination = extracted_root / archive_path.relative_to(source_root).with_suffix("")
+        marker = destination / ".extract_complete"
+        if marker.exists():
+            continue
+        destination.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(destination)
+        marker.write_text(str(archive_path), encoding="utf-8")
+        extracted_count += 1
+    return {"archive_count": archive_count, "extracted_count": extracted_count}
 
 
 def _load_dataset_rows(*, dataset_name: str, source_root: Path, output_root: Path) -> Iterable[dict[str, Any]]:
@@ -264,11 +288,33 @@ def _resolve_source_path(value: str, source_root: Path, suffixes: set[str]) -> s
     if Path(value).suffix.lower() not in suffixes:
         return ""
     path = Path(value)
-    candidates = [path] if path.is_absolute() else [source_root / path, source_root / value.lstrip("./")]
+    candidates = [path] if path.is_absolute() else _relative_media_candidates(value, source_root)
     for candidate in candidates:
         if candidate.exists():
             return str(candidate)
     return str(candidates[0])
+
+
+def _relative_media_candidates(value: str, source_root: Path) -> list[Path]:
+    normalized = value.lstrip("./")
+    candidates = [source_root / value, source_root / normalized]
+    extracted_root = source_root / "_extracted"
+    candidates.extend([extracted_root / value, extracted_root / normalized])
+    file_name = Path(normalized).name
+    if file_name:
+        candidates.extend(sorted(source_root.rglob(file_name)))
+        if extracted_root.exists():
+            candidates.extend(sorted(extracted_root.rglob(file_name)))
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
 
 
 def _extract_text_fields(row: dict[str, Any]) -> dict[str, Any]:
