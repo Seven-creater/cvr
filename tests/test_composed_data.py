@@ -1370,6 +1370,80 @@ class ComposedDataTests(unittest.TestCase):
         self.assertGreaterEqual(len(candidates), 1)
         self.assertTrue(all(candidate["source_context"]["relation"] != "cross_dataset" for candidate in candidates))
 
+    def test_pair_candidates_retarget_primary_difference_for_type_diversity(self) -> None:
+        annotations = [
+            {
+                "clip_id": "ref",
+                "source_path": "/data/source.mp4",
+                "source_clip": {"start_seconds": 0.0, "end_seconds": 8.0},
+                "output_path": "clips/ref.mp4",
+                "summary": "a presenter speaks at a studio desk",
+                "subjects": ["presenter"],
+                "object_counts": {"presenter": 1},
+                "actions": ["speaking"],
+                "scene": "studio desk",
+                "attributes": ["indoor"],
+                "on_screen_text": [],
+                "speech": ["welcome to the lesson"],
+                "audio_events": ["speech"],
+                "modalities": ["visual", "audio"],
+            },
+            {
+                "clip_id": "target",
+                "source_path": "/data/source.mp4",
+                "source_clip": {"start_seconds": 8.0, "end_seconds": 16.0},
+                "output_path": "clips/target.mp4",
+                "summary": "a presenter speaks at the same studio desk with a laptop visible",
+                "subjects": ["presenter"],
+                "object_counts": {"presenter": 1, "laptop": 1},
+                "actions": ["speaking"],
+                "scene": "studio desk",
+                "attributes": ["indoor"],
+                "on_screen_text": [],
+                "speech": ["use the coupon code today"],
+                "audio_events": ["speech"],
+                "modalities": ["visual", "audio"],
+            },
+            {
+                "clip_id": "neg1",
+                "source_path": "/data/source.mp4",
+                "source_clip": {"start_seconds": 16.0, "end_seconds": 24.0},
+                "output_path": "clips/neg1.mp4",
+                "summary": "a presenter speaks at the studio desk",
+                "subjects": ["presenter"],
+                "object_counts": {"presenter": 1},
+                "actions": ["speaking"],
+                "scene": "studio desk",
+                "attributes": ["indoor"],
+                "on_screen_text": [],
+                "speech": ["welcome to the lesson"],
+                "audio_events": ["speech"],
+                "modalities": ["visual", "audio"],
+            },
+            {
+                "clip_id": "neg2",
+                "source_path": "/data/source.mp4",
+                "source_clip": {"start_seconds": 24.0, "end_seconds": 32.0},
+                "output_path": "clips/neg2.mp4",
+                "summary": "a presenter speaks at the studio desk with a poster visible",
+                "subjects": ["presenter"],
+                "object_counts": {"presenter": 1, "poster": 1},
+                "actions": ["speaking"],
+                "scene": "studio desk",
+                "attributes": ["indoor"],
+                "on_screen_text": [],
+                "speech": ["thanks for watching"],
+                "audio_events": ["speech"],
+                "modalities": ["visual", "audio"],
+            },
+        ]
+
+        candidates = _build_pair_candidates(root=Path("/tmp/composed"), annotations=annotations)
+        proposal_ids = [candidate["proposal_id"] for candidate in candidates]
+
+        self.assertEqual(len(proposal_ids), len(set(proposal_ids)))
+        self.assertTrue(any(candidate["primary_difference"]["type"] == "speech" for candidate in candidates))
+
     def test_pair_context_uses_temporal_proximity_for_same_source_video(self) -> None:
         left = {
             "source_path": "/data/video.mp4",

@@ -50,6 +50,16 @@ HIGH_CONTEXT_PAIR_PRIORITY = (
     "attribute",
     "scene",
 )
+DIVERSE_PAIR_BUCKET_TARGETS = {
+    "object_count": 3,
+    "action": 3,
+    "audio_event": 3,
+    "speech": 3,
+    "object_presence": 3,
+    "visible_text": 3,
+    "attribute": 2,
+    "scene": 1,
+}
 MIN_ACCEPT_SAME_CONTEXT_SCORE = 0.55
 MIN_ACCEPT_EDIT_MATCH_SCORE = 0.75
 MIN_ACCEPT_TARGET_UNIQUENESS_SCORE = 0.70
@@ -1701,7 +1711,91 @@ def _build_pair_candidates(*, root: Path, annotations: list[dict[str, Any]]) -> 
             if chosen is not None:
                 candidates.append(chosen)
     candidates.sort(key=lambda item: (-item["composite_score"], item["proposal_id"]))
-    return candidates[:MAX_PAIR_CANDIDATES]
+    return _select_diverse_pair_candidates(candidates, max_candidates=MAX_PAIR_CANDIDATES)
+
+
+def _select_diverse_pair_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    max_candidates: int,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+
+    for difference_type, target_count in DIVERSE_PAIR_BUCKET_TARGETS.items():
+        bucket_count = 0
+        for candidate in candidates:
+            if len(selected) >= max_candidates or bucket_count >= target_count:
+                break
+            if candidate["proposal_id"] in selected_ids:
+                continue
+            if difference_type not in candidate.get("changed_difference_types", []):
+                continue
+            retargeted = _retarget_pair_candidate(candidate, difference_type)
+            if retargeted is None:
+                continue
+            selected.append(retargeted)
+            selected_ids.add(retargeted["proposal_id"])
+            bucket_count += 1
+
+    for candidate in candidates:
+        if len(selected) >= max_candidates:
+            break
+        if candidate["proposal_id"] in selected_ids:
+            continue
+        selected.append(candidate)
+        selected_ids.add(candidate["proposal_id"])
+
+    return selected
+
+
+def _retarget_pair_candidate(candidate: dict[str, Any], difference_type: str) -> dict[str, Any] | None:
+    if candidate["primary_difference"]["type"] == difference_type:
+        return candidate
+
+    priority_order = (difference_type,) + tuple(item for item in PAIR_PRIORITY if item != difference_type)
+    reference_annotation = candidate["reference_annotation"]
+    target_annotation = candidate["target_annotation"]
+    primary_difference = _detect_primary_difference(
+        reference_annotation,
+        target_annotation,
+        priority_order=priority_order,
+    )
+    if primary_difference is None or primary_difference["type"] != difference_type:
+        return None
+
+    changed_types = primary_difference.pop("changed_types")
+    same_context_score = _score_float(candidate["quality"].get("same_context_score"))
+    edit_match_score = _edit_match_score(
+        same_context_score=same_context_score,
+        primary_difference_type=difference_type,
+        changed_types=changed_types,
+    )
+    if edit_match_score < MIN_PAIR_EDIT_MATCH_SCORE:
+        return None
+
+    retargeted = dict(candidate)
+    retargeted["primary_difference"] = primary_difference
+    retargeted["changed_difference_types"] = list(changed_types)
+    quality = dict(candidate["quality"])
+    quality["edit_match_score"] = round(edit_match_score, 3)
+    quality["difference_strength_score"] = round(
+        _difference_strength_score(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            primary_difference=primary_difference,
+            changed_types=changed_types,
+        ),
+        3,
+    )
+    retargeted["quality"] = quality
+    retargeted["composite_score"] = _candidate_composite_score(quality, candidate["source_context"])
+    retargeted["difference_evidence"] = _difference_evidence_from_annotations(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        primary_difference=primary_difference,
+    )
+    return retargeted
 
 
 def _score_ordered_pair(
@@ -1786,14 +1880,7 @@ def _score_ordered_pair(
             3,
         ),
     }
-    composite_score = round(
-        quality["same_context_score"] * 0.45
-        + quality["edit_match_score"] * 0.35
-        + quality["target_uniqueness_score"] * 0.15
-        + quality["difference_strength_score"] * 0.05,
-        4,
-    )
-    composite_score = round(composite_score + source_context["score"] * 0.08, 4)
+    composite_score = _candidate_composite_score(quality, source_context)
     return {
         "proposal_id": _build_proposal_id(reference_path, target_path),
         "reference_annotation": _sanitize_annotation_for_output(reference_annotation, root),
@@ -1811,6 +1898,17 @@ def _score_ordered_pair(
         "hard_negative_annotations": [_sanitize_annotation_for_output(annotation, root) for annotation in hard_negative_annotations[:3]],
         "hard_negative_paths": hard_negative_paths,
     }
+
+
+def _candidate_composite_score(quality: dict[str, Any], source_context: dict[str, Any]) -> float:
+    composite_score = round(
+        _score_float(quality.get("same_context_score")) * 0.45
+        + _score_float(quality.get("edit_match_score")) * 0.35
+        + _score_float(quality.get("target_uniqueness_score")) * 0.15
+        + _score_float(quality.get("difference_strength_score")) * 0.05,
+        4,
+    )
+    return round(composite_score + _score_float(source_context.get("score")) * 0.08, 4)
 
 
 def _sanitize_annotation_for_output(annotation: dict[str, Any], root: Path) -> dict[str, Any]:
