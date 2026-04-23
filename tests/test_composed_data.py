@@ -9,6 +9,7 @@ from unittest import mock
 from app.composed_data import (
     _compose_reject_reason,
     _detect_primary_difference,
+    _difference_priority_order,
     _effective_pair_quality,
     _build_pair_candidates,
     _build_proposal_id,
@@ -1135,6 +1136,33 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertIsNotNone(difference)
         self.assertEqual("speech", difference["type"])
+
+    def test_high_context_priority_prefers_object_change_over_visible_text(self) -> None:
+        reference = {
+            "object_counts": {"person": 1},
+            "actions": ["speaking"],
+            "audio_events": ["speech"],
+            "attributes": ["studio"],
+            "scene": "studio desk shot",
+            "visible_text": ["speaker name"],
+        }
+        target = {
+            "object_counts": {"person": 1, "toy bin": 1},
+            "actions": ["speaking"],
+            "audio_events": ["speech"],
+            "attributes": ["studio"],
+            "scene": "studio desk shot",
+            "visible_text": [],
+        }
+
+        difference = _detect_primary_difference(
+            reference,
+            target,
+            priority_order=_difference_priority_order(same_context_score=0.9),
+        )
+
+        self.assertIsNotNone(difference)
+        self.assertEqual("object_presence", difference["type"])
 
     def test_pair_candidates_keep_low_context_pairs_with_available_negatives(self) -> None:
         annotations = [

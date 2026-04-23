@@ -42,11 +42,11 @@ PAIR_PRIORITY = (
 )
 HIGH_CONTEXT_PAIR_PRIORITY = (
     "object_count",
+    "object_presence",
+    "action",
     "speech",
     "audio_event",
     "visible_text",
-    "object_presence",
-    "action",
     "attribute",
     "scene",
 )
