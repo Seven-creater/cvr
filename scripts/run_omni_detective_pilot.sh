@@ -4,11 +4,12 @@ set -euo pipefail
 source /data02/usr/wangqihao/miniconda3/etc/profile.d/conda.sh
 conda activate omni_src
 
-cd /data02/usr/wangqihao/Demo/test/cvr
-export PYTHONPATH=/data02/usr/wangqihao/Demo/test/cvr
+REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 ROOT=${ROOT:-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval}
-RUN_ROOT=${RUN_ROOT:-/data02/usr/wangqihao/Demo/test/cvr/runs/omni_detective_pilot_20260422}
+RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/omni_detective_pilot_20260422}
 MODEL=${MODEL:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-instruct}
 BASE_URL=${BASE_URL:-http://127.0.0.1:8093/v1}
 SOURCE_CLIPS=${SOURCE_CLIPS:-$ROOT/metadata/source_clips_all.jsonl}
