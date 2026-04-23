@@ -13,6 +13,8 @@ from app.composed_data import (
     _build_pair_candidates,
     _build_proposal_id,
     _judge_accepts,
+    _pair_context_score,
+    _source_context,
     annotate_clips,
     build_ffmpeg_extract_command,
     detective_annotate_clips,
@@ -1267,6 +1269,29 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(candidates), 1)
         self.assertTrue(all(candidate["source_context"]["relation"] != "cross_dataset" for candidate in candidates))
+
+    def test_pair_context_uses_temporal_proximity_for_same_source_video(self) -> None:
+        left = {
+            "source_path": "/data/video.mp4",
+            "source_clip": {"start_seconds": 0.0, "end_seconds": 8.0},
+        }
+        adjacent = {
+            "source_path": "/data/video.mp4",
+            "source_clip": {"start_seconds": 8.0, "end_seconds": 16.0},
+        }
+        distant = {
+            "source_path": "/data/video.mp4",
+            "source_clip": {"start_seconds": 80.0, "end_seconds": 88.0},
+        }
+
+        adjacent_context = _source_context(left, adjacent)
+        distant_context = _source_context(left, distant)
+
+        self.assertEqual("same_source_video", adjacent_context["relation"])
+        self.assertEqual("adjacent_or_overlapping", adjacent_context["temporal_relation"])
+        self.assertEqual(0.9, _pair_context_score(semantic_context_score=0.05, source_context=adjacent_context))
+        self.assertEqual("distant", distant_context["temporal_relation"])
+        self.assertEqual(0.45, _pair_context_score(semantic_context_score=0.05, source_context=distant_context))
 
     def test_propose_pairs_marks_fallback_when_model_call_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

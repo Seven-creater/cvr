@@ -1678,10 +1678,14 @@ def _score_ordered_pair(
     if reference_annotation["clip_id"] == target_annotation["clip_id"]:
         return None
 
-    same_context_score = _same_context_score(reference_annotation, target_annotation)
+    semantic_context_score = _same_context_score(reference_annotation, target_annotation)
     source_context = _source_context(reference_annotation, target_annotation)
     if source_context["relation"] == "cross_dataset":
         return None
+    same_context_score = _pair_context_score(
+        semantic_context_score=semantic_context_score,
+        source_context=source_context,
+    )
     priority_order = _difference_priority_order(same_context_score=same_context_score)
     primary_difference = _detect_primary_difference(
         reference_annotation,
@@ -1733,6 +1737,7 @@ def _score_ordered_pair(
 
     quality = {
         "same_context_score": round(same_context_score, 3),
+        "semantic_context_score": round(semantic_context_score, 3),
         "edit_match_score": round(edit_match_score, 3),
         "target_uniqueness_score": round(target_uniqueness_score, 3),
     }
@@ -1801,12 +1806,19 @@ def _source_context(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
     right_rows = {str(value).strip() for value in right.get("source_row_ids", []) if str(value).strip()}
     shared_rows = sorted(left_rows & right_rows)
     if shared_rows:
-        return {"relation": "shared_source_row", "score": 1.0, "shared_source_row_ids": shared_rows}
+        return {
+            "relation": "shared_source_row",
+            **_source_temporal_context(left, right, default_score=0.9),
+            "shared_source_row_ids": shared_rows,
+        }
 
     left_source_path = str(left.get("source_path", "")).strip()
     right_source_path = str(right.get("source_path", "")).strip()
     if left_source_path and left_source_path == right_source_path:
-        return {"relation": "same_source_video", "score": 0.9}
+        return {
+            "relation": "same_source_video",
+            **_source_temporal_context(left, right, default_score=0.65),
+        }
 
     left_dataset = str(left.get("dataset", "")).strip()
     right_dataset = str(right.get("dataset", "")).strip()
@@ -1823,6 +1835,61 @@ def _source_context(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
 
     text_score = _source_text_similarity(left, right)
     return {"relation": "unknown", "score": round(text_score * 0.2, 3), "text_similarity": round(text_score, 3)}
+
+
+def _pair_context_score(*, semantic_context_score: float, source_context: dict[str, Any]) -> float:
+    source_score = _score_float(source_context.get("score"))
+    relation = str(source_context.get("relation", "")).strip()
+    if relation in {"shared_source_row", "same_source_video"}:
+        return max(semantic_context_score, source_score)
+    return semantic_context_score
+
+
+def _source_temporal_context(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    default_score: float,
+) -> dict[str, Any]:
+    left_bounds = _clip_time_bounds(left)
+    right_bounds = _clip_time_bounds(right)
+    if left_bounds is None or right_bounds is None:
+        return {"score": round(default_score, 3), "temporal_relation": "unknown"}
+
+    left_start, left_end = left_bounds
+    right_start, right_end = right_bounds
+    gap_seconds = max(0.0, max(left_start, right_start) - min(left_end, right_end))
+    if gap_seconds <= 0.5:
+        score = 0.9
+        temporal_relation = "adjacent_or_overlapping"
+    elif gap_seconds <= 8.0:
+        score = 0.78
+        temporal_relation = "nearby"
+    elif gap_seconds <= 16.0:
+        score = 0.65
+        temporal_relation = "loose"
+    else:
+        score = 0.45
+        temporal_relation = "distant"
+    return {
+        "score": round(score, 3),
+        "temporal_relation": temporal_relation,
+        "temporal_gap_seconds": round(gap_seconds, 3),
+    }
+
+
+def _clip_time_bounds(annotation: dict[str, Any]) -> tuple[float, float] | None:
+    source_clip = annotation.get("source_clip")
+    if not isinstance(source_clip, dict):
+        return None
+    try:
+        start_seconds = float(source_clip["start_seconds"])
+        end_seconds = float(source_clip["end_seconds"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if end_seconds <= start_seconds:
+        return None
+    return start_seconds, end_seconds
 
 
 def _source_text_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
