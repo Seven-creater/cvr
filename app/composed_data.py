@@ -53,6 +53,8 @@ HIGH_CONTEXT_PAIR_PRIORITY = (
 MIN_ACCEPT_SAME_CONTEXT_SCORE = 0.55
 MIN_ACCEPT_EDIT_MATCH_SCORE = 0.75
 MIN_ACCEPT_TARGET_UNIQUENESS_SCORE = 0.70
+MIN_ACCEPT_EDIT_NECESSITY_SCORE = 0.70
+MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE = 0.75
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 STOPWORDS = {
     "a",
@@ -839,6 +841,7 @@ def propose_group_pairs(
                 target_annotation = candidate["target_annotation"]
                 raw_model_output: dict[str, Any] = {}
                 judge_raw_output: dict[str, Any] = {}
+                verification_raw_output: dict[str, Any] = {}
                 try:
                     model_fields, raw_model_output = client.propose_pair(
                         reference_annotation=_annotation_prompt_view(reference_annotation),
@@ -900,9 +903,24 @@ def propose_group_pairs(
                     judge_raw_output = {"error": f"{type(exc).__name__}: {exc}"}
                     judge_fallback_used = True
 
+                try:
+                    verification, verification_raw_output = client.verify_pair_difference(
+                        proposal=proposal_view,
+                        reference_annotation=_annotation_prompt_view(reference_annotation),
+                        target_annotation=_annotation_prompt_view(target_annotation),
+                    )
+                    verification_fallback_used = False
+                except Exception as exc:
+                    verification = _fallback_pair_verification(reason=f"{type(exc).__name__}: {exc}")
+                    verification_raw_output = {"error": f"{type(exc).__name__}: {exc}"}
+                    verification_fallback_used = True
+
                 judge = _finalize_pair_judge(judge)
-                fallback_used = proposal_fallback_used or judge_fallback_used
-                accepted = _judge_accepts(judge)
+                verification = _finalize_pair_verification(verification)
+                fallback_used = proposal_fallback_used or judge_fallback_used or verification_fallback_used
+                accepted = _judge_accepts(judge, verification)
+                if not accepted:
+                    judge["reject_reason"] = _compose_reject_reason(judge, verification)
                 record = {
                     "proposal_id": proposal_id,
                     "group_id": group_id,
@@ -926,13 +944,23 @@ def propose_group_pairs(
                     "proposal_reason": model_fields["proposal_reason"],
                     "evidence": _evidence_from_annotations(reference_annotation, target_annotation),
                     "judge": judge,
+                    "verification": verification,
                     "accepted": accepted,
                     "fallback_used": fallback_used,
                     "raw_model_output": raw_model_output,
                     "raw_judge_output": judge_raw_output,
+                    "raw_verification_output": verification_raw_output,
                 }
                 proposed_count += 1
 
+            if "verification" not in record:
+                record = dict(record)
+                record["verification"] = _fallback_pair_verification(reason="existing record has no verification")
+                record["accepted"] = False
+                record["fallback_used"] = True
+                judge = dict(record.get("judge", {}))
+                judge["reject_reason"] = _compose_reject_reason(judge, record["verification"])
+                record["judge"] = judge
             if bool(record.get("fallback_used")):
                 fallback_count += 1
             if bool(record.get("accepted")):
@@ -945,6 +973,7 @@ def propose_group_pairs(
 
     _write_jsonl(output, output_records)
     _write_jsonl(accepted_output, accepted_records)
+    verification_counts = _pair_verification_counts(output_records)
     return {
         "clip_annotations_path": str(annotations_path),
         "clip_groups_path": str(groups_path),
@@ -959,10 +988,13 @@ def propose_group_pairs(
         "proposed_count": proposed_count,
         "reused_count": reused_count,
         "fallback_count": fallback_count,
+        "verification_counts": verification_counts,
         "thresholds": {
             "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
             "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
             "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
+            "edit_necessity_score": MIN_ACCEPT_EDIT_NECESSITY_SCORE,
+            "edit_target_alignment_score": MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE,
         },
     }
 
@@ -1077,6 +1109,7 @@ def validate_pilot_dataset(
         "difference_type_counts": dict(sorted(difference_counter.items())),
         "source_context_counts": dict(sorted(source_context_counter.items())),
         "quality_summary": _quality_summary(same_context_scores),
+        "verification_counts": _load_pair_verification_counts(Path(pilot_jsonl_path)),
         "automated_acceptance": {
             "sample_count_between_5_and_10": 5 <= len(pilot_records) <= 10,
             "audio_samples_at_least_2": modality_counter.get("audio", 0) >= 2,
@@ -1100,6 +1133,57 @@ def _quality_summary(same_context_scores: list[float]) -> dict[str, float]:
         "same_context_avg": round(sum(same_context_scores) / len(same_context_scores), 3),
         "same_context_max": round(max(same_context_scores), 3),
     }
+
+
+def _load_pair_verification_counts(pilot_jsonl_path: Path) -> dict[str, int]:
+    judged_path = pilot_jsonl_path.with_name("judged_pair_proposals.jsonl")
+    if not judged_path.exists():
+        return _empty_pair_verification_counts()
+    return _pair_verification_counts(list(_load_jsonl(judged_path)))
+
+
+def _empty_pair_verification_counts() -> dict[str, int]:
+    return {
+        "caption_equivalent_reject_count": 0,
+        "missing_delta_reject_count": 0,
+        "difference_mismatch_reject_count": 0,
+        "edit_projection_reject_count": 0,
+        "edit_not_needed_reject_count": 0,
+        "accepted_after_verification_count": 0,
+    }
+
+
+def _pair_verification_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    counts = _empty_pair_verification_counts()
+    for record in records:
+        verification = record.get("verification")
+        if not isinstance(verification, dict):
+            continue
+        if bool(record.get("accepted")) and _verification_accepts(verification):
+            counts["accepted_after_verification_count"] += 1
+            continue
+        caption_delta = verification.get("caption_delta", {})
+        edit_projection = verification.get("edit_projection", {})
+        edit_necessity = verification.get("edit_necessity", {})
+        if _boolish(caption_delta.get("caption_equivalent")):
+            counts["caption_equivalent_reject_count"] += 1
+        if not _boolish(caption_delta.get("has_concrete_difference")):
+            counts["missing_delta_reject_count"] += 1
+        if not _boolish(caption_delta.get("difference_matches_edit")):
+            counts["difference_mismatch_reject_count"] += 1
+        if (
+            not _boolish(edit_projection.get("target_matches_projection"))
+            or _score_float(edit_projection.get("score")) < MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE
+        ):
+            counts["edit_projection_reject_count"] += 1
+        if (
+            not _boolish(edit_necessity.get("edit_needed"))
+            or _boolish(edit_necessity.get("reference_satisfies_edit"))
+            or not _boolish(edit_necessity.get("target_satisfies_edit"))
+            or _score_float(edit_necessity.get("score")) < MIN_ACCEPT_EDIT_NECESSITY_SCORE
+        ):
+            counts["edit_not_needed_reject_count"] += 1
+    return counts
 
 
 def probe_media(source_path: str | Path) -> dict[str, Any]:
@@ -1445,6 +1529,18 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
     lines.extend(["", "## Automated Acceptance Checks"])
     for key, value in acceptance.items():
         lines.append(f"- `{key}`: `{'PASS' if value else 'FAIL'}`")
+    verification_counts = summary.get("verification_counts", {})
+    if verification_counts:
+        lines.extend(["", "## Verification Reject Counts"])
+        for key in (
+            "caption_equivalent_reject_count",
+            "missing_delta_reject_count",
+            "difference_mismatch_reject_count",
+            "edit_projection_reject_count",
+            "edit_not_needed_reject_count",
+            "accepted_after_verification_count",
+        ):
+            lines.append(f"- `{key}`: `{verification_counts.get(key, 0)}`")
     lines.append("")
     lines.append("Manual review is still required for semantic correctness and target uniqueness.")
     return "\n".join(lines) + "\n"
@@ -2050,6 +2146,61 @@ def _fallback_pair_judge(quality: dict[str, Any], *, reason: str) -> dict[str, A
     }
 
 
+def _fallback_pair_verification(*, reason: str) -> dict[str, Any]:
+    return {
+        "caption_delta": {
+            "caption_equivalent": True,
+            "has_concrete_difference": False,
+            "difference_matches_edit": False,
+            "concrete_differences": [],
+            "reason": f"pair verification fallback: {reason}",
+        },
+        "edit_projection": {
+            "projected_target_caption": "",
+            "target_matches_projection": False,
+            "score": 0.0,
+            "missing_requirements": ["verification unavailable"],
+            "reason": f"pair verification fallback: {reason}",
+        },
+        "edit_necessity": {
+            "edit_needed": False,
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": False,
+            "score": 0.0,
+            "reason": f"pair verification fallback: {reason}",
+        },
+    }
+
+
+def _finalize_pair_verification(verification: dict[str, Any]) -> dict[str, Any]:
+    caption_delta = dict(verification.get("caption_delta", {}))
+    edit_projection = dict(verification.get("edit_projection", {}))
+    edit_necessity = dict(verification.get("edit_necessity", {}))
+    return {
+        "caption_delta": {
+            "caption_equivalent": _boolish(caption_delta.get("caption_equivalent")),
+            "has_concrete_difference": _boolish(caption_delta.get("has_concrete_difference")),
+            "difference_matches_edit": _boolish(caption_delta.get("difference_matches_edit")),
+            "concrete_differences": _normalize_list(caption_delta.get("concrete_differences", [])),
+            "reason": str(caption_delta.get("reason", "")).strip(),
+        },
+        "edit_projection": {
+            "projected_target_caption": str(edit_projection.get("projected_target_caption", "")).strip(),
+            "target_matches_projection": _boolish(edit_projection.get("target_matches_projection")),
+            "score": _score_float(edit_projection.get("score")),
+            "missing_requirements": _normalize_list(edit_projection.get("missing_requirements", [])),
+            "reason": str(edit_projection.get("reason", "")).strip(),
+        },
+        "edit_necessity": {
+            "edit_needed": _boolish(edit_necessity.get("edit_needed")),
+            "reference_satisfies_edit": _boolish(edit_necessity.get("reference_satisfies_edit")),
+            "target_satisfies_edit": _boolish(edit_necessity.get("target_satisfies_edit")),
+            "score": _score_float(edit_necessity.get("score")),
+            "reason": str(edit_necessity.get("reason", "")).strip(),
+        },
+    }
+
+
 def _finalize_pair_judge(judge: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(judge)
     accepted = _judge_accepts(normalized)
@@ -2060,7 +2211,7 @@ def _finalize_pair_judge(judge: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _compose_reject_reason(judge: dict[str, Any]) -> str:
+def _compose_reject_reason(judge: dict[str, Any], verification: dict[str, Any] | None = None) -> str:
     original_reason = str(judge.get("reject_reason", "")).strip()
     failures: list[str] = []
     if judge.get("reference_satisfies_edit"):
@@ -2088,6 +2239,8 @@ def _compose_reject_reason(judge: dict[str, Any]) -> str:
         failures.append(
             f"target_uniqueness_score {target_uniqueness_score:.3f} is below {MIN_ACCEPT_TARGET_UNIQUENESS_SCORE:.2f}"
         )
+    if verification is not None:
+        failures.extend(_verification_failures(verification))
     if not judge.get("accept"):
         failures.append("the model judge did not accept the pair")
 
@@ -2104,8 +2257,8 @@ def _compose_reject_reason(judge: dict[str, Any]) -> str:
     return "the pair was rejected without a structured reason from the judge"
 
 
-def _judge_accepts(judge: dict[str, Any]) -> bool:
-    return bool(
+def _judge_accepts(judge: dict[str, Any], verification: dict[str, Any] | None = None) -> bool:
+    judge_accepted = bool(
         judge.get("accept")
         and not judge.get("reference_satisfies_edit")
         and judge.get("target_satisfies_edit")
@@ -2115,6 +2268,58 @@ def _judge_accepts(judge: dict[str, Any]) -> bool:
         and _score_float(judge.get("edit_match_score")) >= MIN_ACCEPT_EDIT_MATCH_SCORE
         and _score_float(judge.get("target_uniqueness_score")) >= MIN_ACCEPT_TARGET_UNIQUENESS_SCORE
     )
+    if verification is None:
+        return judge_accepted
+    return judge_accepted and _verification_accepts(verification)
+
+
+def _verification_accepts(verification: dict[str, Any]) -> bool:
+    caption_delta = verification.get("caption_delta", {})
+    edit_projection = verification.get("edit_projection", {})
+    edit_necessity = verification.get("edit_necessity", {})
+    return bool(
+        not _boolish(caption_delta.get("caption_equivalent"))
+        and _boolish(caption_delta.get("has_concrete_difference"))
+        and _boolish(caption_delta.get("difference_matches_edit"))
+        and _boolish(edit_projection.get("target_matches_projection"))
+        and _score_float(edit_projection.get("score")) >= MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE
+        and _boolish(edit_necessity.get("edit_needed"))
+        and not _boolish(edit_necessity.get("reference_satisfies_edit"))
+        and _boolish(edit_necessity.get("target_satisfies_edit"))
+        and _score_float(edit_necessity.get("score")) >= MIN_ACCEPT_EDIT_NECESSITY_SCORE
+    )
+
+
+def _verification_failures(verification: dict[str, Any]) -> list[str]:
+    failures: list[str] = []
+    caption_delta = verification.get("caption_delta", {})
+    edit_projection = verification.get("edit_projection", {})
+    edit_necessity = verification.get("edit_necessity", {})
+    if _boolish(caption_delta.get("caption_equivalent")):
+        failures.append("caption_delta says reference and target are equivalent")
+    if not _boolish(caption_delta.get("has_concrete_difference")):
+        failures.append("caption_delta found no concrete difference")
+    if not _boolish(caption_delta.get("difference_matches_edit")):
+        failures.append("caption_delta difference does not match the edit")
+    projection_score = _score_float(edit_projection.get("score"))
+    if not _boolish(edit_projection.get("target_matches_projection")):
+        failures.append("edit_projection does not match the target")
+    if projection_score < MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE:
+        failures.append(
+            f"edit_projection score {projection_score:.3f} is below {MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE:.2f}"
+        )
+    necessity_score = _score_float(edit_necessity.get("score"))
+    if not _boolish(edit_necessity.get("edit_needed")):
+        failures.append("edit_necessity says the edit is not needed")
+    if _boolish(edit_necessity.get("reference_satisfies_edit")):
+        failures.append("edit_necessity says the reference already satisfies the edit")
+    if not _boolish(edit_necessity.get("target_satisfies_edit")):
+        failures.append("edit_necessity says the target does not satisfy the edit")
+    if necessity_score < MIN_ACCEPT_EDIT_NECESSITY_SCORE:
+        failures.append(
+            f"edit_necessity score {necessity_score:.3f} is below {MIN_ACCEPT_EDIT_NECESSITY_SCORE:.2f}"
+        )
+    return failures
 
 
 def _score_float(value: Any) -> float:
@@ -2123,6 +2328,15 @@ def _score_float(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(0.0, min(1.0, parsed))
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    return normalized in {"1", "true", "yes", "y", "pass", "accept", "accepted"}
 
 
 def _evidence_from_annotations(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> dict[str, Any]:
@@ -2162,6 +2376,7 @@ def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str
         "source_context": dict(record.get("source_context", {})),
         "evidence": dict(record.get("evidence", {})),
         "judge": dict(record.get("judge", {})),
+        "verification": dict(record.get("verification", {})),
         "group_id": record.get("group_id", ""),
         "group_reason": record.get("group_reason", ""),
     }

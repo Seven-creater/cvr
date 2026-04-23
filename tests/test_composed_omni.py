@@ -335,6 +335,66 @@ class ComposedOmniClientTests(unittest.TestCase):
         request_body = json.loads(request_holder["request"].data.decode("utf-8"))
         self.assertEqual({"type": "json_object"}, request_body["response_format"])
 
+    def test_verify_pair_difference_normalizes_nested_schema(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "caption_delta": {
+                                    "caption_equivalent": "false",
+                                    "has_concrete_difference": "yes",
+                                    "difference_matches_edit": True,
+                                    "concrete_differences": ["one cat becomes two cats"],
+                                    "reason": "the count changes",
+                                },
+                                "edit_projection": {
+                                    "projected_target_caption": "two orange cats rest on a sofa",
+                                    "target_matches_projection": True,
+                                    "score": 1.2,
+                                    "missing_requirements": [],
+                                    "reason": "projection matches the target",
+                                },
+                                "edit_necessity": {
+                                    "edit_needed": True,
+                                    "reference_satisfies_edit": False,
+                                    "target_satisfies_edit": True,
+                                    "score": 0.88,
+                                    "reason": "the reference has one cat",
+                                },
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8093/v1",
+            api_key="EMPTY",
+            model="qwen3-omni",
+        )
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            normalized, _raw_payload = client.verify_pair_difference(
+                proposal={"edit_text": "change one cat into two cats"},
+                reference_annotation={"clip_id": "ref", "summary": "one cat on a sofa"},
+                target_annotation={"clip_id": "target", "summary": "two cats on a sofa"},
+            )
+
+        self.assertFalse(normalized["caption_delta"]["caption_equivalent"])
+        self.assertTrue(normalized["caption_delta"]["has_concrete_difference"])
+        self.assertEqual(1.0, normalized["edit_projection"]["score"])
+        self.assertEqual(0.88, normalized["edit_necessity"]["score"])
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        self.assertIn("edit-required difference", request_body["messages"][1]["content"][0]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

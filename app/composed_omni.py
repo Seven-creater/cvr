@@ -79,6 +79,12 @@ REQUIRED_PAIR_JUDGE_FIELDS = (
     "reject_reason",
 )
 
+REQUIRED_PAIR_VERIFICATION_FIELDS = (
+    "caption_delta",
+    "edit_projection",
+    "edit_necessity",
+)
+
 
 def _string_list(value: Any) -> list[str]:
     if isinstance(value, str):
@@ -242,6 +248,24 @@ def _pair_judge_system_prompt() -> str:
     )
 
 
+def _pair_verification_system_prompt() -> str:
+    return (
+        "You verify whether a composed retrieval pair truly needs the edit text. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"caption_delta": {"caption_equivalent": boolean, '
+        '"has_concrete_difference": boolean, "difference_matches_edit": boolean, '
+        '"concrete_differences": [string], "reason": string}, '
+        '"edit_projection": {"projected_target_caption": string, '
+        '"target_matches_projection": boolean, "score": number, '
+        '"missing_requirements": [string], "reason": string}, '
+        '"edit_necessity": {"edit_needed": boolean, "reference_satisfies_edit": boolean, '
+        '"target_satisfies_edit": boolean, "score": number, "reason": string}}. '
+        "Reject pairs where the reference and target captions are semantically equivalent, "
+        "where no concrete visual/audio/text difference is present, or where the edit is not necessary. "
+        "The projected target caption should describe what the reference would become after applying the edit."
+    )
+
+
 def _build_clip_annotation_user_content(clip_path: str) -> list[dict[str, Any]]:
     prompt = (
         "Task: describe this clip for composed retrieval dataset construction.\n"
@@ -356,6 +380,28 @@ def _build_pair_judge_user_content(
     return [{"type": "text", "text": prompt}]
 
 
+def _build_pair_verification_user_content(
+    *,
+    proposal: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: verify whether this pair has a real edit-required difference.\n"
+        f"Pair proposal JSON:\n{json.dumps(proposal, ensure_ascii=False)}\n"
+        f"Reference annotation JSON:\n{json.dumps(reference_annotation, ensure_ascii=False)}\n"
+        f"Target annotation JSON:\n{json.dumps(target_annotation, ensure_ascii=False)}\n"
+        "Step 1 caption_delta: decide whether the two captions/annotations are effectively the same. "
+        "If they are the same clip content with only wording differences, set caption_equivalent=true.\n"
+        "Step 2 edit_projection: apply edit_text to the reference caption and write the expected target caption. "
+        "Then judge whether the actual target annotation matches that projection.\n"
+        "Step 3 edit_necessity: decide whether the edit is needed. "
+        "The reference must not satisfy the edit, and the target must satisfy it. "
+        "Use concrete visual, audio, speech, visible-text, object-count, or action evidence."
+    )
+    return [{"type": "text", "text": prompt}]
+
+
 class OpenAIComposedDataClient:
     def __init__(
         self,
@@ -459,6 +505,24 @@ class OpenAIComposedDataClient:
             max_tokens=900,
         )
         return _normalize_pair_judge_payload(raw_payload), raw_payload
+
+    def verify_pair_difference(
+        self,
+        *,
+        proposal: dict[str, Any],
+        reference_annotation: dict[str, Any],
+        target_annotation: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_pair_verification_user_content(
+                proposal=proposal,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            ),
+            system_prompt=_pair_verification_system_prompt(),
+            max_tokens=1100,
+        )
+        return _normalize_pair_verification_payload(raw_payload), raw_payload
 
     def _request_json(
         self,
@@ -599,6 +663,46 @@ def _normalize_pair_judge_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "hard_negative_quality": hard_negative_quality,
         "accept": _bool_value(payload.get("accept")),
         "reject_reason": str(payload.get("reject_reason", "")).strip(),
+    }
+
+
+def _normalize_pair_verification_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_PAIR_VERIFICATION_FIELDS)
+    if missing_fields:
+        raise ValueError(f"pair verification missing fields: {missing_fields}")
+
+    caption_delta = payload.get("caption_delta")
+    edit_projection = payload.get("edit_projection")
+    edit_necessity = payload.get("edit_necessity")
+    if not isinstance(caption_delta, dict):
+        raise ValueError("pair verification caption_delta must be an object")
+    if not isinstance(edit_projection, dict):
+        raise ValueError("pair verification edit_projection must be an object")
+    if not isinstance(edit_necessity, dict):
+        raise ValueError("pair verification edit_necessity must be an object")
+
+    return {
+        "caption_delta": {
+            "caption_equivalent": _bool_value(caption_delta.get("caption_equivalent")),
+            "has_concrete_difference": _bool_value(caption_delta.get("has_concrete_difference")),
+            "difference_matches_edit": _bool_value(caption_delta.get("difference_matches_edit")),
+            "concrete_differences": _string_list(caption_delta.get("concrete_differences")),
+            "reason": str(caption_delta.get("reason", "")).strip(),
+        },
+        "edit_projection": {
+            "projected_target_caption": str(edit_projection.get("projected_target_caption", "")).strip(),
+            "target_matches_projection": _bool_value(edit_projection.get("target_matches_projection")),
+            "score": _score_value(edit_projection.get("score")),
+            "missing_requirements": _string_list(edit_projection.get("missing_requirements")),
+            "reason": str(edit_projection.get("reason", "")).strip(),
+        },
+        "edit_necessity": {
+            "edit_needed": _bool_value(edit_necessity.get("edit_needed")),
+            "reference_satisfies_edit": _bool_value(edit_necessity.get("reference_satisfies_edit")),
+            "target_satisfies_edit": _bool_value(edit_necessity.get("target_satisfies_edit")),
+            "score": _score_value(edit_necessity.get("score")),
+            "reason": str(edit_necessity.get("reason", "")).strip(),
+        },
     }
 
 

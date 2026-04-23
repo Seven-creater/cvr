@@ -768,6 +768,32 @@ class ComposedDataTests(unittest.TestCase):
                     },
                     {"provider": "mock-judge"},
                 )
+                client_cls.return_value.verify_pair_difference.return_value = (
+                    {
+                        "caption_delta": {
+                            "caption_equivalent": False,
+                            "has_concrete_difference": True,
+                            "difference_matches_edit": True,
+                            "concrete_differences": ["one cat becomes two cats"],
+                            "reason": "cat count changes",
+                        },
+                        "edit_projection": {
+                            "projected_target_caption": "two orange cats resting on a sofa in a living room",
+                            "target_matches_projection": True,
+                            "score": 0.92,
+                            "missing_requirements": [],
+                            "reason": "projected caption matches target",
+                        },
+                        "edit_necessity": {
+                            "edit_needed": True,
+                            "reference_satisfies_edit": False,
+                            "target_satisfies_edit": True,
+                            "score": 0.9,
+                            "reason": "reference only has one cat",
+                        },
+                    },
+                    {"provider": "mock-verification"},
+                )
                 summary = propose_group_pairs(
                     root=root,
                     clip_annotations_path=annotations_path,
@@ -787,7 +813,172 @@ class ComposedDataTests(unittest.TestCase):
             self.assertGreaterEqual(summary["accepted_count"], 1)
             self.assertEqual(summary["accepted_count"], len(accepted_records))
             self.assertTrue(all(record["judge"]["target_satisfies_edit"] for record in accepted_records))
+            self.assertTrue(all(record["verification"]["caption_delta"]["difference_matches_edit"] for record in accepted_records))
             self.assertTrue(all(record["group_id"] == "group_cat_room" for record in accepted_records))
+
+    def test_propose_group_pairs_rejects_caption_equivalent_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("clip_ref.mp4", "clip_target.mp4", "clip_neg1.mp4", "clip_neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+            annotations_path = root / "captions" / "detective_annotations.jsonl"
+            annotations = [
+                {
+                    "clip_id": "clip_ref",
+                    "output_path": "clips/clip_ref.mp4",
+                    "summary": "a man writes on a paper at a desk",
+                    "subjects": ["man", "paper"],
+                    "object_counts": {"man": 1, "paper": 1},
+                    "actions": ["writing"],
+                    "scene": "desk",
+                    "attributes": ["indoor"],
+                    "on_screen_text": ["formula"],
+                    "speech": [],
+                    "audio_events": ["speech"],
+                    "modalities": ["visual", "audio"],
+                    "fallback_used": False,
+                },
+                {
+                    "clip_id": "clip_target",
+                    "output_path": "clips/clip_target.mp4",
+                    "summary": "a man writes on a paper at the same desk",
+                    "subjects": ["man", "paper", "pen"],
+                    "object_counts": {"man": 1, "paper": 1, "pen": 1},
+                    "actions": ["writing"],
+                    "scene": "desk",
+                    "attributes": ["indoor"],
+                    "on_screen_text": ["formula"],
+                    "speech": [],
+                    "audio_events": ["speech"],
+                    "modalities": ["visual", "audio"],
+                    "fallback_used": False,
+                },
+                {
+                    "clip_id": "clip_neg1",
+                    "output_path": "clips/clip_neg1.mp4",
+                    "summary": "a man reads a paper at a desk",
+                    "subjects": ["man", "paper"],
+                    "object_counts": {"man": 1, "paper": 1},
+                    "actions": ["reading"],
+                    "scene": "desk",
+                    "attributes": ["indoor"],
+                    "on_screen_text": ["formula"],
+                    "speech": [],
+                    "audio_events": ["speech"],
+                    "modalities": ["visual", "audio"],
+                    "fallback_used": False,
+                },
+                {
+                    "clip_id": "clip_neg2",
+                    "output_path": "clips/clip_neg2.mp4",
+                    "summary": "a woman writes on a paper at a desk",
+                    "subjects": ["woman", "paper"],
+                    "object_counts": {"woman": 1, "paper": 1},
+                    "actions": ["writing"],
+                    "scene": "desk",
+                    "attributes": ["indoor"],
+                    "on_screen_text": ["formula"],
+                    "speech": [],
+                    "audio_events": ["speech"],
+                    "modalities": ["visual", "audio"],
+                    "fallback_used": False,
+                },
+            ]
+            self._write_jsonl(annotations_path, annotations)
+            groups_path = root / "metadata" / "clip_groups.jsonl"
+            self._write_jsonl(
+                groups_path,
+                [
+                    {
+                        "group_id": "group_desk",
+                        "dataset": "daily_omni",
+                        "group_reason": "same_source_video",
+                        "source_clip_ids": ["source_desk"],
+                        "candidate_clip_ids": ["clip_ref", "clip_target", "clip_neg1", "clip_neg2"],
+                        "group_tags": ["desk"],
+                    }
+                ],
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.propose_pair.return_value = (
+                    {
+                        "edit_text": "add a pen to the writing scene",
+                        "modalities": ["visual"],
+                        "reference_caption": "a man writes on a paper at a desk",
+                        "target_caption": "a man writes on a paper at the same desk",
+                        "difference": {
+                            "type": "object_presence",
+                            "from": "no pen",
+                            "to": "pen present",
+                            "description": "a pen is visible",
+                        },
+                        "proposal_reason": "same desk scene",
+                    },
+                    {"provider": "mock"},
+                )
+                client_cls.return_value.judge_pair.return_value = (
+                    {
+                        "reference_satisfies_edit": False,
+                        "target_satisfies_edit": True,
+                        "single_main_difference": True,
+                        "same_context_score": 0.9,
+                        "edit_match_score": 0.9,
+                        "target_uniqueness_score": 0.8,
+                        "audio_required": False,
+                        "hard_negative_quality": "good",
+                        "accept": True,
+                        "reject_reason": "",
+                    },
+                    {"provider": "mock-judge"},
+                )
+                client_cls.return_value.verify_pair_difference.return_value = (
+                    {
+                        "caption_delta": {
+                            "caption_equivalent": True,
+                            "has_concrete_difference": False,
+                            "difference_matches_edit": False,
+                            "concrete_differences": [],
+                            "reason": "the captions describe the same writing content",
+                        },
+                        "edit_projection": {
+                            "projected_target_caption": "a man writes on a paper with a pen visible",
+                            "target_matches_projection": False,
+                            "score": 0.4,
+                            "missing_requirements": ["pen visibility"],
+                            "reason": "target caption does not add the edit",
+                        },
+                        "edit_necessity": {
+                            "edit_needed": False,
+                            "reference_satisfies_edit": False,
+                            "target_satisfies_edit": False,
+                            "score": 0.3,
+                            "reason": "the edit is not supported by the target",
+                        },
+                    },
+                    {"provider": "mock-verification"},
+                )
+                summary = propose_group_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    clip_groups_path=groups_path,
+                    output_path=root / "pairs" / "judged_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            records = [
+                json.loads(line)
+                for line in (root / "pairs" / "judged_pair_proposals.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertGreaterEqual(summary["proposal_count"], 1)
+            self.assertEqual(0, summary["accepted_count"])
+            self.assertGreaterEqual(summary["verification_counts"]["caption_equivalent_reject_count"], 1)
+            self.assertTrue(any("equivalent" in record["judge"]["reject_reason"] for record in records))
 
     def test_propose_group_pairs_cli_passes_max_accepted_pairs(self) -> None:
         argv = [
@@ -1146,10 +1337,80 @@ class ComposedDataTests(unittest.TestCase):
                             "url": "https://example.com/video",
                             "license_note": "internal research pilot only",
                         },
+                        "verification": {
+                            "caption_delta": {
+                                "caption_equivalent": False,
+                                "has_concrete_difference": True,
+                                "difference_matches_edit": True,
+                                "concrete_differences": ["one cat becomes two cats"],
+                                "reason": "cat count changes",
+                            },
+                            "edit_projection": {
+                                "projected_target_caption": "two cats on a sofa",
+                                "target_matches_projection": True,
+                                "score": 0.9,
+                                "missing_requirements": [],
+                                "reason": "projection matches",
+                            },
+                            "edit_necessity": {
+                                "edit_needed": True,
+                                "reference_satisfies_edit": False,
+                                "target_satisfies_edit": True,
+                                "score": 0.88,
+                                "reason": "reference has one cat",
+                            },
+                        },
                     }
                 )
                 + "\n",
                 encoding="utf-8",
+            )
+            self._write_jsonl(
+                pilot_dir / "judged_pair_proposals.jsonl",
+                [
+                    {
+                        "proposal_id": _build_proposal_id("clips/ref.mp4", "clips/target.mp4"),
+                        "accepted": True,
+                        "verification": {
+                            "caption_delta": {
+                                "caption_equivalent": False,
+                                "has_concrete_difference": True,
+                                "difference_matches_edit": True,
+                            },
+                            "edit_projection": {
+                                "target_matches_projection": True,
+                                "score": 0.9,
+                            },
+                            "edit_necessity": {
+                                "edit_needed": True,
+                                "reference_satisfies_edit": False,
+                                "target_satisfies_edit": True,
+                                "score": 0.88,
+                            },
+                        },
+                    },
+                    {
+                        "proposal_id": "proposal_rejected_equivalent",
+                        "accepted": False,
+                        "verification": {
+                            "caption_delta": {
+                                "caption_equivalent": True,
+                                "has_concrete_difference": False,
+                                "difference_matches_edit": False,
+                            },
+                            "edit_projection": {
+                                "target_matches_projection": False,
+                                "score": 0.2,
+                            },
+                            "edit_necessity": {
+                                "edit_needed": False,
+                                "reference_satisfies_edit": False,
+                                "target_satisfies_edit": False,
+                                "score": 0.1,
+                            },
+                        },
+                    },
+                ],
             )
 
             gallery_path = pilot_dir / "gallery.jsonl"
@@ -1170,6 +1431,9 @@ class ComposedDataTests(unittest.TestCase):
                 summary["quality_summary"],
             )
             self.assertTrue(report_path.exists())
+            self.assertEqual(1, summary["verification_counts"]["caption_equivalent_reject_count"])
+            self.assertEqual(1, summary["verification_counts"]["accepted_after_verification_count"])
+            self.assertIn("caption_equivalent_reject_count", report_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 {"clips/target.mp4", "clips/neg1.mp4", "clips/neg2.mp4"},
                 {record["video_path"] for record in gallery_records},
