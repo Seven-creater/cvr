@@ -67,6 +67,7 @@ MIN_ACCEPT_TARGET_UNIQUENESS_SCORE = 0.70
 MIN_ACCEPT_EDIT_NECESSITY_SCORE = 0.70
 MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE = 0.75
 MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE = 0.65
+MIN_ACCEPT_ACTION_EVIDENCE_SCORE = 0.65
 MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE = 0.995
 VISUAL_DIFFERENCE_TYPES = {"object_count", "object_presence", "attribute", "action", "scene", "visible_text"}
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
@@ -905,6 +906,7 @@ def propose_group_pairs(
                         "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
                         "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
                         "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
+                        "action_evidence_score_for_action_edits": MIN_ACCEPT_ACTION_EVIDENCE_SCORE,
                         "max_visual_near_duplicate_score_for_visual_edits": MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE,
                     },
                 }
@@ -1022,6 +1024,7 @@ def propose_group_pairs(
             "edit_necessity_score": MIN_ACCEPT_EDIT_NECESSITY_SCORE,
             "edit_target_alignment_score": MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE,
             "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
+            "action_evidence_score_for_action_edits": MIN_ACCEPT_ACTION_EVIDENCE_SCORE,
         },
     }
 
@@ -1808,6 +1811,8 @@ def _retarget_pair_candidate(candidate: dict[str, Any], difference_type: str) ->
         3,
     )
     quality["difference_type"] = primary_difference["type"]
+    if primary_difference["type"] == "action":
+        quality["action_evidence_score"] = _action_evidence_score(reference_annotation, target_annotation)
     retargeted["quality"] = quality
     retargeted["composite_score"] = _candidate_composite_score(quality, candidate["source_context"])
     retargeted["difference_evidence"] = _difference_evidence_from_annotations(
@@ -1906,6 +1911,8 @@ def _score_ordered_pair(
         ),
         "difference_type": primary_difference["type"],
     }
+    if primary_difference["type"] == "action":
+        quality["action_evidence_score"] = _action_evidence_score(reference_annotation, target_annotation)
     if visual_near_duplicate_score is not None:
         quality["visual_near_duplicate_score"] = round(visual_near_duplicate_score, 3)
     composite_score = _candidate_composite_score(quality, source_context)
@@ -2235,8 +2242,8 @@ def _detect_primary_difference(
                 "description": f"{label} disappears in the target clip",
             }
 
-    reference_actions = _normalize_list(reference.get("actions", []))
-    target_actions = _normalize_list(target.get("actions", []))
+    reference_actions = _action_terms_from_annotation(reference)
+    target_actions = _action_terms_from_annotation(target)
     added_action = _first_unique(target_actions, reference_actions)
     removed_action = _first_unique(reference_actions, target_actions)
     if added_action or removed_action:
@@ -2244,7 +2251,7 @@ def _detect_primary_difference(
             "type": "action",
             "from": removed_action or _first_item(reference_actions) or "current action",
             "to": added_action or _first_item(target_actions) or "new action",
-            "description": "the main action changes between the clips",
+            "description": "the main action changes between the clips and is supported by action/timeline evidence",
         }
 
     reference_audio = _normalize_list(reference.get("audio_events", []))
@@ -2348,7 +2355,7 @@ def _difference_strength_score(
     elif difference_type == "object_presence":
         score = 0.82 if from_value.startswith("no ") or to_value.startswith("no ") else 0.70
     elif difference_type == "action":
-        score = _list_delta_strength(reference_annotation.get("actions", []), target_annotation.get("actions", []))
+        score = _action_evidence_score(reference_annotation, target_annotation)
     elif difference_type == "audio_event":
         score = _list_delta_strength(reference_annotation.get("audio_events", []), target_annotation.get("audio_events", []))
     elif difference_type == "speech":
@@ -2373,7 +2380,7 @@ def _difference_strength_score(
         target_annotation=target_annotation,
         primary_difference=primary_difference,
     )
-    if evidence["supporting_evidence"]:
+    if evidence["supporting_evidence"] and difference_type != "action":
         score = max(score, 0.70)
     if len(changed_types) == 1:
         score += 0.08
@@ -2410,6 +2417,53 @@ def _list_delta_strength(left: Any, right: Any) -> float:
     return max(0.62, min(0.92, 0.92 - token_overlap * 0.25))
 
 
+def _action_terms_from_annotation(annotation: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+
+    def add_values(value: Any) -> None:
+        for item in _normalize_list(value):
+            if item not in terms:
+                terms.append(item)
+
+    add_values(annotation.get("actions", []))
+    for container_name in ("events", "storyline"):
+        container = annotation.get(container_name, [])
+        if not isinstance(container, list):
+            continue
+        for item in container:
+            if isinstance(item, dict):
+                add_values(item.get("actions", []))
+                action_value = item.get("action")
+                if action_value:
+                    add_values([action_value])
+    return terms
+
+
+def _has_timeline_action_evidence(annotation: dict[str, Any]) -> bool:
+    return bool(
+        _normalize_events_for_evidence(annotation.get("events", []))
+        or _normalize_events_for_evidence(annotation.get("storyline", []))
+    )
+
+
+def _action_evidence_score(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> float:
+    reference_terms = _action_terms_from_annotation(reference_annotation)
+    target_terms = _action_terms_from_annotation(target_annotation)
+    if not reference_terms or not target_terms:
+        return 0.0
+    if not _first_unique(reference_terms, target_terms) and not _first_unique(target_terms, reference_terms):
+        return 0.0
+
+    score = _list_delta_strength(reference_terms, target_terms)
+    reference_has_timeline = _has_timeline_action_evidence(reference_annotation)
+    target_has_timeline = _has_timeline_action_evidence(target_annotation)
+    if reference_has_timeline and target_has_timeline:
+        return round(max(score, 0.74), 3)
+    if reference_annotation.get("actions") and target_annotation.get("actions"):
+        return round(min(score, 0.62), 3)
+    return round(min(score, 0.55), 3)
+
+
 def _difference_evidence_from_annotations(
     *,
     reference_annotation: dict[str, Any],
@@ -2424,7 +2478,11 @@ def _difference_evidence_from_annotations(
             f"{reference_annotation.get('object_counts', {})} -> {target_annotation.get('object_counts', {})}"
         )
     if difference_type == "action":
-        evidence.append(_change_text(reference_annotation.get("actions", []), target_annotation.get("actions", [])))
+        evidence.append(_change_text(_action_terms_from_annotation(reference_annotation), _action_terms_from_annotation(target_annotation)))
+        evidence.append(
+            "action_evidence_score: "
+            f"{_action_evidence_score(reference_annotation, target_annotation):.3f}"
+        )
     if difference_type == "audio_event":
         evidence.append(_change_text(reference_annotation.get("audio_events", []), target_annotation.get("audio_events", [])))
     if difference_type == "speech":
@@ -2780,6 +2838,8 @@ def _effective_pair_quality(
         result["visual_near_duplicate_score"] = _score_float(heuristic_quality.get("visual_near_duplicate_score"))
     if "difference_type" in heuristic_quality:
         result["difference_type"] = str(heuristic_quality.get("difference_type", "")).strip()
+    if "action_evidence_score" in heuristic_quality:
+        result["action_evidence_score"] = _score_float(heuristic_quality.get("action_evidence_score"))
     return result
 
 
@@ -2830,6 +2890,12 @@ def _compose_reject_reason(
         failures.append(
             f"visual_near_duplicate_score {visual_near_duplicate_score:.3f} is too high for visual difference type {difference_type}"
         )
+    if difference_type == "action":
+        action_evidence_score = _score_float(quality.get("action_evidence_score"))
+        if action_evidence_score < MIN_ACCEPT_ACTION_EVIDENCE_SCORE:
+            failures.append(
+                f"action_evidence_score {action_evidence_score:.3f} is below {MIN_ACCEPT_ACTION_EVIDENCE_SCORE:.2f}"
+            )
     if verification is not None:
         failures.extend(_verification_failures(verification))
     if not judge.get("accept"):
@@ -2869,6 +2935,10 @@ def _judge_accepts(
         and not _visual_near_duplicate_rejects(
             _score_float(quality.get("visual_near_duplicate_score")),
             str(quality.get("difference_type", "")).strip(),
+        )
+        and (
+            str(quality.get("difference_type", "")).strip() != "action"
+            or _score_float(quality.get("action_evidence_score")) >= MIN_ACCEPT_ACTION_EVIDENCE_SCORE
         )
     )
     if verification is None:

@@ -230,6 +230,8 @@ def _pair_proposal_system_prompt() -> str:
         f"Allowed difference.type values: {difference_types}. "
         "If the main subject/person/object appears or disappears, use object_presence rather than subject. "
         "Prefer fine-grained action, audio_event, object_count, or object_presence changes over broad scene changes when both apply. "
+        "Use action only when the action itself changes and both clips contain action/storyline/event evidence for that change. "
+        "Do not label object appearance, color/attribute, visible text, speech topic, or scene/background changes as action. "
         "Use scene only when the location or background is the primary edit. "
         "Keep edit_text short and only describe the change from reference to target. "
         "Prefer a single key difference instead of multiple simultaneous changes."
@@ -351,6 +353,9 @@ def _build_pair_proposal_user_content(
         "Use one primary difference type only. "
         "The chosen difference.type, edit_text, modalities, and difference.from/to must all describe the same main change. "
         "Prefer action/audio/object differences over broad scene differences if they are visible or audible. "
+        "For action proposals, edit_text must be a verb/action change such as starts/stops/changes from doing X to doing Y, "
+        "and both reference and target storyline/events/actions must support that action change. "
+        "If the evidence is mainly object presence, color, visible text, speech content, or audio, choose that type instead of action. "
         "If the clips come from the same source context and the main localized change is in speech, audio, or visible text, "
         "prefer speech/audio_event/visible_text over attribute or scene. "
         "Use event/timeline evidence to choose a difference that is concrete, localized, and needed for retrieval. "
@@ -376,6 +381,8 @@ def _build_pair_judge_user_content(
         f"Hard negative annotations JSON:\n{json.dumps(hard_negative_candidates, ensure_ascii=False)}\n"
         "The edit_text must describe the change only. The reference should not satisfy the edit; "
         "the target should satisfy it. Reject broad scene-only changes unless the context remains clearly related. "
+        "For action edits, require concrete action evidence on both sides; reject if action is inferred only from a vague summary "
+        "or if the actual difference is object/color/text/speech/audio rather than a verb/action change. "
         "If the pair proposal JSON says the clips share the same source context, treat localized speech/audio/visible-text changes "
         "as valid composed edits when the rest of the scene stays aligned. "
         "If you reject the pair, reject_reason must be a non-empty sentence naming the main failed gate or threshold."
@@ -400,7 +407,9 @@ def _build_pair_verification_user_content(
         "Then judge whether the actual target annotation matches that projection.\n"
         "Step 3 edit_necessity: decide whether the edit is needed. "
         "The reference must not satisfy the edit, and the target must satisfy it. "
-        "Use concrete visual, audio, speech, visible-text, object-count, action, and event/timeline evidence."
+        "Use concrete visual, audio, speech, visible-text, object-count, action, and event/timeline evidence. "
+        "For action edit_text, set difference_matches_edit=false unless the reference and target have different concrete actions "
+        "supported by action/storyline/event evidence."
     )
     return [{"type": "text", "text": prompt}]
 

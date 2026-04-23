@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from app.composed_data import (
+    _action_evidence_score,
     _compose_reject_reason,
     _detect_primary_difference,
     _difference_strength_score,
@@ -1179,6 +1180,55 @@ class ComposedDataTests(unittest.TestCase):
         self.assertFalse(_judge_accepts(judge, verification, quality))
         self.assertIn("difference_strength_score", _compose_reject_reason(judge, verification, quality))
 
+    def test_action_evidence_gate_blocks_weak_action_override(self) -> None:
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.9,
+            "edit_match_score": 0.6,
+            "target_uniqueness_score": 0.9,
+            "audio_required": False,
+            "hard_negative_quality": "good",
+            "accept": False,
+            "reject_reason": "",
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {
+                "target_matches_projection": True,
+                "score": 0.9,
+            },
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.9,
+            },
+        }
+
+        weak_quality = _effective_pair_quality(
+            judge,
+            verification,
+            {
+                "same_context_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "difference_type": "action",
+                "action_evidence_score": 0.62,
+            },
+        )
+        strong_quality = dict(weak_quality)
+        strong_quality["action_evidence_score"] = 0.74
+
+        self.assertFalse(_judge_accepts(judge, verification, weak_quality))
+        self.assertIn("action_evidence_score", _compose_reject_reason(judge, verification, weak_quality))
+        self.assertTrue(_judge_accepts(judge, verification, strong_quality))
+
     def test_visual_near_duplicate_blocks_visual_difference_override(self) -> None:
         judge = {
             "reference_satisfies_edit": False,
@@ -1294,6 +1344,42 @@ class ComposedDataTests(unittest.TestCase):
         )
 
         self.assertGreaterEqual(score, 0.65)
+
+    def test_detect_primary_difference_uses_timeline_action_evidence(self) -> None:
+        reference = {
+            "object_counts": {"dog": 1},
+            "actions": ["moving"],
+            "events": [{"visual": "the dog walks across the park", "actions": ["walking"]}],
+            "storyline": ["the dog walks across the park"],
+        }
+        target = {
+            "object_counts": {"dog": 1},
+            "actions": ["moving"],
+            "events": [{"visual": "the dog jumps over a low bar", "actions": ["jumping"]}],
+            "storyline": ["the dog jumps over a low bar"],
+        }
+
+        difference = _detect_primary_difference(reference, target, priority_order=("action", "object_presence"))
+
+        self.assertIsNotNone(difference)
+        self.assertEqual("action", difference["type"])
+        self.assertEqual("walking", difference["from"])
+        self.assertEqual("jumping", difference["to"])
+
+    def test_action_evidence_score_requires_timeline_support(self) -> None:
+        reference = {"actions": ["running"]}
+        target = {"actions": ["jumping"]}
+        reference_with_timeline = {
+            "actions": ["running"],
+            "events": [{"visual": "the dog runs across the park", "actions": ["running"]}],
+        }
+        target_with_timeline = {
+            "actions": ["jumping"],
+            "storyline": ["the dog jumps over a low bar"],
+        }
+
+        self.assertLess(_action_evidence_score(reference, target), 0.65)
+        self.assertGreaterEqual(_action_evidence_score(reference_with_timeline, target_with_timeline), 0.65)
 
     def test_target_uniqueness_allows_close_negatives_with_different_edit(self) -> None:
         reference = {
