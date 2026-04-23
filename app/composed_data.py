@@ -55,6 +55,7 @@ MIN_ACCEPT_EDIT_MATCH_SCORE = 0.75
 MIN_ACCEPT_TARGET_UNIQUENESS_SCORE = 0.70
 MIN_ACCEPT_EDIT_NECESSITY_SCORE = 0.70
 MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE = 0.75
+MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE = 0.65
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 STOPWORDS = {
     "a",
@@ -885,10 +886,12 @@ def propose_group_pairs(
                     "heuristic_primary_difference": dict(candidate["primary_difference"]),
                     "changed_difference_types": list(candidate["changed_difference_types"]),
                     "source_context": dict(candidate["source_context"]),
+                    "difference_evidence": dict(candidate["difference_evidence"]),
                     "acceptance_thresholds": {
                         "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
                         "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
                         "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
+                        "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
                     },
                 }
                 try:
@@ -947,7 +950,11 @@ def propose_group_pairs(
                     "source_context": dict(candidate["source_context"]),
                     "source": source,
                     "proposal_reason": model_fields["proposal_reason"],
-                    "evidence": _evidence_from_annotations(reference_annotation, target_annotation),
+                    "evidence": _evidence_from_annotations(
+                        reference_annotation,
+                        target_annotation,
+                        difference_evidence=candidate["difference_evidence"],
+                    ),
                     "judge": judge,
                     "verification": verification,
                     "accepted": accepted,
@@ -1000,6 +1007,7 @@ def propose_group_pairs(
             "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
             "edit_necessity_score": MIN_ACCEPT_EDIT_NECESSITY_SCORE,
             "edit_target_alignment_score": MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE,
+            "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
         },
     }
 
@@ -1023,6 +1031,7 @@ def validate_pilot_dataset(
     difference_counter: Counter[str] = Counter()
     modality_counter: Counter[str] = Counter()
     same_context_scores: list[float] = []
+    difference_strength_scores: list[float] = []
     source_context_counter: Counter[str] = Counter()
     gallery_accumulator: dict[str, dict[str, Any]] = {}
 
@@ -1070,6 +1079,11 @@ def validate_pilot_dataset(
                 same_context_scores.append(float(quality.get("same_context_score", 0.0)))
             except (TypeError, ValueError):
                 pass
+            if "difference_strength_score" in quality:
+                try:
+                    difference_strength_scores.append(float(quality.get("difference_strength_score", 0.0)))
+                except (TypeError, ValueError):
+                    pass
 
         source_context = record.get("source_context", {})
         if isinstance(source_context, dict):
@@ -1114,6 +1128,7 @@ def validate_pilot_dataset(
         "difference_type_counts": dict(sorted(difference_counter.items())),
         "source_context_counts": dict(sorted(source_context_counter.items())),
         "quality_summary": _quality_summary(same_context_scores),
+        "difference_strength_summary": _score_summary(difference_strength_scores, "difference_strength"),
         "verification_counts": _load_pair_verification_counts(Path(pilot_jsonl_path)),
         "automated_acceptance": {
             "sample_count_between_5_and_10": 5 <= len(pilot_records) <= 10,
@@ -1137,6 +1152,16 @@ def _quality_summary(same_context_scores: list[float]) -> dict[str, float]:
         "same_context_min": round(min(same_context_scores), 3),
         "same_context_avg": round(sum(same_context_scores) / len(same_context_scores), 3),
         "same_context_max": round(max(same_context_scores), 3),
+    }
+
+
+def _score_summary(values: list[float], prefix: str) -> dict[str, float]:
+    if not values:
+        return {f"{prefix}_min": 0.0, f"{prefix}_avg": 0.0, f"{prefix}_max": 0.0}
+    return {
+        f"{prefix}_min": round(min(values), 3),
+        f"{prefix}_avg": round(sum(values) / len(values), 3),
+        f"{prefix}_max": round(max(values), 3),
     }
 
 
@@ -1541,6 +1566,17 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
             f"- `same_context_max`: `{quality['same_context_max']}`",
         ]
     )
+    strength = summary.get("difference_strength_summary", {})
+    if strength:
+        lines.extend(
+            [
+                "",
+                "## Difference Strength Summary",
+                f"- `difference_strength_min`: `{strength.get('difference_strength_min', 0.0)}`",
+                f"- `difference_strength_avg`: `{strength.get('difference_strength_avg', 0.0)}`",
+                f"- `difference_strength_max`: `{strength.get('difference_strength_max', 0.0)}`",
+            ]
+        )
 
     lines.extend(["", "## Automated Acceptance Checks"])
     for key, value in acceptance.items():
@@ -1740,11 +1776,21 @@ def _score_ordered_pair(
         "semantic_context_score": round(semantic_context_score, 3),
         "edit_match_score": round(edit_match_score, 3),
         "target_uniqueness_score": round(target_uniqueness_score, 3),
+        "difference_strength_score": round(
+            _difference_strength_score(
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                primary_difference=primary_difference,
+                changed_types=changed_types,
+            ),
+            3,
+        ),
     }
     composite_score = round(
         quality["same_context_score"] * 0.45
         + quality["edit_match_score"] * 0.35
-        + quality["target_uniqueness_score"] * 0.20,
+        + quality["target_uniqueness_score"] * 0.15
+        + quality["difference_strength_score"] * 0.05,
         4,
     )
     composite_score = round(composite_score + source_context["score"] * 0.08, 4)
@@ -1757,6 +1803,11 @@ def _score_ordered_pair(
         "quality": quality,
         "composite_score": composite_score,
         "source_context": source_context,
+        "difference_evidence": _difference_evidence_from_annotations(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            primary_difference=primary_difference,
+        ),
         "hard_negative_annotations": [_sanitize_annotation_for_output(annotation, root) for annotation in hard_negative_annotations[:3]],
         "hard_negative_paths": hard_negative_paths,
     }
@@ -2080,6 +2131,152 @@ def _edit_match_score(
     return max(0.0, min(1.0, base_score - penalty))
 
 
+def _difference_strength_score(
+    *,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    primary_difference: dict[str, Any],
+    changed_types: list[str],
+) -> float:
+    difference_type = str(primary_difference.get("type", "")).strip()
+    from_value = str(primary_difference.get("from", "")).strip().lower()
+    to_value = str(primary_difference.get("to", "")).strip().lower()
+    if not difference_type or not from_value or not to_value or from_value == to_value:
+        return 0.0
+
+    if difference_type == "object_count":
+        score = _object_count_delta_score(from_value, to_value)
+    elif difference_type == "object_presence":
+        score = 0.82 if from_value.startswith("no ") or to_value.startswith("no ") else 0.70
+    elif difference_type == "action":
+        score = _list_delta_strength(reference_annotation.get("actions", []), target_annotation.get("actions", []))
+    elif difference_type == "audio_event":
+        score = _list_delta_strength(reference_annotation.get("audio_events", []), target_annotation.get("audio_events", []))
+    elif difference_type == "speech":
+        score = _list_delta_strength(reference_annotation.get("speech", []), target_annotation.get("speech", []))
+    elif difference_type == "visible_text":
+        score = _list_delta_strength(
+            reference_annotation.get("visible_text") or reference_annotation.get("on_screen_text", []),
+            target_annotation.get("visible_text") or target_annotation.get("on_screen_text", []),
+        )
+    elif difference_type == "attribute":
+        score = _list_delta_strength(reference_annotation.get("attributes", []), target_annotation.get("attributes", []))
+    elif difference_type == "scene":
+        score = 0.65 + _scene_similarity(
+            str(reference_annotation.get("scene", "")),
+            str(target_annotation.get("scene", "")),
+        ) * 0.10
+    else:
+        score = 0.0
+
+    evidence = _difference_evidence_from_annotations(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        primary_difference=primary_difference,
+    )
+    if evidence["supporting_evidence"]:
+        score = max(score, 0.70)
+    if len(changed_types) == 1:
+        score += 0.08
+    else:
+        score -= min(0.15, (len(changed_types) - 1) * 0.04)
+    return round(max(0.0, min(1.0, score)), 3)
+
+
+def _object_count_delta_score(from_value: str, to_value: str) -> float:
+    from_count = _first_integer(from_value)
+    to_count = _first_integer(to_value)
+    if from_count is None or to_count is None or from_count == to_count:
+        return 0.65
+    delta = abs(to_count - from_count)
+    return min(1.0, 0.74 + min(delta, 4) * 0.05)
+
+
+def _first_integer(value: str) -> int | None:
+    match = re.search(r"\d+", value)
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
+
+
+def _list_delta_strength(left: Any, right: Any) -> float:
+    left_values = _normalize_list(left)
+    right_values = _normalize_list(right)
+    if left_values == right_values:
+        return 0.0
+    token_overlap = _jaccard(_tokenize_values(left_values), _tokenize_values(right_values))
+    return max(0.62, min(0.92, 0.92 - token_overlap * 0.25))
+
+
+def _difference_evidence_from_annotations(
+    *,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    primary_difference: dict[str, Any],
+) -> dict[str, Any]:
+    difference_type = str(primary_difference.get("type", "")).strip()
+    evidence: list[str] = []
+    if difference_type in {"object_count", "object_presence"}:
+        evidence.append(
+            "object_counts: "
+            f"{reference_annotation.get('object_counts', {})} -> {target_annotation.get('object_counts', {})}"
+        )
+    if difference_type == "action":
+        evidence.append(_change_text(reference_annotation.get("actions", []), target_annotation.get("actions", [])))
+    if difference_type == "audio_event":
+        evidence.append(_change_text(reference_annotation.get("audio_events", []), target_annotation.get("audio_events", [])))
+    if difference_type == "speech":
+        evidence.append(_change_text(reference_annotation.get("speech", []), target_annotation.get("speech", [])))
+    if difference_type == "visible_text":
+        evidence.append(
+            _change_text(
+                reference_annotation.get("visible_text") or reference_annotation.get("on_screen_text", []),
+                target_annotation.get("visible_text") or target_annotation.get("on_screen_text", []),
+            )
+        )
+    if difference_type == "attribute":
+        evidence.append(_change_text(reference_annotation.get("attributes", []), target_annotation.get("attributes", [])))
+    if difference_type == "scene":
+        evidence.append(f"scene: {reference_annotation.get('scene', '')} -> {target_annotation.get('scene', '')}")
+
+    reference_events = _normalize_events_for_evidence(reference_annotation.get("events", []))
+    target_events = _normalize_events_for_evidence(target_annotation.get("events", []))
+    if reference_events or target_events:
+        evidence.append(f"events: {' | '.join(reference_events[:2]) or 'none'} -> {' | '.join(target_events[:2]) or 'none'}")
+
+    return {
+        "difference_type": difference_type,
+        "from": str(primary_difference.get("from", "")).strip(),
+        "to": str(primary_difference.get("to", "")).strip(),
+        "supporting_evidence": [item for item in evidence if item.strip() and not item.strip().endswith("-> none")],
+        "reference_events": reference_events,
+        "target_events": target_events,
+    }
+
+
+def _normalize_events_for_evidence(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    events: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            pieces = [
+                str(item.get("visual", "")).strip(),
+                str(item.get("audio", "")).strip(),
+                "; ".join(_normalize_list(item.get("objects", []))),
+                "; ".join(_normalize_list(item.get("actions", []))),
+            ]
+            text = " / ".join(piece for piece in pieces if piece)
+        else:
+            text = str(item).strip()
+        if text:
+            events.append(text)
+    return events
+
+
 def _select_hard_negative_annotations(
     *,
     reference_annotation: dict[str, Any],
@@ -2140,6 +2337,7 @@ def _annotation_prompt_view(annotation: dict[str, Any]) -> dict[str, Any]:
         "audio_events": list(annotation.get("audio_events", [])),
         "modalities": list(annotation.get("modalities", [])),
         "storyline": list(annotation.get("storyline", [])),
+        "events": list(annotation.get("events", [])),
         "visible_text": list(annotation.get("visible_text", [])),
         "speakers_and_transcript": list(annotation.get("speakers_and_transcript", [])),
         "uncertainties": list(annotation.get("uncertainties", [])),
@@ -2304,13 +2502,18 @@ def _effective_pair_quality(
 ) -> dict[str, float]:
     heuristic_quality = heuristic_quality or {}
     verification_edit_score = 0.0
-    if verification is not None and _verification_accepts(verification):
+    verification_accepted = verification is not None and _verification_accepts(verification)
+    if verification_accepted:
         edit_projection = verification.get("edit_projection", {})
         edit_necessity = verification.get("edit_necessity", {})
         verification_edit_score = min(
             _score_float(edit_projection.get("score")),
             _score_float(edit_necessity.get("score")),
         )
+    if "difference_strength_score" in heuristic_quality:
+        difference_strength_score = _score_float(heuristic_quality.get("difference_strength_score"))
+    else:
+        difference_strength_score = MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE if verification_accepted else 0.0
     return {
         "same_context_score": max(
             _score_float(judge.get("same_context_score")),
@@ -2324,6 +2527,7 @@ def _effective_pair_quality(
             _score_float(judge.get("target_uniqueness_score")),
             _score_float(heuristic_quality.get("target_uniqueness_score")),
         ),
+        "difference_strength_score": difference_strength_score,
     }
 
 
@@ -2360,6 +2564,14 @@ def _compose_reject_reason(
         failures.append(
             f"target_uniqueness_score {target_uniqueness_score:.3f} is below {MIN_ACCEPT_TARGET_UNIQUENESS_SCORE:.2f}"
         )
+    if "difference_strength_score" in quality:
+        difference_strength_score = _score_float(quality.get("difference_strength_score"))
+    else:
+        difference_strength_score = MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE
+    if difference_strength_score < MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE:
+        failures.append(
+            f"difference_strength_score {difference_strength_score:.3f} is below {MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE:.2f}"
+        )
     if verification is not None:
         failures.extend(_verification_failures(verification))
     if not judge.get("accept"):
@@ -2392,6 +2604,10 @@ def _judge_accepts(
         and _score_float(quality.get("same_context_score")) >= MIN_ACCEPT_SAME_CONTEXT_SCORE
         and _score_float(quality.get("edit_match_score")) >= MIN_ACCEPT_EDIT_MATCH_SCORE
         and _score_float(quality.get("target_uniqueness_score")) >= MIN_ACCEPT_TARGET_UNIQUENESS_SCORE
+        and (
+            "difference_strength_score" not in quality
+            or _score_float(quality.get("difference_strength_score")) >= MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE
+        )
     )
     if verification is None:
         return bool(judge.get("accept")) and judge_accepted
@@ -2464,15 +2680,23 @@ def _boolish(value: Any) -> bool:
     return normalized in {"1", "true", "yes", "y", "pass", "accept", "accepted"}
 
 
-def _evidence_from_annotations(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> dict[str, Any]:
+def _evidence_from_annotations(
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    *,
+    difference_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "reference_storyline": list(reference_annotation.get("storyline", [])),
         "target_storyline": list(target_annotation.get("storyline", [])),
+        "reference_events": list(reference_annotation.get("events", [])),
+        "target_events": list(target_annotation.get("events", [])),
         "audio_change": _change_text(reference_annotation.get("audio_events", []), target_annotation.get("audio_events", [])),
         "visible_text_change": _change_text(
             reference_annotation.get("visible_text") or reference_annotation.get("on_screen_text", []),
             target_annotation.get("visible_text") or target_annotation.get("on_screen_text", []),
         ),
+        "difference_evidence": dict(difference_evidence or {}),
     }
 
 

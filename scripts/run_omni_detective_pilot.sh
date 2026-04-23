@@ -15,6 +15,41 @@ BASE_URL=${BASE_URL:-http://127.0.0.1:8093/v1}
 SOURCE_CLIPS=${SOURCE_CLIPS:-$ROOT/metadata/source_clips_all.jsonl}
 MAX_SOURCE_VIDEOS=${MAX_SOURCE_VIDEOS:-80}
 SEGMENT_SECONDS=${SEGMENT_SECONDS:-8}
+MODEL_STAGE=${MODEL_STAGE:-instruct}
+GPU_IDS=${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-}}
+MAX_GPUS=${MAX_GPUS:-6}
+
+count_gpu_ids() {
+  local value="$1"
+  if [[ -z "$value" ]]; then
+    echo 0
+    return
+  fi
+  python - "$value" <<'PY'
+import sys
+items = [item.strip() for item in sys.argv[1].split(",") if item.strip()]
+print(len(items))
+PY
+}
+
+GPU_COUNT=$(count_gpu_ids "$GPU_IDS")
+if (( GPU_COUNT > MAX_GPUS )); then
+  echo "[resource-policy] refusing to run with GPU_COUNT=$GPU_COUNT > MAX_GPUS=$MAX_GPUS" >&2
+  exit 2
+fi
+
+case "$MODEL_STAGE" in
+  instruct)
+    ;;
+  captioner|thinking)
+    echo "[resource-policy] this script runs the Instruct pair-construction stage only; stop the current service and run a dedicated $MODEL_STAGE stage separately" >&2
+    exit 2
+    ;;
+  *)
+    echo "[resource-policy] unsupported MODEL_STAGE=$MODEL_STAGE; expected instruct, captioner, or thinking" >&2
+    exit 2
+    ;;
+esac
 
 mkdir -p "$RUN_ROOT"
 
@@ -24,6 +59,8 @@ echo "[omni-detective] run_root=$RUN_ROOT"
 echo "[omni-detective] source_clips=$SOURCE_CLIPS"
 echo "[omni-detective] base_url=$BASE_URL"
 echo "[omni-detective] model=$MODEL"
+echo "[resource-policy] one Omni model per run; do not keep Captioner/Instruct/Thinking loaded together"
+echo "[resource-policy] model_stage=$MODEL_STAGE gpu_ids=${GPU_IDS:-unset} gpu_count=$GPU_COUNT max_gpus=$MAX_GPUS"
 curl -fsS "$BASE_URL/models"
 echo
 

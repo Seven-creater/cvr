@@ -14,6 +14,15 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("cd /data02/usr/wangqihao/Demo/test/cvr", script)
         self.assertNotIn("PYTHONPATH=/data02/usr/wangqihao/Demo/test/cvr", script)
 
+    def test_omni_detective_script_has_gpu_resource_policy(self) -> None:
+        script = Path("scripts/run_omni_detective_pilot.sh").read_text(encoding="utf-8")
+
+        self.assertIn("MAX_GPUS", script)
+        self.assertIn("GPU_IDS", script)
+        self.assertIn("MODEL_STAGE", script)
+        self.assertIn("one Omni model per run", script)
+        self.assertIn("refusing to run with GPU_COUNT", script)
+
 
 if __name__ == "__main__":
     unittest.main()

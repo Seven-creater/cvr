@@ -243,6 +243,7 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("detective agent", requests[1]["messages"][0]["content"].lower())
         self.assertEqual("a person plays guitar on a small stage", normalized["summary"])
         self.assertEqual(["person sits with guitar", "person plays music"], normalized["storyline"])
+        self.assertEqual("person sits with guitar", normalized["events"][0]["visual"])
         self.assertEqual(["guitar music"], normalized["audio_events"])
         self.assertEqual(["observer", "detective_final"], [item["stage"] for item in raw_payload["detective_trajectory"]])
 

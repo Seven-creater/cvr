@@ -9,6 +9,7 @@ from unittest import mock
 from app.composed_data import (
     _compose_reject_reason,
     _detect_primary_difference,
+    _difference_strength_score,
     _difference_priority_order,
     _effective_pair_quality,
     _build_pair_candidates,
@@ -1107,6 +1108,77 @@ class ComposedDataTests(unittest.TestCase):
         quality = _effective_pair_quality(judge, verification, {})
 
         self.assertFalse(_judge_accepts(judge, verification, quality))
+
+    def test_difference_strength_gate_blocks_weak_changes(self) -> None:
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.9,
+            "edit_match_score": 0.9,
+            "target_uniqueness_score": 0.9,
+            "audio_required": False,
+            "hard_negative_quality": "good",
+            "accept": True,
+            "reject_reason": "",
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {
+                "target_matches_projection": True,
+                "score": 0.9,
+            },
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.9,
+            },
+        }
+
+        quality = _effective_pair_quality(
+            judge,
+            verification,
+            {
+                "same_context_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.2,
+            },
+        )
+
+        self.assertFalse(_judge_accepts(judge, verification, quality))
+        self.assertIn("difference_strength_score", _compose_reject_reason(judge, verification, quality))
+
+    def test_difference_strength_scores_concrete_object_changes(self) -> None:
+        reference = {
+            "object_counts": {"cat": 1},
+            "actions": ["sitting"],
+            "events": [{"visual": "one cat sits on a sofa", "audio": "", "objects": ["cat"], "actions": ["sitting"]}],
+        }
+        target = {
+            "object_counts": {"cat": 2},
+            "actions": ["sitting"],
+            "events": [{"visual": "two cats sit on the same sofa", "audio": "", "objects": ["cat"], "actions": ["sitting"]}],
+        }
+        difference = {
+            "type": "object_count",
+            "from": "1 cat",
+            "to": "2 cat",
+            "description": "the count of cat changes from 1 to 2",
+        }
+
+        score = _difference_strength_score(
+            reference_annotation=reference,
+            target_annotation=target,
+            primary_difference=difference,
+            changed_types=["object_count"],
+        )
+
+        self.assertGreaterEqual(score, 0.65)
 
     def test_detect_primary_difference_prefers_speech_in_high_context_order(self) -> None:
         reference = {

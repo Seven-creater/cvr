@@ -209,7 +209,9 @@ def _detective_final_system_prompt() -> str:
         'Required schema: {"summary": string, "subjects": [string], "object_counts": {string: integer}, '
         '"actions": [string], "scene": string, "attributes": [string], "on_screen_text": [string], '
         '"speech": [string], "audio_events": [string], "modalities": ["visual"|"audio", ...], '
-        '"storyline": [string], "visible_text": [string], "speakers_and_transcript": [string], '
+        '"storyline": [string], "events": [{"start": number, "end": number, "visual": string, '
+        '"audio": string, "objects": [string], "actions": [string]}], '
+        '"visible_text": [string], "speakers_and_transcript": [string], '
         '"detective_notes": [string]}. '
         "Keep the summary concise, but preserve discriminative subject, action, audio, OCR, and timeline details. "
         "Use 'audio' in modalities only when audible information helps distinguish the clip."
@@ -351,6 +353,7 @@ def _build_pair_proposal_user_content(
         "Prefer action/audio/object differences over broad scene differences if they are visible or audible. "
         "If the clips come from the same source context and the main localized change is in speech, audio, or visible text, "
         "prefer speech/audio_event/visible_text over attribute or scene. "
+        "Use event/timeline evidence to choose a difference that is concrete, localized, and needed for retrieval. "
         "Only include audio in modalities when the edit actually requires listening. "
         "Do not mention secondary audio, speech, or visible-text details in edit_text unless they are the chosen primary difference. "
         "Keep captions factual and concise."
@@ -397,7 +400,7 @@ def _build_pair_verification_user_content(
         "Then judge whether the actual target annotation matches that projection.\n"
         "Step 3 edit_necessity: decide whether the edit is needed. "
         "The reference must not satisfy the edit, and the target must satisfy it. "
-        "Use concrete visual, audio, speech, visible-text, object-count, or action evidence."
+        "Use concrete visual, audio, speech, visible-text, object-count, action, and event/timeline evidence."
     )
     return [{"type": "text", "text": prompt}]
 
@@ -604,13 +607,15 @@ def _normalize_detective_clip_annotation_payload(payload: dict[str, Any]) -> dic
     normalized = _normalize_clip_annotation_payload(payload)
     visible_text = _detail_list(payload.get("visible_text"))
     transcript = _detail_list(payload.get("speakers_and_transcript"))
+    storyline = _detail_list(payload.get("storyline"))
     if visible_text and not normalized["on_screen_text"]:
         normalized["on_screen_text"] = visible_text
     if transcript and not normalized["speech"]:
         normalized["speech"] = transcript
     normalized.update(
         {
-            "storyline": _detail_list(payload.get("storyline")),
+            "storyline": storyline,
+            "events": _event_list(payload.get("events"), fallback_storyline=storyline),
             "visible_text": visible_text,
             "speakers_and_transcript": transcript,
             "detective_notes": _detail_list(payload.get("detective_notes")),
@@ -712,6 +717,41 @@ def _score_value(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(0.0, min(1.0, parsed))
+
+
+def _event_list(value: Any, *, fallback_storyline: list[str] | None = None) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                event = {
+                    "start": _score_or_zero(item.get("start")),
+                    "end": _score_or_zero(item.get("end")),
+                    "visual": str(item.get("visual", "")).strip(),
+                    "audio": str(item.get("audio", "")).strip(),
+                    "objects": _string_list(item.get("objects")),
+                    "actions": _string_list(item.get("actions")),
+                }
+                if event["visual"] or event["audio"] or event["objects"] or event["actions"]:
+                    events.append(event)
+            else:
+                text = str(item).strip()
+                if text:
+                    events.append({"start": 0.0, "end": 0.0, "visual": text, "audio": "", "objects": [], "actions": []})
+    if not events and fallback_storyline:
+        for item in fallback_storyline:
+            text = str(item).strip()
+            if text:
+                events.append({"start": 0.0, "end": 0.0, "visual": text, "audio": "", "objects": [], "actions": []})
+    return events
+
+
+def _score_or_zero(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, parsed)
 
 
 def _bool_value(value: Any) -> bool:
