@@ -344,6 +344,7 @@ def plan_detective_event_clips(
 
         source_clip_id = str(item.get("clip_id", "")).strip() or _stable_hash(source_key)
         dataset = str(item.get("dataset", "unknown")).strip() or "unknown"
+        source_group_id = f"group_{dataset}_{_stable_hash(source_key)}"
         segments = _event_segments(
             duration_seconds=duration,
             segment_seconds=segment_seconds,
@@ -356,7 +357,6 @@ def plan_detective_event_clips(
             if clip_id in used_clip_ids:
                 continue
             used_clip_ids.add(clip_id)
-            group_id = f"group_{dataset}_{_stable_hash(source_key)}"
             output_path = f"clips/detective/{dataset}/{clip_id}.mp4"
             record = {
                 "clip_id": clip_id,
@@ -369,7 +369,7 @@ def plan_detective_event_clips(
                 "notes": "planned by Omni-Detective event segmentation",
                 "dataset": dataset,
                 "source_clip_id": source_clip_id,
-                "group_id": group_id,
+                "group_id": source_group_id,
                 "source_row_ids": list(item.get("source_row_ids", [])),
                 "text_fields": item.get("text_fields", {}),
                 "media_probe": media,
@@ -383,7 +383,7 @@ def plan_detective_event_clips(
         if len(candidate_clip_ids) >= 2:
             group_records.append(
                 {
-                    "group_id": f"group_{dataset}_{_stable_hash(source_key)}",
+                    "group_id": source_group_id,
                     "dataset": dataset,
                     "group_reason": "same_source_video",
                     "source_clip_ids": [source_clip_id],
@@ -817,7 +817,10 @@ def propose_group_pairs(
     seen_proposal_ids: set[str] = set()
 
     for group in groups:
-        group_id = str(group.get("group_id", "")).strip()
+        group_metadata = {
+            "group_id": str(group.get("group_id", "")).strip(),
+            "group_reason": str(group.get("group_reason", "")).strip(),
+        }
         candidate_clip_ids = [str(value).strip() for value in group.get("candidate_clip_ids", []) if str(value).strip()]
         group_annotations = [
             annotations_by_id[clip_id]
@@ -923,8 +926,8 @@ def propose_group_pairs(
                     judge["reject_reason"] = _compose_reject_reason(judge, verification)
                 record = {
                     "proposal_id": proposal_id,
-                    "group_id": group_id,
-                    "group_reason": str(group.get("group_reason", "")).strip(),
+                    "group_id": group_metadata["group_id"],
+                    "group_reason": group_metadata["group_reason"],
                     "reference_video": reference_annotation["output_path"],
                     "target_video": target_annotation["output_path"],
                     "edit_text": model_fields["edit_text"],
