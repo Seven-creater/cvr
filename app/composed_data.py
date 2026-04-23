@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 from collections import Counter
 from dataclasses import dataclass
@@ -66,6 +67,8 @@ MIN_ACCEPT_TARGET_UNIQUENESS_SCORE = 0.70
 MIN_ACCEPT_EDIT_NECESSITY_SCORE = 0.70
 MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE = 0.75
 MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE = 0.65
+MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE = 0.995
+VISUAL_DIFFERENCE_TYPES = {"object_count", "object_presence", "attribute", "action", "scene", "visible_text"}
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 STOPWORDS = {
     "a",
@@ -902,6 +905,7 @@ def propose_group_pairs(
                         "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
                         "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
                         "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
+                        "max_visual_near_duplicate_score_for_visual_edits": MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE,
                     },
                 }
                 try:
@@ -1803,6 +1807,7 @@ def _retarget_pair_candidate(candidate: dict[str, Any], difference_type: str) ->
         ),
         3,
     )
+    quality["difference_type"] = primary_difference["type"]
     retargeted["quality"] = quality
     retargeted["composite_score"] = _candidate_composite_score(quality, candidate["source_context"])
     retargeted["difference_evidence"] = _difference_evidence_from_annotations(
@@ -1868,6 +1873,10 @@ def _score_ordered_pair(
         annotations=annotations,
         primary_difference=primary_difference,
     )
+    visual_near_duplicate_score = _visual_near_duplicate_score(
+        _resolve_under_root(root, reference_annotation["output_path"]),
+        _resolve_under_root(root, target_annotation["output_path"]),
+    )
     hard_negative_paths = [
         _display_path(root, _resolve_under_root(root, annotation["output_path"])) for annotation in hard_negative_annotations[:3]
     ]
@@ -1895,7 +1904,10 @@ def _score_ordered_pair(
             ),
             3,
         ),
+        "difference_type": primary_difference["type"],
     }
+    if visual_near_duplicate_score is not None:
+        quality["visual_near_duplicate_score"] = round(visual_near_duplicate_score, 3)
     composite_score = _candidate_composite_score(quality, source_context)
     return {
         "proposal_id": _build_proposal_id(reference_path, target_path),
@@ -1925,6 +1937,79 @@ def _candidate_composite_score(quality: dict[str, Any], source_context: dict[str
         4,
     )
     return round(composite_score + _score_float(source_context.get("score")) * 0.08, 4)
+
+
+def _visual_near_duplicate_score(left_path: Path, right_path: Path) -> float | None:
+    if not left_path.exists() or not right_path.exists():
+        return None
+    left_frames = _sample_video_rgb_frames(left_path)
+    right_frames = _sample_video_rgb_frames(right_path)
+    if not left_frames or not right_frames:
+        return None
+
+    best_scores: list[float] = []
+    for left_frame in left_frames:
+        left_hash = _average_frame_hash(left_frame)
+        frame_scores: list[float] = []
+        for right_frame in right_frames:
+            pixel_score = 1.0 - _frame_mae(left_frame, right_frame)
+            hash_score = 1.0 - _hash_hamming(left_hash, _average_frame_hash(right_frame))
+            frame_scores.append(max(0.0, min(1.0, min(pixel_score, hash_score))))
+        best_scores.append(max(frame_scores))
+    return sum(best_scores) / len(best_scores)
+
+
+def _sample_video_rgb_frames(path: Path, *, size: int = 32, max_frames: int = 6) -> list[bytes]:
+    if shutil.which("ffmpeg") is None:
+        return []
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        str(path),
+        "-vf",
+        f"fps=1,scale={size}:{size},format=rgb24",
+        "-frames:v",
+        str(max_frames),
+        "-f",
+        "rawvideo",
+        "-",
+    ]
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0:
+        return []
+    frame_size = size * size * 3
+    data = completed.stdout
+    return [data[index : index + frame_size] for index in range(0, len(data), frame_size) if len(data[index : index + frame_size]) == frame_size]
+
+
+def _frame_mae(left: bytes, right: bytes) -> float:
+    if not left or len(left) != len(right):
+        return 1.0
+    return sum(abs(a - b) for a, b in zip(left, right)) / (255.0 * len(left))
+
+
+def _average_frame_hash(frame: bytes) -> tuple[bool, ...]:
+    if not frame:
+        return tuple()
+    luminance = [
+        (int(frame[index]) * 299 + int(frame[index + 1]) * 587 + int(frame[index + 2]) * 114) // 1000
+        for index in range(0, len(frame) - 2, 3)
+    ]
+    if not luminance:
+        return tuple()
+    mean_value = sum(luminance) / len(luminance)
+    return tuple(value >= mean_value for value in luminance)
+
+
+def _hash_hamming(left: tuple[bool, ...], right: tuple[bool, ...]) -> float:
+    if not left or len(left) != len(right):
+        return 1.0
+    return sum(1 for left_bit, right_bit in zip(left, right) if left_bit != right_bit) / len(left)
 
 
 def _sanitize_annotation_for_output(annotation: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -2676,7 +2761,7 @@ def _effective_pair_quality(
         difference_strength_score = _score_float(heuristic_quality.get("difference_strength_score"))
     else:
         difference_strength_score = MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE if verification_accepted else 0.0
-    return {
+    result: dict[str, Any] = {
         "same_context_score": max(
             _score_float(judge.get("same_context_score")),
             _score_float(heuristic_quality.get("same_context_score")),
@@ -2691,6 +2776,11 @@ def _effective_pair_quality(
         ),
         "difference_strength_score": difference_strength_score,
     }
+    if "visual_near_duplicate_score" in heuristic_quality:
+        result["visual_near_duplicate_score"] = _score_float(heuristic_quality.get("visual_near_duplicate_score"))
+    if "difference_type" in heuristic_quality:
+        result["difference_type"] = str(heuristic_quality.get("difference_type", "")).strip()
+    return result
 
 
 def _compose_reject_reason(
@@ -2734,6 +2824,12 @@ def _compose_reject_reason(
         failures.append(
             f"difference_strength_score {difference_strength_score:.3f} is below {MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE:.2f}"
         )
+    visual_near_duplicate_score = _score_float(quality.get("visual_near_duplicate_score"))
+    difference_type = str(quality.get("difference_type", "")).strip()
+    if _visual_near_duplicate_rejects(visual_near_duplicate_score, difference_type):
+        failures.append(
+            f"visual_near_duplicate_score {visual_near_duplicate_score:.3f} is too high for visual difference type {difference_type}"
+        )
     if verification is not None:
         failures.extend(_verification_failures(verification))
     if not judge.get("accept"):
@@ -2770,10 +2866,21 @@ def _judge_accepts(
             "difference_strength_score" not in quality
             or _score_float(quality.get("difference_strength_score")) >= MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE
         )
+        and not _visual_near_duplicate_rejects(
+            _score_float(quality.get("visual_near_duplicate_score")),
+            str(quality.get("difference_type", "")).strip(),
+        )
     )
     if verification is None:
         return bool(judge.get("accept")) and judge_accepted
     return judge_accepted and _verification_accepts(verification)
+
+
+def _visual_near_duplicate_rejects(score: float, difference_type: str) -> bool:
+    return bool(
+        difference_type in VISUAL_DIFFERENCE_TYPES
+        and score >= MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE
+    )
 
 
 def _verification_accepts(verification: dict[str, Any]) -> bool:

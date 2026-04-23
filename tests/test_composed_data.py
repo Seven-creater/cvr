@@ -1179,6 +1179,95 @@ class ComposedDataTests(unittest.TestCase):
         self.assertFalse(_judge_accepts(judge, verification, quality))
         self.assertIn("difference_strength_score", _compose_reject_reason(judge, verification, quality))
 
+    def test_visual_near_duplicate_blocks_visual_difference_override(self) -> None:
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.9,
+            "edit_match_score": 0.6,
+            "target_uniqueness_score": 0.9,
+            "audio_required": False,
+            "hard_negative_quality": "good",
+            "accept": False,
+            "reject_reason": "",
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {
+                "target_matches_projection": True,
+                "score": 0.92,
+            },
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.9,
+            },
+        }
+        quality = _effective_pair_quality(
+            judge,
+            verification,
+            {
+                "same_context_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "visual_near_duplicate_score": 0.998,
+                "difference_type": "attribute",
+            },
+        )
+
+        self.assertFalse(_judge_accepts(judge, verification, quality))
+        self.assertIn("visual_near_duplicate_score", _compose_reject_reason(judge, verification, quality))
+
+    def test_visual_near_duplicate_allows_speech_difference(self) -> None:
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.9,
+            "edit_match_score": 0.6,
+            "target_uniqueness_score": 0.9,
+            "audio_required": True,
+            "hard_negative_quality": "good",
+            "accept": False,
+            "reject_reason": "",
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {
+                "target_matches_projection": True,
+                "score": 0.92,
+            },
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.9,
+            },
+        }
+        quality = _effective_pair_quality(
+            judge,
+            verification,
+            {
+                "same_context_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "visual_near_duplicate_score": 0.998,
+                "difference_type": "speech",
+            },
+        )
+
+        self.assertTrue(_judge_accepts(judge, verification, quality))
+
     def test_difference_strength_scores_concrete_object_changes(self) -> None:
         reference = {
             "object_counts": {"cat": 1},
