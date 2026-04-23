@@ -151,6 +151,8 @@ VISUAL_DESCRIPTION_TOKENS = {
     "wearing",
 }
 NON_SPEECH_AUDIO_TOKENS = {
+    "ambient",
+    "ambience",
     "applause",
     "bark",
     "barking",
@@ -166,27 +168,47 @@ NON_SPEECH_AUDIO_TOKENS = {
     "cheering",
     "clap",
     "clapping",
+    "crash",
     "crowd",
     "drum",
     "electronic",
     "engine",
     "footstep",
     "gunshot",
+    "hiss",
     "hum",
     "instrument",
     "machine",
     "mechanical",
     "laugh",
     "laughter",
+    "melody",
     "music",
     "noise",
+    "orchestra",
+    "orchestral",
     "piano",
     "rain",
+    "ring",
     "ringing",
+    "river",
+    "roar",
+    "rumble",
+    "rustle",
+    "rustling",
+    "score",
+    "siren",
     "song",
     "splash",
+    "static",
+    "stream",
     "thunder",
     "traffic",
+    "water",
+    "waves",
+    "whir",
+    "whirring",
+    "whoosh",
     "wind",
 }
 
@@ -2813,9 +2835,27 @@ def _speech_is_transcript_backed(reference_annotation: dict[str, Any], target_an
 
 def _non_speech_audio_terms(annotation: dict[str, Any]) -> list[str]:
     terms: list[str] = []
-    for item in _normalize_list(annotation.get("audio_events", [])) + _timeline_audio_terms(annotation):
+    for item in (
+        _normalize_list(annotation.get("audio_events", []))
+        + _timeline_audio_terms(annotation)
+        + _annotation_audio_text_terms(annotation)
+    ):
         if not _is_speech_like_audio_event(item) and item not in terms:
             terms.append(item)
+    return terms
+
+
+def _annotation_audio_text_terms(annotation: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+
+    def add(value: Any) -> None:
+        for item in _normalize_list(value):
+            if _is_non_speech_audio_phrase(item) and item not in terms:
+                terms.append(item)
+
+    add(annotation.get("summary", ""))
+    add(annotation.get("detective_notes", []))
+    add(annotation.get("audio_observations", []))
     return terms
 
 
@@ -2827,16 +2867,13 @@ def _timeline_audio_terms(annotation: dict[str, Any]) -> list[str]:
             if _is_non_speech_audio_phrase(item) and item not in terms:
                 terms.append(item)
 
-    for container_name in ("events", "storyline"):
-        container = annotation.get(container_name, [])
-        if not isinstance(container, list):
-            continue
-        for item in container:
-            if isinstance(item, dict):
-                add_if_relevant([item.get("audio", "")])
-                add_if_relevant(item.get("audio_events", []))
-            elif container_name == "storyline":
-                add_if_relevant([item])
+    container = annotation.get("events", [])
+    if not isinstance(container, list):
+        return terms
+    for item in container:
+        if isinstance(item, dict):
+            add_if_relevant([item.get("audio", "")])
+            add_if_relevant(item.get("audio_events", []))
     return terms
 
 

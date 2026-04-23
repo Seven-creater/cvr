@@ -1556,6 +1556,37 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertGreaterEqual(_non_speech_audio_event_score(reference, target), 0.70)
 
+    def test_audio_event_gate_accepts_summary_audio_delta_without_structured_audio_fields(self) -> None:
+        reference = {
+            "summary": "a robot stands on a platform with a low electronic hum in the background",
+            "detective_notes": ["background electronic hum remains constant"],
+        }
+        target = {
+            "summary": "the same robot stands on the platform while dramatic orchestral music swells",
+            "detective_notes": ["dramatic orchestral music replaces the previous hum"],
+        }
+
+        self.assertGreaterEqual(_non_speech_audio_event_score(reference, target), 0.70)
+
+    def test_detect_primary_difference_uses_summary_audio_delta(self) -> None:
+        reference = {
+            "summary": "a robot stands on a platform with a low electronic hum in the background",
+            "object_counts": {"robot": 1},
+            "scene": "dark studio platform",
+            "detective_notes": ["background electronic hum remains constant"],
+        }
+        target = {
+            "summary": "the same robot stands on the platform while dramatic orchestral music swells",
+            "object_counts": {"robot": 1},
+            "scene": "dark studio platform",
+            "detective_notes": ["dramatic orchestral music replaces the previous hum"],
+        }
+
+        difference = _detect_primary_difference(reference, target, priority_order=("audio_event", "object_presence", "scene"))
+
+        self.assertIsNotNone(difference)
+        self.assertEqual("audio_event", difference["type"])
+
     def test_pair_verification_counts_tracks_speech_audio_rejects(self) -> None:
         records = [
             {
@@ -1639,6 +1670,39 @@ class ComposedDataTests(unittest.TestCase):
         self.assertEqual(True, sample["transcript_backed"])
         self.assertEqual(True, sample["speech_quality"]["transcript_backed"])
         self.assertEqual(0.88, sample["speech_quality"]["evidence_score"])
+
+    def test_accepted_sample_carries_audio_event_quality_fields(self) -> None:
+        sample = _accepted_sample_from_record(
+            {
+                "proposal_id": "proposal__audio",
+                "reference_video": "clips/ref.mp4",
+                "target_video": "clips/target.mp4",
+                "edit_text": "change low electronic hum into orchestral music",
+                "modalities": ["audio"],
+                "reference_caption": "ref",
+                "target_caption": "target",
+                "difference": {"type": "audio_event", "from": "electronic hum", "to": "orchestral music"},
+                "hard_negatives": ["clips/neg.mp4"],
+                "quality": {"difference_type": "audio_event"},
+                "source": {"platform": "unknown", "url": "file:///tmp/target.mp4", "license_note": "internal"},
+                "source_context": {"relation": "same_source_video"},
+                "evidence": {},
+                "judge": {},
+                "verification": {},
+                "speech_quality": {},
+                "audio_event_quality": {
+                    "non_speech_score": 0.84,
+                    "audio_required": True,
+                },
+                "transcript_backed": None,
+                "group_id": "group_a",
+                "group_reason": "same_source_video",
+            },
+            1,
+        )
+
+        self.assertEqual(0.84, sample["audio_event_quality"]["non_speech_score"])
+        self.assertEqual(True, sample["audio_event_quality"]["audio_required"])
 
     def test_difference_strength_scores_concrete_object_changes(self) -> None:
         reference = {

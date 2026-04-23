@@ -247,6 +247,86 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertEqual(["guitar music"], normalized["audio_events"])
         self.assertEqual(["observer", "detective_final"], [item["stage"] for item in raw_payload["detective_trajectory"]])
 
+    def test_detective_annotation_infers_audio_events_from_event_audio_and_notes(self) -> None:
+        observer_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "visual_observations": ["a robot stands on a platform"],
+                                "audio_observations": ["low electronic hum"],
+                                "text_observations": [],
+                                "timeline": ["robot rotates slowly"],
+                                "uncertainties": [],
+                                "follow_up_questions": [],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        final_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "summary": "a robot stands on a platform with a low electronic hum in the background",
+                                "subjects": ["robot"],
+                                "object_counts": {"robot": 1},
+                                "actions": ["standing"],
+                                "scene": "dark studio platform",
+                                "attributes": ["metallic"],
+                                "on_screen_text": [],
+                                "speech": [],
+                                "audio_events": [],
+                                "modalities": ["visual"],
+                                "storyline": ["the robot rotates in place"],
+                                "events": [
+                                    {
+                                        "start": 0,
+                                        "end": 4,
+                                        "visual": "the robot rotates in place",
+                                        "audio": "low electronic hum and occasional beeps",
+                                        "objects": ["robot"],
+                                        "actions": ["rotating"],
+                                    }
+                                ],
+                                "visible_text": [],
+                                "speakers_and_transcript": [],
+                                "detective_notes": ["background electronic hum remains constant"],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        responses = [_FakeHTTPResponse(observer_payload), _FakeHTTPResponse(final_payload)]
+
+        def fake_urlopen(_request, timeout=None):
+            return responses.pop(0)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-detective-omni-audio-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            clip_path = tmp_dir / "clip.mp4"
+            clip_path.write_bytes(b"fake-mp4-bytes")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.annotate_clip_detective(clip_path=str(clip_path))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertIn("audio", normalized["modalities"])
+        self.assertTrue(any("electronic hum" in item for item in normalized["audio_events"]))
+
     def test_propose_pair_normalizes_subject_difference_alias(self) -> None:
         response_payload = {
             "choices": [

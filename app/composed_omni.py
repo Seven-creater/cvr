@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from typing import Any
@@ -85,6 +86,88 @@ REQUIRED_PAIR_VERIFICATION_FIELDS = (
     "edit_necessity",
 )
 
+TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+NON_SPEECH_AUDIO_TOKENS = {
+    "ambient",
+    "ambience",
+    "applause",
+    "bark",
+    "barking",
+    "beep",
+    "bell",
+    "bird",
+    "birds",
+    "buzz",
+    "buzzing",
+    "chain",
+    "chainsaw",
+    "cheer",
+    "cheering",
+    "chirp",
+    "chirping",
+    "clap",
+    "clapping",
+    "crash",
+    "crowd",
+    "drum",
+    "electronic",
+    "engine",
+    "footstep",
+    "gunshot",
+    "hiss",
+    "hum",
+    "instrument",
+    "laugh",
+    "laughter",
+    "machine",
+    "mechanical",
+    "melody",
+    "music",
+    "noise",
+    "orchestra",
+    "orchestral",
+    "piano",
+    "rain",
+    "ring",
+    "ringing",
+    "river",
+    "roar",
+    "rumble",
+    "rustle",
+    "rustling",
+    "score",
+    "siren",
+    "song",
+    "splash",
+    "static",
+    "stream",
+    "thunder",
+    "traffic",
+    "water",
+    "waves",
+    "whir",
+    "whirring",
+    "whoosh",
+    "wind",
+}
+GENERIC_SPEECH_AUDIO_TOKENS = {
+    "dialog",
+    "dialogue",
+    "narrate",
+    "narrates",
+    "narrating",
+    "narration",
+    "narrator",
+    "speaker",
+    "speak",
+    "speaking",
+    "speech",
+    "talk",
+    "talking",
+    "voice",
+    "voiceover",
+}
+
 
 def _string_list(value: Any) -> list[str]:
     if isinstance(value, str):
@@ -111,6 +194,53 @@ def _detail_list(value: Any) -> list[str]:
         if text:
             normalized.append(text)
     return normalized
+
+
+def _tokenize_text(value: str) -> set[str]:
+    return set(TOKEN_PATTERN.findall(str(value).lower()))
+
+
+def _is_speech_like_audio_value(value: str) -> bool:
+    tokens = _tokenize_text(value)
+    if not tokens:
+        return False
+    if tokens & NON_SPEECH_AUDIO_TOKENS:
+        return False
+    return bool(tokens & GENERIC_SPEECH_AUDIO_TOKENS)
+
+
+def _is_non_speech_audio_value(value: str) -> bool:
+    tokens = _tokenize_text(value)
+    return bool(tokens & NON_SPEECH_AUDIO_TOKENS) and not _is_speech_like_audio_value(value)
+
+
+def _collect_non_speech_audio_terms(payload: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+
+    def add(value: Any) -> None:
+        for item in _detail_list(value):
+            if _is_non_speech_audio_value(item) and item not in terms:
+                terms.append(item)
+
+    add(payload.get("audio_events"))
+    add(payload.get("audio_observations"))
+    add(payload.get("detective_notes"))
+    add(payload.get("summary"))
+    events = payload.get("events", [])
+    if isinstance(events, list):
+        for item in events:
+            if isinstance(item, dict):
+                add(item.get("audio"))
+                add(item.get("audio_events"))
+    return terms
+
+
+def _merge_audio_events(existing: list[str], inferred: list[str]) -> list[str]:
+    merged = list(existing)
+    for item in inferred:
+        if item not in merged:
+            merged.append(item)
+    return merged
 
 
 def _normalize_modalities(value: Any) -> list[str]:
@@ -172,6 +302,10 @@ def _clip_annotation_system_prompt() -> str:
         '"speech": [string], "audio_events": [string], "modalities": ["visual"|"audio", ...]}. '
         "All keys are mandatory. "
         "Use concrete and distinguishing details. Keep phrases short. "
+        "Use speech only for spoken words, transcript paraphrases, or speaker delivery. "
+        "Use audio_events only for non-speech audio such as music, applause, wind, footsteps, machinery, animal sounds, hums, or ambient noise. "
+        "If a clip has both speech and non-speech audio, put language in speech and non-language sounds in audio_events. "
+        "Never use audio_events for generic labels like speech, narration, talking, or voiceover. "
         "Include 'audio' in modalities only when the clip contains useful audible content such as speech, music, or sound events."
     )
 
@@ -184,6 +318,8 @@ def _detective_observation_system_prompt() -> str:
         '"text_observations": [string], "timeline": [string], "uncertainties": [string], '
         '"follow_up_questions": [string]}. '
         "Capture concrete details that distinguish this clip from similar clips. "
+        "In audio_observations, call out non-speech audio explicitly: music, ambience, hums, applause, animal sounds, mechanical noise, water, wind, or similar sounds. "
+        "Do not collapse non-speech audio into vague phrases like audio or background sound. "
         "Do not infer unsupported identities or events."
     )
 
@@ -197,6 +333,7 @@ def _detective_toolbox_system_prompt() -> str:
         '"text_observations": [string], "timeline": [string], "uncertainties": [string], '
         '"follow_up_questions": [string]}. '
         "Prefer timestamped facts when possible. Separate visual, audio, visible text, and speech evidence. "
+        "When audio is present, name non-speech sounds explicitly instead of vague placeholders. "
         "Do not hide uncertainty."
     )
 
@@ -214,6 +351,9 @@ def _detective_final_system_prompt() -> str:
         '"visible_text": [string], "speakers_and_transcript": [string], '
         '"detective_notes": [string]}. '
         "Keep the summary concise, but preserve discriminative subject, action, audio, OCR, and timeline details. "
+        "Use speech only for spoken-language content. Use audio_events only for non-speech sounds such as music, applause, environmental ambience, hums, machinery, footsteps, animal sounds, water, or wind. "
+        "If non-speech audio exists, name it explicitly in audio_events and also mention it in events[].audio or detective_notes. "
+        "Never fill audio_events with speech, narration, talking, or voiceover. "
         "Use 'audio' in modalities only when audible information helps distinguish the clip."
     )
 
@@ -280,7 +420,9 @@ def _pair_verification_system_prompt() -> str:
 def _build_clip_annotation_user_content(clip_path: str) -> list[dict[str, Any]]:
     prompt = (
         "Task: describe this clip for composed retrieval dataset construction.\n"
-        "Focus on the main subject, object counts, actions, scene, attributes, visible text, speech, and audio events.\n"
+        "Focus on the main subject, object counts, actions, scene, attributes, visible text, spoken language, and non-speech audio events.\n"
+        "If there is music, ambience, hum, applause, footsteps, animal sound, water, wind, or machine noise, list it explicitly in audio_events.\n"
+        "Keep speech and non-speech audio separate.\n"
         "Use details that help distinguish this clip from similar clips in the same series."
     )
     return [
@@ -292,7 +434,8 @@ def _build_clip_annotation_user_content(clip_path: str) -> list[dict[str, Any]]:
 def _build_detective_observation_user_content(clip_path: str) -> list[dict[str, Any]]:
     prompt = (
         "Observation pass: inspect the clip like an independent observer.\n"
-        "List visible subjects, object counts, actions, scene, visible text, speech, music, sound events, and timeline beats.\n"
+        "List visible subjects, object counts, actions, scene, visible text, speech, non-speech audio events, and timeline beats.\n"
+        "Name non-speech audio explicitly, for example background music, applause, electronic hum, wind, machinery, footsteps, or animal sounds.\n"
         "Also list any uncertainties that a later detective pass should be careful about."
     )
     return [
@@ -309,7 +452,7 @@ def _build_detective_toolbox_user_content(
     prompt = (
         "Tool-box observation pass: inspect the clip using the structured tool observations below.\n"
         f"Tool observations JSON:\n{json.dumps(tool_observations, ensure_ascii=False)}\n"
-        "Return concrete evidence for visual events, audio events, visible text, speech/transcript, timeline beats, "
+        "Return concrete evidence for visual events, non-speech audio events, visible text, speech/transcript, timeline beats, "
         "and remaining uncertainties."
     )
     return [
@@ -332,6 +475,8 @@ def _build_detective_final_user_content(
         f"{tool_text}"
         f"Prior observer JSON:\n{json.dumps(observations, ensure_ascii=False)}\n"
         "Prefer facts supported by the video or observer notes. "
+        "When there is non-speech audio, write it explicitly into audio_events and mention it in the event timeline or detective_notes. "
+        "Keep speech/transcript separate from non-speech audio. "
         "Make the annotation useful for later finding pairs that differ by one clear visual/audio/text change."
     )
     return [
@@ -623,6 +768,9 @@ def _normalize_clip_annotation_payload(payload: dict[str, Any]) -> dict[str, Any
         "audio_events": _string_list(payload.get("audio_events")),
         "modalities": modalities,
     }
+    normalized["audio_events"] = _merge_audio_events(normalized["audio_events"], _collect_non_speech_audio_terms(payload))
+    if normalized["audio_events"] and "audio" not in normalized["modalities"]:
+        normalized["modalities"] = list(normalized["modalities"]) + ["audio"]
     if not normalized["summary"]:
         raise ValueError("clip annotation summary is required")
     return normalized
@@ -647,6 +795,9 @@ def _normalize_detective_clip_annotation_payload(payload: dict[str, Any]) -> dic
             "uncertainties": _detail_list(payload.get("uncertainties")),
         }
     )
+    normalized["audio_events"] = _merge_audio_events(normalized["audio_events"], _collect_non_speech_audio_terms(normalized))
+    if normalized["audio_events"] and "audio" not in normalized["modalities"]:
+        normalized["modalities"] = list(normalized["modalities"]) + ["audio"]
     return normalized
 
 
