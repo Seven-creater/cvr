@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from app.composed_data import (
+    _accepted_sample_from_record,
     _action_evidence_score,
     _compose_reject_reason,
     _detect_primary_difference,
@@ -1549,6 +1550,12 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertGreaterEqual(_non_speech_audio_event_score(reference, target), 0.70)
 
+    def test_audio_event_gate_accepts_timeline_audio_delta_without_top_level_audio_events(self) -> None:
+        reference = {"events": [{"audio": "quiet forest ambience"}]}
+        target = {"events": [{"audio": "chainsaw noise and machine buzzing"}]}
+
+        self.assertGreaterEqual(_non_speech_audio_event_score(reference, target), 0.70)
+
     def test_pair_verification_counts_tracks_speech_audio_rejects(self) -> None:
         records = [
             {
@@ -1596,6 +1603,42 @@ class ComposedDataTests(unittest.TestCase):
         self.assertEqual(1, counts["speech_rejected_as_too_generic_count"])
         self.assertEqual(1, counts["speech_rejected_for_missing_transcript_count"])
         self.assertEqual(1, counts["audio_event_rejected_as_speech_only_count"])
+
+    def test_accepted_sample_carries_speech_quality_fields(self) -> None:
+        sample = _accepted_sample_from_record(
+            {
+                "proposal_id": "proposal__speech",
+                "reference_video": "clips/ref.mp4",
+                "target_video": "clips/target.mp4",
+                "edit_text": "change speech from A to B",
+                "modalities": ["audio"],
+                "reference_caption": "ref",
+                "target_caption": "target",
+                "difference": {"type": "speech", "from": "A", "to": "B"},
+                "hard_negatives": ["clips/neg.mp4"],
+                "quality": {"difference_type": "speech"},
+                "source": {"platform": "unknown", "url": "file:///tmp/target.mp4", "license_note": "internal"},
+                "source_context": {"relation": "same_source_video"},
+                "evidence": {},
+                "judge": {},
+                "verification": {},
+                "speech_quality": {
+                    "transcript_backed": True,
+                    "evidence_score": 0.88,
+                    "specificity_score": 0.9,
+                    "audio_required": True,
+                },
+                "audio_event_quality": {},
+                "transcript_backed": True,
+                "group_id": "group_a",
+                "group_reason": "same_source_video",
+            },
+            1,
+        )
+
+        self.assertEqual(True, sample["transcript_backed"])
+        self.assertEqual(True, sample["speech_quality"]["transcript_backed"])
+        self.assertEqual(0.88, sample["speech_quality"]["evidence_score"])
 
     def test_difference_strength_scores_concrete_object_changes(self) -> None:
         reference = {

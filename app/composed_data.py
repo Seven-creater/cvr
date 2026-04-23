@@ -1058,6 +1058,8 @@ def propose_group_pairs(
                 accepted = _judge_accepts(judge, verification, effective_quality)
                 if not accepted:
                     judge["reject_reason"] = _compose_reject_reason(judge, verification, effective_quality)
+                speech_quality = _speech_quality_payload(effective_quality)
+                audio_event_quality = _audio_event_quality_payload(effective_quality)
                 record = {
                     "proposal_id": proposal_id,
                     "group_id": group_metadata["group_id"],
@@ -1087,6 +1089,9 @@ def propose_group_pairs(
                     ),
                     "judge": judge,
                     "verification": verification,
+                    "speech_quality": speech_quality,
+                    "audio_event_quality": audio_event_quality,
+                    "transcript_backed": speech_quality.get("transcript_backed"),
                     "accepted": accepted,
                     "fallback_used": fallback_used,
                     "raw_model_output": raw_model_output,
@@ -2286,6 +2291,7 @@ def _annotation_has_signal(annotation: dict[str, Any]) -> bool:
         or annotation.get("subjects")
         or annotation.get("actions")
         or annotation.get("audio_events")
+        or _timeline_audio_terms(annotation)
         or annotation.get("speech")
     )
 
@@ -2807,10 +2813,36 @@ def _speech_is_transcript_backed(reference_annotation: dict[str, Any], target_an
 
 def _non_speech_audio_terms(annotation: dict[str, Any]) -> list[str]:
     terms: list[str] = []
-    for item in _normalize_list(annotation.get("audio_events", [])):
+    for item in _normalize_list(annotation.get("audio_events", [])) + _timeline_audio_terms(annotation):
         if not _is_speech_like_audio_event(item) and item not in terms:
             terms.append(item)
     return terms
+
+
+def _timeline_audio_terms(annotation: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+
+    def add_if_relevant(value: Any) -> None:
+        for item in _normalize_list(value):
+            if _is_non_speech_audio_phrase(item) and item not in terms:
+                terms.append(item)
+
+    for container_name in ("events", "storyline"):
+        container = annotation.get(container_name, [])
+        if not isinstance(container, list):
+            continue
+        for item in container:
+            if isinstance(item, dict):
+                add_if_relevant([item.get("audio", "")])
+                add_if_relevant(item.get("audio_events", []))
+            elif container_name == "storyline":
+                add_if_relevant([item])
+    return terms
+
+
+def _is_non_speech_audio_phrase(value: str) -> bool:
+    tokens = _tokenize_text(value)
+    return bool(tokens & NON_SPEECH_AUDIO_TOKENS) and not _is_speech_like_audio_event(value)
 
 
 def _is_speech_like_audio_event(value: str) -> bool:
@@ -3235,6 +3267,26 @@ def _effective_pair_quality(
     return result
 
 
+def _speech_quality_payload(quality: dict[str, Any]) -> dict[str, Any]:
+    if str(quality.get("difference_type", "")).strip() != "speech":
+        return {}
+    return {
+        "transcript_backed": _score_float(quality.get("speech_transcript_backed")) >= 1.0,
+        "evidence_score": _score_float(quality.get("speech_evidence_score")),
+        "specificity_score": _score_float(quality.get("speech_specificity_score")),
+        "audio_required": _score_float(quality.get("has_audio_modality")) >= 1.0,
+    }
+
+
+def _audio_event_quality_payload(quality: dict[str, Any]) -> dict[str, Any]:
+    if str(quality.get("difference_type", "")).strip() != "audio_event":
+        return {}
+    return {
+        "non_speech_score": _score_float(quality.get("non_speech_audio_event_score")),
+        "audio_required": _score_float(quality.get("has_audio_modality")) >= 1.0,
+    }
+
+
 def _compose_reject_reason(
     judge: dict[str, Any],
     verification: dict[str, Any] | None = None,
@@ -3454,12 +3506,14 @@ def _evidence_from_annotations(
     *,
     difference_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    reference_audio_terms = _non_speech_audio_terms(reference_annotation) or _normalize_list(reference_annotation.get("audio_events", []))
+    target_audio_terms = _non_speech_audio_terms(target_annotation) or _normalize_list(target_annotation.get("audio_events", []))
     return {
         "reference_storyline": list(reference_annotation.get("storyline", [])),
         "target_storyline": list(target_annotation.get("storyline", [])),
         "reference_events": list(reference_annotation.get("events", [])),
         "target_events": list(target_annotation.get("events", [])),
-        "audio_change": _change_text(reference_annotation.get("audio_events", []), target_annotation.get("audio_events", [])),
+        "audio_change": _change_text(reference_audio_terms, target_audio_terms),
         "visible_text_change": _change_text(
             reference_annotation.get("visible_text") or reference_annotation.get("on_screen_text", []),
             target_annotation.get("visible_text") or target_annotation.get("on_screen_text", []),
@@ -3494,6 +3548,9 @@ def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str
         "evidence": dict(record.get("evidence", {})),
         "judge": dict(record.get("judge", {})),
         "verification": dict(record.get("verification", {})),
+        "speech_quality": dict(record.get("speech_quality", {})),
+        "audio_event_quality": dict(record.get("audio_event_quality", {})),
+        "transcript_backed": record.get("transcript_backed"),
         "group_id": record.get("group_id", ""),
         "group_reason": record.get("group_reason", ""),
     }
