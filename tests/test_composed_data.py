@@ -9,8 +9,10 @@ from unittest import mock
 from app.composed_data import (
     _compose_reject_reason,
     _detect_primary_difference,
+    _effective_pair_quality,
     _build_pair_candidates,
     _build_proposal_id,
+    _judge_accepts,
     annotate_clips,
     build_ffmpeg_extract_command,
     detective_annotate_clips,
@@ -1026,6 +1028,82 @@ class ComposedDataTests(unittest.TestCase):
         self.assertIn("edit_match_score 0.620 is below 0.75", reason)
         self.assertIn("target_uniqueness_score 0.580 is below 0.70", reason)
         self.assertIn("the model judge did not accept the pair", reason)
+
+    def test_verification_can_override_low_judge_edit_score(self) -> None:
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.82,
+            "edit_match_score": 0.395,
+            "target_uniqueness_score": 0.86,
+            "audio_required": False,
+            "hard_negative_quality": "good",
+            "accept": False,
+            "reject_reason": "",
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {
+                "target_matches_projection": True,
+                "score": 0.92,
+            },
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.9,
+            },
+        }
+
+        quality = _effective_pair_quality(
+            judge,
+            verification,
+            {"same_context_score": 0.82, "target_uniqueness_score": 0.86},
+        )
+
+        self.assertEqual(0.9, quality["edit_match_score"])
+        self.assertFalse(_judge_accepts(judge))
+        self.assertTrue(_judge_accepts(judge, verification, quality))
+
+    def test_verification_override_still_rejects_equivalent_captions(self) -> None:
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.9,
+            "edit_match_score": 0.95,
+            "target_uniqueness_score": 0.9,
+            "audio_required": False,
+            "hard_negative_quality": "good",
+            "accept": True,
+            "reject_reason": "",
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": True,
+                "has_concrete_difference": False,
+                "difference_matches_edit": False,
+            },
+            "edit_projection": {
+                "target_matches_projection": True,
+                "score": 0.9,
+            },
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.9,
+            },
+        }
+
+        quality = _effective_pair_quality(judge, verification, {})
+
+        self.assertFalse(_judge_accepts(judge, verification, quality))
 
     def test_detect_primary_difference_prefers_speech_in_high_context_order(self) -> None:
         reference = {

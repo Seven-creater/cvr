@@ -921,9 +921,10 @@ def propose_group_pairs(
                 judge = _finalize_pair_judge(judge)
                 verification = _finalize_pair_verification(verification)
                 fallback_used = proposal_fallback_used or judge_fallback_used or verification_fallback_used
-                accepted = _judge_accepts(judge, verification)
+                effective_quality = _effective_pair_quality(judge, verification, candidate["quality"])
+                accepted = _judge_accepts(judge, verification, effective_quality)
                 if not accepted:
-                    judge["reject_reason"] = _compose_reject_reason(judge, verification)
+                    judge["reject_reason"] = _compose_reject_reason(judge, verification, effective_quality)
                 record = {
                     "proposal_id": proposal_id,
                     "group_id": group_metadata["group_id"],
@@ -936,11 +937,12 @@ def propose_group_pairs(
                     "target_caption": model_fields["target_caption"],
                     "difference": model_fields["difference"],
                     "hard_negatives": list(candidate["hard_negative_paths"]),
-                    "quality": {
+                    "judge_quality": {
                         "same_context_score": judge["same_context_score"],
                         "edit_match_score": judge["edit_match_score"],
                         "target_uniqueness_score": judge["target_uniqueness_score"],
                     },
+                    "quality": effective_quality,
                     "heuristic_quality": dict(candidate["quality"]),
                     "source_context": dict(candidate["source_context"]),
                     "source": source,
@@ -962,7 +964,7 @@ def propose_group_pairs(
                 record["accepted"] = False
                 record["fallback_used"] = True
                 judge = dict(record.get("judge", {}))
-                judge["reject_reason"] = _compose_reject_reason(judge, record["verification"])
+                judge["reject_reason"] = _compose_reject_reason(judge, record["verification"], record.get("quality"))
                 record["judge"] = judge
             if bool(record.get("fallback_used")):
                 fallback_count += 1
@@ -1147,6 +1149,9 @@ def _load_pair_verification_counts(pilot_jsonl_path: Path) -> dict[str, int]:
 
 def _empty_pair_verification_counts() -> dict[str, int]:
     return {
+        "verification_passed_count": 0,
+        "verification_passed_rejected_count": 0,
+        "verification_override_accept_count": 0,
         "caption_equivalent_reject_count": 0,
         "missing_delta_reject_count": 0,
         "difference_mismatch_reject_count": 0,
@@ -1162,9 +1167,17 @@ def _pair_verification_counts(records: list[dict[str, Any]]) -> dict[str, int]:
         verification = record.get("verification")
         if not isinstance(verification, dict):
             continue
-        if bool(record.get("accepted")) and _verification_accepts(verification):
+        verification_passed = _verification_accepts(verification)
+        if verification_passed:
+            counts["verification_passed_count"] += 1
+        if bool(record.get("accepted")) and verification_passed:
             counts["accepted_after_verification_count"] += 1
+            judge = record.get("judge", {})
+            if isinstance(judge, dict) and not _boolish(judge.get("accept")):
+                counts["verification_override_accept_count"] += 1
             continue
+        if verification_passed and not bool(record.get("accepted")):
+            counts["verification_passed_rejected_count"] += 1
         caption_delta = verification.get("caption_delta", {})
         edit_projection = verification.get("edit_projection", {})
         edit_necessity = verification.get("edit_necessity", {})
@@ -1536,6 +1549,9 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
     if verification_counts:
         lines.extend(["", "## Verification Reject Counts"])
         for key in (
+            "verification_passed_count",
+            "verification_passed_rejected_count",
+            "verification_override_accept_count",
             "caption_equivalent_reject_count",
             "missing_delta_reject_count",
             "difference_mismatch_reject_count",
@@ -2214,7 +2230,41 @@ def _finalize_pair_judge(judge: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _compose_reject_reason(judge: dict[str, Any], verification: dict[str, Any] | None = None) -> str:
+def _effective_pair_quality(
+    judge: dict[str, Any],
+    verification: dict[str, Any] | None,
+    heuristic_quality: dict[str, Any] | None,
+) -> dict[str, float]:
+    heuristic_quality = heuristic_quality or {}
+    verification_edit_score = 0.0
+    if verification is not None and _verification_accepts(verification):
+        edit_projection = verification.get("edit_projection", {})
+        edit_necessity = verification.get("edit_necessity", {})
+        verification_edit_score = min(
+            _score_float(edit_projection.get("score")),
+            _score_float(edit_necessity.get("score")),
+        )
+    return {
+        "same_context_score": max(
+            _score_float(judge.get("same_context_score")),
+            _score_float(heuristic_quality.get("same_context_score")),
+        ),
+        "edit_match_score": max(
+            _score_float(judge.get("edit_match_score")),
+            verification_edit_score,
+        ),
+        "target_uniqueness_score": max(
+            _score_float(judge.get("target_uniqueness_score")),
+            _score_float(heuristic_quality.get("target_uniqueness_score")),
+        ),
+    }
+
+
+def _compose_reject_reason(
+    judge: dict[str, Any],
+    verification: dict[str, Any] | None = None,
+    effective_quality: dict[str, Any] | None = None,
+) -> str:
     original_reason = str(judge.get("reject_reason", "")).strip()
     failures: list[str] = []
     if judge.get("reference_satisfies_edit"):
@@ -2227,17 +2277,18 @@ def _compose_reject_reason(judge: dict[str, Any], verification: dict[str, Any] |
     if hard_negative_quality not in {"good", "weak"}:
         failures.append(f"hard_negative_quality is {hard_negative_quality or 'bad'}")
 
-    same_context_score = _score_float(judge.get("same_context_score"))
+    quality = effective_quality or judge
+    same_context_score = _score_float(quality.get("same_context_score"))
     if same_context_score < MIN_ACCEPT_SAME_CONTEXT_SCORE:
         failures.append(
             f"same_context_score {same_context_score:.3f} is below {MIN_ACCEPT_SAME_CONTEXT_SCORE:.2f}"
         )
-    edit_match_score = _score_float(judge.get("edit_match_score"))
+    edit_match_score = _score_float(quality.get("edit_match_score"))
     if edit_match_score < MIN_ACCEPT_EDIT_MATCH_SCORE:
         failures.append(
             f"edit_match_score {edit_match_score:.3f} is below {MIN_ACCEPT_EDIT_MATCH_SCORE:.2f}"
         )
-    target_uniqueness_score = _score_float(judge.get("target_uniqueness_score"))
+    target_uniqueness_score = _score_float(quality.get("target_uniqueness_score"))
     if target_uniqueness_score < MIN_ACCEPT_TARGET_UNIQUENESS_SCORE:
         failures.append(
             f"target_uniqueness_score {target_uniqueness_score:.3f} is below {MIN_ACCEPT_TARGET_UNIQUENESS_SCORE:.2f}"
@@ -2260,19 +2311,23 @@ def _compose_reject_reason(judge: dict[str, Any], verification: dict[str, Any] |
     return "the pair was rejected without a structured reason from the judge"
 
 
-def _judge_accepts(judge: dict[str, Any], verification: dict[str, Any] | None = None) -> bool:
+def _judge_accepts(
+    judge: dict[str, Any],
+    verification: dict[str, Any] | None = None,
+    effective_quality: dict[str, Any] | None = None,
+) -> bool:
+    quality = effective_quality or judge
     judge_accepted = bool(
-        judge.get("accept")
-        and not judge.get("reference_satisfies_edit")
+        not judge.get("reference_satisfies_edit")
         and judge.get("target_satisfies_edit")
         and judge.get("single_main_difference")
         and judge.get("hard_negative_quality") in {"good", "weak"}
-        and _score_float(judge.get("same_context_score")) >= MIN_ACCEPT_SAME_CONTEXT_SCORE
-        and _score_float(judge.get("edit_match_score")) >= MIN_ACCEPT_EDIT_MATCH_SCORE
-        and _score_float(judge.get("target_uniqueness_score")) >= MIN_ACCEPT_TARGET_UNIQUENESS_SCORE
+        and _score_float(quality.get("same_context_score")) >= MIN_ACCEPT_SAME_CONTEXT_SCORE
+        and _score_float(quality.get("edit_match_score")) >= MIN_ACCEPT_EDIT_MATCH_SCORE
+        and _score_float(quality.get("target_uniqueness_score")) >= MIN_ACCEPT_TARGET_UNIQUENESS_SCORE
     )
     if verification is None:
-        return judge_accepted
+        return bool(judge.get("accept")) and judge_accepted
     return judge_accepted and _verification_accepts(verification)
 
 
