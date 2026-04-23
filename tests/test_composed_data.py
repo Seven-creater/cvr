@@ -18,6 +18,7 @@ from app.composed_data import (
     _judge_accepts,
     _pair_context_score,
     _source_context,
+    _target_uniqueness_score,
     annotate_clips,
     build_ffmpeg_extract_command,
     detective_annotate_clips,
@@ -1204,6 +1205,70 @@ class ComposedDataTests(unittest.TestCase):
         )
 
         self.assertGreaterEqual(score, 0.65)
+
+    def test_target_uniqueness_allows_close_negatives_with_different_edit(self) -> None:
+        reference = {
+            "clip_id": "ref",
+            "summary": "a presenter speaks at a studio desk",
+            "subjects": ["presenter"],
+            "object_counts": {"presenter": 1},
+            "actions": ["speaking"],
+            "scene": "studio desk",
+            "attributes": ["indoor"],
+            "on_screen_text": [],
+        }
+        target = {
+            "clip_id": "target",
+            "summary": "a presenter speaks at the same studio desk with a laptop visible",
+            "subjects": ["presenter"],
+            "object_counts": {"presenter": 1, "laptop": 1},
+            "actions": ["speaking"],
+            "scene": "studio desk",
+            "attributes": ["indoor"],
+            "on_screen_text": [],
+        }
+        close_negative = {
+            "clip_id": "negative",
+            "summary": "a presenter speaks at the same studio desk with a poster visible",
+            "subjects": ["presenter"],
+            "object_counts": {"presenter": 1, "poster": 1},
+            "actions": ["speaking"],
+            "scene": "studio desk",
+            "attributes": ["indoor"],
+            "on_screen_text": [],
+        }
+        duplicate_target = {
+            "clip_id": "duplicate",
+            "summary": "a presenter speaks at the same studio desk with another laptop visible",
+            "subjects": ["presenter"],
+            "object_counts": {"presenter": 1, "laptop": 1},
+            "actions": ["speaking"],
+            "scene": "studio desk",
+            "attributes": ["indoor"],
+            "on_screen_text": [],
+        }
+        difference = {
+            "type": "object_presence",
+            "from": "no laptop",
+            "to": "1 laptop",
+            "description": "laptop appears in the target clip",
+        }
+
+        with_different_edit = _target_uniqueness_score(
+            reference_annotation=reference,
+            target_annotation=target,
+            annotations=[reference, target, close_negative],
+            primary_difference=difference,
+        )
+        with_duplicate_edit = _target_uniqueness_score(
+            reference_annotation=reference,
+            target_annotation=target,
+            annotations=[reference, target, duplicate_target],
+            primary_difference=difference,
+        )
+
+        self.assertGreaterEqual(with_different_edit, 0.70)
+        self.assertLess(with_duplicate_edit, 0.70)
 
     def test_detect_primary_difference_prefers_speech_in_high_context_order(self) -> None:
         reference = {

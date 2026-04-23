@@ -1866,6 +1866,7 @@ def _score_ordered_pair(
         reference_annotation=reference_annotation,
         target_annotation=target_annotation,
         annotations=annotations,
+        primary_difference=primary_difference,
     )
     hard_negative_paths = [
         _display_path(root, _resolve_under_root(root, annotation["output_path"])) for annotation in hard_negative_annotations[:3]
@@ -2423,16 +2424,61 @@ def _target_uniqueness_score(
     reference_annotation: dict[str, Any],
     target_annotation: dict[str, Any],
     annotations: list[dict[str, Any]],
+    primary_difference: dict[str, Any],
 ) -> float:
     competitor_scores = []
+    priority_order = (primary_difference["type"],) + tuple(
+        item for item in PAIR_PRIORITY if item != primary_difference["type"]
+    )
     for other in annotations:
         if other["clip_id"] in {reference_annotation["clip_id"], target_annotation["clip_id"]}:
             continue
-        competitor_scores.append(_same_context_score(target_annotation, other))
+        context_score = _same_context_score(target_annotation, other)
+        other_difference = _detect_primary_difference(
+            reference_annotation,
+            other,
+            priority_order=priority_order,
+        )
+        competitor_scores.append(
+            _target_competitor_score(
+                context_score=context_score,
+                primary_difference=primary_difference,
+                competitor_difference=other_difference,
+            )
+        )
     if not competitor_scores:
         return 1.0
     highest_competitor = max(competitor_scores)
     return max(0.0, min(1.0, 1.0 - highest_competitor * 0.75))
+
+
+def _target_competitor_score(
+    *,
+    context_score: float,
+    primary_difference: dict[str, Any],
+    competitor_difference: dict[str, Any] | None,
+) -> float:
+    if competitor_difference is None:
+        return context_score * 0.35
+    if competitor_difference["type"] != primary_difference["type"]:
+        return context_score * 0.35
+    if _difference_targets_overlap(primary_difference, competitor_difference):
+        return context_score
+    return context_score * 0.35
+
+
+def _difference_targets_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_target = str(left.get("to", "")).strip().lower()
+    right_target = str(right.get("to", "")).strip().lower()
+    if left_target and right_target and left_target == right_target:
+        return True
+    if left_target and right_target:
+        left_tokens = _tokenize_text(left_target)
+        right_tokens = _tokenize_text(right_target)
+        return _jaccard(left_tokens, right_tokens) >= 0.67
+    left_tokens = _tokenize_text(str(left.get("description", "")))
+    right_tokens = _tokenize_text(str(right.get("description", "")))
+    return _jaccard(left_tokens, right_tokens) >= 0.50
 
 
 def _annotation_prompt_view(annotation: dict[str, Any]) -> dict[str, Any]:
