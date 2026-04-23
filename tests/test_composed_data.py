@@ -1440,9 +1440,11 @@ class ComposedDataTests(unittest.TestCase):
 
         candidates = _build_pair_candidates(root=Path("/tmp/composed"), annotations=annotations)
         proposal_ids = [candidate["proposal_id"] for candidate in candidates]
+        primary_types = [candidate["primary_difference"]["type"] for candidate in candidates]
 
         self.assertEqual(len(proposal_ids), len(set(proposal_ids)))
-        self.assertTrue(any(candidate["primary_difference"]["type"] == "speech" for candidate in candidates))
+        self.assertIn("object_presence", primary_types)
+        self.assertIn("speech", primary_types)
 
     def test_pair_context_uses_temporal_proximity_for_same_source_video(self) -> None:
         left = {

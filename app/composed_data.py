@@ -1729,6 +1729,21 @@ def _select_diverse_pair_candidates(
                 break
             if candidate["proposal_id"] in selected_ids:
                 continue
+            if candidate["primary_difference"]["type"] != difference_type:
+                continue
+            selected.append(candidate)
+            selected_ids.add(candidate["proposal_id"])
+            bucket_count += 1
+
+    for difference_type, target_count in DIVERSE_PAIR_BUCKET_TARGETS.items():
+        bucket_count = sum(
+            1 for candidate in selected if candidate["primary_difference"]["type"] == difference_type
+        )
+        for candidate in candidates:
+            if len(selected) >= max_candidates or bucket_count >= target_count:
+                break
+            if candidate["proposal_id"] in selected_ids:
+                continue
             if difference_type not in candidate.get("changed_difference_types", []):
                 continue
             retargeted = _retarget_pair_candidate(candidate, difference_type)
