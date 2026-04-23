@@ -1166,6 +1166,7 @@ def validate_pilot_dataset(
     modality_counter: Counter[str] = Counter()
     speech_count = 0
     high_quality_speech_count = 0
+    transcript_backed_speech_count = 0
     non_speech_audio_event_count = 0
     same_context_scores: list[float] = []
     difference_strength_scores: list[float] = []
@@ -1214,6 +1215,8 @@ def validate_pilot_dataset(
         if isinstance(quality, dict):
             if difference_type == "speech":
                 speech_count += 1
+                if _score_float(quality.get("speech_transcript_backed")) >= 1.0:
+                    transcript_backed_speech_count += 1
                 if (
                     _score_float(quality.get("speech_evidence_score")) >= MIN_ACCEPT_SPEECH_EVIDENCE_SCORE
                     and _score_float(quality.get("speech_specificity_score")) >= MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE
@@ -1283,6 +1286,7 @@ def validate_pilot_dataset(
         "speech_audio_quality_counts": {
             "speech_count": speech_count,
             "high_quality_speech_count": high_quality_speech_count,
+            "transcript_backed_speech_count": transcript_backed_speech_count,
             "non_speech_audio_event_count": non_speech_audio_event_count,
             "speech_rejected_as_too_generic_count": verification_counts.get("speech_rejected_as_too_generic_count", 0),
             "audio_event_rejected_as_speech_only_count": verification_counts.get(
@@ -1295,6 +1299,7 @@ def validate_pilot_dataset(
             "audio_samples_at_least_2": modality_counter.get("audio", 0) >= 2,
             "non_speech_audio_samples_at_least_1": non_speech_audio_event_count >= 1,
             "speech_samples_all_have_evidence": speech_count == high_quality_speech_count,
+            "speech_samples_all_transcript_backed": speech_count == transcript_backed_speech_count,
             "object_change_samples_at_least_2": difference_counter.get("object_count", 0)
             + difference_counter.get("object_presence", 0)
             >= 2,
@@ -1345,6 +1350,7 @@ def _empty_pair_verification_counts() -> dict[str, int]:
         "edit_projection_reject_count": 0,
         "edit_not_needed_reject_count": 0,
         "speech_rejected_as_too_generic_count": 0,
+        "speech_rejected_for_missing_transcript_count": 0,
         "audio_event_rejected_as_speech_only_count": 0,
         "accepted_after_verification_count": 0,
     }
@@ -1377,6 +1383,8 @@ def _pair_verification_counts(records: list[dict[str, Any]]) -> dict[str, int]:
                 or _score_float(quality.get("speech_specificity_score")) < MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE
             ):
                 counts["speech_rejected_as_too_generic_count"] += 1
+            if difference_type == "speech" and _score_float(quality.get("speech_transcript_backed")) < 1.0:
+                counts["speech_rejected_for_missing_transcript_count"] += 1
             if (
                 difference_type == "audio_event"
                 and _score_float(quality.get("non_speech_audio_event_score")) < MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE
@@ -1763,6 +1771,7 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
         for key in (
             "speech_count",
             "high_quality_speech_count",
+            "transcript_backed_speech_count",
             "non_speech_audio_event_count",
             "speech_rejected_as_too_generic_count",
             "audio_event_rejected_as_speech_only_count",
@@ -1785,6 +1794,7 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
             "edit_projection_reject_count",
             "edit_not_needed_reject_count",
             "speech_rejected_as_too_generic_count",
+            "speech_rejected_for_missing_transcript_count",
             "audio_event_rejected_as_speech_only_count",
             "accepted_after_verification_count",
         ):
@@ -1992,6 +2002,7 @@ def _retarget_pair_candidate(candidate: dict[str, Any], difference_type: str) ->
     if primary_difference["type"] == "speech":
         quality["speech_evidence_score"] = _speech_evidence_score(reference_annotation, target_annotation)
         quality["speech_specificity_score"] = _speech_specificity_score(reference_annotation, target_annotation)
+        quality["speech_transcript_backed"] = 1.0 if _speech_is_transcript_backed(reference_annotation, target_annotation) else 0.0
         quality["has_audio_modality"] = 1.0
     if primary_difference["type"] == "audio_event":
         quality["non_speech_audio_event_score"] = _non_speech_audio_event_score(
@@ -2024,6 +2035,7 @@ def _quality_for_model_fields(
     if difference_type == "speech":
         quality["speech_evidence_score"] = _speech_evidence_score(reference_annotation, target_annotation)
         quality["speech_specificity_score"] = _speech_specificity_score(reference_annotation, target_annotation)
+        quality["speech_transcript_backed"] = 1.0 if _speech_is_transcript_backed(reference_annotation, target_annotation) else 0.0
     if difference_type == "audio_event":
         quality["non_speech_audio_event_score"] = _non_speech_audio_event_score(
             reference_annotation,
@@ -2125,6 +2137,7 @@ def _score_ordered_pair(
     if primary_difference["type"] == "speech":
         quality["speech_evidence_score"] = _speech_evidence_score(reference_annotation, target_annotation)
         quality["speech_specificity_score"] = _speech_specificity_score(reference_annotation, target_annotation)
+        quality["speech_transcript_backed"] = 1.0 if _speech_is_transcript_backed(reference_annotation, target_annotation) else 0.0
         quality["has_audio_modality"] = 1.0
     if primary_difference["type"] == "audio_event":
         quality["non_speech_audio_event_score"] = _non_speech_audio_event_score(
@@ -2765,13 +2778,13 @@ def _speech_evidence_score(reference_annotation: dict[str, Any], target_annotati
     if specificity < MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE:
         return round(min(specificity, 0.69), 3)
 
-    score = _list_delta_strength(reference_texts, target_texts)
     has_reference_transcript = _has_transcript_evidence(reference_annotation)
     has_target_transcript = _has_transcript_evidence(target_annotation)
-    if has_reference_transcript and has_target_transcript:
-        score = max(score, 0.88)
-    else:
-        score = min(max(score, 0.75), 0.82)
+    if not (has_reference_transcript and has_target_transcript):
+        return round(min(specificity, 0.69), 3)
+
+    score = _list_delta_strength(reference_texts, target_texts)
+    score = max(score, 0.88)
     return round(min(score, specificity), 3)
 
 
@@ -2786,6 +2799,10 @@ def _has_transcript_evidence(annotation: dict[str, Any]) -> bool:
         elif str(item).strip():
             return True
     return False
+
+
+def _speech_is_transcript_backed(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> bool:
+    return _has_transcript_evidence(reference_annotation) and _has_transcript_evidence(target_annotation)
 
 
 def _non_speech_audio_terms(annotation: dict[str, Any]) -> list[str]:
@@ -3207,6 +3224,8 @@ def _effective_pair_quality(
         result["speech_evidence_score"] = _score_float(heuristic_quality.get("speech_evidence_score"))
     if "speech_specificity_score" in heuristic_quality:
         result["speech_specificity_score"] = _score_float(heuristic_quality.get("speech_specificity_score"))
+    if "speech_transcript_backed" in heuristic_quality:
+        result["speech_transcript_backed"] = _score_float(heuristic_quality.get("speech_transcript_backed"))
     if "non_speech_audio_event_score" in heuristic_quality:
         result["non_speech_audio_event_score"] = _score_float(
             heuristic_quality.get("non_speech_audio_event_score")
@@ -3274,6 +3293,8 @@ def _compose_reject_reason(
             failures.append("speech edit is missing audio modality")
         if not _boolish(judge.get("audio_required")):
             failures.append("speech edit must be marked audio_required")
+        if _score_float(quality.get("speech_transcript_backed")) < 1.0:
+            failures.append("speech edit is not backed by transcript evidence on both clips")
         speech_evidence_score = _score_float(quality.get("speech_evidence_score"))
         if speech_evidence_score < MIN_ACCEPT_SPEECH_EVIDENCE_SCORE:
             failures.append(
@@ -3339,6 +3360,7 @@ def _judge_accepts(
             or (
                 _score_float(quality.get("has_audio_modality")) >= 1.0
                 and _boolish(judge.get("audio_required"))
+                and _score_float(quality.get("speech_transcript_backed")) >= 1.0
                 and _score_float(quality.get("speech_evidence_score")) >= MIN_ACCEPT_SPEECH_EVIDENCE_SCORE
                 and _score_float(quality.get("speech_specificity_score")) >= MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE
             )

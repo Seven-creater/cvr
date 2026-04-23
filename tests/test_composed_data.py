@@ -1320,6 +1320,7 @@ class ComposedDataTests(unittest.TestCase):
                 "has_audio_modality": 1.0,
                 "speech_evidence_score": 0.88,
                 "speech_specificity_score": 0.82,
+                "speech_transcript_backed": 1.0,
             },
         )
 
@@ -1378,6 +1379,59 @@ class ComposedDataTests(unittest.TestCase):
         self.assertFalse(_judge_accepts(judge, verification, quality))
         self.assertIn("speech_evidence_score", _compose_reject_reason(judge, verification, quality))
 
+    def test_speech_gate_requires_transcript_backing_for_specific_content(self) -> None:
+        reference = {"speech": ["today I am introducing the old forest and its wildlife habitat"]}
+        target = {"speech": ["the old forest is scheduled to be cut down next week"]}
+
+        self.assertLess(_speech_evidence_score(reference, target), 0.75)
+
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.9,
+            "edit_match_score": 0.6,
+            "target_uniqueness_score": 0.9,
+            "audio_required": True,
+            "hard_negative_quality": "good",
+            "accept": False,
+            "reject_reason": "",
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {
+                "target_matches_projection": True,
+                "score": 0.9,
+            },
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.9,
+            },
+        }
+        quality = _effective_pair_quality(
+            judge,
+            verification,
+            {
+                "same_context_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "difference_type": "speech",
+                "has_audio_modality": 1.0,
+                "speech_evidence_score": _speech_evidence_score(reference, target),
+                "speech_specificity_score": _speech_specificity_score(reference, target),
+                "speech_transcript_backed": 0.0,
+            },
+        )
+
+        self.assertFalse(_judge_accepts(judge, verification, quality))
+        self.assertIn("transcript evidence", _compose_reject_reason(judge, verification, quality))
+
     def test_speech_gate_accepts_specific_transcript_delta(self) -> None:
         reference = {
             "speakers_and_transcript": [
@@ -1433,6 +1487,7 @@ class ComposedDataTests(unittest.TestCase):
                 "has_audio_modality": 1.0,
                 "speech_evidence_score": _speech_evidence_score(reference, target),
                 "speech_specificity_score": _speech_specificity_score(reference, target),
+                "speech_transcript_backed": 1.0,
             },
         )
 
@@ -1539,6 +1594,7 @@ class ComposedDataTests(unittest.TestCase):
         counts = _pair_verification_counts(records)
 
         self.assertEqual(1, counts["speech_rejected_as_too_generic_count"])
+        self.assertEqual(1, counts["speech_rejected_for_missing_transcript_count"])
         self.assertEqual(1, counts["audio_event_rejected_as_speech_only_count"])
 
     def test_difference_strength_scores_concrete_object_changes(self) -> None:
@@ -2216,6 +2272,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(0, summary["speech_audio_quality_counts"]["non_speech_audio_event_count"])
             self.assertFalse(summary["automated_acceptance"]["non_speech_audio_samples_at_least_1"])
             self.assertTrue(summary["automated_acceptance"]["speech_samples_all_have_evidence"])
+            self.assertTrue(summary["automated_acceptance"]["speech_samples_all_transcript_backed"])
             self.assertIn("caption_equivalent_reject_count", report_path.read_text(encoding="utf-8"))
             self.assertIn("Speech / Audio Quality Counts", report_path.read_text(encoding="utf-8"))
             self.assertEqual(
