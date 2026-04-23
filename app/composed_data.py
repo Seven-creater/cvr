@@ -2573,7 +2573,7 @@ def _finalize_pair_verification(verification: dict[str, Any]) -> dict[str, Any]:
     caption_delta = dict(verification.get("caption_delta", {}))
     edit_projection = dict(verification.get("edit_projection", {}))
     edit_necessity = dict(verification.get("edit_necessity", {}))
-    return {
+    normalized = {
         "caption_delta": {
             "caption_equivalent": _boolish(caption_delta.get("caption_equivalent")),
             "has_concrete_difference": _boolish(caption_delta.get("has_concrete_difference")),
@@ -2596,6 +2596,9 @@ def _finalize_pair_verification(verification: dict[str, Any]) -> dict[str, Any]:
             "reason": str(edit_necessity.get("reason", "")).strip(),
         },
     }
+    normalized["passed"] = _verification_accepts(normalized)
+    normalized["failures"] = _verification_failures(normalized)
+    return normalized
 
 
 def _finalize_pair_judge(judge: dict[str, Any]) -> dict[str, Any]:

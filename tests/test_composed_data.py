@@ -14,6 +14,7 @@ from app.composed_data import (
     _effective_pair_quality,
     _build_pair_candidates,
     _build_proposal_id,
+    _finalize_pair_verification,
     _judge_accepts,
     _pair_context_score,
     _source_context,
@@ -1108,6 +1109,30 @@ class ComposedDataTests(unittest.TestCase):
         quality = _effective_pair_quality(judge, verification, {})
 
         self.assertFalse(_judge_accepts(judge, verification, quality))
+
+    def test_finalize_pair_verification_writes_passed_diagnostics(self) -> None:
+        verification = _finalize_pair_verification(
+            {
+                "caption_delta": {
+                    "caption_equivalent": False,
+                    "has_concrete_difference": True,
+                    "difference_matches_edit": True,
+                },
+                "edit_projection": {
+                    "target_matches_projection": True,
+                    "score": 0.9,
+                },
+                "edit_necessity": {
+                    "edit_needed": True,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.85,
+                },
+            }
+        )
+
+        self.assertTrue(verification["passed"])
+        self.assertEqual([], verification["failures"])
 
     def test_difference_strength_gate_blocks_weak_changes(self) -> None:
         judge = {
