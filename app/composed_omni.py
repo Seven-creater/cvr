@@ -232,6 +232,9 @@ def _pair_proposal_system_prompt() -> str:
         "Prefer fine-grained action, audio_event, object_count, or object_presence changes over broad scene changes when both apply. "
         "Use action only when the action itself changes and both clips contain action/storyline/event evidence for that change. "
         "Do not label object appearance, color/attribute, visible text, speech topic, or scene/background changes as action. "
+        "Use speech only for concrete spoken-language content, speaker, tone, or dialogue changes with specific speech evidence. "
+        "Use audio_event only for non-speech sounds such as music, applause, machinery, footsteps, wind, animals, or environmental sounds. "
+        "Never label a pure speech topic or narration change as audio_event. "
         "Use scene only when the location or background is the primary edit. "
         "Keep edit_text short and only describe the change from reference to target. "
         "Prefer a single key difference instead of multiple simultaneous changes."
@@ -248,6 +251,8 @@ def _pair_judge_system_prompt() -> str:
         '"hard_negative_quality": "good"|"weak"|"bad", "accept": boolean, "reject_reason": string}. '
         "Accept only when the reference does not satisfy the edit, the target does satisfy it, "
         "there is one main difference, the context is similar, and negatives are close but wrong. "
+        "For speech edits, require specific speech/transcript evidence on both sides and audio_required=true; generic 'talking' or 'speaking to camera' is not enough. "
+        "For audio_event edits, accept only non-speech sound/music/environment changes; reject if the audio difference is only speech or narration content. "
         "Use scores from 0.0 to 1.0."
     )
 
@@ -266,6 +271,8 @@ def _pair_verification_system_prompt() -> str:
         '"target_satisfies_edit": boolean, "score": number, "reason": string}}. '
         "Reject pairs where the reference and target captions are semantically equivalent, "
         "where no concrete visual/audio/text difference is present, or where the edit is not necessary. "
+        "For speech pairs, state what the reference speech says and what the target speech says; if either side lacks concrete speech content, mark difference_matches_edit=false. "
+        "For audio_event pairs, reject speech-only/narration-only changes as audio_event; audio_event must be non-language sound evidence. "
         "The projected target caption should describe what the reference would become after applying the edit."
     )
 
@@ -356,6 +363,9 @@ def _build_pair_proposal_user_content(
         "For action proposals, edit_text must be a verb/action change such as starts/stops/changes from doing X to doing Y, "
         "and both reference and target storyline/events/actions must support that action change. "
         "If the evidence is mainly object presence, color, visible text, speech content, or audio, choose that type instead of action. "
+        "Separate speech from audio_event: speech is language content or speaker delivery; audio_event is non-speech music, environment, or event sound. "
+        "For speech, edit_text must name the specific spoken content change, not just 'talks about a different topic'. "
+        "For audio_event, edit_text must name a non-speech sound change and must not be only narration/speech. "
         "If the clips come from the same source context and the main localized change is in speech, audio, or visible text, "
         "prefer speech/audio_event/visible_text over attribute or scene. "
         "Use event/timeline evidence to choose a difference that is concrete, localized, and needed for retrieval. "
@@ -383,6 +393,8 @@ def _build_pair_judge_user_content(
         "the target should satisfy it. Reject broad scene-only changes unless the context remains clearly related. "
         "For action edits, require concrete action evidence on both sides; reject if action is inferred only from a vague summary "
         "or if the actual difference is object/color/text/speech/audio rather than a verb/action change. "
+        "For speech edits, require concrete lexical speech evidence on both sides, audio_required=true, and a target speech change that cannot be judged from visuals alone. "
+        "For audio_event edits, reject if audio_events only say speech/narration/talking/voiceover; require music or non-language sound evidence. "
         "If the pair proposal JSON says the clips share the same source context, treat localized speech/audio/visible-text changes "
         "as valid composed edits when the rest of the scene stays aligned. "
         "If you reject the pair, reject_reason must be a non-empty sentence naming the main failed gate or threshold."
@@ -409,7 +421,11 @@ def _build_pair_verification_user_content(
         "The reference must not satisfy the edit, and the target must satisfy it. "
         "Use concrete visual, audio, speech, visible-text, object-count, action, and event/timeline evidence. "
         "For action edit_text, set difference_matches_edit=false unless the reference and target have different concrete actions "
-        "supported by action/storyline/event evidence."
+        "supported by action/storyline/event evidence. "
+        "For speech edit_text, explicitly check: what does the reference speech say, what does the target speech say, "
+        "whether the edit requires listening, and whether visuals alone would fail to distinguish the target. "
+        "If speech evidence is generic or missing, set target_matches_projection=false or difference_matches_edit=false. "
+        "For audio_event edit_text, set difference_matches_edit=false if the change is only spoken topic/narration rather than a non-speech sound."
     )
     return [{"type": "text", "text": prompt}]
 

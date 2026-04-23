@@ -68,6 +68,9 @@ MIN_ACCEPT_EDIT_NECESSITY_SCORE = 0.70
 MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE = 0.75
 MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE = 0.65
 MIN_ACCEPT_ACTION_EVIDENCE_SCORE = 0.65
+MIN_ACCEPT_SPEECH_EVIDENCE_SCORE = 0.75
+MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE = 0.70
+MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE = 0.70
 MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE = 0.995
 VISUAL_DIFFERENCE_TYPES = {"object_count", "object_presence", "attribute", "action", "scene", "visible_text"}
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
@@ -88,6 +91,103 @@ STOPWORDS = {
     "the",
     "to",
     "with",
+}
+GENERIC_SPEECH_TOKENS = {
+    "camera",
+    "conversation",
+    "dialog",
+    "dialogue",
+    "discuss",
+    "discusses",
+    "discussing",
+    "female",
+    "interview",
+    "male",
+    "man",
+    "monologue",
+    "narrate",
+    "narrates",
+    "narrating",
+    "narration",
+    "narrator",
+    "person",
+    "says",
+    "speak",
+    "speaker",
+    "speaking",
+    "speech",
+    "talk",
+    "talking",
+    "voice",
+    "voiceover",
+    "woman",
+}
+GENERIC_SPEECH_PHRASES = {
+    "speaks to camera",
+    "speaking to camera",
+    "talks to camera",
+    "talking to camera",
+    "speaks directly to the camera",
+    "speaking directly to the camera",
+    "speech",
+    "narration",
+    "talking",
+    "voiceover",
+}
+VISUAL_DESCRIPTION_TOKENS = {
+    "background",
+    "beard",
+    "blue",
+    "camera",
+    "clothes",
+    "forest",
+    "glasses",
+    "hat",
+    "jacket",
+    "looking",
+    "scene",
+    "shirt",
+    "standing",
+    "wearing",
+}
+NON_SPEECH_AUDIO_TOKENS = {
+    "applause",
+    "bark",
+    "barking",
+    "beep",
+    "bell",
+    "bird",
+    "birds",
+    "buzz",
+    "buzzing",
+    "chain",
+    "chainsaw",
+    "cheer",
+    "cheering",
+    "clap",
+    "clapping",
+    "crowd",
+    "drum",
+    "electronic",
+    "engine",
+    "footstep",
+    "gunshot",
+    "hum",
+    "instrument",
+    "machine",
+    "mechanical",
+    "laugh",
+    "laughter",
+    "music",
+    "noise",
+    "piano",
+    "rain",
+    "ringing",
+    "song",
+    "splash",
+    "thunder",
+    "traffic",
+    "wind",
 }
 
 
@@ -889,6 +989,17 @@ def propose_group_pairs(
                     target_annotation=target_annotation,
                     raw_index=raw_index,
                 )
+                proposal_quality = _quality_for_model_fields(
+                    base_quality=candidate["quality"],
+                    model_fields=model_fields,
+                    reference_annotation=reference_annotation,
+                    target_annotation=target_annotation,
+                )
+                proposal_difference_evidence = _difference_evidence_from_annotations(
+                    reference_annotation=reference_annotation,
+                    target_annotation=target_annotation,
+                    primary_difference=model_fields["difference"],
+                )
                 proposal_view = {
                     "proposal_id": proposal_id,
                     "edit_text": model_fields["edit_text"],
@@ -896,17 +1007,20 @@ def propose_group_pairs(
                     "reference_caption": model_fields["reference_caption"],
                     "target_caption": model_fields["target_caption"],
                     "difference": model_fields["difference"],
-                    "quality": dict(candidate["quality"]),
+                    "quality": dict(proposal_quality),
                     "heuristic_primary_difference": dict(candidate["primary_difference"]),
                     "changed_difference_types": list(candidate["changed_difference_types"]),
                     "source_context": dict(candidate["source_context"]),
-                    "difference_evidence": dict(candidate["difference_evidence"]),
+                    "difference_evidence": dict(proposal_difference_evidence),
                     "acceptance_thresholds": {
                         "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
                         "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
                         "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
                         "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
                         "action_evidence_score_for_action_edits": MIN_ACCEPT_ACTION_EVIDENCE_SCORE,
+                        "speech_evidence_score_for_speech_edits": MIN_ACCEPT_SPEECH_EVIDENCE_SCORE,
+                        "speech_specificity_score_for_speech_edits": MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE,
+                        "non_speech_audio_event_score_for_audio_event_edits": MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE,
                         "max_visual_near_duplicate_score_for_visual_edits": MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE,
                     },
                 }
@@ -940,7 +1054,7 @@ def propose_group_pairs(
                 judge = _finalize_pair_judge(judge)
                 verification = _finalize_pair_verification(verification)
                 fallback_used = proposal_fallback_used or judge_fallback_used or verification_fallback_used
-                effective_quality = _effective_pair_quality(judge, verification, candidate["quality"])
+                effective_quality = _effective_pair_quality(judge, verification, proposal_quality)
                 accepted = _judge_accepts(judge, verification, effective_quality)
                 if not accepted:
                     judge["reject_reason"] = _compose_reject_reason(judge, verification, effective_quality)
@@ -962,14 +1076,14 @@ def propose_group_pairs(
                         "target_uniqueness_score": judge["target_uniqueness_score"],
                     },
                     "quality": effective_quality,
-                    "heuristic_quality": dict(candidate["quality"]),
+                    "heuristic_quality": dict(proposal_quality),
                     "source_context": dict(candidate["source_context"]),
                     "source": source,
                     "proposal_reason": model_fields["proposal_reason"],
                     "evidence": _evidence_from_annotations(
                         reference_annotation,
                         target_annotation,
-                        difference_evidence=candidate["difference_evidence"],
+                        difference_evidence=proposal_difference_evidence,
                     ),
                     "judge": judge,
                     "verification": verification,
@@ -1025,6 +1139,9 @@ def propose_group_pairs(
             "edit_target_alignment_score": MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE,
             "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
             "action_evidence_score_for_action_edits": MIN_ACCEPT_ACTION_EVIDENCE_SCORE,
+            "speech_evidence_score_for_speech_edits": MIN_ACCEPT_SPEECH_EVIDENCE_SCORE,
+            "speech_specificity_score_for_speech_edits": MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE,
+            "non_speech_audio_event_score_for_audio_event_edits": MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE,
         },
     }
 
@@ -1047,6 +1164,9 @@ def validate_pilot_dataset(
     seen_pair_keys: set[tuple[str, str]] = set()
     difference_counter: Counter[str] = Counter()
     modality_counter: Counter[str] = Counter()
+    speech_count = 0
+    high_quality_speech_count = 0
+    non_speech_audio_event_count = 0
     same_context_scores: list[float] = []
     difference_strength_scores: list[float] = []
     source_context_counter: Counter[str] = Counter()
@@ -1092,6 +1212,18 @@ def validate_pilot_dataset(
 
         quality = record.get("quality", {})
         if isinstance(quality, dict):
+            if difference_type == "speech":
+                speech_count += 1
+                if (
+                    _score_float(quality.get("speech_evidence_score")) >= MIN_ACCEPT_SPEECH_EVIDENCE_SCORE
+                    and _score_float(quality.get("speech_specificity_score")) >= MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE
+                ):
+                    high_quality_speech_count += 1
+            if (
+                difference_type == "audio_event"
+                and _score_float(quality.get("non_speech_audio_event_score")) >= MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE
+            ):
+                non_speech_audio_event_count += 1
             try:
                 same_context_scores.append(float(quality.get("same_context_score", 0.0)))
             except (TypeError, ValueError):
@@ -1138,6 +1270,7 @@ def validate_pilot_dataset(
     ]
     _write_jsonl(Path(gallery_output_path), gallery_records)
 
+    verification_counts = _load_pair_verification_counts(Path(pilot_jsonl_path))
     summary = {
         "sample_count": len(pilot_records),
         "gallery_count": len(gallery_records),
@@ -1146,10 +1279,22 @@ def validate_pilot_dataset(
         "source_context_counts": dict(sorted(source_context_counter.items())),
         "quality_summary": _quality_summary(same_context_scores),
         "difference_strength_summary": _score_summary(difference_strength_scores, "difference_strength"),
-        "verification_counts": _load_pair_verification_counts(Path(pilot_jsonl_path)),
+        "verification_counts": verification_counts,
+        "speech_audio_quality_counts": {
+            "speech_count": speech_count,
+            "high_quality_speech_count": high_quality_speech_count,
+            "non_speech_audio_event_count": non_speech_audio_event_count,
+            "speech_rejected_as_too_generic_count": verification_counts.get("speech_rejected_as_too_generic_count", 0),
+            "audio_event_rejected_as_speech_only_count": verification_counts.get(
+                "audio_event_rejected_as_speech_only_count",
+                0,
+            ),
+        },
         "automated_acceptance": {
             "sample_count_between_5_and_10": 5 <= len(pilot_records) <= 10,
             "audio_samples_at_least_2": modality_counter.get("audio", 0) >= 2,
+            "non_speech_audio_samples_at_least_1": non_speech_audio_event_count >= 1,
+            "speech_samples_all_have_evidence": speech_count == high_quality_speech_count,
             "object_change_samples_at_least_2": difference_counter.get("object_count", 0)
             + difference_counter.get("object_presence", 0)
             >= 2,
@@ -1199,6 +1344,8 @@ def _empty_pair_verification_counts() -> dict[str, int]:
         "difference_mismatch_reject_count": 0,
         "edit_projection_reject_count": 0,
         "edit_not_needed_reject_count": 0,
+        "speech_rejected_as_too_generic_count": 0,
+        "audio_event_rejected_as_speech_only_count": 0,
         "accepted_after_verification_count": 0,
     }
 
@@ -1220,6 +1367,21 @@ def _pair_verification_counts(records: list[dict[str, Any]]) -> dict[str, int]:
             continue
         if verification_passed and not bool(record.get("accepted")):
             counts["verification_passed_rejected_count"] += 1
+        if not bool(record.get("accepted")):
+            difference_type = str(record.get("difference", {}).get("type", "")).strip()
+            quality = record.get("quality", {})
+            if not isinstance(quality, dict):
+                quality = {}
+            if difference_type == "speech" and (
+                _score_float(quality.get("speech_evidence_score")) < MIN_ACCEPT_SPEECH_EVIDENCE_SCORE
+                or _score_float(quality.get("speech_specificity_score")) < MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE
+            ):
+                counts["speech_rejected_as_too_generic_count"] += 1
+            if (
+                difference_type == "audio_event"
+                and _score_float(quality.get("non_speech_audio_event_score")) < MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE
+            ):
+                counts["audio_event_rejected_as_speech_only_count"] += 1
         caption_delta = verification.get("caption_delta", {})
         edit_projection = verification.get("edit_projection", {})
         edit_necessity = verification.get("edit_necessity", {})
@@ -1595,6 +1757,18 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
             ]
         )
 
+    speech_audio_counts = summary.get("speech_audio_quality_counts", {})
+    if speech_audio_counts:
+        lines.extend(["", "## Speech / Audio Quality Counts"])
+        for key in (
+            "speech_count",
+            "high_quality_speech_count",
+            "non_speech_audio_event_count",
+            "speech_rejected_as_too_generic_count",
+            "audio_event_rejected_as_speech_only_count",
+        ):
+            lines.append(f"- `{key}`: `{speech_audio_counts.get(key, 0)}`")
+
     lines.extend(["", "## Automated Acceptance Checks"])
     for key, value in acceptance.items():
         lines.append(f"- `{key}`: `{'PASS' if value else 'FAIL'}`")
@@ -1610,6 +1784,8 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
             "difference_mismatch_reject_count",
             "edit_projection_reject_count",
             "edit_not_needed_reject_count",
+            "speech_rejected_as_too_generic_count",
+            "audio_event_rejected_as_speech_only_count",
             "accepted_after_verification_count",
         ):
             lines.append(f"- `{key}`: `{verification_counts.get(key, 0)}`")
@@ -1813,6 +1989,16 @@ def _retarget_pair_candidate(candidate: dict[str, Any], difference_type: str) ->
     quality["difference_type"] = primary_difference["type"]
     if primary_difference["type"] == "action":
         quality["action_evidence_score"] = _action_evidence_score(reference_annotation, target_annotation)
+    if primary_difference["type"] == "speech":
+        quality["speech_evidence_score"] = _speech_evidence_score(reference_annotation, target_annotation)
+        quality["speech_specificity_score"] = _speech_specificity_score(reference_annotation, target_annotation)
+        quality["has_audio_modality"] = 1.0
+    if primary_difference["type"] == "audio_event":
+        quality["non_speech_audio_event_score"] = _non_speech_audio_event_score(
+            reference_annotation,
+            target_annotation,
+        )
+        quality["has_audio_modality"] = 1.0
     retargeted["quality"] = quality
     retargeted["composite_score"] = _candidate_composite_score(quality, candidate["source_context"])
     retargeted["difference_evidence"] = _difference_evidence_from_annotations(
@@ -1821,6 +2007,29 @@ def _retarget_pair_candidate(candidate: dict[str, Any], difference_type: str) ->
         primary_difference=primary_difference,
     )
     return retargeted
+
+
+def _quality_for_model_fields(
+    *,
+    base_quality: dict[str, Any],
+    model_fields: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> dict[str, Any]:
+    quality = dict(base_quality)
+    difference = model_fields.get("difference", {})
+    difference_type = str(difference.get("type", "")).strip()
+    quality["difference_type"] = difference_type
+    quality["has_audio_modality"] = 1.0 if "audio" in set(model_fields.get("modalities", [])) else 0.0
+    if difference_type == "speech":
+        quality["speech_evidence_score"] = _speech_evidence_score(reference_annotation, target_annotation)
+        quality["speech_specificity_score"] = _speech_specificity_score(reference_annotation, target_annotation)
+    if difference_type == "audio_event":
+        quality["non_speech_audio_event_score"] = _non_speech_audio_event_score(
+            reference_annotation,
+            target_annotation,
+        )
+    return quality
 
 
 def _score_ordered_pair(
@@ -1913,6 +2122,16 @@ def _score_ordered_pair(
     }
     if primary_difference["type"] == "action":
         quality["action_evidence_score"] = _action_evidence_score(reference_annotation, target_annotation)
+    if primary_difference["type"] == "speech":
+        quality["speech_evidence_score"] = _speech_evidence_score(reference_annotation, target_annotation)
+        quality["speech_specificity_score"] = _speech_specificity_score(reference_annotation, target_annotation)
+        quality["has_audio_modality"] = 1.0
+    if primary_difference["type"] == "audio_event":
+        quality["non_speech_audio_event_score"] = _non_speech_audio_event_score(
+            reference_annotation,
+            target_annotation,
+        )
+        quality["has_audio_modality"] = 1.0
     if visual_near_duplicate_score is not None:
         quality["visual_near_duplicate_score"] = round(visual_near_duplicate_score, 3)
     composite_score = _candidate_composite_score(quality, source_context)
@@ -2254,8 +2473,8 @@ def _detect_primary_difference(
             "description": "the main action changes between the clips and is supported by action/timeline evidence",
         }
 
-    reference_audio = _normalize_list(reference.get("audio_events", []))
-    target_audio = _normalize_list(target.get("audio_events", []))
+    reference_audio = _non_speech_audio_terms(reference)
+    target_audio = _non_speech_audio_terms(target)
     added_audio = _first_unique(target_audio, reference_audio)
     removed_audio = _first_unique(reference_audio, target_audio)
     if added_audio or removed_audio:
@@ -2288,11 +2507,11 @@ def _detect_primary_difference(
             "description": "the scene changes between the clips",
         }
 
-    reference_speech = _normalize_list(reference.get("speech", []))
-    target_speech = _normalize_list(target.get("speech", []))
+    reference_speech = _speech_texts_from_annotation(reference)
+    target_speech = _speech_texts_from_annotation(target)
     added_speech = _first_unique(target_speech, reference_speech)
     removed_speech = _first_unique(reference_speech, target_speech)
-    if added_speech or removed_speech:
+    if (added_speech or removed_speech) and _speech_evidence_score(reference, target) >= MIN_ACCEPT_SPEECH_EVIDENCE_SCORE:
         differences["speech"] = {
             "type": "speech",
             "from": removed_speech or _first_item(reference_speech) or "no speech",
@@ -2357,9 +2576,9 @@ def _difference_strength_score(
     elif difference_type == "action":
         score = _action_evidence_score(reference_annotation, target_annotation)
     elif difference_type == "audio_event":
-        score = _list_delta_strength(reference_annotation.get("audio_events", []), target_annotation.get("audio_events", []))
+        score = _non_speech_audio_event_score(reference_annotation, target_annotation)
     elif difference_type == "speech":
-        score = _list_delta_strength(reference_annotation.get("speech", []), target_annotation.get("speech", []))
+        score = _speech_evidence_score(reference_annotation, target_annotation)
     elif difference_type == "visible_text":
         score = _list_delta_strength(
             reference_annotation.get("visible_text") or reference_annotation.get("on_screen_text", []),
@@ -2464,6 +2683,138 @@ def _action_evidence_score(reference_annotation: dict[str, Any], target_annotati
     return round(min(score, 0.55), 3)
 
 
+def _speech_texts_from_annotation(annotation: dict[str, Any]) -> list[str]:
+    texts: list[str] = []
+
+    def add_text(value: Any) -> None:
+        for item in _normalize_list(value):
+            if item not in texts:
+                texts.append(item)
+
+    add_text(annotation.get("speech", []))
+    transcript = annotation.get("speakers_and_transcript", [])
+    if isinstance(transcript, list):
+        for item in transcript:
+            if isinstance(item, dict):
+                add_text(
+                    [
+                        item.get("content")
+                        or item.get("transcript")
+                        or item.get("text")
+                        or item.get("utterance")
+                        or ""
+                    ]
+                )
+            else:
+                add_text([item])
+    return texts
+
+
+def _speech_specificity_score(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> float:
+    reference_score = _speech_specificity_score_for_texts(_speech_texts_from_annotation(reference_annotation))
+    target_score = _speech_specificity_score_for_texts(_speech_texts_from_annotation(target_annotation))
+    if reference_score == 0.0 or target_score == 0.0:
+        return 0.0
+    return round(min(reference_score, target_score), 3)
+
+
+def _speech_specificity_score_for_texts(texts: list[str]) -> float:
+    if not texts:
+        return 0.0
+    best_score = 0.0
+    for text in texts:
+        normalized = text.strip().lower()
+        if not normalized:
+            continue
+        if normalized in GENERIC_SPEECH_PHRASES:
+            best_score = max(best_score, 0.2)
+            continue
+        tokens = _tokenize_text(normalized)
+        content_tokens = {
+            token
+            for token in tokens
+            if token not in GENERIC_SPEECH_TOKENS and token not in VISUAL_DESCRIPTION_TOKENS
+        }
+        generic_overlap = len(tokens & GENERIC_SPEECH_TOKENS)
+        score = 0.0
+        if len(content_tokens) >= 6:
+            score = 0.9
+        elif len(content_tokens) >= 4:
+            score = 0.78
+        elif len(content_tokens) >= 3 and len(normalized) >= 35:
+            score = 0.72
+        elif len(content_tokens) >= 2 and generic_overlap:
+            score = 0.55
+        else:
+            score = 0.3
+        if any(phrase in normalized for phrase in GENERIC_SPEECH_PHRASES) and len(content_tokens) < 4:
+            score = min(score, 0.55)
+        best_score = max(best_score, score)
+    return round(best_score, 3)
+
+
+def _speech_evidence_score(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> float:
+    reference_texts = _speech_texts_from_annotation(reference_annotation)
+    target_texts = _speech_texts_from_annotation(target_annotation)
+    if not reference_texts or not target_texts:
+        return 0.0
+    if not _first_unique(reference_texts, target_texts) and not _first_unique(target_texts, reference_texts):
+        return 0.0
+
+    specificity = _speech_specificity_score(reference_annotation, target_annotation)
+    if specificity < MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE:
+        return round(min(specificity, 0.69), 3)
+
+    score = _list_delta_strength(reference_texts, target_texts)
+    has_reference_transcript = _has_transcript_evidence(reference_annotation)
+    has_target_transcript = _has_transcript_evidence(target_annotation)
+    if has_reference_transcript and has_target_transcript:
+        score = max(score, 0.88)
+    else:
+        score = min(max(score, 0.75), 0.82)
+    return round(min(score, specificity), 3)
+
+
+def _has_transcript_evidence(annotation: dict[str, Any]) -> bool:
+    transcript = annotation.get("speakers_and_transcript", [])
+    if not isinstance(transcript, list):
+        return False
+    for item in transcript:
+        if isinstance(item, dict):
+            if str(item.get("content") or item.get("transcript") or item.get("text") or "").strip():
+                return True
+        elif str(item).strip():
+            return True
+    return False
+
+
+def _non_speech_audio_terms(annotation: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+    for item in _normalize_list(annotation.get("audio_events", [])):
+        if not _is_speech_like_audio_event(item) and item not in terms:
+            terms.append(item)
+    return terms
+
+
+def _is_speech_like_audio_event(value: str) -> bool:
+    tokens = _tokenize_text(value)
+    if not tokens:
+        return False
+    if tokens & NON_SPEECH_AUDIO_TOKENS:
+        return False
+    return bool(tokens & GENERIC_SPEECH_TOKENS)
+
+
+def _non_speech_audio_event_score(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> float:
+    reference_terms = _non_speech_audio_terms(reference_annotation)
+    target_terms = _non_speech_audio_terms(target_annotation)
+    if not reference_terms and not target_terms:
+        return 0.0
+    if not _first_unique(reference_terms, target_terms) and not _first_unique(target_terms, reference_terms):
+        return 0.0
+    return round(max(_list_delta_strength(reference_terms, target_terms), 0.70), 3)
+
+
 def _difference_evidence_from_annotations(
     *,
     reference_annotation: dict[str, Any],
@@ -2484,9 +2835,21 @@ def _difference_evidence_from_annotations(
             f"{_action_evidence_score(reference_annotation, target_annotation):.3f}"
         )
     if difference_type == "audio_event":
-        evidence.append(_change_text(reference_annotation.get("audio_events", []), target_annotation.get("audio_events", [])))
+        evidence.append(_change_text(_non_speech_audio_terms(reference_annotation), _non_speech_audio_terms(target_annotation)))
+        evidence.append(
+            "non_speech_audio_event_score: "
+            f"{_non_speech_audio_event_score(reference_annotation, target_annotation):.3f}"
+        )
     if difference_type == "speech":
-        evidence.append(_change_text(reference_annotation.get("speech", []), target_annotation.get("speech", [])))
+        evidence.append(_change_text(_speech_texts_from_annotation(reference_annotation), _speech_texts_from_annotation(target_annotation)))
+        evidence.append(
+            "speech_evidence_score: "
+            f"{_speech_evidence_score(reference_annotation, target_annotation):.3f}"
+        )
+        evidence.append(
+            "speech_specificity_score: "
+            f"{_speech_specificity_score(reference_annotation, target_annotation):.3f}"
+        )
     if difference_type == "visible_text":
         evidence.append(
             _change_text(
@@ -2840,6 +3203,16 @@ def _effective_pair_quality(
         result["difference_type"] = str(heuristic_quality.get("difference_type", "")).strip()
     if "action_evidence_score" in heuristic_quality:
         result["action_evidence_score"] = _score_float(heuristic_quality.get("action_evidence_score"))
+    if "speech_evidence_score" in heuristic_quality:
+        result["speech_evidence_score"] = _score_float(heuristic_quality.get("speech_evidence_score"))
+    if "speech_specificity_score" in heuristic_quality:
+        result["speech_specificity_score"] = _score_float(heuristic_quality.get("speech_specificity_score"))
+    if "non_speech_audio_event_score" in heuristic_quality:
+        result["non_speech_audio_event_score"] = _score_float(
+            heuristic_quality.get("non_speech_audio_event_score")
+        )
+    if "has_audio_modality" in heuristic_quality:
+        result["has_audio_modality"] = _score_float(heuristic_quality.get("has_audio_modality"))
     return result
 
 
@@ -2896,6 +3269,27 @@ def _compose_reject_reason(
             failures.append(
                 f"action_evidence_score {action_evidence_score:.3f} is below {MIN_ACCEPT_ACTION_EVIDENCE_SCORE:.2f}"
             )
+    if difference_type == "speech":
+        if _score_float(quality.get("has_audio_modality")) < 1.0:
+            failures.append("speech edit is missing audio modality")
+        if not _boolish(judge.get("audio_required")):
+            failures.append("speech edit must be marked audio_required")
+        speech_evidence_score = _score_float(quality.get("speech_evidence_score"))
+        if speech_evidence_score < MIN_ACCEPT_SPEECH_EVIDENCE_SCORE:
+            failures.append(
+                f"speech_evidence_score {speech_evidence_score:.3f} is below {MIN_ACCEPT_SPEECH_EVIDENCE_SCORE:.2f}"
+            )
+        speech_specificity_score = _score_float(quality.get("speech_specificity_score"))
+        if speech_specificity_score < MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE:
+            failures.append(
+                f"speech_specificity_score {speech_specificity_score:.3f} is below {MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE:.2f}"
+            )
+    if difference_type == "audio_event":
+        non_speech_audio_event_score = _score_float(quality.get("non_speech_audio_event_score"))
+        if non_speech_audio_event_score < MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE:
+            failures.append(
+                f"non_speech_audio_event_score {non_speech_audio_event_score:.3f} is below {MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE:.2f}"
+            )
     if verification is not None:
         failures.extend(_verification_failures(verification))
     if not judge.get("accept"):
@@ -2939,6 +3333,19 @@ def _judge_accepts(
         and (
             str(quality.get("difference_type", "")).strip() != "action"
             or _score_float(quality.get("action_evidence_score")) >= MIN_ACCEPT_ACTION_EVIDENCE_SCORE
+        )
+        and (
+            str(quality.get("difference_type", "")).strip() != "speech"
+            or (
+                _score_float(quality.get("has_audio_modality")) >= 1.0
+                and _boolish(judge.get("audio_required"))
+                and _score_float(quality.get("speech_evidence_score")) >= MIN_ACCEPT_SPEECH_EVIDENCE_SCORE
+                and _score_float(quality.get("speech_specificity_score")) >= MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE
+            )
+        )
+        and (
+            str(quality.get("difference_type", "")).strip() != "audio_event"
+            or _score_float(quality.get("non_speech_audio_event_score")) >= MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE
         )
     )
     if verification is None:

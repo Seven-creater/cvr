@@ -17,7 +17,11 @@ from app.composed_data import (
     _build_proposal_id,
     _finalize_pair_verification,
     _judge_accepts,
+    _non_speech_audio_event_score,
     _pair_context_score,
+    _pair_verification_counts,
+    _speech_evidence_score,
+    _speech_specificity_score,
     _source_context,
     _target_uniqueness_score,
     annotate_clips,
@@ -1313,10 +1317,229 @@ class ComposedDataTests(unittest.TestCase):
                 "difference_strength_score": 0.8,
                 "visual_near_duplicate_score": 0.998,
                 "difference_type": "speech",
+                "has_audio_modality": 1.0,
+                "speech_evidence_score": 0.88,
+                "speech_specificity_score": 0.82,
             },
         )
 
         self.assertTrue(_judge_accepts(judge, verification, quality))
+
+    def test_speech_gate_blocks_generic_speaking_to_camera(self) -> None:
+        reference = {"speech": ["a man speaks to camera"]}
+        target = {"speech": ["a man talks to camera in a forest"]}
+
+        self.assertLess(_speech_evidence_score(reference, target), 0.75)
+        self.assertLess(_speech_specificity_score(reference, target), 0.70)
+
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.9,
+            "edit_match_score": 0.6,
+            "target_uniqueness_score": 0.9,
+            "audio_required": True,
+            "hard_negative_quality": "good",
+            "accept": False,
+            "reject_reason": "",
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {
+                "target_matches_projection": True,
+                "score": 0.9,
+            },
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.9,
+            },
+        }
+        quality = _effective_pair_quality(
+            judge,
+            verification,
+            {
+                "same_context_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "difference_type": "speech",
+                "has_audio_modality": 1.0,
+                "speech_evidence_score": _speech_evidence_score(reference, target),
+                "speech_specificity_score": _speech_specificity_score(reference, target),
+            },
+        )
+
+        self.assertFalse(_judge_accepts(judge, verification, quality))
+        self.assertIn("speech_evidence_score", _compose_reject_reason(judge, verification, quality))
+
+    def test_speech_gate_accepts_specific_transcript_delta(self) -> None:
+        reference = {
+            "speakers_and_transcript": [
+                {"speaker": "narrator", "content": "Today I am introducing the old forest and its wildlife habitat."}
+            ]
+        }
+        target = {
+            "speakers_and_transcript": [
+                {"speaker": "narrator", "content": "The old forest is scheduled to be cut down next week."}
+            ]
+        }
+
+        self.assertGreaterEqual(_speech_evidence_score(reference, target), 0.75)
+        self.assertGreaterEqual(_speech_specificity_score(reference, target), 0.70)
+
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.9,
+            "edit_match_score": 0.6,
+            "target_uniqueness_score": 0.9,
+            "audio_required": True,
+            "hard_negative_quality": "good",
+            "accept": False,
+            "reject_reason": "",
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {
+                "target_matches_projection": True,
+                "score": 0.9,
+            },
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.9,
+            },
+        }
+        quality = _effective_pair_quality(
+            judge,
+            verification,
+            {
+                "same_context_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": _speech_evidence_score(reference, target),
+                "difference_type": "speech",
+                "has_audio_modality": 1.0,
+                "speech_evidence_score": _speech_evidence_score(reference, target),
+                "speech_specificity_score": _speech_specificity_score(reference, target),
+            },
+        )
+
+        self.assertTrue(_judge_accepts(judge, verification, quality))
+
+    def test_audio_event_gate_rejects_speech_only_events(self) -> None:
+        reference = {"audio_events": ["speech", "narration"]}
+        target = {"audio_events": ["voiceover", "talking"]}
+
+        self.assertEqual(0.0, _non_speech_audio_event_score(reference, target))
+
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.9,
+            "edit_match_score": 0.6,
+            "target_uniqueness_score": 0.9,
+            "audio_required": True,
+            "hard_negative_quality": "good",
+            "accept": False,
+            "reject_reason": "",
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {
+                "target_matches_projection": True,
+                "score": 0.9,
+            },
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.9,
+            },
+        }
+        quality = _effective_pair_quality(
+            judge,
+            verification,
+            {
+                "same_context_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "difference_type": "audio_event",
+                "non_speech_audio_event_score": _non_speech_audio_event_score(reference, target),
+            },
+        )
+
+        self.assertFalse(_judge_accepts(judge, verification, quality))
+        self.assertIn("non_speech_audio_event_score", _compose_reject_reason(judge, verification, quality))
+
+    def test_audio_event_gate_accepts_non_speech_audio_delta(self) -> None:
+        reference = {"audio_events": ["quiet forest ambience"]}
+        target = {"audio_events": ["chainsaw noise", "machine buzzing"]}
+
+        self.assertGreaterEqual(_non_speech_audio_event_score(reference, target), 0.70)
+
+    def test_pair_verification_counts_tracks_speech_audio_rejects(self) -> None:
+        records = [
+            {
+                "accepted": False,
+                "difference": {"type": "speech"},
+                "quality": {"speech_evidence_score": 0.2, "speech_specificity_score": 0.3},
+                "verification": {
+                    "caption_delta": {
+                        "caption_equivalent": False,
+                        "has_concrete_difference": True,
+                        "difference_matches_edit": True,
+                    },
+                    "edit_projection": {"target_matches_projection": True, "score": 0.9},
+                    "edit_necessity": {
+                        "edit_needed": True,
+                        "reference_satisfies_edit": False,
+                        "target_satisfies_edit": True,
+                        "score": 0.9,
+                    },
+                },
+            },
+            {
+                "accepted": False,
+                "difference": {"type": "audio_event"},
+                "quality": {"non_speech_audio_event_score": 0.0},
+                "verification": {
+                    "caption_delta": {
+                        "caption_equivalent": False,
+                        "has_concrete_difference": True,
+                        "difference_matches_edit": True,
+                    },
+                    "edit_projection": {"target_matches_projection": True, "score": 0.9},
+                    "edit_necessity": {
+                        "edit_needed": True,
+                        "reference_satisfies_edit": False,
+                        "target_satisfies_edit": True,
+                        "score": 0.9,
+                    },
+                },
+            },
+        ]
+
+        counts = _pair_verification_counts(records)
+
+        self.assertEqual(1, counts["speech_rejected_as_too_generic_count"])
+        self.assertEqual(1, counts["audio_event_rejected_as_speech_only_count"])
 
     def test_difference_strength_scores_concrete_object_changes(self) -> None:
         reference = {
@@ -1452,7 +1675,9 @@ class ComposedDataTests(unittest.TestCase):
             "audio_events": ["speech"],
             "attributes": ["studio"],
             "scene": "studio desk shot",
-            "speech": ["welcome to the show"],
+            "speakers_and_transcript": [
+                {"speaker": "host", "content": "Welcome to the show where we introduce today's camera setup."}
+            ],
             "visible_text": ["episode 1"],
         }
         target = {
@@ -1461,7 +1686,9 @@ class ComposedDataTests(unittest.TestCase):
             "audio_events": ["speech"],
             "attributes": ["studio"],
             "scene": "studio desk shot",
-            "speech": ["today we review the camera"],
+            "speakers_and_transcript": [
+                {"speaker": "host", "content": "Today we review the camera lens and compare the autofocus performance."}
+            ],
             "visible_text": ["episode 1"],
         }
 
@@ -1649,7 +1876,9 @@ class ComposedDataTests(unittest.TestCase):
                 "scene": "studio desk",
                 "attributes": ["indoor"],
                 "on_screen_text": [],
-                "speech": ["welcome to the lesson"],
+                "speakers_and_transcript": [
+                    {"speaker": "presenter", "content": "Welcome to the lesson about writing formulas on the board."}
+                ],
                 "audio_events": ["speech"],
                 "modalities": ["visual", "audio"],
             },
@@ -1665,7 +1894,9 @@ class ComposedDataTests(unittest.TestCase):
                 "scene": "studio desk",
                 "attributes": ["indoor"],
                 "on_screen_text": [],
-                "speech": ["use the coupon code today"],
+                "speakers_and_transcript": [
+                    {"speaker": "presenter", "content": "Use the coupon code today to save money on this course."}
+                ],
                 "audio_events": ["speech"],
                 "modalities": ["visual", "audio"],
             },
@@ -1681,7 +1912,9 @@ class ComposedDataTests(unittest.TestCase):
                 "scene": "studio desk",
                 "attributes": ["indoor"],
                 "on_screen_text": [],
-                "speech": ["welcome to the lesson"],
+                "speakers_and_transcript": [
+                    {"speaker": "presenter", "content": "Welcome to the lesson about writing formulas on the board."}
+                ],
                 "audio_events": ["speech"],
                 "modalities": ["visual", "audio"],
             },
@@ -1697,7 +1930,9 @@ class ComposedDataTests(unittest.TestCase):
                 "scene": "studio desk",
                 "attributes": ["indoor"],
                 "on_screen_text": [],
-                "speech": ["thanks for watching"],
+                "speakers_and_transcript": [
+                    {"speaker": "presenter", "content": "Thanks for watching this studio lesson until the end."}
+                ],
                 "audio_events": ["speech"],
                 "modalities": ["visual", "audio"],
             },
@@ -1977,7 +2212,12 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(report_path.exists())
             self.assertEqual(1, summary["verification_counts"]["caption_equivalent_reject_count"])
             self.assertEqual(1, summary["verification_counts"]["accepted_after_verification_count"])
+            self.assertEqual(0, summary["speech_audio_quality_counts"]["speech_count"])
+            self.assertEqual(0, summary["speech_audio_quality_counts"]["non_speech_audio_event_count"])
+            self.assertFalse(summary["automated_acceptance"]["non_speech_audio_samples_at_least_1"])
+            self.assertTrue(summary["automated_acceptance"]["speech_samples_all_have_evidence"])
             self.assertIn("caption_equivalent_reject_count", report_path.read_text(encoding="utf-8"))
+            self.assertIn("Speech / Audio Quality Counts", report_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 {"clips/target.mp4", "clips/neg1.mp4", "clips/neg2.mp4"},
                 {record["video_path"] for record in gallery_records},
