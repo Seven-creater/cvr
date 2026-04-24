@@ -26,6 +26,7 @@ from app.composed_data import (
     _pair_record_acceptance_issues,
     _pair_context_score,
     _pair_verification_counts,
+    _prepare_record_for_acceptance,
     _repair_pair_model_fields,
     _select_final_accepted_records,
     _build_fallback_edit_text,
@@ -1953,6 +1954,155 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertFalse(_judge_accepts(judge, verification, quality))
         self.assertIn("edit_text_quality_check", _compose_reject_reason(judge, verification, quality))
+
+    def test_prepare_record_recomputes_quality_after_local_verification_sync(self) -> None:
+        record = {
+            "edit_text": "add a dollhouse to the background",
+            "modalities": ["visual"],
+            "reference_caption": "A playroom with toy bins.",
+            "target_caption": "A playroom with toy bins and a dollhouse.",
+            "difference": {"type": "object_presence", "from": "no dollhouse", "to": "1 dollhouse"},
+            "judge": {
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "single_main_difference": True,
+                "same_context_score": 0.9,
+                "edit_match_score": 0.4,
+                "target_uniqueness_score": 0.9,
+                "audio_required": False,
+                "hard_negative_quality": "good",
+                "accept": False,
+            },
+            "verification": {
+                "caption_delta": {
+                    "caption_equivalent": False,
+                    "has_concrete_difference": True,
+                    "difference_matches_edit": True,
+                },
+                "edit_projection": {"target_matches_projection": True, "score": 0.9},
+                "edit_necessity": {
+                    "edit_needed": True,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.9,
+                },
+                "edit_text_quality_check": {
+                    "not_caption_like": True,
+                    "matches_modality": True,
+                    "single_primary_difference": True,
+                    "reference_does_not_satisfy": False,
+                    "target_satisfies": False,
+                    "score": 0.2,
+                    "failure_reason": "model duplicated necessity check",
+                },
+            },
+            "quality": {"same_context_score": 0.9, "edit_match_score": 0.4, "target_uniqueness_score": 0.9},
+            "heuristic_quality": {
+                "same_context_score": 0.9,
+                "edit_match_score": 0.4,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.82,
+                "difference_type": "object_presence",
+                "edit_text_quality_score": 1.0,
+                "edit_text_is_imperative": 1.0,
+                "edit_text_matches_difference_type": 1.0,
+                "edit_text_single_change": 1.0,
+                "edit_text_not_caption_like": 1.0,
+                "edit_text_no_modality_leakage": 1.0,
+                "observable_difference_passed": 1.0,
+            },
+            "edit_text_quality": {
+                "score": 1.0,
+                "is_imperative_edit": True,
+                "matches_difference_type": True,
+                "single_change": True,
+                "not_caption_like": True,
+                "no_modality_leakage": True,
+                "bad_patterns": [],
+            },
+            "observable_difference": {"passed": True, "supporting_fields": ["object_counts"]},
+        }
+
+        prepared = _prepare_record_for_acceptance(
+            record,
+            reference_annotation={"object_counts": {"toy bins": 2}},
+            target_annotation={"object_counts": {"toy bins": 2, "dollhouse": 1}},
+        )
+
+        self.assertTrue(prepared["verification"]["passed"])
+        self.assertEqual(0.9, prepared["quality"]["edit_match_score"])
+        self.assertTrue(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
+
+    def test_prepare_record_keeps_local_bad_edit_text_rejected(self) -> None:
+        record = {
+            "edit_text": "A woman with blonde hair speaks in a room",
+            "modalities": ["audio"],
+            "reference_caption": "A quiet room.",
+            "target_caption": "A woman with blonde hair speaks in a room.",
+            "difference": {"type": "audio_event", "from": "none", "to": "whoosh"},
+            "judge": {
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "single_main_difference": True,
+                "same_context_score": 0.9,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "audio_required": True,
+                "hard_negative_quality": "good",
+                "accept": True,
+            },
+            "verification": {
+                "caption_delta": {
+                    "caption_equivalent": False,
+                    "has_concrete_difference": True,
+                    "difference_matches_edit": True,
+                },
+                "edit_projection": {"target_matches_projection": True, "score": 0.9},
+                "edit_necessity": {
+                    "edit_needed": True,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.9,
+                },
+                "edit_text_quality_check": {"not_caption_like": True, "matches_modality": True, "score": 1.0},
+            },
+            "quality": {"same_context_score": 0.9, "edit_match_score": 0.9, "target_uniqueness_score": 0.9},
+            "heuristic_quality": {
+                "same_context_score": 0.9,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "difference_type": "audio_event",
+                "non_speech_audio_event_score": 0.92,
+                "edit_text_quality_score": 0.5,
+                "edit_text_is_imperative": 1.0,
+                "edit_text_matches_difference_type": 0.0,
+                "edit_text_single_change": 1.0,
+                "edit_text_not_caption_like": 0.0,
+                "edit_text_no_modality_leakage": 0.0,
+                "observable_difference_passed": 1.0,
+            },
+            "edit_text_quality": {
+                "score": 0.5,
+                "is_imperative_edit": True,
+                "matches_difference_type": False,
+                "single_change": True,
+                "not_caption_like": False,
+                "no_modality_leakage": False,
+                "bad_patterns": ["audio_event edit_text contains visual subject"],
+            },
+            "observable_difference": {"passed": True, "supporting_fields": ["audio_events"]},
+        }
+
+        prepared = _prepare_record_for_acceptance(
+            record,
+            reference_annotation={"audio_events": []},
+            target_annotation={"audio_events": ["whoosh"]},
+        )
+
+        self.assertFalse(prepared["verification"]["passed"])
+        self.assertFalse(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
+        self.assertIn("edit_text_quality_check", _compose_reject_reason(prepared["judge"], prepared["verification"], prepared["quality"]))
 
     def test_pair_record_acceptance_issues_rejects_missing_target_and_intraclip_audio_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

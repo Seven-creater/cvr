@@ -592,7 +592,10 @@ def _build_pair_verification_user_content(
         "whether the edit requires listening, and whether visuals alone would fail to distinguish the target. "
         "If speech evidence is generic or missing, set target_matches_projection=false or difference_matches_edit=false. "
         "For audio_event edit_text, set difference_matches_edit=false if the change is only spoken topic/narration rather than a non-speech sound. "
-        "Fill edit_text_quality_check: not_caption_like=false if edit_text copies a caption; matches_modality=false if audio_event edit_text mentions visual subjects or speech; single_primary_difference=false if it mixes modalities."
+        "The pair proposal may include deterministic edit_text_quality and observable_difference gates; use them as local evidence. "
+        "Fill edit_text_quality_check for edit-text surface problems only: not_caption_like=false if edit_text copies a caption; "
+        "matches_modality=false if audio_event edit_text mentions visual subjects or speech; single_primary_difference=false if it mixes modalities. "
+        "Do not use edit_text_quality_check to duplicate edit_necessity; reference/target satisfaction belongs in edit_necessity."
     )
     return [{"type": "text", "text": prompt}]
 

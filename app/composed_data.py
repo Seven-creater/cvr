@@ -1221,6 +1221,8 @@ def propose_group_pairs(
                     "changed_difference_types": list(candidate["changed_difference_types"]),
                     "source_context": dict(candidate["source_context"]),
                     "difference_evidence": dict(proposal_difference_evidence),
+                    "edit_text_quality": dict(edit_text_quality),
+                    "observable_difference": dict(observable_difference),
                     "acceptance_thresholds": {
                         "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
                         "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
@@ -1321,7 +1323,7 @@ def propose_group_pairs(
                 judge = dict(record.get("judge", {}))
                 judge["reject_reason"] = _compose_reject_reason(judge, record["verification"], record.get("quality"))
                 record["judge"] = judge
-            record = _ensure_structured_gate_fields(
+            record = _prepare_record_for_acceptance(
                 record,
                 reference_annotation=reference_annotation,
                 target_annotation=target_annotation,
@@ -1547,6 +1549,8 @@ def validate_known_pairs(
                 "source_context": dict(source_context),
                 "generation": dict(pair.get("generation", {})),
                 "difference_evidence": dict(proposal_difference_evidence),
+                "edit_text_quality": dict(edit_text_quality),
+                "observable_difference": dict(observable_difference),
                 "acceptance_thresholds": {
                     "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
                     "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
@@ -1638,7 +1642,7 @@ def validate_known_pairs(
             }
             proposed_count += 1
 
-        record = _ensure_structured_gate_fields(
+        record = _prepare_record_for_acceptance(
             record,
             reference_annotation=reference_annotation,
             target_annotation=target_annotation,
@@ -3040,31 +3044,42 @@ def _ensure_structured_gate_fields(
     verification = dict(record.get("verification", {}))
     if verification:
         existing_check = dict(verification.get("edit_text_quality_check", {}))
+        edit_necessity = dict(verification.get("edit_necessity", {}))
+        judge = dict(record.get("judge", {}))
+        reference_does_not_satisfy = not _boolish(
+            edit_necessity.get(
+                "reference_satisfies_edit",
+                judge.get("reference_satisfies_edit", False),
+            )
+        )
+        target_satisfies = _boolish(
+            edit_necessity.get(
+                "target_satisfies_edit",
+                judge.get("target_satisfies_edit", False),
+            )
+        )
         local_check = {
             "not_caption_like": bool(edit_text_quality.get("not_caption_like")),
             "matches_modality": bool(edit_text_quality.get("no_modality_leakage")),
             "single_primary_difference": bool(edit_text_quality.get("single_change")),
-            "reference_does_not_satisfy": not _boolish(record.get("judge", {}).get("reference_satisfies_edit")),
-            "target_satisfies": _boolish(record.get("judge", {}).get("target_satisfies_edit")),
+            "reference_does_not_satisfy": reference_does_not_satisfy,
+            "target_satisfies": target_satisfies,
             "score": _score_float(edit_text_quality.get("score")),
             "failure_reason": "; ".join(edit_text_quality.get("bad_patterns", [])),
         }
-        merged_reason = "; ".join(
-            item
-            for item in (
-                str(existing_check.get("failure_reason", "")).strip(),
-                str(local_check.get("failure_reason", "")).strip(),
-            )
-            if item
-        )
+        local_reason = str(local_check.get("failure_reason", "")).strip()
+        model_reason = str(existing_check.get("failure_reason", "")).strip()
+        failure_reason = local_reason
+        if local_reason and model_reason:
+            failure_reason = f"{local_reason}; model verifier note: {model_reason}"
         verification["edit_text_quality_check"] = {
-            "not_caption_like": _boolish(existing_check.get("not_caption_like", True)) and local_check["not_caption_like"],
-            "matches_modality": _boolish(existing_check.get("matches_modality", True)) and local_check["matches_modality"],
-            "single_primary_difference": _boolish(existing_check.get("single_primary_difference", True)) and local_check["single_primary_difference"],
-            "reference_does_not_satisfy": _boolish(existing_check.get("reference_does_not_satisfy", True)) and local_check["reference_does_not_satisfy"],
-            "target_satisfies": _boolish(existing_check.get("target_satisfies", True)) and local_check["target_satisfies"],
-            "score": min(_score_float(existing_check.get("score", 1.0)), local_check["score"]),
-            "failure_reason": merged_reason,
+            "not_caption_like": local_check["not_caption_like"],
+            "matches_modality": local_check["matches_modality"],
+            "single_primary_difference": local_check["single_primary_difference"],
+            "reference_does_not_satisfy": local_check["reference_does_not_satisfy"],
+            "target_satisfies": local_check["target_satisfies"],
+            "score": local_check["score"],
+            "failure_reason": failure_reason,
         }
         verification["passed"] = _verification_accepts(verification)
         verification["failures"] = _verification_failures(verification)
@@ -3072,6 +3087,26 @@ def _ensure_structured_gate_fields(
     record["quality"] = quality
     record["edit_text_quality"] = edit_text_quality
     record["observable_difference"] = observable_difference
+    return record
+
+
+def _prepare_record_for_acceptance(
+    record: dict[str, Any],
+    *,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> dict[str, Any]:
+    record = _ensure_structured_gate_fields(
+        record,
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+    )
+    judge = dict(record.get("judge", {}))
+    verification = record.get("verification", {})
+    heuristic_quality = record.get("heuristic_quality")
+    if not isinstance(heuristic_quality, dict) or not heuristic_quality:
+        heuristic_quality = record.get("quality", {})
+    record["quality"] = _effective_pair_quality(judge, verification, heuristic_quality)
     return record
 
 
