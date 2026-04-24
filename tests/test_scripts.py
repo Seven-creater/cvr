@@ -50,6 +50,9 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("Wan-AI/Wan2.1-VACE-14B", script)
         self.assertIn("Wan-Video/Wan2.1.git", script)
         self.assertIn("--model-size 1.3B|14B|both", script)
+        self.assertIn("--provider modelscope|hf", script)
+        self.assertIn("DOWNLOAD_PROVIDER=${DOWNLOAD_PROVIDER:-modelscope}", script)
+        self.assertIn("modelscope download", script)
         self.assertIn("03_audio_vlm2vec_backbone", script)
         self.assertIn("snapshot_download", script)
 

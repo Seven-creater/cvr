@@ -5,6 +5,9 @@ MODEL_ROOT=${MODEL_ROOT:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_v
 WAN_ROOT=${WAN_ROOT:-$MODEL_ROOT/Wan2.1}
 MODEL_SIZE=${MODEL_SIZE:-1.3B}
 INCLUDE_CODE=${INCLUDE_CODE:-1}
+DOWNLOAD_PROVIDER=${DOWNLOAD_PROVIDER:-modelscope}
+WAN_VACE_13B_REPO=${WAN_VACE_13B_REPO:-Wan-AI/Wan2.1-VACE-1.3B}
+WAN_VACE_14B_REPO=${WAN_VACE_14B_REPO:-Wan-AI/Wan2.1-VACE-14B}
 
 usage() {
   cat <<'EOF'
@@ -14,11 +17,17 @@ Options:
   --model-root PATH
   --wan-root PATH
   --model-size 1.3B|14B|both
+  --provider modelscope|hf
   --skip-code
   -h, --help
 
 Downloads Wan2.1 VACE weights into:
   /data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/Wan2.1
+
+Environment overrides:
+  DOWNLOAD_PROVIDER=modelscope|hf
+  WAN_VACE_13B_REPO=Wan-AI/Wan2.1-VACE-1.3B
+  WAN_VACE_14B_REPO=Wan-AI/Wan2.1-VACE-14B
 EOF
 }
 
@@ -37,6 +46,10 @@ while [[ $# -gt 0 ]]; do
       MODEL_SIZE="$2"
       shift 2
       ;;
+    --provider)
+      DOWNLOAD_PROVIDER="$2"
+      shift 2
+      ;;
     --skip-code)
       INCLUDE_CODE=0
       shift
@@ -52,6 +65,27 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+download_modelscope_repo() {
+  local repo_id="$1"
+  local local_dir="$2"
+  mkdir -p "$local_dir"
+  if command -v modelscope >/dev/null 2>&1; then
+    modelscope download --model "$repo_id" --local_dir "$local_dir"
+    return
+  fi
+  python - "$repo_id" "$local_dir" <<'PY'
+import sys
+
+try:
+    from modelscope import snapshot_download
+except ImportError:
+    from modelscope.hub.snapshot_download import snapshot_download
+
+repo_id, local_dir = sys.argv[1], sys.argv[2]
+snapshot_download(repo_id, local_dir=local_dir)
+PY
+}
 
 download_hf_repo() {
   local repo_id="$1"
@@ -70,9 +104,29 @@ snapshot_download(repo_id=repo_id, local_dir=local_dir)
 PY
 }
 
+download_repo() {
+  local repo_id="$1"
+  local local_dir="$2"
+  case "$DOWNLOAD_PROVIDER" in
+    modelscope)
+      download_modelscope_repo "$repo_id" "$local_dir"
+      ;;
+    hf|huggingface)
+      download_hf_repo "$repo_id" "$local_dir"
+      ;;
+    *)
+      echo "[wan-download] unsupported --provider=$DOWNLOAD_PROVIDER; expected modelscope or hf" >&2
+      exit 2
+      ;;
+  esac
+}
+
 echo "[wan-download] start $(date)"
 echo "[wan-download] wan_root=$WAN_ROOT"
 echo "[wan-download] model_size=$MODEL_SIZE"
+echo "[wan-download] provider=$DOWNLOAD_PROVIDER"
+echo "[wan-download] repo_1.3B=$WAN_VACE_13B_REPO"
+echo "[wan-download] repo_14B=$WAN_VACE_14B_REPO"
 mkdir -p "$WAN_ROOT"
 
 if [[ "$INCLUDE_CODE" == "1" ]]; then
@@ -85,14 +139,14 @@ fi
 
 case "$MODEL_SIZE" in
   1.3B)
-    download_hf_repo "Wan-AI/Wan2.1-VACE-1.3B" "$WAN_ROOT/Wan2.1-VACE-1.3B"
+    download_repo "$WAN_VACE_13B_REPO" "$WAN_ROOT/Wan2.1-VACE-1.3B"
     ;;
   14B)
-    download_hf_repo "Wan-AI/Wan2.1-VACE-14B" "$WAN_ROOT/Wan2.1-VACE-14B"
+    download_repo "$WAN_VACE_14B_REPO" "$WAN_ROOT/Wan2.1-VACE-14B"
     ;;
   both)
-    download_hf_repo "Wan-AI/Wan2.1-VACE-1.3B" "$WAN_ROOT/Wan2.1-VACE-1.3B"
-    download_hf_repo "Wan-AI/Wan2.1-VACE-14B" "$WAN_ROOT/Wan2.1-VACE-14B"
+    download_repo "$WAN_VACE_13B_REPO" "$WAN_ROOT/Wan2.1-VACE-1.3B"
+    download_repo "$WAN_VACE_14B_REPO" "$WAN_ROOT/Wan2.1-VACE-14B"
     ;;
   *)
     echo "[wan-download] unsupported --model-size=$MODEL_SIZE; expected 1.3B, 14B, or both" >&2
