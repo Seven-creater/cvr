@@ -31,6 +31,7 @@ from app.composed_data import (
     _source_context,
     _target_uniqueness_score,
     annotate_clips,
+    build_seeded_pair_slice,
     build_ffmpeg_extract_command,
     detective_annotate_clips,
     discover_raw_sources,
@@ -41,6 +42,7 @@ from app.composed_data import (
     plan_detective_event_clips,
     propose_group_pairs,
     propose_pairs,
+    propose_seeded_pairs,
     validate_pilot_dataset,
 )
 from app.composed_omni import ALLOWED_DIFFERENCE_TYPES
@@ -1025,6 +1027,578 @@ class ComposedDataTests(unittest.TestCase):
             composed_data_main()
 
         self.assertEqual(7, propose_mock.call_args.kwargs["max_accepted_pairs"])
+
+    def test_build_seeded_pair_slice_filters_split_and_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            videos = []
+            for name in ("ref_a.mp4", "tgt_a.mp4", "ref_b.mp4", "tgt_b.mp4", "ref_val.mp4", "tgt_val.mp4"):
+                path = root / "clips" / name
+                path.write_bytes(b"x")
+                videos.append(path)
+
+            pair_seeds_path = root / "metadata" / "webvid_covr_pair_seeds.jsonl"
+            self._write_jsonl(
+                pair_seeds_path,
+                [
+                    {
+                        "pair_seed_id": "seed_train_a",
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "reference_video_path": str(root / "clips" / "ref_a.mp4"),
+                        "target_video_path": str(root / "clips" / "tgt_a.mp4"),
+                    },
+                    {
+                        "pair_seed_id": "seed_train_b",
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "reference_video_path": str(root / "clips" / "ref_b.mp4"),
+                        "target_video_path": str(root / "clips" / "tgt_b.mp4"),
+                    },
+                    {
+                        "pair_seed_id": "seed_val",
+                        "dataset": "webvid_covr",
+                        "split": "validation",
+                        "reference_video_path": str(root / "clips" / "ref_val.mp4"),
+                        "target_video_path": str(root / "clips" / "tgt_val.mp4"),
+                    },
+                ],
+            )
+            source_clips_path = root / "metadata" / "source_clips_all.jsonl"
+            self._write_jsonl(
+                source_clips_path,
+                [
+                    {
+                        "clip_id": "ref_a",
+                        "source_path": str(root / "clips" / "ref_a.mp4"),
+                        "output_path": str(root / "clips" / "ref_a.mp4"),
+                        "dataset": "webvid_covr",
+                    },
+                    {
+                        "clip_id": "tgt_a",
+                        "source_path": str(root / "clips" / "tgt_a.mp4"),
+                        "output_path": str(root / "clips" / "tgt_a.mp4"),
+                        "dataset": "webvid_covr",
+                    },
+                    {
+                        "clip_id": "ref_b",
+                        "source_path": str(root / "clips" / "ref_b.mp4"),
+                        "output_path": str(root / "clips" / "ref_b.mp4"),
+                        "dataset": "webvid_covr",
+                    },
+                    {
+                        "clip_id": "tgt_b",
+                        "source_path": str(root / "clips" / "tgt_b.mp4"),
+                        "output_path": str(root / "clips" / "tgt_b.mp4"),
+                        "dataset": "webvid_covr",
+                    },
+                    {
+                        "clip_id": "ref_val",
+                        "source_path": str(root / "clips" / "ref_val.mp4"),
+                        "output_path": str(root / "clips" / "ref_val.mp4"),
+                        "dataset": "webvid_covr",
+                    },
+                    {
+                        "clip_id": "tgt_val",
+                        "source_path": str(root / "clips" / "tgt_val.mp4"),
+                        "output_path": str(root / "clips" / "tgt_val.mp4"),
+                        "dataset": "webvid_covr",
+                    },
+                ],
+            )
+
+            summary = build_seeded_pair_slice(
+                pair_seeds_path=pair_seeds_path,
+                source_clips_path=source_clips_path,
+                output_seeds_path=root / "runs" / "slice_seeds.jsonl",
+                output_clips_path=root / "runs" / "slice_clips.jsonl",
+                split="train",
+                max_seed_rows=1,
+                seed_offset=1,
+            )
+
+            seeds = [json.loads(line) for line in (root / "runs" / "slice_seeds.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            clips = [json.loads(line) for line in (root / "runs" / "slice_clips.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, summary["selected_seed_count"])
+            self.assertEqual(["seed_train_b"], [seed["pair_seed_id"] for seed in seeds])
+            self.assertEqual({"ref_b", "tgt_b"}, {clip["clip_id"] for clip in clips})
+            self.assertTrue(all(clip["split"] == "train" for clip in clips))
+
+    def test_propose_seeded_pairs_accepts_visual_webvid_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4", "val_neg.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            annotations_path = root / "captions" / "webvid_annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "clip_ref",
+                        "output_path": "clips/ref.mp4",
+                        "source_path": str(root / "clips" / "ref.mp4"),
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "summary": "a red car parked outside a house",
+                        "subjects": ["car"],
+                        "object_counts": {"car": 1},
+                        "actions": ["parked"],
+                        "scene": "outside house",
+                        "attributes": ["red"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                        "storyline": ["a red car is parked outside"],
+                        "visible_text": [],
+                        "speakers_and_transcript": [],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "clip_target",
+                        "output_path": "clips/target.mp4",
+                        "source_path": str(root / "clips" / "target.mp4"),
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "summary": "a blue car parked outside a house",
+                        "subjects": ["car"],
+                        "object_counts": {"car": 1},
+                        "actions": ["parked"],
+                        "scene": "outside house",
+                        "attributes": ["blue"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                        "storyline": ["a blue car is parked outside"],
+                        "visible_text": [],
+                        "speakers_and_transcript": [],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "clip_neg1",
+                        "output_path": "clips/neg1.mp4",
+                        "source_path": str(root / "clips" / "neg1.mp4"),
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "summary": "a green car parked outside a house",
+                        "subjects": ["car"],
+                        "object_counts": {"car": 1},
+                        "actions": ["parked"],
+                        "scene": "outside house",
+                        "attributes": ["green"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                        "storyline": ["a green car is parked outside"],
+                        "visible_text": [],
+                        "speakers_and_transcript": [],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "clip_neg2",
+                        "output_path": "clips/neg2.mp4",
+                        "source_path": str(root / "clips" / "neg2.mp4"),
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "summary": "a red bus parked outside a house",
+                        "subjects": ["bus"],
+                        "object_counts": {"bus": 1},
+                        "actions": ["parked"],
+                        "scene": "outside house",
+                        "attributes": ["red"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                        "storyline": ["a bus is parked outside"],
+                        "visible_text": [],
+                        "speakers_and_transcript": [],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "clip_val_neg",
+                        "output_path": "clips/val_neg.mp4",
+                        "source_path": str(root / "clips" / "val_neg.mp4"),
+                        "dataset": "webvid_covr",
+                        "split": "validation",
+                        "summary": "a yellow car parked outside a house",
+                        "subjects": ["car"],
+                        "object_counts": {"car": 1},
+                        "actions": ["parked"],
+                        "scene": "outside house",
+                        "attributes": ["yellow"],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                        "storyline": ["a yellow car is parked outside"],
+                        "visible_text": [],
+                        "speakers_and_transcript": [],
+                        "fallback_used": False,
+                    },
+                ],
+            )
+            seeds_path = root / "metadata" / "webvid_covr_seed_slice.jsonl"
+            self._write_jsonl(
+                seeds_path,
+                [
+                    {
+                        "pair_seed_id": "seed_pair_1",
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "reference_video_path": str(root / "clips" / "ref.mp4"),
+                        "target_video_path": str(root / "clips" / "target.mp4"),
+                        "txt1": "a red car parked outside",
+                        "txt2": "a blue car parked outside",
+                        "edit": "change the car from red to blue",
+                        "sim_txt": 0.85,
+                        "sim_vid": 0.77,
+                        "scores": {"clip": 0.6},
+                        "person_prob": 0.1,
+                    }
+                ],
+            )
+
+            def fake_propose_pair(*, reference_annotation, target_annotation, hard_negative_candidates, heuristic_pair=None):
+                self.assertEqual("change the car from red to blue", heuristic_pair["seed_metadata"]["edit"])
+                self.assertTrue(all(candidate.get("split") == "train" for candidate in hard_negative_candidates))
+                return (
+                    {
+                        "edit_text": "change the car from red to blue",
+                        "modalities": ["visual"],
+                        "reference_caption": reference_annotation["summary"],
+                        "target_caption": target_annotation["summary"],
+                        "difference": {
+                            "type": "attribute",
+                            "from": "red car",
+                            "to": "blue car",
+                            "description": "the car color changes from red to blue",
+                        },
+                        "proposal_reason": "same setting with a color change",
+                    },
+                    {"provider": "mock"},
+                )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.propose_pair.side_effect = fake_propose_pair
+                client_cls.return_value.judge_pair.return_value = (
+                    {
+                        "reference_satisfies_edit": False,
+                        "target_satisfies_edit": True,
+                        "single_main_difference": True,
+                        "same_context_score": 0.8,
+                        "edit_match_score": 0.9,
+                        "target_uniqueness_score": 0.88,
+                        "audio_required": False,
+                        "hard_negative_quality": "good",
+                        "accept": True,
+                        "reject_reason": "",
+                    },
+                    {"provider": "mock-judge"},
+                )
+                client_cls.return_value.verify_pair_difference.return_value = (
+                    {
+                        "caption_delta": {
+                            "caption_equivalent": False,
+                            "has_concrete_difference": True,
+                            "difference_matches_edit": True,
+                            "concrete_differences": ["red car becomes blue car"],
+                            "reason": "car color changes",
+                        },
+                        "edit_projection": {
+                            "projected_target_caption": "a blue car parked outside a house",
+                            "target_matches_projection": True,
+                            "score": 0.93,
+                            "missing_requirements": [],
+                            "reason": "projection matches target",
+                        },
+                        "edit_necessity": {
+                            "edit_needed": True,
+                            "reference_satisfies_edit": False,
+                            "target_satisfies_edit": True,
+                            "score": 0.9,
+                            "reason": "reference is red and target is blue",
+                        },
+                    },
+                    {"provider": "mock-verification"},
+                )
+                summary = propose_seeded_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_seeds_path=seeds_path,
+                    output_path=root / "pairs" / "judged_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            accepted_records = [
+                json.loads(line)
+                for line in (root / "pairs" / "accepted_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["accepted_count"])
+            self.assertEqual("webvid_covr_seed_pair", accepted_records[0]["group_reason"])
+            self.assertEqual("webvid_covr_seed_pair", accepted_records[0]["source_context"]["relation"])
+            self.assertEqual("seed_pair_1", accepted_records[0]["seed_metadata"]["pair_seed_id"])
+            self.assertEqual("webvid_covr", accepted_records[0]["source"]["platform"])
+            self.assertTrue(all("val_neg" not in path for path in accepted_records[0]["hard_negatives"]))
+
+    def test_propose_seeded_pairs_rejects_webvid_speech_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            annotations_path = root / "captions" / "webvid_annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "clip_ref",
+                        "output_path": "clips/ref.mp4",
+                        "source_path": str(root / "clips" / "ref.mp4"),
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "summary": "a person speaks about red cars",
+                        "subjects": ["person"],
+                        "object_counts": {"person": 1},
+                        "actions": ["speaking"],
+                        "scene": "studio",
+                        "attributes": [],
+                        "on_screen_text": ["red cars"],
+                        "speech": ["red cars are popular"],
+                        "audio_events": [],
+                        "modalities": ["visual", "audio"],
+                        "storyline": ["speaker discusses red cars"],
+                        "visible_text": ["red cars"],
+                        "speakers_and_transcript": ["speaker: red cars are popular"],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "clip_target",
+                        "output_path": "clips/target.mp4",
+                        "source_path": str(root / "clips" / "target.mp4"),
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "summary": "a person speaks about blue cars",
+                        "subjects": ["person"],
+                        "object_counts": {"person": 1},
+                        "actions": ["speaking"],
+                        "scene": "studio",
+                        "attributes": [],
+                        "on_screen_text": ["blue cars"],
+                        "speech": ["blue cars are popular"],
+                        "audio_events": [],
+                        "modalities": ["visual", "audio"],
+                        "storyline": ["speaker discusses blue cars"],
+                        "visible_text": ["blue cars"],
+                        "speakers_and_transcript": ["speaker: blue cars are popular"],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "clip_neg1",
+                        "output_path": "clips/neg1.mp4",
+                        "source_path": str(root / "clips" / "neg1.mp4"),
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "summary": "a person gestures in a studio",
+                        "subjects": ["person"],
+                        "object_counts": {"person": 1},
+                        "actions": ["gesturing"],
+                        "scene": "studio",
+                        "attributes": [],
+                        "on_screen_text": [],
+                        "speech": ["cars are expensive"],
+                        "audio_events": [],
+                        "modalities": ["visual", "audio"],
+                        "storyline": ["speaker gestures"],
+                        "visible_text": [],
+                        "speakers_and_transcript": ["speaker: cars are expensive"],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "clip_neg2",
+                        "output_path": "clips/neg2.mp4",
+                        "source_path": str(root / "clips" / "neg2.mp4"),
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "summary": "a person sits in a studio",
+                        "subjects": ["person"],
+                        "object_counts": {"person": 1},
+                        "actions": ["sitting"],
+                        "scene": "studio",
+                        "attributes": [],
+                        "on_screen_text": [],
+                        "speech": ["cars are available"],
+                        "audio_events": [],
+                        "modalities": ["visual", "audio"],
+                        "storyline": ["speaker sits"],
+                        "visible_text": [],
+                        "speakers_and_transcript": ["speaker: cars are available"],
+                        "fallback_used": False,
+                    },
+                ],
+            )
+            seeds_path = root / "metadata" / "webvid_covr_seed_slice.jsonl"
+            self._write_jsonl(
+                seeds_path,
+                [
+                    {
+                        "pair_seed_id": "seed_pair_speech",
+                        "dataset": "webvid_covr",
+                        "split": "train",
+                        "reference_video_path": str(root / "clips" / "ref.mp4"),
+                        "target_video_path": str(root / "clips" / "target.mp4"),
+                        "txt1": "a person speaks about red cars",
+                        "txt2": "a person speaks about blue cars",
+                        "edit": "change the speech from red cars to blue cars",
+                        "sim_txt": 0.9,
+                        "sim_vid": 0.8,
+                    }
+                ],
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.propose_pair.return_value = (
+                    {
+                        "edit_text": "change the speech from red cars to blue cars",
+                        "modalities": ["audio"],
+                        "reference_caption": "a person speaks about red cars",
+                        "target_caption": "a person speaks about blue cars",
+                        "difference": {
+                            "type": "speech",
+                            "from": "red cars are popular",
+                            "to": "blue cars are popular",
+                            "description": "speech changes topic",
+                        },
+                        "proposal_reason": "speech content changes",
+                    },
+                    {"provider": "mock"},
+                )
+                client_cls.return_value.judge_pair.return_value = (
+                    {
+                        "reference_satisfies_edit": False,
+                        "target_satisfies_edit": True,
+                        "single_main_difference": True,
+                        "same_context_score": 0.9,
+                        "edit_match_score": 0.9,
+                        "target_uniqueness_score": 0.85,
+                        "audio_required": True,
+                        "hard_negative_quality": "good",
+                        "accept": True,
+                        "reject_reason": "",
+                    },
+                    {"provider": "mock-judge"},
+                )
+                client_cls.return_value.verify_pair_difference.return_value = (
+                    {
+                        "caption_delta": {
+                            "caption_equivalent": False,
+                            "has_concrete_difference": True,
+                            "difference_matches_edit": True,
+                            "concrete_differences": ["red cars becomes blue cars"],
+                            "reason": "speech content changes",
+                        },
+                        "edit_projection": {
+                            "projected_target_caption": "a person speaks about blue cars",
+                            "target_matches_projection": True,
+                            "score": 0.95,
+                            "missing_requirements": [],
+                            "reason": "projection matches target",
+                        },
+                        "edit_necessity": {
+                            "edit_needed": True,
+                            "reference_satisfies_edit": False,
+                            "target_satisfies_edit": True,
+                            "score": 0.92,
+                            "reason": "reference says red cars and target says blue cars",
+                        },
+                    },
+                    {"provider": "mock-verification"},
+                )
+                summary = propose_seeded_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_seeds_path=seeds_path,
+                    output_path=root / "pairs" / "judged_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            records = [
+                json.loads(line)
+                for line in (root / "pairs" / "judged_pair_proposals.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(0, summary["accepted_count"])
+            self.assertEqual("speech", records[0]["difference"]["type"])
+            self.assertIn("webvid_covr only allows visual difference types", records[0]["judge"]["reject_reason"])
+
+    def test_build_seeded_pair_slice_cli_passes_arguments(self) -> None:
+        argv = [
+            "composed_data.py",
+            "build-seeded-pair-slice",
+            "--pair-seeds-path",
+            "/tmp/seeds.jsonl",
+            "--source-clips-path",
+            "/tmp/source_clips.jsonl",
+            "--output-seeds-path",
+            "/tmp/output_seeds.jsonl",
+            "--output-clips-path",
+            "/tmp/output_clips.jsonl",
+            "--split",
+            "train",
+            "--max-seed-rows",
+            "11",
+            "--seed-offset",
+            "3",
+        ]
+        with mock.patch("sys.argv", argv), mock.patch("builtins.print"), mock.patch(
+            "app.composed_data.build_seeded_pair_slice",
+            return_value={"ok": True},
+        ) as build_mock:
+            composed_data_main()
+
+        self.assertEqual("train", build_mock.call_args.kwargs["split"])
+        self.assertEqual(11, build_mock.call_args.kwargs["max_seed_rows"])
+        self.assertEqual(3, build_mock.call_args.kwargs["seed_offset"])
+
+    def test_propose_seeded_pairs_cli_passes_max_accepted_pairs(self) -> None:
+        argv = [
+            "composed_data.py",
+            "propose-seeded-pairs",
+            "--root",
+            "/tmp/root",
+            "--clip-annotations-path",
+            "/tmp/annotations.jsonl",
+            "--pair-seeds-path",
+            "/tmp/pair_seeds.jsonl",
+            "--base-url",
+            "http://127.0.0.1:8093/v1",
+            "--api-key",
+            "EMPTY",
+            "--model",
+            "qwen3-omni",
+            "--max-accepted-pairs",
+            "9",
+        ]
+        with mock.patch("sys.argv", argv), mock.patch("builtins.print"), mock.patch(
+            "app.composed_data.propose_seeded_pairs",
+            return_value={"ok": True},
+        ) as propose_mock:
+            composed_data_main()
+
+        self.assertEqual(9, propose_mock.call_args.kwargs["max_accepted_pairs"])
 
     def test_compose_reject_reason_includes_threshold_failures(self) -> None:
         judge = {

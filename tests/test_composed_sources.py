@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 import zipfile
+from csv import DictWriter
 from pathlib import Path
 from unittest import mock
 
@@ -118,6 +119,83 @@ class ComposedSourcesTests(unittest.TestCase):
             self.assertTrue(Path(rows[0]["video_path"]).exists())
             self.assertIn("_extracted", rows[0]["video_path"])
             self.assertEqual(1, result["dataset_counts"]["worldsense"]["archives"])
+
+    def test_prepare_source_datasets_loads_webvid_covr_pair_seeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            webvid = root / "raw_datasets" / "webvid_covr"
+            videos = webvid / "videos"
+            videos.mkdir(parents=True)
+            (videos / "ref.mp4").write_bytes(b"ref")
+            (videos / "tgt.mp4").write_bytes(b"tgt")
+            with (webvid / "train.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = DictWriter(
+                    handle,
+                    fieldnames=["txt1", "txt2", "edit", "pth1", "pth2", "sim_txt", "sim_vid", "scores", "person-prob"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "txt1": "a red car parked outside",
+                        "txt2": "a blue car parked outside",
+                        "edit": "change the car from red to blue",
+                        "pth1": "videos/ref.mp4",
+                        "pth2": "videos/tgt.mp4",
+                        "sim_txt": "0.82",
+                        "sim_vid": "0.74",
+                        "scores": "{\"clip\": 0.6}",
+                        "person-prob": "0.1",
+                    }
+                )
+
+            result = prepare_source_datasets(root=root, clip_limit=5, webvid_covr_splits=["train"])
+
+            self.assertEqual(2, result["row_count"])
+            self.assertEqual(2, result["clip_count"])
+            self.assertEqual(1, result["pair_seed_count"])
+            pair_seeds = [
+                json.loads(line)
+                for line in Path(result["webvid_covr_pair_seeds_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, len(pair_seeds))
+            self.assertEqual("webvid_covr", pair_seeds[0]["dataset"])
+            self.assertEqual("train", pair_seeds[0]["split"])
+            rows = [json.loads(line) for line in Path(result["source_rows_path"]).read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual({"webvid_covr"}, {row["dataset"] for row in rows})
+            self.assertEqual({"reference", "target"}, {row["text_fields"]["video_role"] for row in rows})
+
+    def test_prepare_source_datasets_skips_webvid_covr_missing_video_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            webvid = root / "raw_datasets" / "webvid_covr"
+            videos = webvid / "videos"
+            videos.mkdir(parents=True)
+            (videos / "ref.mp4").write_bytes(b"ref")
+            with (webvid / "train.csv").open("w", encoding="utf-8", newline="") as handle:
+                writer = DictWriter(
+                    handle,
+                    fieldnames=["txt1", "txt2", "edit", "pth1", "pth2", "sim_txt", "sim_vid", "scores", "person-prob"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "txt1": "a red car parked outside",
+                        "txt2": "a blue car parked outside",
+                        "edit": "change the car from red to blue",
+                        "pth1": "videos/ref.mp4",
+                        "pth2": "videos/missing.mp4",
+                        "sim_txt": "0.82",
+                        "sim_vid": "0.74",
+                        "scores": "",
+                        "person-prob": "0.1",
+                    }
+                )
+
+            result = prepare_source_datasets(root=root, clip_limit=5, webvid_covr_splits=["train"])
+
+            self.assertEqual(0, result["pair_seed_count"])
+            self.assertEqual(1, result["dataset_counts"]["webvid_covr"]["missing_video_seeds"])
 
 
 if __name__ == "__main__":

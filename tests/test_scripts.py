@@ -31,6 +31,24 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("omni_detective_pilot_20260422", script)
         self.assertIn("omni_detective_pilot", script)
 
+    def test_webvid_covr_script_accepts_seed_slice_arguments(self) -> None:
+        script = Path("scripts/run_webvid_covr_pilot.sh").read_text(encoding="utf-8")
+
+        self.assertIn("--webvid-covr-root", script)
+        self.assertIn("--max-seed-rows", script)
+        self.assertIn("--seed-offset", script)
+        self.assertIn("build-seeded-pair-slice", script)
+        self.assertIn("propose-seeded-pairs", script)
+
+    def test_webvid_covr_script_has_gpu_resource_policy(self) -> None:
+        script = Path("scripts/run_webvid_covr_pilot.sh").read_text(encoding="utf-8")
+
+        self.assertIn("MAX_GPUS", script)
+        self.assertIn("GPU_IDS", script)
+        self.assertIn("MODEL_STAGE", script)
+        self.assertIn("one Omni model per run", script)
+        self.assertIn("refusing to run with GPU_COUNT", script)
+
 
 if __name__ == "__main__":
     unittest.main()
