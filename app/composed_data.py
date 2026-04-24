@@ -43,9 +43,9 @@ PAIR_PRIORITY = (
 )
 HIGH_CONTEXT_PAIR_PRIORITY = (
     "object_count",
-    "audio_event",
-    "action",
     "object_presence",
+    "action",
+    "audio_event",
     "speech",
     "visible_text",
     "attribute",
@@ -54,7 +54,7 @@ HIGH_CONTEXT_PAIR_PRIORITY = (
 DIVERSE_PAIR_BUCKET_TARGETS = {
     "object_count": 3,
     "action": 3,
-    "audio_event": 5,
+    "audio_event": 4,
     "speech": 3,
     "object_presence": 3,
     "visible_text": 3,
@@ -2121,6 +2121,8 @@ def _quality_for_model_fields(
     reference_annotation: dict[str, Any],
     target_annotation: dict[str, Any],
 ) -> dict[str, Any]:
+    if str(model_fields.get("difference", {}).get("type", "")).strip() == "audio_event":
+        model_fields = _normalize_audio_event_model_fields(model_fields)
     quality = dict(base_quality)
     difference = model_fields.get("difference", {})
     difference_type = str(difference.get("type", "")).strip()
@@ -2975,6 +2977,33 @@ def _is_speech_only_or_absence_audio_phrase(value: str) -> bool:
     return any(pattern in normalized for pattern in SPEECH_ONLY_AUDIO_PATTERNS + NON_SPEECH_AUDIO_ABSENCE_PATTERNS)
 
 
+def _is_non_speech_absence_audio_phrase(value: str) -> bool:
+    normalized = _normalized_phrase(value)
+    if not normalized:
+        return False
+    return any(pattern in normalized for pattern in NON_SPEECH_AUDIO_ABSENCE_PATTERNS)
+
+
+def _is_speech_only_audio_phrase(value: str) -> bool:
+    normalized = _normalized_phrase(value)
+    if not normalized:
+        return False
+    return any(pattern in normalized for pattern in SPEECH_ONLY_AUDIO_PATTERNS)
+
+
+def _normalize_audio_event_model_fields(model_fields: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(model_fields)
+    difference = dict(normalized.get("difference", {}))
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    if _is_non_speech_absence_audio_phrase(from_value) and to_value:
+        normalized["edit_text"] = f"add {to_value} to the audio"
+    elif _is_non_speech_absence_audio_phrase(to_value) and from_value:
+        normalized["edit_text"] = f"remove {from_value} from the audio"
+    normalized["difference"] = difference
+    return normalized
+
+
 def _non_speech_audio_event_score(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> float:
     reference_terms = _non_speech_audio_terms(reference_annotation)
     target_terms = _non_speech_audio_terms(target_annotation)
@@ -3221,6 +3250,10 @@ def _build_fallback_edit_text(primary_difference: dict[str, Any]) -> str:
     if difference_type == "action":
         return f"change the action from {from_value} to {to_value}"
     if difference_type == "audio_event":
+        if _is_non_speech_absence_audio_phrase(from_value) and to_value:
+            return f"add {to_value} to the audio"
+        if _is_non_speech_absence_audio_phrase(to_value) and from_value:
+            return f"remove {from_value} from the audio"
         return f"change the audio from {from_value} to {to_value}"
     if difference_type == "attribute":
         return f"change the attribute from {from_value} to {to_value}"
@@ -3735,6 +3768,12 @@ def _pair_record_acceptance_issues(
         target_annotation=target_annotation,
     ):
         issues.append("the proposed difference appears inside a single clip instead of between reference and target")
+    difference = record.get("difference", {})
+    if str(difference.get("type", "")).strip() == "audio_event":
+        from_value = str(difference.get("from", "")).strip()
+        to_value = str(difference.get("to", "")).strip()
+        if _is_speech_only_audio_phrase(from_value) or _is_speech_only_audio_phrase(to_value):
+            issues.append("audio_event must not use speech-only or narration-only text as the main difference")
     return issues
 
 

@@ -24,6 +24,7 @@ from app.composed_data import (
     _pair_context_score,
     _pair_verification_counts,
     _select_final_accepted_records,
+    _build_fallback_edit_text,
     _speech_evidence_score,
     _speech_specificity_score,
     _source_context,
@@ -1583,6 +1584,28 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertEqual(0.0, _non_speech_audio_event_score(reference, target))
 
+    def test_fallback_audio_event_edit_text_uses_add_remove_for_absence(self) -> None:
+        self.assertEqual(
+            "add low-frequency electronic hum to the audio",
+            _build_fallback_edit_text(
+                {
+                    "type": "audio_event",
+                    "from": "no distinctive audio event",
+                    "to": "low-frequency electronic hum",
+                }
+            ),
+        )
+        self.assertEqual(
+            "remove low-frequency electronic hum from the audio",
+            _build_fallback_edit_text(
+                {
+                    "type": "audio_event",
+                    "from": "low-frequency electronic hum",
+                    "to": "no distinctive audio event",
+                }
+            ),
+        )
+
     def test_intraclip_audio_event_conflict_detects_from_to_in_target_caption(self) -> None:
         reference = {
             "summary": "a person writes on paper",
@@ -1803,6 +1826,33 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertTrue(any("target_video does not exist" in issue for issue in issues))
         self.assertTrue(any("single clip" in issue for issue in issues))
+
+    def test_pair_record_acceptance_issues_rejects_speech_only_audio_event_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "ref.mp4").write_bytes(b"x")
+            (root / "clips" / "target.mp4").write_bytes(b"x")
+
+            issues = _pair_record_acceptance_issues(
+                root=root,
+                record={
+                    "reference_video": "clips/ref.mp4",
+                    "target_video": "clips/target.mp4",
+                    "hard_negatives": [],
+                    "difference": {
+                        "type": "audio_event",
+                        "from": "no distinctive audio event",
+                        "to": "The audio track contains only speech; no background music or ambient noise is present.",
+                    },
+                    "reference_caption": "A man talks in a forest.",
+                    "target_caption": "A man talks in a forest.",
+                },
+                reference_annotation={"audio_events": []},
+                target_annotation={"audio_events": []},
+            )
+
+        self.assertTrue(any("speech-only" in issue for issue in issues))
 
     def test_select_final_accepted_records_dedupes_repeated_group_audio_events(self) -> None:
         base_record = {
@@ -2082,7 +2132,7 @@ class ComposedDataTests(unittest.TestCase):
         self.assertIsNotNone(difference)
         self.assertEqual("object_presence", difference["type"])
 
-    def test_high_context_priority_promotes_non_speech_audio_event(self) -> None:
+    def test_high_context_priority_keeps_object_change_ahead_of_audio_event(self) -> None:
         reference = {
             "object_counts": {"person": 1},
             "actions": ["speaking"],
@@ -2107,7 +2157,7 @@ class ComposedDataTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(difference)
-        self.assertEqual("audio_event", difference["type"])
+        self.assertEqual("object_presence", difference["type"])
 
     def test_pair_candidates_keep_low_context_pairs_with_available_negatives(self) -> None:
         annotations = [
