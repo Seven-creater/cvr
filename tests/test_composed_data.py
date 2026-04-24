@@ -17,8 +17,10 @@ from app.composed_data import (
     _build_pair_candidates,
     _build_proposal_id,
     _finalize_pair_verification,
+    _has_intraclip_difference_conflict,
     _judge_accepts,
     _non_speech_audio_event_score,
+    _pair_record_acceptance_issues,
     _pair_context_score,
     _pair_verification_counts,
     _speech_evidence_score,
@@ -1568,6 +1570,31 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertGreaterEqual(_non_speech_audio_event_score(reference, target), 0.70)
 
+    def test_intraclip_audio_event_conflict_detects_from_to_in_target_caption(self) -> None:
+        reference = {
+            "summary": "a person writes on paper",
+            "audio_events": ["low-frequency electronic hum"],
+        }
+        target = {
+            "summary": "a person writes on paper",
+            "audio_events": ["scratching sound"],
+        }
+        difference = {
+            "type": "audio_event",
+            "from": "low-frequency electronic hum",
+            "to": "scratching sound",
+        }
+
+        self.assertTrue(
+            _has_intraclip_difference_conflict(
+                difference=difference,
+                reference_caption="A person writes on paper with a low-frequency electronic hum.",
+                target_caption="The audio changes from a low-frequency electronic hum to a scratching sound while the person writes.",
+                reference_annotation=reference,
+                target_annotation=target,
+            )
+        )
+
     def test_detect_primary_difference_uses_summary_audio_delta(self) -> None:
         reference = {
             "summary": "a robot stands on a platform with a low electronic hum in the background",
@@ -1703,6 +1730,66 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertEqual(0.84, sample["audio_event_quality"]["non_speech_score"])
         self.assertEqual(True, sample["audio_event_quality"]["audio_required"])
+
+    def test_accepted_sample_carries_clip_ids(self) -> None:
+        sample = _accepted_sample_from_record(
+            {
+                "proposal_id": "proposal__ids",
+                "reference_clip_id": "clip_ref",
+                "target_clip_id": "clip_target",
+                "reference_video": "clips/ref.mp4",
+                "target_video": "clips/target.mp4",
+                "edit_text": "add a toy bin",
+                "modalities": ["visual"],
+                "reference_caption": "ref",
+                "target_caption": "target",
+                "difference": {"type": "object_presence", "from": "no toy bin", "to": "toy bin present"},
+                "hard_negatives": ["clips/neg.mp4"],
+                "quality": {"difference_type": "object_presence"},
+                "source": {"platform": "unknown", "url": "file:///tmp/target.mp4", "license_note": "internal"},
+                "source_context": {"relation": "same_source_video"},
+                "evidence": {},
+                "judge": {},
+                "verification": {},
+                "speech_quality": {},
+                "audio_event_quality": {},
+                "transcript_backed": None,
+                "group_id": "group_a",
+                "group_reason": "same_source_video",
+            },
+            1,
+        )
+
+        self.assertEqual("clip_ref", sample["reference_clip_id"])
+        self.assertEqual("clip_target", sample["target_clip_id"])
+
+    def test_pair_record_acceptance_issues_rejects_missing_target_and_intraclip_audio_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "ref.mp4").write_bytes(b"x")
+            (root / "clips" / "neg.mp4").write_bytes(b"x")
+
+            issues = _pair_record_acceptance_issues(
+                root=root,
+                record={
+                    "reference_video": "clips/ref.mp4",
+                    "target_video": "clips/missing.mp4",
+                    "hard_negatives": ["clips/neg.mp4"],
+                    "difference": {
+                        "type": "audio_event",
+                        "from": "low-frequency electronic hum",
+                        "to": "scratching sound",
+                    },
+                    "reference_caption": "A person writes with a low-frequency electronic hum.",
+                    "target_caption": "The audio changes from a low-frequency electronic hum to a scratching sound while writing.",
+                },
+                reference_annotation={"audio_events": ["low-frequency electronic hum"]},
+                target_annotation={"audio_events": ["scratching sound"]},
+            )
+
+        self.assertTrue(any("target_video does not exist" in issue for issue in issues))
+        self.assertTrue(any("single clip" in issue for issue in issues))
 
     def test_difference_strength_scores_concrete_object_changes(self) -> None:
         reference = {

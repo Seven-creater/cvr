@@ -73,6 +73,21 @@ MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE = 0.70
 MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE = 0.70
 MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE = 0.995
 VISUAL_DIFFERENCE_TYPES = {"object_count", "object_presence", "attribute", "action", "scene", "visible_text"}
+INTRACLIP_CHANGE_MARKERS = (
+    "change from",
+    "changes from",
+    "changed from",
+    "changes to",
+    "changed to",
+    "replace",
+    "replaced by",
+    "replaces",
+    "transition from",
+    "transitions from",
+    "turns into",
+    "becomes",
+    "followed by",
+)
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 STOPWORDS = {
     "a",
@@ -1086,6 +1101,8 @@ def propose_group_pairs(
                     "proposal_id": proposal_id,
                     "group_id": group_metadata["group_id"],
                     "group_reason": group_metadata["group_reason"],
+                    "reference_clip_id": reference_annotation.get("clip_id", ""),
+                    "target_clip_id": target_annotation.get("clip_id", ""),
                     "reference_video": reference_annotation["output_path"],
                     "target_video": target_annotation["output_path"],
                     "edit_text": model_fields["edit_text"],
@@ -1130,6 +1147,23 @@ def propose_group_pairs(
                 judge = dict(record.get("judge", {}))
                 judge["reject_reason"] = _compose_reject_reason(judge, record["verification"], record.get("quality"))
                 record["judge"] = judge
+            acceptance_issues = _pair_record_acceptance_issues(
+                root=layout["root"],
+                record=record,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            )
+            if acceptance_issues:
+                record = dict(record)
+                judge = dict(record.get("judge", {}))
+                judge["accept"] = False
+                judge["reject_reason"] = "; ".join(acceptance_issues)
+                record["judge"] = judge
+                record["accepted"] = False
+                quality = dict(record.get("quality", {}))
+                if any("single clip" in issue for issue in acceptance_issues):
+                    quality["intraclip_change_conflict"] = 1.0
+                record["quality"] = quality
             if bool(record.get("fallback_used")):
                 fallback_count += 1
             if bool(record.get("accepted")):
@@ -2068,6 +2102,14 @@ def _quality_for_model_fields(
             reference_annotation,
             target_annotation,
         )
+    if _has_intraclip_difference_conflict(
+        difference=difference,
+        reference_caption=str(model_fields.get("reference_caption", "")),
+        target_caption=str(model_fields.get("target_caption", "")),
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+    ):
+        quality["intraclip_change_conflict"] = 1.0
     return quality
 
 
@@ -3400,6 +3442,8 @@ def _compose_reject_reason(
             failures.append(
                 f"non_speech_audio_event_score {non_speech_audio_event_score:.3f} is below {MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE:.2f}"
             )
+    if _score_float(quality.get("intraclip_change_conflict")) >= 1.0:
+        failures.append("the proposed edit appears to describe an intra-clip transition instead of a cross-clip difference")
     if verification is not None:
         failures.extend(_verification_failures(verification))
     if not judge.get("accept"):
@@ -3458,6 +3502,7 @@ def _judge_accepts(
             str(quality.get("difference_type", "")).strip() != "audio_event"
             or _score_float(quality.get("non_speech_audio_event_score")) >= MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE
         )
+        and _score_float(quality.get("intraclip_change_conflict")) < 1.0
     )
     if verification is None:
         return bool(judge.get("accept")) and judge_accepted
@@ -3567,10 +3612,96 @@ def _change_text(left: Any, right: Any) -> str:
     return f"{'; '.join(left_values) or 'none'} -> { '; '.join(right_values) or 'none'}"
 
 
+def _normalized_phrase(value: str) -> str:
+    return " ".join(TOKEN_PATTERN.findall(str(value).lower()))
+
+
+def _text_mentions_phrase(text: str, phrase: str) -> bool:
+    normalized_phrase = _normalized_phrase(phrase)
+    if not normalized_phrase:
+        return False
+    return normalized_phrase in _normalized_phrase(text)
+
+
+def _has_intraclip_change_description(text: str, from_value: str, to_value: str) -> bool:
+    normalized_text = _normalized_phrase(text)
+    if not normalized_text:
+        return False
+    if not _text_mentions_phrase(text, from_value) or not _text_mentions_phrase(text, to_value):
+        return False
+    return any(marker in normalized_text for marker in INTRACLIP_CHANGE_MARKERS)
+
+
+def _annotation_difference_texts(annotation: dict[str, Any], difference_type: str) -> list[str]:
+    if difference_type == "speech":
+        return _speech_texts_from_annotation(annotation)
+    if difference_type == "audio_event":
+        values = _non_speech_audio_terms(annotation)
+        values.extend(_normalize_list(annotation.get("detective_notes", [])))
+        values.extend(_normalize_list(annotation.get("summary", "")))
+        return values
+    return []
+
+
+def _has_intraclip_difference_conflict(
+    *,
+    difference: dict[str, Any],
+    reference_caption: str,
+    target_caption: str,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> bool:
+    difference_type = str(difference.get("type", "")).strip()
+    if difference_type not in {"speech", "audio_event"}:
+        return False
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    if not from_value or not to_value:
+        return False
+
+    texts_to_check = [
+        reference_caption,
+        target_caption,
+        *_annotation_difference_texts(reference_annotation, difference_type),
+        *_annotation_difference_texts(target_annotation, difference_type),
+    ]
+    return any(_has_intraclip_change_description(text, from_value, to_value) for text in texts_to_check)
+
+
+def _pair_record_acceptance_issues(
+    *,
+    root: Path,
+    record: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> list[str]:
+    issues: list[str] = []
+    for field_name in ("reference_video", "target_video"):
+        raw_path = str(record.get(field_name, "")).strip()
+        if raw_path and not _resolve_under_root(root, raw_path).exists():
+            issues.append(f"{field_name} does not exist: {raw_path}")
+
+    for negative_path in [str(item).strip() for item in record.get("hard_negatives", []) if str(item).strip()]:
+        if not _resolve_under_root(root, negative_path).exists():
+            issues.append(f"hard_negative does not exist: {negative_path}")
+
+    if _has_intraclip_difference_conflict(
+        difference=record.get("difference", {}),
+        reference_caption=str(record.get("reference_caption", "")),
+        target_caption=str(record.get("target_caption", "")),
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+    ):
+        issues.append("the proposed difference appears inside a single clip instead of between reference and target")
+    return issues
+
+
 def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str, Any]:
     return {
         "sample_id": f"covr_omni_pilot_{index:04d}",
         "proposal_id": record["proposal_id"],
+        "reference_clip_id": record.get("reference_clip_id", ""),
+        "target_clip_id": record.get("target_clip_id", ""),
         "reference_video": record["reference_video"],
         "target_video": record["target_video"],
         "edit_text": record["edit_text"],
