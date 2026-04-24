@@ -9,7 +9,7 @@ cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 ROOT=${ROOT:-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval}
-RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/omni_detective_pilot_20260422}
+RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/omni_detective_pilot}
 MODEL=${MODEL:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-instruct}
 BASE_URL=${BASE_URL:-http://127.0.0.1:8093/v1}
 SOURCE_CLIPS=${SOURCE_CLIPS:-$ROOT/metadata/source_clips_all.jsonl}
@@ -18,6 +18,79 @@ SEGMENT_SECONDS=${SEGMENT_SECONDS:-8}
 MODEL_STAGE=${MODEL_STAGE:-instruct}
 GPU_IDS=${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-}}
 MAX_GPUS=${MAX_GPUS:-6}
+
+usage() {
+  cat <<'EOF'
+Usage: run_omni_detective_pilot.sh [options]
+
+Options:
+  --root PATH
+  --run-root PATH
+  --model PATH
+  --base-url URL
+  --source-clips PATH
+  --max-source-videos N
+  --segment-seconds N
+  --model-stage VALUE
+  --gpu-ids IDS
+  --max-gpus N
+  -h, --help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root)
+      ROOT="$2"
+      shift 2
+      ;;
+    --run-root)
+      RUN_ROOT="$2"
+      shift 2
+      ;;
+    --model)
+      MODEL="$2"
+      shift 2
+      ;;
+    --base-url)
+      BASE_URL="$2"
+      shift 2
+      ;;
+    --source-clips)
+      SOURCE_CLIPS="$2"
+      shift 2
+      ;;
+    --max-source-videos)
+      MAX_SOURCE_VIDEOS="$2"
+      shift 2
+      ;;
+    --segment-seconds)
+      SEGMENT_SECONDS="$2"
+      shift 2
+      ;;
+    --model-stage)
+      MODEL_STAGE="$2"
+      shift 2
+      ;;
+    --gpu-ids)
+      GPU_IDS="$2"
+      shift 2
+      ;;
+    --max-gpus)
+      MAX_GPUS="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "[omni-detective] unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
 count_gpu_ids() {
   local value="$1"
