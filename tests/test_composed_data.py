@@ -23,6 +23,7 @@ from app.composed_data import (
     _pair_record_acceptance_issues,
     _pair_context_score,
     _pair_verification_counts,
+    _select_final_accepted_records,
     _speech_evidence_score,
     _speech_specificity_score,
     _source_context,
@@ -1570,6 +1571,18 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertGreaterEqual(_non_speech_audio_event_score(reference, target), 0.70)
 
+    def test_audio_event_gate_rejects_speech_only_absence_phrase(self) -> None:
+        reference = {
+            "summary": "a man speaks in a forest",
+            "audio_events": [],
+        }
+        target = {
+            "summary": "The audio track contains only speech; no background music or ambient noise is present.",
+            "audio_events": [],
+        }
+
+        self.assertEqual(0.0, _non_speech_audio_event_score(reference, target))
+
     def test_intraclip_audio_event_conflict_detects_from_to_in_target_caption(self) -> None:
         reference = {
             "summary": "a person writes on paper",
@@ -1790,6 +1803,97 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertTrue(any("target_video does not exist" in issue for issue in issues))
         self.assertTrue(any("single clip" in issue for issue in issues))
+
+    def test_select_final_accepted_records_dedupes_repeated_group_audio_events(self) -> None:
+        base_record = {
+            "accepted": True,
+            "group_id": "group_audio",
+            "source_context": {"relation": "same_source_video"},
+            "modalities": ["audio"],
+            "reference_caption": "ref",
+            "target_caption": "target",
+            "hard_negatives": ["clips/neg.mp4"],
+            "source": {"platform": "unknown", "url": "file:///tmp/target.mp4", "license_note": "internal"},
+            "evidence": {},
+            "judge": {},
+            "verification": {"passed": True},
+            "speech_quality": {},
+            "audio_event_quality": {},
+            "transcript_backed": None,
+            "group_reason": "same_source_video",
+        }
+        records = [
+            {
+                **base_record,
+                "proposal_id": "proposal__audio_a",
+                "reference_video": "clips/ref_a.mp4",
+                "target_video": "clips/target_a.mp4",
+                "edit_text": "add a low-frequency electronic hum",
+                "difference": {"type": "audio_event", "from": "no distinctive audio event", "to": "low-frequency electronic hum"},
+                "quality": {
+                    "difference_type": "audio_event",
+                    "difference_strength_score": 0.9,
+                    "same_context_score": 0.9,
+                    "target_uniqueness_score": 0.8,
+                    "edit_match_score": 0.9,
+                },
+            },
+            {
+                **base_record,
+                "proposal_id": "proposal__audio_b",
+                "reference_video": "clips/ref_b.mp4",
+                "target_video": "clips/target_b.mp4",
+                "edit_text": "introduce a low-frequency electronic hum",
+                "difference": {"type": "audio_event", "from": "no distinctive audio event", "to": "low-frequency electronic hum"},
+                "quality": {
+                    "difference_type": "audio_event",
+                    "difference_strength_score": 0.85,
+                    "same_context_score": 0.9,
+                    "target_uniqueness_score": 0.79,
+                    "edit_match_score": 0.9,
+                },
+            },
+            {
+                **base_record,
+                "proposal_id": "proposal__action",
+                "group_id": "group_action",
+                "reference_video": "clips/action_ref.mp4",
+                "target_video": "clips/action_target.mp4",
+                "edit_text": "change the action from standing to waving",
+                "difference": {"type": "action", "from": "standing", "to": "waving"},
+                "quality": {
+                    "difference_type": "action",
+                    "difference_strength_score": 0.84,
+                    "same_context_score": 0.88,
+                    "target_uniqueness_score": 0.82,
+                    "edit_match_score": 0.86,
+                },
+            },
+            {
+                **base_record,
+                "proposal_id": "proposal__object",
+                "group_id": "group_object",
+                "modalities": ["visual"],
+                "reference_video": "clips/object_ref.mp4",
+                "target_video": "clips/object_target.mp4",
+                "edit_text": "add a toy bin",
+                "difference": {"type": "object_presence", "from": "no toy bin", "to": "1 toy bin"},
+                "quality": {
+                    "difference_type": "object_presence",
+                    "difference_strength_score": 0.83,
+                    "same_context_score": 0.87,
+                    "target_uniqueness_score": 0.81,
+                    "edit_match_score": 0.85,
+                },
+            },
+        ]
+
+        accepted = _select_final_accepted_records(records, max_accepted_pairs=4)
+
+        self.assertEqual(3, len(accepted))
+        self.assertEqual(1, sum(1 for record in accepted if record["difference"]["type"] == "audio_event"))
+        self.assertIn("action", {record["difference"]["type"] for record in accepted})
+        self.assertIn("object_presence", {record["difference"]["type"] for record in accepted})
 
     def test_difference_strength_scores_concrete_object_changes(self) -> None:
         reference = {

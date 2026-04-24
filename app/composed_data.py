@@ -226,6 +226,40 @@ NON_SPEECH_AUDIO_TOKENS = {
     "whoosh",
     "wind",
 }
+SPEECH_ONLY_AUDIO_PATTERNS = (
+    "only speech",
+    "speech only",
+    "contains only speech",
+    "contains speech only",
+    "only narration",
+    "narration only",
+    "only talking",
+    "talking only",
+    "only voiceover",
+    "voiceover only",
+)
+NON_SPEECH_AUDIO_ABSENCE_PATTERNS = (
+    "no background music",
+    "no background noise",
+    "no ambient noise",
+    "no ambient sound",
+    "no ambient sounds",
+    "no distinctive audio",
+    "no non speech audio",
+    "without background music",
+    "without background noise",
+    "without ambient noise",
+)
+FINAL_ACCEPT_BUCKET_TARGETS = {
+    "object_count": 2,
+    "object_presence": 3,
+    "action": 2,
+    "audio_event": 2,
+    "speech": 2,
+    "visible_text": 2,
+    "attribute": 2,
+    "scene": 1,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1168,12 +1202,11 @@ def propose_group_pairs(
                 fallback_count += 1
             if bool(record.get("accepted")):
                 accepted_total_count += 1
-                if len(accepted_records) < max_accepted_pairs:
-                    accepted_records.append(_accepted_sample_from_record(record, len(accepted_records) + 1))
             else:
                 rejected_count += 1
             output_records.append(record)
 
+    accepted_records = _select_final_accepted_records(output_records, max_accepted_pairs=max_accepted_pairs)
     _write_jsonl(output, output_records)
     _write_jsonl(accepted_output, accepted_records)
     verification_counts = _pair_verification_counts(output_records)
@@ -2921,6 +2954,8 @@ def _timeline_audio_terms(annotation: dict[str, Any]) -> list[str]:
 
 def _is_non_speech_audio_phrase(value: str) -> bool:
     tokens = _tokenize_text(value)
+    if _is_speech_only_or_absence_audio_phrase(value):
+        return False
     return bool(tokens & NON_SPEECH_AUDIO_TOKENS) and not _is_speech_like_audio_event(value)
 
 
@@ -2931,6 +2966,13 @@ def _is_speech_like_audio_event(value: str) -> bool:
     if tokens & NON_SPEECH_AUDIO_TOKENS:
         return False
     return bool(tokens & GENERIC_SPEECH_TOKENS)
+
+
+def _is_speech_only_or_absence_audio_phrase(value: str) -> bool:
+    normalized = _normalized_phrase(value)
+    if not normalized:
+        return False
+    return any(pattern in normalized for pattern in SPEECH_ONLY_AUDIO_PATTERNS + NON_SPEECH_AUDIO_ABSENCE_PATTERNS)
 
 
 def _non_speech_audio_event_score(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> float:
@@ -3694,6 +3736,76 @@ def _pair_record_acceptance_issues(
     ):
         issues.append("the proposed difference appears inside a single clip instead of between reference and target")
     return issues
+
+
+def _accepted_record_sort_key(record: dict[str, Any]) -> tuple[float, float, float, float, str]:
+    quality = record.get("quality", {})
+    return (
+        -_score_float(quality.get("difference_strength_score")),
+        -_score_float(quality.get("same_context_score")),
+        -_score_float(quality.get("target_uniqueness_score")),
+        -_score_float(quality.get("edit_match_score")),
+        str(record.get("proposal_id", "")).strip(),
+    )
+
+
+def _accepted_record_signature(record: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    difference = record.get("difference", {})
+    from_value = _normalized_phrase(str(difference.get("from", "")).strip())
+    to_value = _normalized_phrase(str(difference.get("to", "")).strip())
+    if not from_value and not to_value:
+        from_value = _normalized_phrase(str(record.get("edit_text", "")).strip())
+    return (
+        str(record.get("group_id", "")).strip(),
+        str(difference.get("type", "")).strip(),
+        from_value,
+        to_value,
+        str(record.get("source_context", {}).get("relation", "")).strip(),
+    )
+
+
+def _select_final_accepted_records(
+    records: list[dict[str, Any]],
+    *,
+    max_accepted_pairs: int,
+) -> list[dict[str, Any]]:
+    accepted_candidates = sorted(
+        [record for record in records if bool(record.get("accepted"))],
+        key=_accepted_record_sort_key,
+    )
+    if not accepted_candidates or max_accepted_pairs <= 0:
+        return []
+
+    selected: list[dict[str, Any]] = []
+    seen_signatures: set[tuple[str, str, str, str, str]] = set()
+    selected_ids: set[str] = set()
+
+    def try_select(record: dict[str, Any]) -> bool:
+        signature = _accepted_record_signature(record)
+        proposal_id = str(record.get("proposal_id", "")).strip()
+        if signature in seen_signatures or proposal_id in selected_ids:
+            return False
+        selected.append(record)
+        seen_signatures.add(signature)
+        selected_ids.add(proposal_id)
+        return True
+
+    for difference_type, target_count in FINAL_ACCEPT_BUCKET_TARGETS.items():
+        bucket_count = 0
+        for record in accepted_candidates:
+            if len(selected) >= max_accepted_pairs or bucket_count >= target_count:
+                break
+            if str(record.get("difference", {}).get("type", "")).strip() != difference_type:
+                continue
+            if try_select(record):
+                bucket_count += 1
+
+    for record in accepted_candidates:
+        if len(selected) >= max_accepted_pairs:
+            break
+        try_select(record)
+
+    return [_accepted_sample_from_record(record, index + 1) for index, record in enumerate(selected)]
 
 
 def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str, Any]:
