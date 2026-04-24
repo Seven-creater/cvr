@@ -43,10 +43,10 @@ PAIR_PRIORITY = (
 )
 HIGH_CONTEXT_PAIR_PRIORITY = (
     "object_count",
-    "object_presence",
-    "action",
-    "speech",
     "audio_event",
+    "action",
+    "object_presence",
+    "speech",
     "visible_text",
     "attribute",
     "scene",
@@ -54,7 +54,7 @@ HIGH_CONTEXT_PAIR_PRIORITY = (
 DIVERSE_PAIR_BUCKET_TARGETS = {
     "object_count": 3,
     "action": 3,
-    "audio_event": 3,
+    "audio_event": 5,
     "speech": 3,
     "object_presence": 3,
     "visible_text": 3,

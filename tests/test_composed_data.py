@@ -1978,6 +1978,33 @@ class ComposedDataTests(unittest.TestCase):
         self.assertIsNotNone(difference)
         self.assertEqual("object_presence", difference["type"])
 
+    def test_high_context_priority_promotes_non_speech_audio_event(self) -> None:
+        reference = {
+            "object_counts": {"person": 1},
+            "actions": ["speaking"],
+            "audio_events": ["low electronic hum"],
+            "attributes": ["studio"],
+            "scene": "studio desk shot",
+            "visible_text": [],
+        }
+        target = {
+            "object_counts": {"person": 1, "laptop": 1},
+            "actions": ["speaking"],
+            "audio_events": ["scratching sound"],
+            "attributes": ["studio"],
+            "scene": "studio desk shot",
+            "visible_text": [],
+        }
+
+        difference = _detect_primary_difference(
+            reference,
+            target,
+            priority_order=_difference_priority_order(same_context_score=0.9),
+        )
+
+        self.assertIsNotNone(difference)
+        self.assertEqual("audio_event", difference["type"])
+
     def test_pair_candidates_keep_low_context_pairs_with_available_negatives(self) -> None:
         annotations = [
             {
