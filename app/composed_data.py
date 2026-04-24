@@ -24,9 +24,13 @@ DEFAULT_CLIP_GROUPS_NAME = "clip_groups.jsonl"
 DEFAULT_DETECTIVE_CLIP_PLAN_NAME = "clip_plan_detective.jsonl"
 DEFAULT_EVENT_CLIP_MANIFEST_NAME = "extracted_event_clips.jsonl"
 DEFAULT_ACCEPTED_PAIRS_NAME = "accepted_pairs.jsonl"
+DEFAULT_SYNTHETIC_JUDGED_PAIRS_NAME = "judged_synthetic_pair_proposals.jsonl"
+DEFAULT_SYNTHETIC_ACCEPTED_PAIRS_NAME = "accepted_synthetic_pairs.jsonl"
+DEFAULT_SYNTHETIC_PILOT_REVIEW_NAME = "synthetic_pilot_review.md"
 DEFAULT_LICENSE_NOTE = "internal research pilot only"
 VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
 ALLOWED_MODALITIES = {"visual", "audio"}
+ALLOWED_SOURCE_TYPES = {"natural", "synthetic_edit"}
 MAX_PAIR_CANDIDATES = 40
 MIN_PAIR_CONTEXT_SCORE = 0.03
 MAX_PAIR_CHANGED_TYPES = 5
@@ -71,6 +75,7 @@ MIN_ACCEPT_ACTION_EVIDENCE_SCORE = 0.65
 MIN_ACCEPT_SPEECH_EVIDENCE_SCORE = 0.75
 MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE = 0.70
 MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE = 0.70
+MIN_ACCEPT_EDIT_TEXT_QUALITY_SCORE = 0.75
 MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE = 0.995
 VISUAL_DIFFERENCE_TYPES = {"object_count", "object_presence", "attribute", "action", "scene", "visible_text"}
 INTRACLIP_CHANGE_MARKERS = (
@@ -148,6 +153,79 @@ GENERIC_SPEECH_PHRASES = {
     "narration",
     "talking",
     "voiceover",
+}
+GENERIC_EDIT_TEXT_PHRASES = {
+    "change the mood",
+    "make it better",
+    "make it cinematic",
+    "make it more cinematic",
+    "make the video better",
+    "make the scene better",
+    "make the scene more interesting",
+    "change the topic",
+    "change the vibe",
+}
+EDIT_ACTION_VERBS = {
+    "add",
+    "adds",
+    "appear",
+    "appears",
+    "begin",
+    "begins",
+    "change",
+    "changes",
+    "convert",
+    "converts",
+    "delete",
+    "deletes",
+    "disappear",
+    "disappears",
+    "increase",
+    "increases",
+    "insert",
+    "inserts",
+    "introduce",
+    "introduced",
+    "introduces",
+    "launch",
+    "launched",
+    "make",
+    "remove",
+    "removes",
+    "replace",
+    "replaced",
+    "replaces",
+    "start",
+    "starts",
+    "swap",
+    "swaps",
+    "turn",
+    "turns",
+    "wave",
+    "waving",
+}
+EDIT_TEXT_AUDIO_TOKENS = {
+    "audio",
+    "hum",
+    "music",
+    "noise",
+    "scratch",
+    "scratching",
+    "sound",
+    "speech",
+    "voice",
+    "whoosh",
+}
+EDIT_TEXT_VISUAL_TOKENS = {
+    "background",
+    "color",
+    "colour",
+    "object",
+    "scene",
+    "shirt",
+    "text",
+    "video",
+    "visible",
 }
 VISUAL_DESCRIPTION_TOKENS = {
     "background",
@@ -250,6 +328,43 @@ NON_SPEECH_AUDIO_ABSENCE_PATTERNS = (
     "without background noise",
     "without ambient noise",
 )
+EDIT_TEXT_START_VERBS = {
+    "add",
+    "change",
+    "include",
+    "increase",
+    "introduce",
+    "make",
+    "reduce",
+    "remove",
+    "replace",
+    "start",
+    "starts",
+    "stop",
+    "stops",
+    "switch",
+    "turn",
+}
+EDIT_TEXT_CAPTION_MAX_TOKENS = 24
+EDIT_TEXT_VISUAL_LEAK_TOKENS = {
+    "background",
+    "blonde",
+    "camera",
+    "desk",
+    "dollhouse",
+    "hair",
+    "man",
+    "nose",
+    "person",
+    "room",
+    "shirt",
+    "speaking",
+    "toy",
+    "woman",
+}
+EDIT_TEXT_AUDIO_TOKENS = NON_SPEECH_AUDIO_TOKENS | {"audio", "sound", "sounds", "effect", "effects"}
+EDIT_TEXT_VISIBLE_TEXT_TOKENS = {"caption", "ocr", "on", "screen", "text", "subtitle", "subtitles"}
+EDIT_TEXT_SPEECH_TOKENS = GENERIC_SPEECH_TOKENS | {"transcript", "spoken", "says", "say", "topic", "topics"}
 FINAL_ACCEPT_BUCKET_TARGETS = {
     "object_count": 2,
     "object_presence": 3,
@@ -1022,12 +1137,12 @@ def propose_group_pairs(
             if proposal_id in seen_proposal_ids:
                 continue
             seen_proposal_ids.add(proposal_id)
+            reference_annotation = candidate["reference_annotation"]
+            target_annotation = candidate["target_annotation"]
             if proposal_id in existing_records:
                 record = existing_records[proposal_id]
                 reused_count += 1
             else:
-                reference_annotation = candidate["reference_annotation"]
-                target_annotation = candidate["target_annotation"]
                 raw_model_output: dict[str, Any] = {}
                 judge_raw_output: dict[str, Any] = {}
                 verification_raw_output: dict[str, Any] = {}
@@ -1055,6 +1170,11 @@ def propose_group_pairs(
                     raw_model_output = {"error": f"{type(exc).__name__}: {exc}"}
                     proposal_fallback_used = True
 
+                model_fields = _repair_pair_model_fields(
+                    model_fields=model_fields,
+                    reference_annotation=reference_annotation,
+                    target_annotation=target_annotation,
+                )
                 source = _build_source_metadata(
                     root=layout["root"],
                     target_annotation=target_annotation,
@@ -1065,6 +1185,24 @@ def propose_group_pairs(
                     model_fields=model_fields,
                     reference_annotation=reference_annotation,
                     target_annotation=target_annotation,
+                )
+                edit_text_quality = _edit_text_quality_payload(
+                    edit_text=model_fields["edit_text"],
+                    difference=model_fields["difference"],
+                    modalities=model_fields["modalities"],
+                    reference_caption=model_fields["reference_caption"],
+                    target_caption=model_fields["target_caption"],
+                )
+                observable_difference = _observable_difference_gate(
+                    reference_annotation=reference_annotation,
+                    target_annotation=target_annotation,
+                    difference=model_fields["difference"],
+                    visual_near_duplicate_score=proposal_quality.get("visual_near_duplicate_score"),
+                )
+                _apply_structured_gate_quality(
+                    proposal_quality,
+                    edit_text_quality=edit_text_quality,
+                    observable_difference=observable_difference,
                 )
                 proposal_difference_evidence = _difference_evidence_from_annotations(
                     reference_annotation=reference_annotation,
@@ -1164,6 +1302,8 @@ def propose_group_pairs(
                     "verification": verification,
                     "speech_quality": speech_quality,
                     "audio_event_quality": audio_event_quality,
+                    "edit_text_quality": edit_text_quality,
+                    "observable_difference": observable_difference,
                     "transcript_backed": speech_quality.get("transcript_backed"),
                     "accepted": accepted,
                     "fallback_used": fallback_used,
@@ -1180,6 +1320,19 @@ def propose_group_pairs(
                 record["fallback_used"] = True
                 judge = dict(record.get("judge", {}))
                 judge["reject_reason"] = _compose_reject_reason(judge, record["verification"], record.get("quality"))
+                record["judge"] = judge
+            record = _ensure_structured_gate_fields(
+                record,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            )
+            judge = dict(record.get("judge", {}))
+            verification = record.get("verification", {})
+            quality = record.get("quality", {})
+            record["accepted"] = _judge_accepts(judge, verification, quality)
+            if not bool(record.get("accepted")):
+                judge["accept"] = False
+                judge["reject_reason"] = _compose_reject_reason(judge, verification, quality)
                 record["judge"] = judge
             acceptance_issues = _pair_record_acceptance_issues(
                 root=layout["root"],
@@ -1240,6 +1393,307 @@ def propose_group_pairs(
     }
 
 
+def validate_known_pairs(
+    *,
+    root: str | Path,
+    known_pairs_path: str | Path,
+    clip_annotations_path: str | Path,
+    base_url: str,
+    api_key: str,
+    model: str,
+    output_path: str | Path | None = None,
+    accepted_output_path: str | Path | None = None,
+    raw_index_path: str | Path | None = None,
+    overwrite: bool = False,
+    timeout_seconds: float = 180.0,
+    max_accepted_pairs: int = 10,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    known_pairs = list(_load_jsonl(Path(known_pairs_path)))
+    annotations = list(_load_jsonl(Path(clip_annotations_path)))
+    if not known_pairs:
+        raise ValueError("known pairs file is empty")
+    if not annotations:
+        raise ValueError("clip annotations are empty")
+
+    output = Path(output_path) if output_path else layout["pairs"] / DEFAULT_SYNTHETIC_JUDGED_PAIRS_NAME
+    accepted_output = Path(accepted_output_path) if accepted_output_path else layout["pairs"] / DEFAULT_SYNTHETIC_ACCEPTED_PAIRS_NAME
+    existing_records = {} if overwrite else _load_records_by_key(output, "proposal_id")
+    raw_index = _load_raw_asset_index(Path(raw_index_path) if raw_index_path else layout["metadata"] / DEFAULT_RAW_INDEX_NAME)
+    annotation_lookup = _annotation_lookup(root=layout["root"], annotations=annotations)
+    client = OpenAIComposedDataClient(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout_seconds=timeout_seconds,
+    )
+
+    output_records: list[dict[str, Any]] = []
+    proposed_count = 0
+    reused_count = 0
+    fallback_count = 0
+    rejected_count = 0
+    accepted_total_count = 0
+    seen_proposal_ids: set[str] = set()
+
+    for line_number, pair in enumerate(known_pairs, start=1):
+        reference_annotation = _annotation_for_known_pair(
+            root=layout["root"],
+            lookup=annotation_lookup,
+            pair=pair,
+            clip_id_field="reference_clip_id",
+            video_field="reference_video",
+            line_number=line_number,
+        )
+        target_annotation = _annotation_for_known_pair(
+            root=layout["root"],
+            lookup=annotation_lookup,
+            pair=pair,
+            clip_id_field="target_clip_id",
+            video_field="target_video",
+            line_number=line_number,
+        )
+
+        reference_video = _known_pair_video_path(layout["root"], pair, reference_annotation, "reference_video")
+        target_video = _known_pair_video_path(layout["root"], pair, target_annotation, "target_video")
+        proposal_id = str(pair.get("proposal_id", "")).strip() or _build_proposal_id(reference_video, target_video)
+        if proposal_id in seen_proposal_ids:
+            continue
+        seen_proposal_ids.add(proposal_id)
+
+        if proposal_id in existing_records:
+            record = existing_records[proposal_id]
+            reused_count += 1
+        else:
+            raw_judge_output: dict[str, Any] = {}
+            raw_verification_output: dict[str, Any] = {}
+            model_fields = _known_pair_model_fields(
+                pair=pair,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            )
+            model_fields = _repair_pair_model_fields(
+                model_fields=model_fields,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            )
+            source = _build_source_metadata(
+                root=layout["root"],
+                target_annotation=target_annotation,
+                raw_index=raw_index,
+            )
+            source["source_type"] = str(pair.get("source_type", "synthetic_edit")).strip() or "synthetic_edit"
+            source_context = _known_pair_source_context(pair)
+            hard_negative_annotations = _known_pair_hard_negative_annotations(
+                root=layout["root"],
+                lookup=annotation_lookup,
+                annotations=annotations,
+                pair=pair,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                difference=model_fields["difference"],
+            )
+            hard_negative_paths = _known_pair_hard_negative_paths(
+                root=layout["root"],
+                pair=pair,
+                hard_negative_annotations=hard_negative_annotations,
+            )
+            base_quality = _known_pair_base_quality(
+                root=layout["root"],
+                pair=pair,
+                annotations=annotations,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                difference=model_fields["difference"],
+                source_context=source_context,
+            )
+            proposal_quality = _quality_for_model_fields(
+                base_quality=base_quality,
+                model_fields=model_fields,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            )
+            edit_text_quality = _edit_text_quality_payload(
+                edit_text=model_fields["edit_text"],
+                difference=model_fields["difference"],
+                modalities=model_fields["modalities"],
+                reference_caption=model_fields["reference_caption"],
+                target_caption=model_fields["target_caption"],
+            )
+            observable_difference = _observable_difference_gate(
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                difference=model_fields["difference"],
+                visual_near_duplicate_score=proposal_quality.get("visual_near_duplicate_score"),
+            )
+            _apply_structured_gate_quality(
+                proposal_quality,
+                edit_text_quality=edit_text_quality,
+                observable_difference=observable_difference,
+            )
+            proposal_difference_evidence = _difference_evidence_from_annotations(
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                primary_difference=model_fields["difference"],
+            )
+            proposal_view = {
+                "proposal_id": proposal_id,
+                "edit_text": model_fields["edit_text"],
+                "modalities": list(model_fields["modalities"]),
+                "reference_caption": model_fields["reference_caption"],
+                "target_caption": model_fields["target_caption"],
+                "difference": model_fields["difference"],
+                "quality": dict(proposal_quality),
+                "source_context": dict(source_context),
+                "generation": dict(pair.get("generation", {})),
+                "difference_evidence": dict(proposal_difference_evidence),
+                "acceptance_thresholds": {
+                    "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
+                    "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
+                    "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
+                    "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
+                    "max_visual_near_duplicate_score_for_visual_edits": MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE,
+                    "edit_text_quality_score": MIN_ACCEPT_EDIT_TEXT_QUALITY_SCORE,
+                },
+            }
+            try:
+                judge, raw_judge_output = client.judge_pair(
+                    proposal=proposal_view,
+                    reference_annotation=_annotation_prompt_view(reference_annotation),
+                    target_annotation=_annotation_prompt_view(target_annotation),
+                    hard_negative_candidates=[
+                        _annotation_prompt_view(annotation) for annotation in hard_negative_annotations
+                    ],
+                )
+                judge_fallback_used = False
+            except Exception as exc:
+                judge = _fallback_pair_judge(proposal_quality, reason=f"{type(exc).__name__}: {exc}")
+                raw_judge_output = {"error": f"{type(exc).__name__}: {exc}"}
+                judge_fallback_used = True
+
+            try:
+                verification, raw_verification_output = client.verify_pair_difference(
+                    proposal=proposal_view,
+                    reference_annotation=_annotation_prompt_view(reference_annotation),
+                    target_annotation=_annotation_prompt_view(target_annotation),
+                )
+                verification_fallback_used = False
+            except Exception as exc:
+                verification = _fallback_pair_verification(reason=f"{type(exc).__name__}: {exc}")
+                raw_verification_output = {"error": f"{type(exc).__name__}: {exc}"}
+                verification_fallback_used = True
+
+            judge = _finalize_pair_judge(judge)
+            verification = _finalize_pair_verification(verification)
+            fallback_used = judge_fallback_used or verification_fallback_used
+            effective_quality = _effective_pair_quality(judge, verification, proposal_quality)
+            accepted = _judge_accepts(judge, verification, effective_quality)
+            if not accepted:
+                judge["reject_reason"] = _compose_reject_reason(judge, verification, effective_quality)
+            speech_quality = _speech_quality_payload(effective_quality)
+            audio_event_quality = _audio_event_quality_payload(effective_quality)
+            record = {
+                "proposal_id": proposal_id,
+                "source_type": str(pair.get("source_type", "synthetic_edit")).strip() or "synthetic_edit",
+                "generation": dict(pair.get("generation", {})),
+                "group_id": str(pair.get("group_id", "synthetic_edit")).strip() or "synthetic_edit",
+                "group_reason": str(pair.get("group_reason", "known_synthetic_pair")).strip() or "known_synthetic_pair",
+                "reference_clip_id": reference_annotation.get("clip_id", ""),
+                "target_clip_id": target_annotation.get("clip_id", ""),
+                "reference_video": reference_video,
+                "target_video": target_video,
+                "edit_text": model_fields["edit_text"],
+                "modalities": list(model_fields["modalities"]),
+                "reference_caption": model_fields["reference_caption"],
+                "target_caption": model_fields["target_caption"],
+                "difference": model_fields["difference"],
+                "hard_negatives": hard_negative_paths,
+                "judge_quality": {
+                    "same_context_score": judge["same_context_score"],
+                    "edit_match_score": judge["edit_match_score"],
+                    "target_uniqueness_score": judge["target_uniqueness_score"],
+                },
+                "quality": effective_quality,
+                "heuristic_quality": dict(proposal_quality),
+                "source_context": dict(source_context),
+                "source": source,
+                "proposal_reason": str(pair.get("proposal_reason", "known pair validation")).strip(),
+                "evidence": _evidence_from_annotations(
+                    reference_annotation,
+                    target_annotation,
+                    difference_evidence=proposal_difference_evidence,
+                ),
+                "judge": judge,
+                "verification": verification,
+                "speech_quality": speech_quality,
+                "audio_event_quality": audio_event_quality,
+                "edit_text_quality": edit_text_quality,
+                "observable_difference": observable_difference,
+                "transcript_backed": speech_quality.get("transcript_backed"),
+                "accepted": accepted,
+                "fallback_used": fallback_used,
+                "raw_model_output": {"known_pair": True},
+                "raw_judge_output": raw_judge_output,
+                "raw_verification_output": raw_verification_output,
+            }
+            proposed_count += 1
+
+        record = _ensure_structured_gate_fields(
+            record,
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+        )
+        judge = dict(record.get("judge", {}))
+        verification = record.get("verification", {})
+        quality = record.get("quality", {})
+        record["accepted"] = _judge_accepts(judge, verification, quality)
+        if not bool(record.get("accepted")):
+            judge["accept"] = False
+            judge["reject_reason"] = _compose_reject_reason(judge, verification, quality)
+            record["judge"] = judge
+        acceptance_issues = _pair_record_acceptance_issues(
+            root=layout["root"],
+            record=record,
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+        )
+        acceptance_issues.extend(_known_pair_generation_issues(record))
+        if acceptance_issues:
+            record = dict(record)
+            judge = dict(record.get("judge", {}))
+            judge["accept"] = False
+            judge["reject_reason"] = "; ".join(acceptance_issues)
+            record["judge"] = judge
+            record["accepted"] = False
+        if bool(record.get("fallback_used")):
+            fallback_count += 1
+        if bool(record.get("accepted")):
+            accepted_total_count += 1
+        else:
+            rejected_count += 1
+        output_records.append(record)
+
+    accepted_records = _select_final_accepted_records(output_records, max_accepted_pairs=max_accepted_pairs)
+    _write_jsonl(output, output_records)
+    _write_jsonl(accepted_output, accepted_records)
+    verification_counts = _pair_verification_counts(output_records)
+    return {
+        "known_pairs_path": str(known_pairs_path),
+        "clip_annotations_path": str(clip_annotations_path),
+        "output_path": str(output),
+        "accepted_output_path": str(accepted_output),
+        "pair_count": len(known_pairs),
+        "proposal_count": len(output_records),
+        "accepted_count": len(accepted_records),
+        "accepted_total_count": accepted_total_count,
+        "rejected_count": rejected_count,
+        "proposed_count": proposed_count,
+        "reused_count": reused_count,
+        "fallback_count": fallback_count,
+        "verification_counts": verification_counts,
+    }
+
+
 def validate_pilot_dataset(
     *,
     root: str | Path,
@@ -1258,6 +1712,8 @@ def validate_pilot_dataset(
     seen_pair_keys: set[tuple[str, str]] = set()
     difference_counter: Counter[str] = Counter()
     modality_counter: Counter[str] = Counter()
+    source_type_counter: Counter[str] = Counter()
+    source_type_difference_counter: Counter[str] = Counter()
     speech_count = 0
     high_quality_speech_count = 0
     transcript_backed_speech_count = 0
@@ -1300,10 +1756,14 @@ def validate_pilot_dataset(
         modalities = [str(item).strip() for item in record.get("modalities", []) if str(item).strip()]
         modality_counter.update(modalities)
 
+        source_type = str(record.get("source_type", "natural")).strip() or "natural"
+        source_type_counter[source_type] += 1
+
         difference = record.get("difference", {})
         difference_type = str(difference.get("type", "")).strip()
         if difference_type:
             difference_counter[difference_type] += 1
+            source_type_difference_counter[f"{source_type}:{difference_type}"] += 1
 
         quality = record.get("quality", {})
         if isinstance(quality, dict):
@@ -1373,6 +1833,8 @@ def validate_pilot_dataset(
         "gallery_count": len(gallery_records),
         "modality_counts": dict(sorted(modality_counter.items())),
         "difference_type_counts": dict(sorted(difference_counter.items())),
+        "source_type_counts": dict(sorted(source_type_counter.items())),
+        "source_type_difference_counts": dict(sorted(source_type_difference_counter.items())),
         "source_context_counts": dict(sorted(source_context_counter.items())),
         "quality_summary": _quality_summary(same_context_scores),
         "difference_strength_summary": _score_summary(difference_strength_scores, "difference_strength"),
@@ -1427,10 +1889,14 @@ def _score_summary(values: list[float], prefix: str) -> dict[str, float]:
 
 
 def _load_pair_verification_counts(pilot_jsonl_path: Path) -> dict[str, int]:
-    judged_path = pilot_jsonl_path.with_name("judged_pair_proposals.jsonl")
-    if not judged_path.exists():
-        return _empty_pair_verification_counts()
-    return _pair_verification_counts(list(_load_jsonl(judged_path)))
+    candidate_names = ["judged_pair_proposals.jsonl"]
+    if "synthetic" in pilot_jsonl_path.name:
+        candidate_names.insert(0, DEFAULT_SYNTHETIC_JUDGED_PAIRS_NAME)
+    for candidate_name in candidate_names:
+        judged_path = pilot_jsonl_path.with_name(candidate_name)
+        if judged_path.exists():
+            return _pair_verification_counts(list(_load_jsonl(judged_path)))
+    return _empty_pair_verification_counts()
 
 
 def _empty_pair_verification_counts() -> dict[str, int]:
@@ -1446,6 +1912,11 @@ def _empty_pair_verification_counts() -> dict[str, int]:
         "speech_rejected_as_too_generic_count": 0,
         "speech_rejected_for_missing_transcript_count": 0,
         "audio_event_rejected_as_speech_only_count": 0,
+        "good_edit_text_count": 0,
+        "bad_edit_text_rejected_count": 0,
+        "caption_like_edit_rejected_count": 0,
+        "modality_leakage_rejected_count": 0,
+        "near_duplicate_without_delta_rejected_count": 0,
         "accepted_after_verification_count": 0,
     }
 
@@ -1456,6 +1927,11 @@ def _pair_verification_counts(records: list[dict[str, Any]]) -> dict[str, int]:
         verification = record.get("verification")
         if not isinstance(verification, dict):
             continue
+        quality = record.get("quality", {})
+        if not isinstance(quality, dict):
+            quality = {}
+        if bool(record.get("accepted")) and not _structured_edit_text_failures(quality):
+            counts["good_edit_text_count"] += 1
         verification_passed = _verification_accepts(verification)
         if verification_passed:
             counts["verification_passed_count"] += 1
@@ -1469,9 +1945,6 @@ def _pair_verification_counts(records: list[dict[str, Any]]) -> dict[str, int]:
             counts["verification_passed_rejected_count"] += 1
         if not bool(record.get("accepted")):
             difference_type = str(record.get("difference", {}).get("type", "")).strip()
-            quality = record.get("quality", {})
-            if not isinstance(quality, dict):
-                quality = {}
             if difference_type == "speech" and (
                 _score_float(quality.get("speech_evidence_score")) < MIN_ACCEPT_SPEECH_EVIDENCE_SCORE
                 or _score_float(quality.get("speech_specificity_score")) < MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE
@@ -1484,6 +1957,15 @@ def _pair_verification_counts(records: list[dict[str, Any]]) -> dict[str, int]:
                 and _score_float(quality.get("non_speech_audio_event_score")) < MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE
             ):
                 counts["audio_event_rejected_as_speech_only_count"] += 1
+            edit_text_failures = _structured_edit_text_failures(quality)
+            if edit_text_failures:
+                counts["bad_edit_text_rejected_count"] += 1
+            if any("caption-like" in failure for failure in edit_text_failures):
+                counts["caption_like_edit_rejected_count"] += 1
+            if any("leaks another modality" in failure for failure in edit_text_failures):
+                counts["modality_leakage_rejected_count"] += 1
+            if _observable_difference_rejects(quality):
+                counts["near_duplicate_without_delta_rejected_count"] += 1
         caption_delta = verification.get("caption_delta", {})
         edit_projection = verification.get("edit_projection", {})
         edit_necessity = verification.get("edit_necessity", {})
@@ -1831,6 +2313,18 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
     if not summary["difference_type_counts"]:
         lines.append("- none")
 
+    lines.extend(["", "## Source Type Counts"])
+    for key, value in summary.get("source_type_counts", {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    if not summary.get("source_type_counts"):
+        lines.append("- none")
+
+    lines.extend(["", "## Source Type Difference Counts"])
+    for key, value in summary.get("source_type_difference_counts", {}).items():
+        lines.append(f"- `{key}`: `{value}`")
+    if not summary.get("source_type_difference_counts"):
+        lines.append("- none")
+
     lines.extend(["", "## Source Context Counts"])
     for key, value in summary["source_context_counts"].items():
         lines.append(f"- `{key}`: `{value}`")
@@ -1877,6 +2371,15 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
         lines.append(f"- `{key}`: `{'PASS' if value else 'FAIL'}`")
     verification_counts = summary.get("verification_counts", {})
     if verification_counts:
+        lines.extend(["", "## Edit Text / Difference Gate Counts"])
+        for key in (
+            "good_edit_text_count",
+            "bad_edit_text_rejected_count",
+            "caption_like_edit_rejected_count",
+            "modality_leakage_rejected_count",
+            "near_duplicate_without_delta_rejected_count",
+        ):
+            lines.append(f"- `{key}`: `{verification_counts.get(key, 0)}`")
         lines.extend(["", "## Verification Reject Counts"])
         for key in (
             "verification_passed_count",
@@ -1909,6 +2412,17 @@ def _validate_pilot_record(root: Path, record: dict[str, Any], line_number: int)
     edit_text = str(record.get("edit_text", "")).strip()
     reference_caption = str(record.get("reference_caption", "")).strip()
     target_caption = str(record.get("target_caption", "")).strip()
+    source_type = str(record.get("source_type", "natural")).strip() or "natural"
+    if source_type not in ALLOWED_SOURCE_TYPES:
+        errors.append(f"pilot line {line_number}: unsupported source_type={source_type!r}")
+    if source_type == "synthetic_edit":
+        generation = record.get("generation")
+        if not isinstance(generation, dict) or not generation:
+            errors.append(f"pilot line {line_number}: synthetic_edit sample requires generation metadata")
+        else:
+            for field_name in ("model", "prompt", "source_video"):
+                if not str(generation.get(field_name, "")).strip():
+                    errors.append(f"pilot line {line_number}: generation.{field_name} is required")
 
     for field_name, value in (
         ("reference_video", reference_video),
@@ -2112,6 +2626,453 @@ def _retarget_pair_candidate(candidate: dict[str, Any], difference_type: str) ->
         primary_difference=primary_difference,
     )
     return retargeted
+
+
+def _repair_pair_model_fields(
+    *,
+    model_fields: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> dict[str, Any]:
+    repaired = dict(model_fields)
+    if str(repaired.get("difference", {}).get("type", "")).strip() == "audio_event":
+        repaired = _normalize_audio_event_model_fields(repaired)
+    current_quality = _edit_text_quality_payload(
+        edit_text=str(repaired.get("edit_text", "")),
+        difference=repaired.get("difference", {}),
+        modalities=repaired.get("modalities", []),
+        reference_caption=str(repaired.get("reference_caption", "")),
+        target_caption=str(repaired.get("target_caption", "")),
+    )
+    if _edit_text_quality_passes(current_quality):
+        return repaired
+
+    template_edit = _build_fallback_edit_text(repaired.get("difference", {}))
+    template_quality = _edit_text_quality_payload(
+        edit_text=template_edit,
+        difference=repaired.get("difference", {}),
+        modalities=repaired.get("modalities", []),
+        reference_caption=str(reference_annotation.get("summary", "")),
+        target_caption=str(target_annotation.get("summary", "")),
+    )
+    if _edit_text_quality_passes(template_quality):
+        repaired["edit_text"] = template_edit
+        reason = str(repaired.get("proposal_reason", "")).strip()
+        repaired["proposal_reason"] = f"{reason} edit_text normalized from evidence template".strip()
+    return repaired
+
+
+def _edit_text_quality_payload(
+    *,
+    edit_text: str,
+    difference: dict[str, Any],
+    modalities: list[str] | tuple[str, ...] | Any,
+    reference_caption: str,
+    target_caption: str,
+) -> dict[str, Any]:
+    text = str(edit_text).strip()
+    tokens = _tokenize_text(text)
+    difference_type = str(difference.get("type", "")).strip()
+    modality_set = {str(item).strip() for item in modalities if str(item).strip()} if isinstance(modalities, (list, tuple, set)) else set()
+    bad_patterns: list[str] = []
+
+    if not text:
+        bad_patterns.append("edit_text is empty")
+    if any(phrase in _normalized_phrase(text) for phrase in GENERIC_EDIT_TEXT_PHRASES):
+        bad_patterns.append("edit_text is too broad")
+
+    first_token = _normalized_phrase(text).split()[0] if _normalized_phrase(text).split() else ""
+    is_imperative_edit = first_token in EDIT_TEXT_START_VERBS or first_token in EDIT_ACTION_VERBS
+    if not is_imperative_edit:
+        bad_patterns.append("edit_text is not an imperative edit")
+
+    matches_difference_type = _edit_text_matches_difference_type(
+        edit_text=text,
+        difference=difference,
+        modalities=modality_set,
+    )
+    if not matches_difference_type:
+        bad_patterns.append(f"edit_text does not match difference type {difference_type or 'unknown'}")
+
+    single_change = _edit_text_single_change(text, difference_type)
+    if not single_change:
+        bad_patterns.append("edit_text appears to contain multiple unrelated changes")
+
+    not_caption_like = _edit_text_not_caption_like(
+        edit_text=text,
+        reference_caption=reference_caption,
+        target_caption=target_caption,
+    )
+    if not not_caption_like:
+        bad_patterns.append("edit_text reads like a caption instead of an edit instruction")
+
+    no_modality_leakage = _edit_text_no_modality_leakage(text, modalities, difference_type)
+    if not no_modality_leakage:
+        bad_patterns.append("edit_text mentions a modality outside the declared difference")
+
+    malformed_presence = _edit_text_has_malformed_presence(text)
+    if malformed_presence:
+        bad_patterns.append("edit_text uses malformed object-presence wording")
+
+    score = 1.0
+    for failed, penalty in (
+        (not bool(text), 0.50),
+        (not is_imperative_edit, 0.30),
+        (not matches_difference_type, 0.35),
+        (not single_change, 0.25),
+        (not not_caption_like, 0.35),
+        (not no_modality_leakage, 0.35),
+        (malformed_presence, 0.35),
+        (any(phrase in _normalized_phrase(text) for phrase in GENERIC_EDIT_TEXT_PHRASES), 0.30),
+    ):
+        if failed:
+            score -= penalty
+    score = round(max(0.0, min(1.0, score)), 3)
+    return {
+        "score": score,
+        "is_imperative_edit": is_imperative_edit,
+        "matches_difference_type": matches_difference_type,
+        "single_change": single_change,
+        "not_caption_like": not_caption_like,
+        "no_modality_leakage": no_modality_leakage,
+        "bad_patterns": bad_patterns,
+    }
+
+
+def _edit_text_quality_passes(payload: dict[str, Any]) -> bool:
+    return bool(
+        _score_float(payload.get("score")) >= MIN_ACCEPT_EDIT_TEXT_QUALITY_SCORE
+        and bool(payload.get("is_imperative_edit"))
+        and bool(payload.get("matches_difference_type"))
+        and bool(payload.get("single_change"))
+        and bool(payload.get("not_caption_like"))
+        and bool(payload.get("no_modality_leakage"))
+        and not payload.get("bad_patterns")
+    )
+
+
+def _edit_text_matches_difference_type(
+    *,
+    edit_text: str,
+    difference: dict[str, Any],
+    modalities: set[str],
+) -> bool:
+    tokens = _tokenize_text(edit_text)
+    difference_type = str(difference.get("type", "")).strip()
+    from_tokens = _tokenize_text(str(difference.get("from", "")))
+    to_tokens = _tokenize_text(str(difference.get("to", "")))
+    delta_tokens = from_tokens | to_tokens
+    if not difference_type:
+        return bool(tokens & EDIT_ACTION_VERBS)
+    if difference_type in {"object_count", "object_presence"}:
+        leaked_modality_tokens = {"audio", "sound", "sounds", "speech", "transcript", "spoken", "voiceover", "narration"}
+        return bool(tokens & delta_tokens) and not bool(tokens & leaked_modality_tokens)
+    if difference_type == "action":
+        return bool({"action", "gesture", "doing"} & tokens or tokens & delta_tokens or tokens & EDIT_ACTION_VERBS)
+    if difference_type == "audio_event":
+        return bool("audio" in modalities and tokens & EDIT_TEXT_AUDIO_TOKENS) and not (
+            _is_speech_only_or_absence_audio_phrase(edit_text) or bool(tokens & EDIT_TEXT_VISUAL_LEAK_TOKENS)
+        )
+    if difference_type == "speech":
+        return bool("audio" in modalities and tokens & EDIT_TEXT_SPEECH_TOKENS)
+    if difference_type == "visible_text":
+        return bool(tokens & EDIT_TEXT_VISIBLE_TEXT_TOKENS)
+    if difference_type in {"attribute", "scene"}:
+        return bool(tokens & EDIT_ACTION_VERBS or tokens & delta_tokens)
+    return bool(tokens & EDIT_ACTION_VERBS)
+
+
+def _edit_text_single_change(edit_text: str, difference_type: str) -> bool:
+    normalized = _normalized_phrase(edit_text)
+    if not normalized:
+        return False
+    if len(normalized.split()) > 32:
+        return False
+    multi_markers = ("and also", "as well as", " plus ")
+    if any(marker in normalized for marker in multi_markers):
+        return False
+    tokens = _tokenize_text(edit_text)
+    modality_hits = 0
+    if tokens & EDIT_TEXT_AUDIO_TOKENS:
+        modality_hits += 1
+    if tokens & EDIT_TEXT_SPEECH_TOKENS:
+        modality_hits += 1
+    if tokens & EDIT_TEXT_VISIBLE_TEXT_TOKENS:
+        modality_hits += 1
+    return not (difference_type not in {"integrated", "speech"} and modality_hits > 1)
+
+
+def _edit_text_not_caption_like(*, edit_text: str, reference_caption: str, target_caption: str) -> bool:
+    text = edit_text.strip()
+    if not text:
+        return False
+    text_tokens = _tokenize_text(text)
+    if len(text_tokens) > EDIT_TEXT_CAPTION_MAX_TOKENS:
+        return False
+    normalized_text = _normalized_phrase(text)
+    if len(text_tokens) <= 8:
+        return True
+    for caption in (reference_caption, target_caption):
+        normalized_caption = _normalized_phrase(caption)
+        caption_tokens = _tokenize_text(caption)
+        if not caption_tokens:
+            continue
+        if normalized_text and normalized_text in normalized_caption:
+            return False
+        if _jaccard(text_tokens, caption_tokens) >= 0.72:
+            return False
+    return True
+
+
+def _edit_text_no_modality_leakage(
+    edit_text: str,
+    modalities: list[str] | tuple[str, ...] | Any,
+    difference_type: str,
+) -> bool:
+    modality_set = {str(item).strip() for item in modalities if str(item).strip()} if isinstance(modalities, (list, tuple, set)) else set()
+    tokens = _tokenize_text(edit_text)
+    if difference_type == "audio_event":
+        if "audio" not in modality_set:
+            return False
+        if tokens & EDIT_TEXT_VISUAL_LEAK_TOKENS:
+            return False
+        if _is_speech_only_or_absence_audio_phrase(edit_text):
+            return False
+        return True
+    if difference_type == "speech":
+        return "audio" in modality_set and not bool(tokens & (NON_SPEECH_AUDIO_TOKENS - {"voice"}))
+    if difference_type == "visible_text":
+        return not bool((tokens & EDIT_TEXT_AUDIO_TOKENS) or (tokens & GENERIC_SPEECH_TOKENS))
+    if difference_type in VISUAL_DIFFERENCE_TYPES and tokens & {"audio", "sound", "sounds", "speech", "transcript", "spoken"}:
+        return False
+    return True
+
+
+def _edit_text_has_malformed_presence(edit_text: str) -> bool:
+    normalized = _normalized_phrase(edit_text)
+    return bool(normalized.startswith("change no ") and " into " in normalized and re.search(r"\b\d+\b", normalized))
+
+
+def _observable_difference_gate(
+    *,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    difference: dict[str, Any],
+    visual_near_duplicate_score: Any,
+) -> dict[str, Any]:
+    difference_type = str(difference.get("type", "")).strip()
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    near_duplicate_score = _score_float(visual_near_duplicate_score)
+    if near_duplicate_score >= MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE:
+        near_duplicate_risk = "high"
+    elif near_duplicate_score >= 0.97:
+        near_duplicate_risk = "medium"
+    else:
+        near_duplicate_risk = "low"
+
+    if difference_type not in VISUAL_DIFFERENCE_TYPES:
+        return {
+            "passed": True,
+            "type": difference_type,
+            "reference_missing": [],
+            "target_present": [],
+            "reference_value": from_value,
+            "target_value": to_value,
+            "supporting_fields": ["non_visual_difference_type"],
+            "near_duplicate_risk": near_duplicate_risk,
+            "visual_near_duplicate_score": near_duplicate_score,
+            "failure_reason": "",
+        }
+
+    supporting_fields: list[str] = []
+    reference_missing: list[str] = []
+    target_present: list[str] = []
+    reference_counts = _normalize_object_counts(reference_annotation.get("object_counts", {}))
+    target_counts = _normalize_object_counts(target_annotation.get("object_counts", {}))
+    reference_actions = _normalize_list(reference_annotation.get("actions", []))
+    target_actions = _normalize_list(target_annotation.get("actions", []))
+    reference_text = _annotation_observable_text(reference_annotation)
+    target_text = _annotation_observable_text(target_annotation)
+
+    if difference_type in {"object_count", "object_presence"}:
+        label = _strip_presence_prefix(to_value) or _strip_presence_prefix(from_value)
+        if reference_counts != target_counts:
+            supporting_fields.append("object_counts")
+        if label and not _annotation_mentions_value(reference_annotation, label) and _annotation_mentions_value(target_annotation, label):
+            reference_missing.append(label)
+            target_present.append(label)
+            supporting_fields.append("summary")
+        if label and _object_count_for_label(reference_counts, label) != _object_count_for_label(target_counts, label):
+            supporting_fields.append("object_counts")
+    elif difference_type == "action":
+        if _first_unique(reference_actions, target_actions) or _first_unique(target_actions, reference_actions):
+            supporting_fields.append("actions")
+        if from_value and _text_mentions_phrase(reference_text, from_value):
+            supporting_fields.append("storyline")
+        if to_value and _text_mentions_phrase(target_text, to_value):
+            supporting_fields.append("events")
+    elif difference_type == "visible_text":
+        if _normalize_list(reference_annotation.get("visible_text", [])) != _normalize_list(target_annotation.get("visible_text", [])):
+            supporting_fields.append("visible_text")
+    elif difference_type == "attribute":
+        if _normalize_list(reference_annotation.get("attributes", [])) != _normalize_list(target_annotation.get("attributes", [])):
+            supporting_fields.append("attributes")
+        if to_value and _text_mentions_phrase(target_text, to_value):
+            supporting_fields.append("summary")
+    elif difference_type == "scene":
+        if str(reference_annotation.get("scene", "")).strip() != str(target_annotation.get("scene", "")).strip():
+            supporting_fields.append("scene")
+
+    supporting_fields = _dedupe_strings(supporting_fields)
+    hard_fields = {"object_counts", "actions", "events", "visible_text", "attributes", "scene"}
+    passed = bool(supporting_fields)
+    if near_duplicate_risk == "high" and not bool(set(supporting_fields) & hard_fields):
+        passed = False
+    failure_reason = "" if passed else "no observable annotation delta supports this visual edit"
+    return {
+        "passed": passed,
+        "type": difference_type,
+        "reference_missing": _dedupe_strings(reference_missing),
+        "target_present": _dedupe_strings(target_present),
+        "reference_value": from_value,
+        "target_value": to_value,
+        "supporting_fields": supporting_fields,
+        "near_duplicate_risk": near_duplicate_risk,
+        "visual_near_duplicate_score": near_duplicate_score,
+        "failure_reason": failure_reason,
+    }
+
+
+def _annotation_observable_text(annotation: dict[str, Any]) -> str:
+    texts: list[str] = []
+    for field in ("summary", "scene"):
+        value = str(annotation.get(field, "")).strip()
+        if value:
+            texts.append(value)
+    texts.extend(_normalize_list(annotation.get("storyline", [])))
+    texts.extend(_normalize_list(annotation.get("visible_text", [])))
+    for event in annotation.get("events", []):
+        if isinstance(event, dict):
+            texts.extend(_normalize_list([event.get("visual", "")]))
+            texts.extend(_normalize_list(event.get("actions", [])))
+            texts.extend(_normalize_list(event.get("objects", [])))
+        else:
+            texts.extend(_normalize_list([event]))
+    return " ".join(texts)
+
+
+def _annotation_mentions_value(annotation: dict[str, Any], value: str) -> bool:
+    if not value:
+        return False
+    texts = [
+        _annotation_observable_text(annotation),
+        " ".join(_normalize_object_counts(annotation.get("object_counts", {})).keys()),
+        " ".join(_normalize_list(annotation.get("subjects", []))),
+    ]
+    return any(_text_mentions_phrase(text, value) for text in texts)
+
+
+def _object_count_for_label(counts: dict[str, int], label: str) -> int:
+    label_tokens = _tokenize_text(label)
+    for key, count in counts.items():
+        key_tokens = _tokenize_text(key)
+        if label_tokens and key_tokens and (label_tokens <= key_tokens or key_tokens <= label_tokens):
+            return count
+    return 0
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        value = str(value).strip()
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def _apply_structured_gate_quality(
+    quality: dict[str, Any],
+    *,
+    edit_text_quality: dict[str, Any],
+    observable_difference: dict[str, Any],
+) -> None:
+    quality["edit_text_quality_score"] = _score_float(edit_text_quality.get("score"))
+    quality["edit_text_is_imperative"] = 1.0 if edit_text_quality.get("is_imperative_edit") else 0.0
+    quality["edit_text_matches_difference_type"] = 1.0 if edit_text_quality.get("matches_difference_type") else 0.0
+    quality["edit_text_single_change"] = 1.0 if edit_text_quality.get("single_change") else 0.0
+    quality["edit_text_not_caption_like"] = 1.0 if edit_text_quality.get("not_caption_like") else 0.0
+    quality["edit_text_no_modality_leakage"] = 1.0 if edit_text_quality.get("no_modality_leakage") else 0.0
+    quality["observable_difference_passed"] = 1.0 if observable_difference.get("passed") else 0.0
+    quality["near_duplicate_without_delta"] = 1.0 if observable_difference.get("near_duplicate_risk") == "high" and not observable_difference.get("passed") else 0.0
+
+
+def _ensure_structured_gate_fields(
+    record: dict[str, Any],
+    *,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> dict[str, Any]:
+    record = dict(record)
+    quality = dict(record.get("quality", {}))
+    edit_text_quality = dict(record.get("edit_text_quality") or {})
+    if not edit_text_quality:
+        edit_text_quality = _edit_text_quality_payload(
+            edit_text=str(record.get("edit_text", "")),
+            difference=record.get("difference", {}),
+            modalities=record.get("modalities", []),
+            reference_caption=str(record.get("reference_caption", "")),
+            target_caption=str(record.get("target_caption", "")),
+        )
+    observable_difference = dict(record.get("observable_difference") or {})
+    if not observable_difference:
+        observable_difference = _observable_difference_gate(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            difference=record.get("difference", {}),
+            visual_near_duplicate_score=quality.get("visual_near_duplicate_score"),
+        )
+    _apply_structured_gate_quality(
+        quality,
+        edit_text_quality=edit_text_quality,
+        observable_difference=observable_difference,
+    )
+    verification = dict(record.get("verification", {}))
+    if verification:
+        existing_check = dict(verification.get("edit_text_quality_check", {}))
+        local_check = {
+            "not_caption_like": bool(edit_text_quality.get("not_caption_like")),
+            "matches_modality": bool(edit_text_quality.get("no_modality_leakage")),
+            "single_primary_difference": bool(edit_text_quality.get("single_change")),
+            "reference_does_not_satisfy": not _boolish(record.get("judge", {}).get("reference_satisfies_edit")),
+            "target_satisfies": _boolish(record.get("judge", {}).get("target_satisfies_edit")),
+            "score": _score_float(edit_text_quality.get("score")),
+            "failure_reason": "; ".join(edit_text_quality.get("bad_patterns", [])),
+        }
+        merged_reason = "; ".join(
+            item
+            for item in (
+                str(existing_check.get("failure_reason", "")).strip(),
+                str(local_check.get("failure_reason", "")).strip(),
+            )
+            if item
+        )
+        verification["edit_text_quality_check"] = {
+            "not_caption_like": _boolish(existing_check.get("not_caption_like", True)) and local_check["not_caption_like"],
+            "matches_modality": _boolish(existing_check.get("matches_modality", True)) and local_check["matches_modality"],
+            "single_primary_difference": _boolish(existing_check.get("single_primary_difference", True)) and local_check["single_primary_difference"],
+            "reference_does_not_satisfy": _boolish(existing_check.get("reference_does_not_satisfy", True)) and local_check["reference_does_not_satisfy"],
+            "target_satisfies": _boolish(existing_check.get("target_satisfies", True)) and local_check["target_satisfies"],
+            "score": min(_score_float(existing_check.get("score", 1.0)), local_check["score"]),
+            "failure_reason": merged_reason,
+        }
+        verification["passed"] = _verification_accepts(verification)
+        verification["failures"] = _verification_failures(verification)
+        record["verification"] = verification
+    record["quality"] = quality
+    record["edit_text_quality"] = edit_text_quality
+    record["observable_difference"] = observable_difference
+    return record
 
 
 def _quality_for_model_fields(
@@ -3250,9 +4211,18 @@ def _build_fallback_edit_text(primary_difference: dict[str, Any]) -> str:
     from_value = str(primary_difference.get("from", "")).strip()
     to_value = str(primary_difference.get("to", "")).strip()
     if difference_type == "object_count":
-        return f"change {from_value} into {to_value}"
+        from_count, from_label = _count_and_label(from_value)
+        to_count, to_label = _count_and_label(to_value)
+        label = to_label or from_label or "object"
+        if from_count is not None and to_count is not None:
+            return f"change the number of {label} from {from_count} to {to_count}"
+        return f"change the number of {label} from {from_value} to {to_value}"
     if difference_type == "object_presence":
-        return f"change {from_value} into {to_value}"
+        if from_value.lower().startswith("no ") and to_value:
+            return f"add {_object_phrase_for_edit(to_value)}"
+        if to_value.lower().startswith("no ") and from_value:
+            return f"remove {_object_phrase_for_edit(from_value)}"
+        return f"replace {_object_phrase_for_edit(from_value)} with {_object_phrase_for_edit(to_value)}"
     if difference_type == "action":
         return f"change the action from {from_value} to {to_value}"
     if difference_type == "audio_event":
@@ -3260,16 +4230,48 @@ def _build_fallback_edit_text(primary_difference: dict[str, Any]) -> str:
             return f"add {to_value} to the audio"
         if _is_non_speech_absence_audio_phrase(to_value) and from_value:
             return f"remove {from_value} from the audio"
-        return f"change the audio from {from_value} to {to_value}"
+        return f"replace {from_value} with {to_value} in the audio"
     if difference_type == "attribute":
         return f"change the attribute from {from_value} to {to_value}"
     if difference_type == "scene":
         return f"change the scene from {from_value} to {to_value}"
     if difference_type == "speech":
-        return f"change the speech from {from_value} to {to_value}"
+        return f"change the speech from {_short_edit_phrase(from_value)} to {_short_edit_phrase(to_value)}"
     if difference_type == "visible_text":
-        return f"change the visible text from {from_value} to {to_value}"
+        return f"change on-screen text from {_short_edit_phrase(from_value)} to {_short_edit_phrase(to_value)}"
     return str(primary_difference.get("description", "")).strip() or f"change {from_value} to {to_value}"
+
+
+def _count_and_label(value: str) -> tuple[int | None, str]:
+    match = re.match(r"\s*(\d+)\s+(.+?)\s*$", value)
+    if not match:
+        return None, _strip_presence_prefix(value)
+    return int(match.group(1)), _strip_presence_prefix(match.group(2))
+
+
+def _strip_presence_prefix(value: str) -> str:
+    normalized = str(value).strip()
+    normalized = re.sub(r"^\s*no\s+", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"^\s*\d+\s+", "", normalized)
+    return normalized.strip()
+
+
+def _object_phrase_for_edit(value: str) -> str:
+    label = _strip_presence_prefix(value)
+    if not label:
+        return "the object"
+    first_token = label.split()[0].lower()
+    if first_token in {"a", "an", "the"}:
+        return label
+    article = "an" if first_token[:1] in {"a", "e", "i", "o", "u"} else "a"
+    return f"{article} {label}"
+
+
+def _short_edit_phrase(value: str, *, max_words: int = 12) -> str:
+    words = str(value).strip().split()
+    if len(words) <= max_words:
+        return str(value).strip()
+    return " ".join(words[:max_words])
 
 
 def _infer_pair_modalities(
@@ -3334,6 +4336,7 @@ def _finalize_pair_verification(verification: dict[str, Any]) -> dict[str, Any]:
     caption_delta = dict(verification.get("caption_delta", {}))
     edit_projection = dict(verification.get("edit_projection", {}))
     edit_necessity = dict(verification.get("edit_necessity", {}))
+    edit_text_quality_check = dict(verification.get("edit_text_quality_check", {}))
     normalized = {
         "caption_delta": {
             "caption_equivalent": _boolish(caption_delta.get("caption_equivalent")),
@@ -3355,6 +4358,15 @@ def _finalize_pair_verification(verification: dict[str, Any]) -> dict[str, Any]:
             "target_satisfies_edit": _boolish(edit_necessity.get("target_satisfies_edit")),
             "score": _score_float(edit_necessity.get("score")),
             "reason": str(edit_necessity.get("reason", "")).strip(),
+        },
+        "edit_text_quality_check": {
+            "not_caption_like": _boolish(edit_text_quality_check.get("not_caption_like", True)),
+            "matches_modality": _boolish(edit_text_quality_check.get("matches_modality", True)),
+            "single_primary_difference": _boolish(edit_text_quality_check.get("single_primary_difference", True)),
+            "reference_does_not_satisfy": _boolish(edit_text_quality_check.get("reference_does_not_satisfy", True)),
+            "target_satisfies": _boolish(edit_text_quality_check.get("target_satisfies", True)),
+            "score": _score_float(edit_text_quality_check.get("score", 1.0)),
+            "failure_reason": str(edit_text_quality_check.get("failure_reason", "")).strip(),
         },
     }
     normalized["passed"] = _verification_accepts(normalized)
@@ -3424,6 +4436,18 @@ def _effective_pair_quality(
         )
     if "has_audio_modality" in heuristic_quality:
         result["has_audio_modality"] = _score_float(heuristic_quality.get("has_audio_modality"))
+    for key in (
+        "edit_text_quality_score",
+        "edit_text_is_imperative",
+        "edit_text_matches_difference_type",
+        "edit_text_single_change",
+        "edit_text_not_caption_like",
+        "edit_text_no_modality_leakage",
+        "observable_difference_passed",
+        "near_duplicate_without_delta",
+    ):
+        if key in heuristic_quality:
+            result[key] = _score_float(heuristic_quality.get(key))
     return result
 
 
@@ -3525,6 +4549,9 @@ def _compose_reject_reason(
             )
     if _score_float(quality.get("intraclip_change_conflict")) >= 1.0:
         failures.append("the proposed edit appears to describe an intra-clip transition instead of a cross-clip difference")
+    failures.extend(_structured_edit_text_failures(quality))
+    if _observable_difference_rejects(quality):
+        failures.append("observable_difference gate found no concrete visual delta evidence")
     if verification is not None:
         failures.extend(_verification_failures(verification))
     if not judge.get("accept"):
@@ -3584,6 +4611,8 @@ def _judge_accepts(
             or _score_float(quality.get("non_speech_audio_event_score")) >= MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE
         )
         and _score_float(quality.get("intraclip_change_conflict")) < 1.0
+        and not _structured_edit_text_failures(quality)
+        and not _observable_difference_rejects(quality)
     )
     if verification is None:
         return bool(judge.get("accept")) and judge_accepted
@@ -3601,6 +4630,7 @@ def _verification_accepts(verification: dict[str, Any]) -> bool:
     caption_delta = verification.get("caption_delta", {})
     edit_projection = verification.get("edit_projection", {})
     edit_necessity = verification.get("edit_necessity", {})
+    edit_text_quality_check = verification.get("edit_text_quality_check", {})
     return bool(
         not _boolish(caption_delta.get("caption_equivalent"))
         and _boolish(caption_delta.get("has_concrete_difference"))
@@ -3611,6 +4641,7 @@ def _verification_accepts(verification: dict[str, Any]) -> bool:
         and not _boolish(edit_necessity.get("reference_satisfies_edit"))
         and _boolish(edit_necessity.get("target_satisfies_edit"))
         and _score_float(edit_necessity.get("score")) >= MIN_ACCEPT_EDIT_NECESSITY_SCORE
+        and _verification_edit_text_quality_accepts(edit_text_quality_check)
     )
 
 
@@ -3619,6 +4650,7 @@ def _verification_failures(verification: dict[str, Any]) -> list[str]:
     caption_delta = verification.get("caption_delta", {})
     edit_projection = verification.get("edit_projection", {})
     edit_necessity = verification.get("edit_necessity", {})
+    edit_text_quality_check = verification.get("edit_text_quality_check", {})
     if _boolish(caption_delta.get("caption_equivalent")):
         failures.append("caption_delta says reference and target are equivalent")
     if not _boolish(caption_delta.get("has_concrete_difference")):
@@ -3643,7 +4675,55 @@ def _verification_failures(verification: dict[str, Any]) -> list[str]:
         failures.append(
             f"edit_necessity score {necessity_score:.3f} is below {MIN_ACCEPT_EDIT_NECESSITY_SCORE:.2f}"
         )
+    if not _verification_edit_text_quality_accepts(edit_text_quality_check):
+        reason = str(edit_text_quality_check.get("failure_reason", "")).strip() if isinstance(edit_text_quality_check, dict) else ""
+        failures.append(f"edit_text_quality_check failed{': ' + reason if reason else ''}")
     return failures
+
+
+def _structured_edit_text_failures(quality: dict[str, Any]) -> list[str]:
+    if "edit_text_quality_score" not in quality:
+        return []
+    failures: list[str] = []
+    edit_text_quality_score = _score_float(quality.get("edit_text_quality_score"))
+    if edit_text_quality_score < MIN_ACCEPT_EDIT_TEXT_QUALITY_SCORE:
+        failures.append(
+            f"edit_text_quality_score {edit_text_quality_score:.3f} is below {MIN_ACCEPT_EDIT_TEXT_QUALITY_SCORE:.2f}"
+        )
+    for key, label in (
+        ("edit_text_is_imperative", "edit_text is not an imperative edit"),
+        ("edit_text_matches_difference_type", "edit_text does not match the difference type"),
+        ("edit_text_single_change", "edit_text does not describe a single primary change"),
+        ("edit_text_not_caption_like", "edit_text is caption-like"),
+        ("edit_text_no_modality_leakage", "edit_text leaks another modality"),
+    ):
+        if key in quality and _score_float(quality.get(key)) < 1.0:
+            failures.append(label)
+    return failures
+
+
+def _observable_difference_rejects(quality: dict[str, Any]) -> bool:
+    difference_type = str(quality.get("difference_type", "")).strip()
+    if difference_type not in VISUAL_DIFFERENCE_TYPES:
+        return False
+    if "observable_difference_passed" in quality and _score_float(quality.get("observable_difference_passed")) < 1.0:
+        return True
+    if "near_duplicate_without_delta" in quality and _score_float(quality.get("near_duplicate_without_delta")) >= 1.0:
+        return True
+    return False
+
+
+def _verification_edit_text_quality_accepts(check: Any) -> bool:
+    if not isinstance(check, dict) or not check:
+        return True
+    return bool(
+        _boolish(check.get("not_caption_like"))
+        and _boolish(check.get("matches_modality"))
+        and _boolish(check.get("single_primary_difference"))
+        and _boolish(check.get("reference_does_not_satisfy"))
+        and _boolish(check.get("target_satisfies"))
+        and _score_float(check.get("score")) >= MIN_ACCEPT_EDIT_TEXT_QUALITY_SCORE
+    )
 
 
 def _score_float(value: Any) -> float:
@@ -3789,6 +4869,11 @@ def _pair_record_acceptance_issues(
         to_value = str(difference.get("to", "")).strip()
         if _is_speech_only_audio_phrase(from_value) or _is_speech_only_audio_phrase(to_value):
             issues.append("audio_event must not use speech-only or narration-only text as the main difference")
+    quality = record.get("quality", {})
+    if isinstance(quality, dict):
+        issues.extend(_structured_edit_text_failures(quality))
+        if _observable_difference_rejects(quality):
+            issues.append("observable_difference gate found no concrete visual delta evidence")
     return issues
 
 
@@ -3863,13 +4948,16 @@ def _select_final_accepted_records(
 
 
 def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str, Any]:
+    source_type = str(record.get("source_type", "natural")).strip() or "natural"
+    sample_prefix = "covr_omni_synth" if source_type == "synthetic_edit" else "covr_omni_pilot"
     return {
-        "sample_id": f"covr_omni_pilot_{index:04d}",
+        "sample_id": f"{sample_prefix}_{index:04d}",
         "proposal_id": record["proposal_id"],
         "reference_clip_id": record.get("reference_clip_id", ""),
         "target_clip_id": record.get("target_clip_id", ""),
         "reference_video": record["reference_video"],
         "target_video": record["target_video"],
+        "source_type": source_type,
         "edit_text": record["edit_text"],
         "modalities": list(record["modalities"]),
         "reference_caption": record["reference_caption"],
@@ -3878,10 +4966,13 @@ def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str
         "hard_negatives": list(record["hard_negatives"]),
         "quality": dict(record["quality"]),
         "source": dict(record["source"]),
+        "generation": dict(record.get("generation", {})),
         "source_context": dict(record.get("source_context", {})),
         "evidence": dict(record.get("evidence", {})),
         "judge": dict(record.get("judge", {})),
         "verification": dict(record.get("verification", {})),
+        "edit_text_quality": dict(record.get("edit_text_quality", {})),
+        "observable_difference": dict(record.get("observable_difference", {})),
         "speech_quality": dict(record.get("speech_quality", {})),
         "audio_event_quality": dict(record.get("audio_event_quality", {})),
         "transcript_backed": record.get("transcript_backed"),
@@ -3932,6 +5023,244 @@ def _load_records_by_key(path: Path, key_name: str) -> dict[str, dict[str, Any]]
         if key:
             mapping[key] = item
     return mapping
+
+
+def _annotation_lookup(*, root: Path, annotations: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    mapping: dict[str, dict[str, Any]] = {}
+    for annotation in annotations:
+        clip_id = str(annotation.get("clip_id", "")).strip()
+        if clip_id:
+            mapping[clip_id] = annotation
+        output_path = str(annotation.get("output_path", "")).strip()
+        if output_path:
+            resolved = _resolve_under_root(root, output_path)
+            for key in _path_lookup_keys(root, resolved, output_path):
+                mapping.setdefault(key, annotation)
+    return mapping
+
+
+def _path_lookup_keys(root: Path, resolved_path: Path, raw_path: str | Path) -> list[str]:
+    keys: list[str] = []
+
+    def add(value: str) -> None:
+        normalized = value.replace("\\", "/").strip()
+        if normalized and normalized not in keys:
+            keys.append(normalized)
+
+    add(str(raw_path))
+    add(str(resolved_path))
+    try:
+        add(str(resolved_path.resolve()))
+    except OSError:
+        pass
+    try:
+        add(resolved_path.resolve().relative_to(root.resolve()).as_posix())
+    except (OSError, ValueError):
+        pass
+    return keys
+
+
+def _annotation_for_known_pair(
+    *,
+    root: Path,
+    lookup: dict[str, dict[str, Any]],
+    pair: dict[str, Any],
+    clip_id_field: str,
+    video_field: str,
+    line_number: int,
+) -> dict[str, Any]:
+    clip_id = str(pair.get(clip_id_field, "")).strip()
+    if clip_id and clip_id in lookup:
+        return lookup[clip_id]
+
+    video_path = str(pair.get(video_field, "")).strip()
+    if video_path:
+        resolved = _resolve_under_root(root, video_path)
+        for key in _path_lookup_keys(root, resolved, video_path):
+            if key in lookup:
+                return lookup[key]
+    raise ValueError(f"known pair line {line_number}: cannot resolve {clip_id_field} or {video_field}")
+
+
+def _known_pair_video_path(
+    root: Path,
+    pair: dict[str, Any],
+    annotation: dict[str, Any],
+    field_name: str,
+) -> str:
+    raw_value = str(pair.get(field_name, "")).strip()
+    if raw_value:
+        return _display_path(root, _resolve_under_root(root, raw_value))
+    return _display_path(root, _resolve_under_root(root, str(annotation.get("output_path", ""))))
+
+
+def _known_pair_model_fields(
+    *,
+    pair: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> dict[str, Any]:
+    difference = dict(pair.get("difference") or {})
+    if not difference:
+        difference = _detect_primary_difference(reference_annotation, target_annotation) or {}
+        difference.pop("changed_types", None)
+    if not difference:
+        difference = {
+            "type": "attribute",
+            "from": "",
+            "to": "",
+            "description": str(pair.get("edit_text", "")).strip(),
+        }
+    difference_type = str(difference.get("type", "")).strip()
+    edit_text = str(pair.get("edit_text", "")).strip() or _build_fallback_edit_text(difference)
+    modalities = pair.get("modalities")
+    if not isinstance(modalities, list) or not modalities:
+        modalities = _infer_pair_modalities(reference_annotation, target_annotation, difference_type)
+    return {
+        "edit_text": edit_text,
+        "modalities": [str(item).strip() for item in modalities if str(item).strip()],
+        "reference_caption": str(pair.get("reference_caption") or reference_annotation.get("summary", "")).strip(),
+        "target_caption": str(pair.get("target_caption") or target_annotation.get("summary", "")).strip(),
+        "difference": difference,
+        "proposal_reason": str(pair.get("proposal_reason", "known pair validation")).strip(),
+    }
+
+
+def _known_pair_source_context(pair: dict[str, Any]) -> dict[str, Any]:
+    source_context = pair.get("source_context")
+    if isinstance(source_context, dict) and source_context:
+        normalized = dict(source_context)
+        normalized.setdefault("relation", "known_pair")
+        normalized.setdefault("score", 0.9)
+        return normalized
+    return {"relation": "synthetic_edit", "score": 0.9}
+
+
+def _known_pair_hard_negative_annotations(
+    *,
+    root: Path,
+    lookup: dict[str, dict[str, Any]],
+    annotations: list[dict[str, Any]],
+    pair: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    difference: dict[str, Any],
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for raw_value in pair.get("hard_negatives", []) if isinstance(pair.get("hard_negatives"), list) else []:
+        raw_path = str(raw_value).strip()
+        if not raw_path:
+            continue
+        resolved = _resolve_under_root(root, raw_path)
+        for key in _path_lookup_keys(root, resolved, raw_path):
+            if key in lookup and lookup[key].get("clip_id") not in {
+                reference_annotation.get("clip_id"),
+                target_annotation.get("clip_id"),
+            }:
+                selected.append(lookup[key])
+                break
+    if selected:
+        unique: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for annotation in selected:
+            clip_id = str(annotation.get("clip_id", "")).strip()
+            if clip_id and clip_id not in seen_ids:
+                unique.append(annotation)
+                seen_ids.add(clip_id)
+        return unique[:3]
+    return _select_hard_negative_annotations(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        annotations=annotations,
+        primary_difference=difference,
+    )
+
+
+def _known_pair_hard_negative_paths(
+    *,
+    root: Path,
+    pair: dict[str, Any],
+    hard_negative_annotations: list[dict[str, Any]],
+) -> list[str]:
+    raw_values = pair.get("hard_negatives", [])
+    if isinstance(raw_values, list) and raw_values:
+        return [_display_path(root, _resolve_under_root(root, str(item).strip())) for item in raw_values if str(item).strip()]
+    return [
+        _display_path(root, _resolve_under_root(root, str(annotation.get("output_path", ""))))
+        for annotation in hard_negative_annotations
+        if str(annotation.get("output_path", "")).strip()
+    ][:3]
+
+
+def _known_pair_base_quality(
+    *,
+    root: Path,
+    pair: dict[str, Any],
+    annotations: list[dict[str, Any]],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    difference: dict[str, Any],
+    source_context: dict[str, Any],
+) -> dict[str, Any]:
+    provided = pair.get("quality") if isinstance(pair.get("quality"), dict) else {}
+    semantic_context_score = _same_context_score(reference_annotation, target_annotation)
+    same_context_score = _pair_context_score(
+        semantic_context_score=semantic_context_score,
+        source_context=source_context,
+    )
+    detected_difference = _detect_primary_difference(reference_annotation, target_annotation)
+    changed_types = list(detected_difference.get("changed_types", [])) if detected_difference else [str(difference.get("type", "")).strip()]
+    quality: dict[str, Any] = {
+        "same_context_score": _score_float(provided.get("same_context_score", same_context_score)),
+        "edit_match_score": _score_float(provided.get("edit_match_score", 0.75)),
+        "target_uniqueness_score": _score_float(
+            provided.get(
+                "target_uniqueness_score",
+                _target_uniqueness_score(
+                    reference_annotation=reference_annotation,
+                    target_annotation=target_annotation,
+                    annotations=annotations,
+                    primary_difference=difference,
+                ),
+            )
+        ),
+        "difference_strength_score": _score_float(
+            provided.get(
+                "difference_strength_score",
+                _difference_strength_score(
+                    reference_annotation=reference_annotation,
+                    target_annotation=target_annotation,
+                    primary_difference=difference,
+                    changed_types=changed_types,
+                ),
+            )
+        ),
+    }
+    visual_score = provided.get("visual_near_duplicate_score")
+    if visual_score is None:
+        visual_score = _visual_near_duplicate_score(
+            _resolve_under_root(root, str(reference_annotation.get("output_path", ""))),
+            _resolve_under_root(root, str(target_annotation.get("output_path", ""))),
+        )
+    if visual_score is not None:
+        quality["visual_near_duplicate_score"] = _score_float(visual_score)
+    return quality
+
+
+def _known_pair_generation_issues(record: dict[str, Any]) -> list[str]:
+    source_type = str(record.get("source_type", "")).strip() or "natural"
+    if source_type not in ALLOWED_SOURCE_TYPES:
+        return [f"unsupported source_type: {source_type}"]
+    if source_type != "synthetic_edit":
+        return []
+    generation = record.get("generation")
+    if not isinstance(generation, dict) or not generation:
+        return ["synthetic_edit pair is missing generation metadata"]
+    issues: list[str] = []
+    for field_name in ("model", "prompt", "source_video"):
+        if not str(generation.get(field_name, "")).strip():
+            issues.append(f"generation.{field_name} is required for synthetic_edit pairs")
+    return issues
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -4142,6 +5471,20 @@ def build_parser() -> argparse.ArgumentParser:
     propose_group_pairs_parser.add_argument("--max-accepted-pairs", type=int, default=10)
     propose_group_pairs_parser.add_argument("--overwrite", action="store_true")
 
+    validate_known_pairs_parser = subparsers.add_parser("validate-known-pairs")
+    validate_known_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    validate_known_pairs_parser.add_argument("--known-pairs-path", required=True)
+    validate_known_pairs_parser.add_argument("--clip-annotations-path", required=True)
+    validate_known_pairs_parser.add_argument("--output-path")
+    validate_known_pairs_parser.add_argument("--accepted-output-path")
+    validate_known_pairs_parser.add_argument("--raw-index-path")
+    validate_known_pairs_parser.add_argument("--base-url", required=True)
+    validate_known_pairs_parser.add_argument("--api-key", required=True)
+    validate_known_pairs_parser.add_argument("--model", required=True)
+    validate_known_pairs_parser.add_argument("--timeout-seconds", type=float, default=180.0)
+    validate_known_pairs_parser.add_argument("--max-accepted-pairs", type=int, default=10)
+    validate_known_pairs_parser.add_argument("--overwrite", action="store_true")
+
     validate_pilot_parser = subparsers.add_parser("validate-pilot")
     validate_pilot_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
     validate_pilot_parser.add_argument("--pilot-jsonl-path", required=True)
@@ -4240,6 +5583,24 @@ def main() -> None:
             root=args.root,
             clip_annotations_path=args.clip_annotations_path,
             clip_groups_path=args.clip_groups_path,
+            output_path=args.output_path,
+            accepted_output_path=args.accepted_output_path,
+            raw_index_path=args.raw_index_path,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            timeout_seconds=args.timeout_seconds,
+            max_accepted_pairs=args.max_accepted_pairs,
+            overwrite=args.overwrite,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "validate-known-pairs":
+        result = validate_known_pairs(
+            root=args.root,
+            known_pairs_path=args.known_pairs_path,
+            clip_annotations_path=args.clip_annotations_path,
             output_path=args.output_path,
             accepted_output_path=args.accepted_output_path,
             raw_index_path=args.raw_index_path,

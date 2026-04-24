@@ -15,15 +15,18 @@ from app.composed_data import (
     _difference_strength_score,
     _difference_priority_order,
     _effective_pair_quality,
+    _edit_text_quality_payload,
     _build_pair_candidates,
     _build_proposal_id,
     _finalize_pair_verification,
     _has_intraclip_difference_conflict,
     _judge_accepts,
     _non_speech_audio_event_score,
+    _observable_difference_gate,
     _pair_record_acceptance_issues,
     _pair_context_score,
     _pair_verification_counts,
+    _repair_pair_model_fields,
     _select_final_accepted_records,
     _build_fallback_edit_text,
     _speech_evidence_score,
@@ -41,6 +44,7 @@ from app.composed_data import (
     plan_detective_event_clips,
     propose_group_pairs,
     propose_pairs,
+    validate_known_pairs,
     validate_pilot_dataset,
 )
 from app.composed_omni import ALLOWED_DIFFERENCE_TYPES
@@ -1800,6 +1804,156 @@ class ComposedDataTests(unittest.TestCase):
         self.assertEqual("clip_ref", sample["reference_clip_id"])
         self.assertEqual("clip_target", sample["target_clip_id"])
 
+    def test_accepted_sample_carries_edit_text_and_observable_gate_fields(self) -> None:
+        sample = _accepted_sample_from_record(
+            {
+                "proposal_id": "proposal__quality",
+                "reference_video": "clips/ref.mp4",
+                "target_video": "clips/target.mp4",
+                "edit_text": "add a dollhouse",
+                "modalities": ["visual"],
+                "reference_caption": "a playroom",
+                "target_caption": "a playroom with a dollhouse",
+                "difference": {"type": "object_presence", "from": "no dollhouse", "to": "1 dollhouse"},
+                "hard_negatives": ["clips/neg.mp4"],
+                "quality": {"difference_type": "object_presence", "edit_text_quality_score": 1.0},
+                "source": {"platform": "unknown", "url": "file:///tmp/target.mp4", "license_note": "internal"},
+                "source_context": {"relation": "same_source_video"},
+                "evidence": {},
+                "judge": {},
+                "verification": {},
+                "edit_text_quality": {"score": 1.0, "bad_patterns": []},
+                "observable_difference": {"passed": True, "supporting_fields": ["object_counts"]},
+                "speech_quality": {},
+                "audio_event_quality": {},
+                "transcript_backed": None,
+                "group_id": "group_a",
+                "group_reason": "same_source_video",
+            },
+            1,
+        )
+
+        self.assertEqual(1.0, sample["edit_text_quality"]["score"])
+        self.assertTrue(sample["observable_difference"]["passed"])
+
+    def test_edit_text_quality_rejects_audio_event_visual_caption_leakage(self) -> None:
+        quality = _edit_text_quality_payload(
+            edit_text="add a woman with blonde hair and a nose ring speaking to the audio",
+            difference={"type": "audio_event", "from": "no distinctive audio event", "to": "whoosh"},
+            modalities=["audio"],
+            reference_caption="A quiet room.",
+            target_caption="A woman with blonde hair speaks in a room.",
+        )
+
+        self.assertFalse(quality["no_modality_leakage"])
+        self.assertFalse(quality["matches_difference_type"])
+        self.assertLess(quality["score"], 0.75)
+
+    def test_repair_pair_model_fields_rewrites_malformed_object_presence_edit(self) -> None:
+        repaired = _repair_pair_model_fields(
+            model_fields={
+                "edit_text": "change no man into 1 man",
+                "modalities": ["visual"],
+                "reference_caption": "an empty room",
+                "target_caption": "a man appears in the room",
+                "difference": {"type": "object_presence", "from": "no man", "to": "1 man"},
+            },
+            reference_annotation={"summary": "an empty room"},
+            target_annotation={"summary": "a man appears in the room"},
+        )
+
+        self.assertEqual("add a man", repaired["edit_text"])
+
+    def test_edit_text_quality_rejects_caption_like_target_copy(self) -> None:
+        caption = "A man in a white shirt stands at a desk in a bright room and speaks to the camera."
+        quality = _edit_text_quality_payload(
+            edit_text=caption,
+            difference={"type": "object_presence", "from": "no man", "to": "1 man"},
+            modalities=["visual"],
+            reference_caption="A bright room with a desk.",
+            target_caption=caption,
+        )
+
+        self.assertFalse(quality["not_caption_like"])
+        self.assertLess(quality["score"], 0.75)
+
+    def test_observable_difference_gate_rejects_caption_only_visual_delta(self) -> None:
+        gate = _observable_difference_gate(
+            reference_annotation={
+                "summary": "A toy robot rotates on a platform.",
+                "object_counts": {"robot": 1, "platform": 1},
+                "actions": ["rotating"],
+                "visible_text": [],
+            },
+            target_annotation={
+                "summary": "A black and gold robot figure rotates on a platform.",
+                "object_counts": {"robot": 1, "platform": 1},
+                "actions": ["rotating"],
+                "visible_text": [],
+            },
+            difference={"type": "attribute", "from": "black and grey", "to": "black and gold"},
+            visual_near_duplicate_score=0.996,
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertEqual("high", gate["near_duplicate_risk"])
+
+    def test_verification_edit_text_quality_check_blocks_override(self) -> None:
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.9,
+            "edit_match_score": 0.9,
+            "target_uniqueness_score": 0.9,
+            "audio_required": False,
+            "hard_negative_quality": "good",
+            "accept": True,
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {"target_matches_projection": True, "score": 0.9},
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.9,
+            },
+            "edit_text_quality_check": {
+                "not_caption_like": False,
+                "matches_modality": True,
+                "single_primary_difference": True,
+                "reference_does_not_satisfy": True,
+                "target_satisfies": True,
+                "score": 0.4,
+                "failure_reason": "caption-like edit",
+            },
+        }
+        quality = {
+            "same_context_score": 0.9,
+            "edit_match_score": 0.9,
+            "target_uniqueness_score": 0.9,
+            "difference_strength_score": 0.8,
+            "difference_type": "speech",
+            "has_audio_modality": 1.0,
+            "speech_transcript_backed": 1.0,
+            "speech_evidence_score": 0.9,
+            "speech_specificity_score": 0.9,
+            "edit_text_quality_score": 1.0,
+            "edit_text_is_imperative": 1.0,
+            "edit_text_matches_difference_type": 1.0,
+            "edit_text_single_change": 1.0,
+            "edit_text_not_caption_like": 1.0,
+            "edit_text_no_modality_leakage": 1.0,
+        }
+
+        self.assertFalse(_judge_accepts(judge, verification, quality))
+        self.assertIn("edit_text_quality_check", _compose_reject_reason(judge, verification, quality))
+
     def test_pair_record_acceptance_issues_rejects_missing_target_and_intraclip_audio_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2530,6 +2684,257 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(all(record["reference_video"] not in record["hard_negatives"] for record in records))
             self.assertTrue(all(record["target_video"] not in record["hard_negatives"] for record in records))
 
+    def test_validate_known_pairs_writes_synthetic_generation_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            annotations_path = root / "captions" / "known_annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref",
+                        "output_path": "clips/ref.mp4",
+                        "summary": "a chair without a backpack",
+                        "subjects": ["chair"],
+                        "object_counts": {"chair": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                    {
+                        "clip_id": "target",
+                        "output_path": "clips/target.mp4",
+                        "summary": "a chair with a red backpack",
+                        "subjects": ["chair", "red backpack"],
+                        "object_counts": {"chair": 1, "red backpack": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": ["red"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                    {
+                        "clip_id": "neg1",
+                        "output_path": "clips/neg1.mp4",
+                        "summary": "a chair with a blue backpack",
+                        "subjects": ["chair", "blue backpack"],
+                        "object_counts": {"chair": 1, "blue backpack": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": ["blue"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                    {
+                        "clip_id": "neg2",
+                        "output_path": "clips/neg2.mp4",
+                        "summary": "a chair with a laptop",
+                        "subjects": ["chair", "laptop"],
+                        "object_counts": {"chair": 1, "laptop": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                ],
+            )
+            known_pairs_path = root / "pairs" / "synthetic_candidate_pairs.jsonl"
+            self._write_jsonl(
+                known_pairs_path,
+                [
+                    {
+                        "source_type": "synthetic_edit",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": "clips/target.mp4",
+                        "edit_text": "add a red backpack on the chair",
+                        "modalities": ["visual"],
+                        "difference": {
+                            "type": "object_presence",
+                            "from": "no red backpack",
+                            "to": "red backpack",
+                            "description": "a red backpack is added to the chair",
+                        },
+                        "hard_negatives": ["clips/neg1.mp4", "clips/neg2.mp4"],
+                        "generation": {
+                            "model": "Wan2.1-VACE-1.3B",
+                            "source_video": "clips/ref.mp4",
+                            "prompt": "Only add a red backpack on the chair.",
+                            "seed": 1234,
+                        },
+                    }
+                ],
+            )
+            verification = {
+                "caption_delta": {
+                    "caption_equivalent": False,
+                    "has_concrete_difference": True,
+                    "difference_matches_edit": True,
+                },
+                "edit_projection": {
+                    "target_matches_projection": True,
+                    "score": 0.95,
+                },
+                "edit_necessity": {
+                    "edit_needed": True,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.92,
+                },
+            }
+            judge = {
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "single_main_difference": True,
+                "same_context_score": 0.9,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "audio_required": False,
+                "hard_negative_quality": "good",
+                "accept": True,
+                "reject_reason": "",
+            }
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client = client_cls.return_value
+                client.judge_pair.return_value = (judge, {"provider": "mock"})
+                client.verify_pair_difference.return_value = (verification, {"provider": "mock"})
+                summary = validate_known_pairs(
+                    root=root,
+                    known_pairs_path=known_pairs_path,
+                    clip_annotations_path=annotations_path,
+                    output_path=root / "pairs" / "judged_synthetic_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_synthetic_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="instruct-model",
+                    overwrite=True,
+                )
+
+            self.assertEqual(1, summary["accepted_count"])
+            accepted_records = [
+                json.loads(line)
+                for line in (root / "pairs" / "accepted_synthetic_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual("covr_omni_synth_0001", accepted_records[0]["sample_id"])
+            self.assertEqual("synthetic_edit", accepted_records[0]["source_type"])
+            self.assertEqual("Wan2.1-VACE-1.3B", accepted_records[0]["generation"]["model"])
+
+    def test_validate_known_pairs_rejects_missing_generation_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+            annotations_path = root / "captions" / "known_annotations.jsonl"
+            base_annotation = {
+                "summary": "a simple room",
+                "subjects": ["chair"],
+                "object_counts": {"chair": 1},
+                "actions": [],
+                "scene": "room",
+                "attributes": [],
+                "visible_text": [],
+                "speech": [],
+                "audio_events": [],
+                "modalities": ["visual"],
+            }
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {"clip_id": "ref", "output_path": "clips/ref.mp4", **base_annotation},
+                    {"clip_id": "target", "output_path": "clips/target.mp4", **base_annotation},
+                    {"clip_id": "neg1", "output_path": "clips/neg1.mp4", **base_annotation},
+                    {"clip_id": "neg2", "output_path": "clips/neg2.mp4", **base_annotation},
+                ],
+            )
+            known_pairs_path = root / "pairs" / "synthetic_candidate_pairs.jsonl"
+            self._write_jsonl(
+                known_pairs_path,
+                [
+                    {
+                        "source_type": "synthetic_edit",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": "clips/target.mp4",
+                        "edit_text": "add a red backpack on the chair",
+                        "modalities": ["visual"],
+                        "difference": {
+                            "type": "object_presence",
+                            "from": "no red backpack",
+                            "to": "red backpack",
+                        },
+                        "hard_negatives": ["clips/neg1.mp4", "clips/neg2.mp4"],
+                    }
+                ],
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client = client_cls.return_value
+                client.judge_pair.return_value = (
+                    {
+                        "reference_satisfies_edit": False,
+                        "target_satisfies_edit": True,
+                        "single_main_difference": True,
+                        "same_context_score": 0.9,
+                        "edit_match_score": 0.9,
+                        "target_uniqueness_score": 0.9,
+                        "audio_required": False,
+                        "hard_negative_quality": "good",
+                        "accept": True,
+                        "reject_reason": "",
+                    },
+                    {},
+                )
+                client.verify_pair_difference.return_value = (
+                    {
+                        "caption_delta": {
+                            "caption_equivalent": False,
+                            "has_concrete_difference": True,
+                            "difference_matches_edit": True,
+                        },
+                        "edit_projection": {"target_matches_projection": True, "score": 0.95},
+                        "edit_necessity": {
+                            "edit_needed": True,
+                            "reference_satisfies_edit": False,
+                            "target_satisfies_edit": True,
+                            "score": 0.92,
+                        },
+                    },
+                    {},
+                )
+                summary = validate_known_pairs(
+                    root=root,
+                    known_pairs_path=known_pairs_path,
+                    clip_annotations_path=annotations_path,
+                    output_path=root / "pairs" / "judged_synthetic_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_synthetic_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="instruct-model",
+                    overwrite=True,
+                )
+
+            self.assertEqual(0, summary["accepted_count"])
+            judged = [
+                json.loads(line)
+                for line in (root / "pairs" / "judged_synthetic_pair_proposals.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertIn("generation", judged[0]["judge"]["reject_reason"])
+
     def test_validate_pilot_dataset_builds_gallery_from_targets_and_negatives(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2661,6 +3066,8 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(3, len(gallery_records))
             self.assertEqual(1, summary["sample_count"])
             self.assertEqual({"same_dataset": 1}, summary["source_context_counts"])
+            self.assertEqual({"natural": 1}, summary["source_type_counts"])
+            self.assertEqual({"natural:object_count": 1}, summary["source_type_difference_counts"])
             self.assertEqual(
                 {"same_context_min": 0.9, "same_context_avg": 0.9, "same_context_max": 0.9},
                 summary["quality_summary"],
@@ -2675,6 +3082,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(summary["automated_acceptance"]["speech_samples_all_transcript_backed"])
             self.assertIn("caption_equivalent_reject_count", report_path.read_text(encoding="utf-8"))
             self.assertIn("Speech / Audio Quality Counts", report_path.read_text(encoding="utf-8"))
+            self.assertIn("Source Type Counts", report_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 {"clips/target.mp4", "clips/neg1.mp4", "clips/neg2.mp4"},
                 {record["video_path"] for record in gallery_records},

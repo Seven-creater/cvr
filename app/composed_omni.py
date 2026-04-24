@@ -377,6 +377,19 @@ def _pair_proposal_system_prompt() -> str:
         "Never label a pure speech topic or narration change as audio_event. "
         "Use scene only when the location or background is the primary edit. "
         "Keep edit_text short and only describe the change from reference to target. "
+        "edit_text must be an imperative edit, not a caption. "
+        "Do not copy a full reference_caption or target_caption into edit_text. "
+        "Do not mention visual subjects in audio_event edit_text. "
+        "Do not mention speech/topic/content in audio_event edit_text. "
+        "Do not mention audio, speech, visible text, or OCR unless that modality is the chosen difference.type. "
+        "Use exactly one main difference. "
+        "Good object_presence: add a dollhouse to the background. Bad object_presence: change no dollhouse into 1 dollhouse. "
+        "Good object_count: reduce the number of pillows from four to three. Bad object_count: the number of pillows decreases from 4 to 3. "
+        "Good action: change the gesture from making a small circle to waving. Bad action: the man is speaking and then waving. "
+        "Good audio_event: add a whoosh sound. Good audio_event: replace electronic hum with scratching sounds. "
+        "Bad audio_event: add a woman with blonde hair to the audio. Bad audio_event: add speech or no background noise to the audio. "
+        "Good speech: change the speech from discussing cold email to discussing affiliate marketing. Bad speech: change the man to talk about another topic. "
+        "Good visible_text: change on-screen text from cold email to mass emails. Bad visible_text: change the whole speech and on-screen text. "
         "Prefer a single key difference instead of multiple simultaneous changes."
     )
 
@@ -408,11 +421,15 @@ def _pair_verification_system_prompt() -> str:
         '"target_matches_projection": boolean, "score": number, '
         '"missing_requirements": [string], "reason": string}, '
         '"edit_necessity": {"edit_needed": boolean, "reference_satisfies_edit": boolean, '
-        '"target_satisfies_edit": boolean, "score": number, "reason": string}}. '
+        '"target_satisfies_edit": boolean, "score": number, "reason": string}, '
+        '"edit_text_quality_check": {"not_caption_like": boolean, "matches_modality": boolean, '
+        '"single_primary_difference": boolean, "reference_does_not_satisfy": boolean, '
+        '"target_satisfies": boolean, "score": number, "failure_reason": string}}. '
         "Reject pairs where the reference and target captions are semantically equivalent, "
         "where no concrete visual/audio/text difference is present, or where the edit is not necessary. "
         "For speech pairs, state what the reference speech says and what the target speech says; if either side lacks transcript-backed speech content, mark difference_matches_edit=false. "
         "For audio_event pairs, reject speech-only/narration-only changes as audio_event; audio_event must be non-language sound evidence. "
+        "In edit_text_quality_check, reject caption-like edit_text, modality leakage, multiple primary differences, and cases where reference already satisfies the edit. "
         "The projected target caption should describe what the reference would become after applying the edit."
     )
 
@@ -504,6 +521,7 @@ def _build_pair_proposal_user_content(
         "Write a short edit_text that changes the reference into the target. "
         "Use one primary difference type only. "
         "The chosen difference.type, edit_text, modalities, and difference.from/to must all describe the same main change. "
+        "edit_text must be an imperative edit, not a caption, and must not copy a full reference or target caption. "
         "Prefer action/audio/object differences over broad scene differences if they are visible or audible. "
         "For action proposals, edit_text must be a verb/action change such as starts/stops/changes from doing X to doing Y, "
         "and both reference and target storyline/events/actions must support that action change. "
@@ -511,6 +529,9 @@ def _build_pair_proposal_user_content(
         "Separate speech from audio_event: speech is language content or speaker delivery; audio_event is non-speech music, environment, or event sound. "
         "For speech, edit_text must name the specific spoken content change and must be grounded in transcript-backed evidence, not just 'talks about a different topic'. "
         "For audio_event, edit_text must name a non-speech sound change and must not be only narration/speech. "
+        "For audio_event, never mention visual subjects such as person, woman, man, room, background, toy, or dollhouse in edit_text. "
+        "Use type-specific edit_text style: object_presence add/remove X; object_count change the number of X from A to B; action change the action from X to Y; audio_event add/remove/replace sound X; speech change speech from X to Y; visible_text change on-screen text from X to Y. "
+        "Reject your own proposal if edit_text sounds like a caption, contains multiple changes, or leaks another modality. "
         "If the clips come from the same source context and the main localized change is in speech, audio, or visible text, "
         "prefer speech/audio_event/visible_text over attribute or scene. "
         "Use event/timeline evidence to choose a difference that is concrete, localized, and needed for retrieval. "
@@ -570,7 +591,8 @@ def _build_pair_verification_user_content(
         "For speech edit_text, explicitly check: what transcript-backed speech does the reference contain, what transcript-backed speech does the target contain, "
         "whether the edit requires listening, and whether visuals alone would fail to distinguish the target. "
         "If speech evidence is generic or missing, set target_matches_projection=false or difference_matches_edit=false. "
-        "For audio_event edit_text, set difference_matches_edit=false if the change is only spoken topic/narration rather than a non-speech sound."
+        "For audio_event edit_text, set difference_matches_edit=false if the change is only spoken topic/narration rather than a non-speech sound. "
+        "Fill edit_text_quality_check: not_caption_like=false if edit_text copies a caption; matches_modality=false if audio_event edit_text mentions visual subjects or speech; single_primary_difference=false if it mixes modalities."
     )
     return [{"type": "text", "text": prompt}]
 
@@ -855,12 +877,15 @@ def _normalize_pair_verification_payload(payload: dict[str, Any]) -> dict[str, A
     caption_delta = payload.get("caption_delta")
     edit_projection = payload.get("edit_projection")
     edit_necessity = payload.get("edit_necessity")
+    edit_text_quality_check = payload.get("edit_text_quality_check", {})
     if not isinstance(caption_delta, dict):
         raise ValueError("pair verification caption_delta must be an object")
     if not isinstance(edit_projection, dict):
         raise ValueError("pair verification edit_projection must be an object")
     if not isinstance(edit_necessity, dict):
         raise ValueError("pair verification edit_necessity must be an object")
+    if not isinstance(edit_text_quality_check, dict):
+        edit_text_quality_check = {}
 
     return {
         "caption_delta": {
@@ -883,6 +908,15 @@ def _normalize_pair_verification_payload(payload: dict[str, Any]) -> dict[str, A
             "target_satisfies_edit": _bool_value(edit_necessity.get("target_satisfies_edit")),
             "score": _score_value(edit_necessity.get("score")),
             "reason": str(edit_necessity.get("reason", "")).strip(),
+        },
+        "edit_text_quality_check": {
+            "not_caption_like": _bool_value(edit_text_quality_check.get("not_caption_like", True)),
+            "matches_modality": _bool_value(edit_text_quality_check.get("matches_modality", True)),
+            "single_primary_difference": _bool_value(edit_text_quality_check.get("single_primary_difference", True)),
+            "reference_does_not_satisfy": _bool_value(edit_text_quality_check.get("reference_does_not_satisfy", True)),
+            "target_satisfies": _bool_value(edit_text_quality_check.get("target_satisfies", True)),
+            "score": _score_value(edit_text_quality_check.get("score", 1.0)),
+            "failure_reason": str(edit_text_quality_check.get("failure_reason", "")).strip(),
         },
     }
 

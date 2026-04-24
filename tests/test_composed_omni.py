@@ -445,6 +445,15 @@ class ComposedOmniClientTests(unittest.TestCase):
                                     "score": 0.88,
                                     "reason": "the reference has one cat",
                                 },
+                                "edit_text_quality_check": {
+                                    "not_caption_like": "true",
+                                    "matches_modality": "yes",
+                                    "single_primary_difference": True,
+                                    "reference_does_not_satisfy": True,
+                                    "target_satisfies": True,
+                                    "score": 1.2,
+                                    "failure_reason": "",
+                                },
                             }
                         )
                     }
@@ -473,8 +482,11 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertTrue(normalized["caption_delta"]["has_concrete_difference"])
         self.assertEqual(1.0, normalized["edit_projection"]["score"])
         self.assertEqual(0.88, normalized["edit_necessity"]["score"])
+        self.assertTrue(normalized["edit_text_quality_check"]["matches_modality"])
+        self.assertEqual(1.0, normalized["edit_text_quality_check"]["score"])
         request_body = json.loads(request_holder["request"].data.decode("utf-8"))
         self.assertIn("edit-required difference", request_body["messages"][1]["content"][0]["text"])
+        self.assertIn("edit_text_quality_check", request_body["messages"][1]["content"][0]["text"])
 
 
 if __name__ == "__main__":

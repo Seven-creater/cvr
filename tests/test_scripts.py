@@ -31,6 +31,41 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("omni_detective_pilot_20260422", script)
         self.assertIn("omni_detective_pilot", script)
 
+    def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
+        script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")
+
+        self.assertIn("03_audio_vlm2vec_backbone", script)
+        self.assertIn("Wan2.1-VACE-1.3B", script)
+        self.assertIn("Wan2.1-VACE-14B", script)
+        self.assertIn("huggingface_hub", script)
+        self.assertIn("nvidia-smi", script)
+        self.assertIn("never downloads or runs generation", script)
+        self.assertNotIn("snapshot_download", script)
+        self.assertNotIn("python -m app.composed_data", script)
+
+    def test_wan_vace_download_script_targets_expected_models(self) -> None:
+        script = Path("scripts/download_wan_vace_models.sh").read_text(encoding="utf-8")
+
+        self.assertIn("Wan-AI/Wan2.1-VACE-1.3B", script)
+        self.assertIn("Wan-AI/Wan2.1-VACE-14B", script)
+        self.assertIn("Wan-Video/Wan2.1.git", script)
+        self.assertIn("--model-size 1.3B|14B|both", script)
+        self.assertIn("03_audio_vlm2vec_backbone", script)
+        self.assertIn("snapshot_download", script)
+
+    def test_synthetic_validation_script_runs_known_pair_validation(self) -> None:
+        script = Path("scripts/run_synthetic_known_pairs_validation.sh").read_text(encoding="utf-8")
+
+        self.assertIn("--run-root", script)
+        self.assertIn("--known-pairs", script)
+        self.assertIn("--clip-annotations", script)
+        self.assertIn("validate-known-pairs", script)
+        self.assertIn("judged_synthetic_pair_proposals.jsonl", script)
+        self.assertIn("accepted_synthetic_pairs.jsonl", script)
+        self.assertIn("synthetic_pilot_review.md", script)
+        self.assertIn("one Omni model per run", script)
+        self.assertIn("refusing to run with GPU_COUNT", script)
+
 
 if __name__ == "__main__":
     unittest.main()
