@@ -243,6 +243,21 @@ VISUAL_DESCRIPTION_TOKENS = {
     "standing",
     "wearing",
 }
+GENERIC_HUMAN_GROUP_TOKENS = {
+    "audience",
+    "controllers",
+    "crew",
+    "crowd",
+    "employees",
+    "group",
+    "operators",
+    "people",
+    "personnel",
+    "persons",
+    "staff",
+    "team",
+    "workers",
+}
 NON_SPEECH_AUDIO_TOKENS = {
     "ambient",
     "ambience",
@@ -3037,17 +3052,24 @@ def _observable_difference_gate(
     target_actions = _normalize_list(target_annotation.get("actions", []))
     reference_text = _annotation_observable_text(reference_annotation)
     target_text = _annotation_observable_text(target_annotation)
+    conflict_reasons: list[str] = []
 
     if difference_type in {"object_count", "object_presence"}:
         label = _strip_presence_prefix(to_value) or _strip_presence_prefix(from_value)
+        reference_mentions_label = _annotation_mentions_presence_label(reference_annotation, label)
+        target_mentions_label = _annotation_mentions_presence_label(target_annotation, label)
         if reference_counts != target_counts:
             supporting_fields.append("object_counts")
-        if label and not _annotation_mentions_value(reference_annotation, label) and _annotation_mentions_value(target_annotation, label):
+        if label and not reference_mentions_label and target_mentions_label:
             reference_missing.append(label)
             target_present.append(label)
             supporting_fields.append("summary")
         if label and _object_count_for_label(reference_counts, label) != _object_count_for_label(target_counts, label):
             supporting_fields.append("object_counts")
+        if label and _presence_value_claims_absent(from_value) and reference_mentions_label:
+            conflict_reasons.append(f"reference already appears to contain {label}")
+        if label and _presence_value_claims_absent(to_value) and target_mentions_label:
+            conflict_reasons.append(f"target still appears to contain {label}")
     elif difference_type == "action":
         if _first_unique(reference_actions, target_actions) or _first_unique(target_actions, reference_actions):
             supporting_fields.append("actions")
@@ -3070,9 +3092,16 @@ def _observable_difference_gate(
     supporting_fields = _dedupe_strings(supporting_fields)
     hard_fields = {"object_counts", "actions", "events", "visible_text", "attributes", "scene"}
     passed = bool(supporting_fields)
+    if conflict_reasons:
+        passed = False
     if near_duplicate_risk == "high" and not bool(set(supporting_fields) & hard_fields):
         passed = False
-    failure_reason = "" if passed else "no observable annotation delta supports this visual edit"
+    if passed:
+        failure_reason = ""
+    elif conflict_reasons:
+        failure_reason = "; ".join(_dedupe_strings(conflict_reasons))
+    else:
+        failure_reason = "no observable annotation delta supports this visual edit"
     return {
         "passed": passed,
         "type": difference_type,
@@ -3114,6 +3143,38 @@ def _annotation_mentions_value(annotation: dict[str, Any], value: str) -> bool:
         " ".join(_normalize_list(annotation.get("subjects", []))),
     ]
     return any(_text_mentions_phrase(text, value) for text in texts)
+
+
+def _annotation_mentions_presence_label(annotation: dict[str, Any], label: str) -> bool:
+    if not label:
+        return False
+    if _annotation_mentions_value(annotation, label):
+        return True
+    label_tokens = _tokenize_text(label)
+    if not label_tokens or not (label_tokens & GENERIC_HUMAN_GROUP_TOKENS):
+        return False
+    texts = [
+        _annotation_observable_text(annotation),
+        " ".join(_normalize_object_counts(annotation.get("object_counts", {})).keys()),
+        " ".join(_normalize_list(annotation.get("subjects", []))),
+    ]
+    annotation_tokens = _tokenize_text(" ".join(texts))
+    if not (annotation_tokens & GENERIC_HUMAN_GROUP_TOKENS):
+        return False
+    context_tokens = {
+        token
+        for token in label_tokens
+        if token not in GENERIC_HUMAN_GROUP_TOKENS and not token.isdigit()
+    }
+    return not context_tokens or bool(context_tokens & annotation_tokens)
+
+
+def _presence_value_claims_absent(value: str) -> bool:
+    normalized = _normalized_phrase(value)
+    if normalized.startswith("no "):
+        return True
+    count = _first_integer(normalized)
+    return count == 0
 
 
 def _object_count_for_label(counts: dict[str, int], label: str) -> int:

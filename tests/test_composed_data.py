@@ -1910,6 +1910,33 @@ class ComposedDataTests(unittest.TestCase):
         self.assertFalse(gate["passed"])
         self.assertEqual("high", gate["near_duplicate_risk"])
 
+    def test_observable_difference_gate_rejects_human_group_presence_when_reference_already_has_people(self) -> None:
+        gate = _observable_difference_gate(
+            reference_annotation={
+                "summary": "A busy control room with people working at desks, followed by a view of a space station.",
+                "subjects": ["people", "control room"],
+                "object_counts": {"people": 20, "desks": 8},
+                "actions": ["working"],
+                "visible_text": [],
+            },
+            target_annotation={
+                "summary": "A space station in orbit, followed by a busy control room with personnel at work.",
+                "subjects": ["personnel", "control room"],
+                "object_counts": {"personnel": 20, "desks": 8},
+                "actions": ["working"],
+                "visible_text": [],
+            },
+            difference={
+                "type": "object_presence",
+                "from": "no control room personnel",
+                "to": "20 control room personnel",
+            },
+            visual_near_duplicate_score=0.9,
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("reference already appears to contain", gate["failure_reason"])
+
     def test_verification_edit_text_quality_check_blocks_override(self) -> None:
         judge = {
             "reference_satisfies_edit": False,
