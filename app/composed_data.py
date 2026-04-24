@@ -2777,10 +2777,7 @@ def _action_terms_from_annotation(annotation: dict[str, Any]) -> list[str]:
 
 
 def _has_timeline_action_evidence(annotation: dict[str, Any]) -> bool:
-    return bool(
-        _normalize_events_for_evidence(annotation.get("events", []))
-        or _normalize_events_for_evidence(annotation.get("storyline", []))
-    )
+    return bool(_timeline_evidence(annotation))
 
 
 def _action_evidence_score(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> float:
@@ -3061,8 +3058,8 @@ def _difference_evidence_from_annotations(
     if difference_type == "scene":
         evidence.append(f"scene: {reference_annotation.get('scene', '')} -> {target_annotation.get('scene', '')}")
 
-    reference_events = _normalize_events_for_evidence(reference_annotation.get("events", []))
-    target_events = _normalize_events_for_evidence(target_annotation.get("events", []))
+    reference_events = _timeline_evidence(reference_annotation)
+    target_events = _timeline_evidence(target_annotation)
     if reference_events or target_events:
         evidence.append(f"events: {' | '.join(reference_events[:2]) or 'none'} -> {' | '.join(target_events[:2]) or 'none'}")
 
@@ -3094,6 +3091,15 @@ def _normalize_events_for_evidence(value: Any) -> list[str]:
         if text:
             events.append(text)
     return events
+
+
+def _timeline_evidence(annotation: dict[str, Any]) -> list[str]:
+    evidence: list[str] = []
+    for field_name in ("events", "storyline"):
+        for item in _normalize_events_for_evidence(annotation.get(field_name, [])):
+            if item not in evidence:
+                evidence.append(item)
+    return evidence
 
 
 def _select_hard_negative_annotations(
@@ -3665,11 +3671,20 @@ def _evidence_from_annotations(
 ) -> dict[str, Any]:
     reference_audio_terms = _non_speech_audio_terms(reference_annotation) or _normalize_list(reference_annotation.get("audio_events", []))
     target_audio_terms = _non_speech_audio_terms(target_annotation) or _normalize_list(target_annotation.get("audio_events", []))
+    reference_actions = _action_terms_from_annotation(reference_annotation)
+    target_actions = _action_terms_from_annotation(target_annotation)
     return {
+        "reference_summary": str(reference_annotation.get("summary", "")).strip(),
+        "target_summary": str(target_annotation.get("summary", "")).strip(),
         "reference_storyline": list(reference_annotation.get("storyline", [])),
         "target_storyline": list(target_annotation.get("storyline", [])),
         "reference_events": list(reference_annotation.get("events", [])),
         "target_events": list(target_annotation.get("events", [])),
+        "reference_timeline_evidence": _timeline_evidence(reference_annotation),
+        "target_timeline_evidence": _timeline_evidence(target_annotation),
+        "reference_actions": reference_actions,
+        "target_actions": target_actions,
+        "action_change": _change_text(reference_actions, target_actions),
         "audio_change": _change_text(reference_audio_terms, target_audio_terms),
         "visible_text_change": _change_text(
             reference_annotation.get("visible_text") or reference_annotation.get("on_screen_text", []),

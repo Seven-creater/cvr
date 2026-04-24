@@ -11,6 +11,7 @@ from app.composed_data import (
     _action_evidence_score,
     _compose_reject_reason,
     _detect_primary_difference,
+    _evidence_from_annotations,
     _difference_strength_score,
     _difference_priority_order,
     _effective_pair_quality,
@@ -2007,6 +2008,30 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertLess(_action_evidence_score(reference, target), 0.65)
         self.assertGreaterEqual(_action_evidence_score(reference_with_timeline, target_with_timeline), 0.65)
+
+    def test_evidence_from_annotations_carries_action_and_timeline_fields(self) -> None:
+        reference = {
+            "summary": "A game character runs along a cliff edge.",
+            "actions": ["running"],
+            "storyline": ["the character runs along a cliff edge"],
+            "audio_events": ["ambient hum"],
+        }
+        target = {
+            "summary": "A game character is launched from the cliff and glides forward.",
+            "actions": ["launched", "gliding"],
+            "events": [{"visual": "the character is launched from the cliff", "actions": ["launched"]}],
+            "audio_events": ["ambient hum", "whoosh"],
+        }
+
+        evidence = _evidence_from_annotations(reference, target)
+
+        self.assertEqual("A game character runs along a cliff edge.", evidence["reference_summary"])
+        self.assertEqual("A game character is launched from the cliff and glides forward.", evidence["target_summary"])
+        self.assertEqual(["running"], evidence["reference_actions"])
+        self.assertEqual(["launched", "gliding"], evidence["target_actions"])
+        self.assertEqual("running -> launched; gliding", evidence["action_change"])
+        self.assertEqual(["the character runs along a cliff edge"], evidence["reference_timeline_evidence"])
+        self.assertTrue(any("launched" in item for item in evidence["target_timeline_evidence"]))
 
     def test_target_uniqueness_allows_close_negatives_with_different_edit(self) -> None:
         reference = {
