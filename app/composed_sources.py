@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import re
@@ -16,7 +15,6 @@ VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"
 AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
 DAILY_OMNI_NAME = "daily_omni"
 WORLDSENSE_NAME = "worldsense"
-WEBVID_COVR_NAME = "webvid_covr"
 
 
 def prepare_source_datasets(
@@ -24,8 +22,6 @@ def prepare_source_datasets(
     root: str | Path,
     daily_omni_root: str | Path | None = None,
     worldsense_root: str | Path | None = None,
-    webvid_covr_root: str | Path | None = None,
-    webvid_covr_splits: Iterable[str] | None = None,
     clip_limit: int = 50,
 ) -> dict[str, Any]:
     layout = ensure_layout(root)
@@ -35,11 +31,8 @@ def prepare_source_datasets(
         (DAILY_OMNI_NAME, Path(daily_omni_root) if daily_omni_root else raw_datasets_root / DAILY_OMNI_NAME),
         (WORLDSENSE_NAME, Path(worldsense_root) if worldsense_root else raw_datasets_root / WORLDSENSE_NAME),
     ]
-    webvid_root = Path(webvid_covr_root) if webvid_covr_root else raw_datasets_root / WEBVID_COVR_NAME
-    webvid_splits = _normalize_requested_splits(webvid_covr_splits or ("train",))
 
     all_rows: list[dict[str, Any]] = []
-    pair_seeds: list[dict[str, Any]] = []
     dataset_counts: dict[str, dict[str, int]] = {}
     for dataset_name, source_root in source_specs:
         if not source_root.exists():
@@ -58,43 +51,22 @@ def prepare_source_datasets(
             "extracted_archives": extraction_summary["extracted_count"],
         }
 
-    if not webvid_root.exists():
-        dataset_counts[WEBVID_COVR_NAME] = {"rows": 0, "clips": 0, "pair_seeds": 0, "missing_root": 1, "missing_video_seeds": 0}
-    else:
-        webvid_rows, webvid_pair_seeds, webvid_summary = _load_webvid_covr_rows(
-            source_root=webvid_root,
-            splits=webvid_splits,
-        )
-        all_rows.extend(webvid_rows)
-        pair_seeds.extend(webvid_pair_seeds)
-        dataset_counts[WEBVID_COVR_NAME] = {
-            "rows": len(webvid_rows),
-            "clips": len({row["video_path"] for row in webvid_rows if row.get("video_path")}),
-            "pair_seeds": len(webvid_pair_seeds),
-            "missing_root": 0,
-            "missing_video_seeds": webvid_summary["missing_video_seeds"],
-            "csv_files": webvid_summary["csv_file_count"],
-        }
-
     clips_all = _build_clip_records(all_rows, root_path)
     clips_pilot = _select_balanced_pilot_clips(clips_all, max(0, int(clip_limit)))
 
     rows_path = layout["metadata"] / "source_rows.jsonl"
     clips_all_path = layout["metadata"] / "source_clips_all.jsonl"
     clips_pilot_path = layout["metadata"] / f"source_clips_pilot{len(clips_pilot)}.jsonl"
-    pair_seeds_path = layout["metadata"] / "webvid_covr_pair_seeds.jsonl"
     report_path = layout["reports"] / "source_dataset_prepare_summary.md"
 
     _write_jsonl(rows_path, all_rows)
     _write_jsonl(clips_all_path, clips_all)
     _write_jsonl(clips_pilot_path, clips_pilot)
-    _write_jsonl(pair_seeds_path, pair_seeds)
     report_path.write_text(
         _build_prepare_report(
             rows_path=rows_path,
             clips_all_path=clips_all_path,
             clips_pilot_path=clips_pilot_path,
-            pair_seeds_path=pair_seeds_path,
             dataset_counts=dataset_counts,
             row_count=len(all_rows),
             clip_count=len(clips_all),
@@ -108,153 +80,11 @@ def prepare_source_datasets(
         "source_rows_path": str(rows_path),
         "source_clips_all_path": str(clips_all_path),
         "source_clips_pilot_path": str(clips_pilot_path),
-        "webvid_covr_pair_seeds_path": str(pair_seeds_path),
         "report_path": str(report_path),
         "row_count": len(all_rows),
         "clip_count": len(clips_all),
         "pilot_clip_count": len(clips_pilot),
-        "pair_seed_count": len(pair_seeds),
         "dataset_counts": dataset_counts,
-    }
-
-
-def _load_webvid_covr_rows(*, source_root: Path, splits: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
-    rows: list[dict[str, Any]] = []
-    pair_seeds: list[dict[str, Any]] = []
-    missing_video_seeds = 0
-    csv_paths = _find_webvid_covr_csv_paths(source_root, splits)
-    for csv_path in csv_paths:
-        split = _normalize_split_name(csv_path.stem)
-        with csv_path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row_index, raw_row in enumerate(reader, start=1):
-                normalized = _normalize_webvid_covr_row(
-                    source_root=source_root,
-                    csv_path=csv_path,
-                    split=split,
-                    row_index=row_index,
-                    raw_row=raw_row,
-                )
-                if normalized is None:
-                    missing_video_seeds += 1
-                    continue
-                reference_row, target_row, pair_seed = normalized
-                rows.extend([reference_row, target_row])
-                pair_seeds.append(pair_seed)
-    return rows, pair_seeds, {"missing_video_seeds": missing_video_seeds, "csv_file_count": len(csv_paths)}
-
-
-def _find_webvid_covr_csv_paths(source_root: Path, splits: list[str]) -> list[Path]:
-    csv_paths: list[Path] = []
-    indexed: dict[str, Path] = {}
-    for csv_path in sorted(source_root.rglob("*.csv")):
-        indexed[_normalize_split_name(csv_path.stem)] = csv_path
-    for split in splits:
-        if split not in indexed:
-            raise FileNotFoundError(f"WebVid-CoVR split CSV not found for split={split} under {source_root}")
-        csv_paths.append(indexed[split])
-    return csv_paths
-
-
-def _normalize_webvid_covr_row(
-    *,
-    source_root: Path,
-    csv_path: Path,
-    split: str,
-    row_index: int,
-    raw_row: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
-    reference_video_path = _resolve_source_path(str(raw_row.get("pth1", "")).strip(), source_root, VIDEO_SUFFIXES)
-    target_video_path = _resolve_source_path(str(raw_row.get("pth2", "")).strip(), source_root, VIDEO_SUFFIXES)
-    if not reference_video_path or not target_video_path:
-        return None
-    if not Path(reference_video_path).exists() or not Path(target_video_path).exists():
-        return None
-
-    txt1 = str(raw_row.get("txt1", "")).strip()
-    txt2 = str(raw_row.get("txt2", "")).strip()
-    edit = str(raw_row.get("edit", "")).strip()
-    pair_seed_id = _stable_id(
-        WEBVID_COVR_NAME,
-        split,
-        str(csv_path.relative_to(source_root).as_posix()),
-        str(row_index),
-        reference_video_path,
-        target_video_path,
-    )
-    sim_txt = _score_or_text_value(raw_row.get("sim_txt"))
-    sim_vid = _score_or_text_value(raw_row.get("sim_vid"))
-    scores = _jsonish_value(raw_row.get("scores"))
-    person_prob = _score_or_text_value(raw_row.get("person_prob", raw_row.get("person-prob")))
-
-    pair_seed = {
-        "pair_seed_id": pair_seed_id,
-        "dataset": WEBVID_COVR_NAME,
-        "split": split,
-        "reference_video_path": reference_video_path,
-        "target_video_path": target_video_path,
-        "txt1": txt1,
-        "txt2": txt2,
-        "edit": edit,
-        "sim_txt": sim_txt,
-        "sim_vid": sim_vid,
-        "scores": scores,
-        "person_prob": person_prob,
-        "source_file": str(csv_path),
-        "row_index": row_index,
-    }
-
-    reference_row = _webvid_source_row(
-        csv_path=csv_path,
-        split=split,
-        row_index=row_index,
-        pair_seed_id=pair_seed_id,
-        video_role="reference",
-        video_path=reference_video_path,
-        original_caption=txt1,
-        original_edit=edit,
-    )
-    target_row = _webvid_source_row(
-        csv_path=csv_path,
-        split=split,
-        row_index=row_index,
-        pair_seed_id=pair_seed_id,
-        video_role="target",
-        video_path=target_video_path,
-        original_caption=txt2,
-        original_edit=edit,
-    )
-    return reference_row, target_row, pair_seed
-
-
-def _webvid_source_row(
-    *,
-    csv_path: Path,
-    split: str,
-    row_index: int,
-    pair_seed_id: str,
-    video_role: str,
-    video_path: str,
-    original_caption: str,
-    original_edit: str,
-) -> dict[str, Any]:
-    video_id = Path(video_path).stem
-    return {
-        "source_row_id": _stable_id(WEBVID_COVR_NAME, split, pair_seed_id, video_role, video_path),
-        "dataset": WEBVID_COVR_NAME,
-        "split": split,
-        "row_index": row_index,
-        "source_file": str(csv_path),
-        "video_id": video_id,
-        "video_path": video_path,
-        "audio_path": _find_sibling_audio(Path(video_path)),
-        "text_fields": {
-            "original_caption": original_caption,
-            "original_edit": original_edit,
-            "video_role": video_role,
-            "pair_seed_id": pair_seed_id,
-        },
-        "raw_columns": ["txt1", "txt2", "edit", "pth1", "pth2", "sim_txt", "sim_vid", "scores", "person_prob"],
     }
 
 
@@ -531,33 +361,6 @@ def _json_safe_text_value(value: Any) -> Any:
     return str(value)
 
 
-def _jsonish_value(value: Any) -> Any:
-    normalized = _json_safe_text_value(value)
-    if not isinstance(normalized, str):
-        return normalized
-    candidate = normalized.strip()
-    if not candidate:
-        return ""
-    if candidate[:1] in {"{", "["}:
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            return candidate
-    return candidate
-
-
-def _score_or_text_value(value: Any) -> Any:
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if not text:
-        return ""
-    try:
-        return round(float(text), 6)
-    except ValueError:
-        return text
-
-
 def _build_clip_records(rows: list[dict[str, Any]], root: Path) -> list[dict[str, Any]]:
     by_video_path: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -577,17 +380,10 @@ def _build_clip_records(rows: list[dict[str, Any]], root: Path) -> list[dict[str
                 "dataset": row["dataset"],
                 "source_row_ids": [],
                 "text_fields": {},
-                "splits": [],
             }
         by_video_path[video_path]["source_row_ids"].append(row["source_row_id"])
-        split = str(row.get("split", "")).strip()
-        if split and split not in by_video_path[video_path]["splits"]:
-            by_video_path[video_path]["splits"].append(split)
         for key, value in row.get("text_fields", {}).items():
             by_video_path[video_path]["text_fields"].setdefault(key, value)
-    for record in by_video_path.values():
-        if len(record["splits"]) == 1:
-            record["split"] = record["splits"][0]
     return list(by_video_path.values())
 
 
@@ -652,26 +448,8 @@ def _infer_split(path: Path) -> str:
     lowered = path.as_posix().lower()
     for split in ("train", "validation", "valid", "val", "test", "dev"):
         if split in lowered:
-            return _normalize_split_name(split)
+            return "validation" if split in {"valid", "val"} else split
     return "unknown"
-
-
-def _normalize_split_name(value: str) -> str:
-    normalized = str(value).strip().lower()
-    if normalized in {"valid", "val"}:
-        return "validation"
-    if normalized == "dev":
-        return "test"
-    return normalized or "unknown"
-
-
-def _normalize_requested_splits(values: Iterable[str]) -> list[str]:
-    normalized: list[str] = []
-    for value in values:
-        candidate = _normalize_split_name(value)
-        if candidate and candidate not in normalized:
-            normalized.append(candidate)
-    return normalized or ["train"]
 
 
 def _find_sibling_audio(video_path: Path) -> str:
@@ -713,7 +491,6 @@ def _build_prepare_report(
     rows_path: Path,
     clips_all_path: Path,
     clips_pilot_path: Path,
-    pair_seeds_path: Path,
     dataset_counts: dict[str, dict[str, int]],
     row_count: int,
     clip_count: int,
@@ -728,18 +505,15 @@ def _build_prepare_report(
         f"- rows path: `{rows_path}`",
         f"- all clips path: `{clips_all_path}`",
         f"- pilot clips path: `{clips_pilot_path}`",
-        f"- webvid pair seeds path: `{pair_seeds_path}`",
         "",
         "## Dataset Counts",
         "",
-        "| dataset | rows | clips | pair_seeds | missing_root | missing_video_seeds |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| dataset | rows | clips | missing_root |",
+        "|---|---:|---:|---:|",
     ]
     for dataset_name, counts in sorted(dataset_counts.items()):
         lines.append(
-            "| "
-            + f"{dataset_name} | {counts.get('rows', 0)} | {counts.get('clips', 0)} | "
-            + f"{counts.get('pair_seeds', 0)} | {counts.get('missing_root', 0)} | {counts.get('missing_video_seeds', 0)} |"
+            f"| {dataset_name} | {counts.get('rows', 0)} | {counts.get('clips', 0)} | {counts.get('missing_root', 0)} |"
         )
     lines.extend(
         [
@@ -761,8 +535,6 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--root", default=DEFAULT_DATA_ROOT)
     prepare.add_argument("--daily-omni-root")
     prepare.add_argument("--worldsense-root")
-    prepare.add_argument("--webvid-covr-root")
-    prepare.add_argument("--webvid-covr-splits", nargs="+", default=["train"])
     prepare.add_argument("--clip-limit", type=int, default=50)
     return parser
 
@@ -774,8 +546,6 @@ def main() -> None:
             root=args.root,
             daily_omni_root=args.daily_omni_root,
             worldsense_root=args.worldsense_root,
-            webvid_covr_root=args.webvid_covr_root,
-            webvid_covr_splits=args.webvid_covr_splits,
             clip_limit=args.clip_limit,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))

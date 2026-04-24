@@ -24,11 +24,7 @@ DEFAULT_CLIP_GROUPS_NAME = "clip_groups.jsonl"
 DEFAULT_DETECTIVE_CLIP_PLAN_NAME = "clip_plan_detective.jsonl"
 DEFAULT_EVENT_CLIP_MANIFEST_NAME = "extracted_event_clips.jsonl"
 DEFAULT_ACCEPTED_PAIRS_NAME = "accepted_pairs.jsonl"
-DEFAULT_WEBVID_COVR_PAIR_SEEDS_NAME = "webvid_covr_pair_seeds.jsonl"
-DEFAULT_WEBVID_COVR_SEED_SLICE_NAME = "webvid_covr_seed_slice.jsonl"
-DEFAULT_WEBVID_COVR_SEED_SOURCE_CLIPS_NAME = "webvid_covr_seed_source_clips.jsonl"
 DEFAULT_LICENSE_NOTE = "internal research pilot only"
-WEBVID_COVR_NAME = "webvid_covr"
 VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
 ALLOWED_MODALITIES = {"visual", "audio"}
 MAX_PAIR_CANDIDATES = 40
@@ -263,14 +259,6 @@ FINAL_ACCEPT_BUCKET_TARGETS = {
     "visible_text": 2,
     "attribute": 2,
     "scene": 1,
-}
-WEBVID_COVR_ALLOWED_ACCEPT_TYPES = {
-    "object_count",
-    "object_presence",
-    "attribute",
-    "action",
-    "scene",
-    "visible_text",
 }
 
 
@@ -619,87 +607,6 @@ def plan_detective_event_clips(
     }
 
 
-def build_seeded_pair_slice(
-    *,
-    pair_seeds_path: str | Path,
-    source_clips_path: str | Path,
-    output_seeds_path: str | Path,
-    output_clips_path: str | Path,
-    split: str = "train",
-    max_seed_rows: int | None = None,
-    seed_offset: int = 0,
-) -> dict[str, Any]:
-    seeds = list(_load_jsonl(Path(pair_seeds_path)))
-    source_clips = list(_load_jsonl(Path(source_clips_path)))
-    normalized_split = _normalize_split_value(split)
-    filtered_seeds = [seed for seed in seeds if _normalize_split_value(seed.get("split")) == normalized_split]
-    start_index = max(0, int(seed_offset))
-    if max_seed_rows is None:
-        selected_seeds = filtered_seeds[start_index:]
-    else:
-        selected_seeds = filtered_seeds[start_index : start_index + max(0, int(max_seed_rows))]
-
-    if not selected_seeds:
-        raise ValueError(f"no pair seeds found for split={normalized_split}")
-
-    referenced_paths: dict[str, set[str]] = {}
-    for seed in selected_seeds:
-        seed_id = str(seed.get("pair_seed_id", "")).strip()
-        for field_name in ("reference_video_path", "target_video_path"):
-            raw_path = str(seed.get(field_name, "")).strip()
-            if not raw_path:
-                raise ValueError(f"pair seed {seed_id or '<missing>'} is missing {field_name}")
-            referenced_paths.setdefault(_path_identity(Path(raw_path)), set()).add(seed_id)
-
-    path_to_clip: dict[str, dict[str, Any]] = {}
-    for clip in source_clips:
-        source_path = str(clip.get("source_path", "")).strip()
-        if source_path:
-            path_to_clip[_path_identity(Path(source_path))] = clip
-        output_path = str(clip.get("output_path", "")).strip()
-        if output_path:
-            path_to_clip.setdefault(_path_identity(Path(output_path)), clip)
-
-    selected_clips: list[dict[str, Any]] = []
-    seen_clip_ids: set[str] = set()
-    for seed in selected_seeds:
-        seed_split = _normalize_split_value(seed.get("split"))
-        for field_name in ("reference_video_path", "target_video_path"):
-            raw_path = str(seed.get(field_name, "")).strip()
-            path_key = _path_identity(Path(raw_path))
-            clip = path_to_clip.get(path_key)
-            if clip is None:
-                raise ValueError(
-                    f"no source clip found for pair seed {str(seed.get('pair_seed_id', '')).strip()}: {raw_path}"
-                )
-            clip_id = str(clip.get("clip_id", "")).strip()
-            if clip_id in seen_clip_ids:
-                continue
-            record = dict(clip)
-            record["split"] = seed_split
-            record["splits"] = [seed_split]
-            record["pair_seed_ids"] = sorted(referenced_paths[path_key])
-            selected_clips.append(record)
-            seen_clip_ids.add(clip_id)
-
-    output_seeds = Path(output_seeds_path)
-    output_clips = Path(output_clips_path)
-    _write_jsonl(output_seeds, selected_seeds)
-    _write_jsonl(output_clips, selected_clips)
-    return {
-        "pair_seeds_path": str(pair_seeds_path),
-        "source_clips_path": str(source_clips_path),
-        "output_seeds_path": str(output_seeds),
-        "output_clips_path": str(output_clips),
-        "split": normalized_split,
-        "available_seed_count": len(filtered_seeds),
-        "selected_seed_count": len(selected_seeds),
-        "selected_clip_count": len(selected_clips),
-        "seed_offset": start_index,
-        "max_seed_rows": None if max_seed_rows is None else int(max_seed_rows),
-    }
-
-
 def annotate_clips(
     *,
     root: str | Path,
@@ -903,16 +810,10 @@ def _clip_manifest_metadata(*, item: dict[str, Any], root: Path) -> dict[str, An
     dataset = str(item.get("dataset", "")).strip()
     if dataset:
         metadata["dataset"] = dataset
-    split = str(item.get("split", "")).strip()
-    if split:
-        metadata["split"] = split
 
     source_row_ids = [str(value).strip() for value in item.get("source_row_ids", []) if str(value).strip()]
     if source_row_ids:
         metadata["source_row_ids"] = source_row_ids
-    pair_seed_ids = [str(value).strip() for value in item.get("pair_seed_ids", []) if str(value).strip()]
-    if pair_seed_ids:
-        metadata["pair_seed_ids"] = pair_seed_ids
 
     text_fields = item.get("text_fields")
     if isinstance(text_fields, dict) and text_fields:
@@ -1320,309 +1221,6 @@ def propose_group_pairs(
         "accepted_count": len(accepted_records),
         "accepted_total_count": accepted_total_count,
         "rejected_count": rejected_count,
-        "proposed_count": proposed_count,
-        "reused_count": reused_count,
-        "fallback_count": fallback_count,
-        "verification_counts": verification_counts,
-        "thresholds": {
-            "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
-            "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
-            "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
-            "edit_necessity_score": MIN_ACCEPT_EDIT_NECESSITY_SCORE,
-            "edit_target_alignment_score": MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE,
-            "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
-            "action_evidence_score_for_action_edits": MIN_ACCEPT_ACTION_EVIDENCE_SCORE,
-            "speech_evidence_score_for_speech_edits": MIN_ACCEPT_SPEECH_EVIDENCE_SCORE,
-            "speech_specificity_score_for_speech_edits": MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE,
-            "non_speech_audio_event_score_for_audio_event_edits": MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE,
-        },
-    }
-
-
-def propose_seeded_pairs(
-    *,
-    root: str | Path,
-    clip_annotations_path: str | Path,
-    pair_seeds_path: str | Path,
-    base_url: str,
-    api_key: str,
-    model: str,
-    output_path: str | Path | None = None,
-    accepted_output_path: str | Path | None = None,
-    overwrite: bool = False,
-    timeout_seconds: float = 180.0,
-    max_accepted_pairs: int = 10,
-) -> dict[str, Any]:
-    layout = ensure_layout(root)
-    annotations_path = Path(clip_annotations_path)
-    pair_seeds_manifest = Path(pair_seeds_path)
-    annotations = list(_load_jsonl(annotations_path))
-    pair_seeds = list(_load_jsonl(pair_seeds_manifest))
-    if not annotations:
-        raise ValueError("clip annotations are empty")
-    if not pair_seeds:
-        raise ValueError("pair seeds are empty")
-
-    output = Path(output_path) if output_path else layout["pairs"] / "judged_pair_proposals.jsonl"
-    accepted_output = Path(accepted_output_path) if accepted_output_path else layout["pairs"] / DEFAULT_ACCEPTED_PAIRS_NAME
-    existing_records = {} if overwrite else _load_records_by_key(output, "proposal_id")
-    raw_index = _load_raw_asset_index(layout["metadata"] / DEFAULT_RAW_INDEX_NAME)
-    annotations_by_path = _annotations_by_video_identity(root=layout["root"], annotations=annotations)
-    client = OpenAIComposedDataClient(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        timeout_seconds=timeout_seconds,
-    )
-
-    output_records: list[dict[str, Any]] = []
-    accepted_records: list[dict[str, Any]] = []
-    candidate_count = 0
-    proposed_count = 0
-    reused_count = 0
-    fallback_count = 0
-    rejected_count = 0
-    accepted_total_count = 0
-    skipped_seed_count = 0
-    seen_proposal_ids: set[str] = set()
-
-    for seed in pair_seeds:
-        candidate_count += 1
-        seed_id = str(seed.get("pair_seed_id", "")).strip()
-        group_metadata = {
-            "group_id": seed_id,
-            "group_reason": "webvid_covr_seed_pair",
-        }
-        reference_annotation = annotations_by_path.get(_path_identity(Path(str(seed.get("reference_video_path", "")).strip())))
-        target_annotation = annotations_by_path.get(_path_identity(Path(str(seed.get("target_video_path", "")).strip())))
-        if reference_annotation is None or target_annotation is None:
-            skipped_seed_count += 1
-            continue
-        if bool(reference_annotation.get("fallback_used")) or bool(target_annotation.get("fallback_used")):
-            skipped_seed_count += 1
-            continue
-
-        annotation_pool = _seed_annotation_pool(
-            annotations=annotations,
-            dataset=str(reference_annotation.get("dataset", "")),
-            split=str(seed.get("split", "")),
-        )
-        candidate = _score_seeded_pair(
-            root=layout["root"],
-            reference_annotation=reference_annotation,
-            target_annotation=target_annotation,
-            annotations=annotation_pool,
-            seed=seed,
-        )
-        if candidate is None:
-            skipped_seed_count += 1
-            continue
-
-        proposal_id = candidate["proposal_id"]
-        if proposal_id in seen_proposal_ids:
-            continue
-        seen_proposal_ids.add(proposal_id)
-        if proposal_id in existing_records:
-            record = existing_records[proposal_id]
-            reused_count += 1
-        else:
-            raw_model_output: dict[str, Any] = {}
-            judge_raw_output: dict[str, Any] = {}
-            verification_raw_output: dict[str, Any] = {}
-            try:
-                model_fields, raw_model_output = client.propose_pair(
-                    reference_annotation=_annotation_prompt_view(reference_annotation),
-                    target_annotation=_annotation_prompt_view(target_annotation),
-                    hard_negative_candidates=[
-                        _annotation_prompt_view(annotation) for annotation in candidate["hard_negative_annotations"]
-                    ],
-                    heuristic_pair={
-                        "primary_difference": dict(candidate["primary_difference"]),
-                        "changed_difference_types": list(candidate["changed_difference_types"]),
-                        "heuristic_quality": dict(candidate["quality"]),
-                        "source_context": dict(candidate["source_context"]),
-                        "seed_metadata": _seed_prompt_metadata(seed),
-                    },
-                )
-                proposal_fallback_used = False
-            except Exception as exc:
-                model_fields = _fallback_pair_model_fields(
-                    reference_annotation=reference_annotation,
-                    target_annotation=target_annotation,
-                    primary_difference=candidate["primary_difference"],
-                )
-                raw_model_output = {"error": f"{type(exc).__name__}: {exc}"}
-                proposal_fallback_used = True
-
-            source = _build_source_metadata(
-                root=layout["root"],
-                target_annotation=target_annotation,
-                raw_index=raw_index,
-            )
-            proposal_quality = _quality_for_model_fields(
-                base_quality=candidate["quality"],
-                model_fields=model_fields,
-                reference_annotation=reference_annotation,
-                target_annotation=target_annotation,
-            )
-            proposal_difference_evidence = _difference_evidence_from_annotations(
-                reference_annotation=reference_annotation,
-                target_annotation=target_annotation,
-                primary_difference=model_fields["difference"],
-            )
-            proposal_view = {
-                "proposal_id": proposal_id,
-                "edit_text": model_fields["edit_text"],
-                "modalities": list(model_fields["modalities"]),
-                "reference_caption": model_fields["reference_caption"],
-                "target_caption": model_fields["target_caption"],
-                "difference": model_fields["difference"],
-                "quality": dict(proposal_quality),
-                "heuristic_primary_difference": dict(candidate["primary_difference"]),
-                "changed_difference_types": list(candidate["changed_difference_types"]),
-                "source_context": dict(candidate["source_context"]),
-                "difference_evidence": dict(proposal_difference_evidence),
-                "seed_metadata": _seed_prompt_metadata(seed),
-                "acceptance_thresholds": {
-                    "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
-                    "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
-                    "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
-                    "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
-                    "action_evidence_score_for_action_edits": MIN_ACCEPT_ACTION_EVIDENCE_SCORE,
-                    "speech_evidence_score_for_speech_edits": MIN_ACCEPT_SPEECH_EVIDENCE_SCORE,
-                    "speech_specificity_score_for_speech_edits": MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE,
-                    "non_speech_audio_event_score_for_audio_event_edits": MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE,
-                    "max_visual_near_duplicate_score_for_visual_edits": MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE,
-                },
-            }
-            try:
-                judge, judge_raw_output = client.judge_pair(
-                    proposal=proposal_view,
-                    reference_annotation=_annotation_prompt_view(reference_annotation),
-                    target_annotation=_annotation_prompt_view(target_annotation),
-                    hard_negative_candidates=[
-                        _annotation_prompt_view(annotation) for annotation in candidate["hard_negative_annotations"]
-                    ],
-                )
-                judge_fallback_used = False
-            except Exception as exc:
-                judge = _fallback_pair_judge(candidate["quality"], reason=f"{type(exc).__name__}: {exc}")
-                judge_raw_output = {"error": f"{type(exc).__name__}: {exc}"}
-                judge_fallback_used = True
-
-            try:
-                verification, verification_raw_output = client.verify_pair_difference(
-                    proposal=proposal_view,
-                    reference_annotation=_annotation_prompt_view(reference_annotation),
-                    target_annotation=_annotation_prompt_view(target_annotation),
-                )
-                verification_fallback_used = False
-            except Exception as exc:
-                verification = _fallback_pair_verification(reason=f"{type(exc).__name__}: {exc}")
-                verification_raw_output = {"error": f"{type(exc).__name__}: {exc}"}
-                verification_fallback_used = True
-
-            judge = _finalize_pair_judge(judge)
-            verification = _finalize_pair_verification(verification)
-            fallback_used = proposal_fallback_used or judge_fallback_used or verification_fallback_used
-            effective_quality = _effective_pair_quality(judge, verification, proposal_quality)
-            accepted = _judge_accepts(judge, verification, effective_quality)
-            if not accepted:
-                judge["reject_reason"] = _compose_reject_reason(judge, verification, effective_quality)
-            speech_quality = _speech_quality_payload(effective_quality)
-            audio_event_quality = _audio_event_quality_payload(effective_quality)
-            record = {
-                "proposal_id": proposal_id,
-                "group_id": group_metadata["group_id"],
-                "group_reason": group_metadata["group_reason"],
-                "reference_clip_id": reference_annotation.get("clip_id", ""),
-                "target_clip_id": target_annotation.get("clip_id", ""),
-                "reference_video": reference_annotation["output_path"],
-                "target_video": target_annotation["output_path"],
-                "edit_text": model_fields["edit_text"],
-                "modalities": list(model_fields["modalities"]),
-                "reference_caption": model_fields["reference_caption"],
-                "target_caption": model_fields["target_caption"],
-                "difference": model_fields["difference"],
-                "hard_negatives": list(candidate["hard_negative_paths"]),
-                "judge_quality": {
-                    "same_context_score": judge["same_context_score"],
-                    "edit_match_score": judge["edit_match_score"],
-                    "target_uniqueness_score": judge["target_uniqueness_score"],
-                },
-                "quality": effective_quality,
-                "heuristic_quality": dict(proposal_quality),
-                "source_context": dict(candidate["source_context"]),
-                "source": source,
-                "seed_metadata": _seed_record_metadata(seed),
-                "proposal_reason": model_fields["proposal_reason"],
-                "evidence": _evidence_from_annotations(
-                    reference_annotation,
-                    target_annotation,
-                    difference_evidence=proposal_difference_evidence,
-                ),
-                "judge": judge,
-                "verification": verification,
-                "speech_quality": speech_quality,
-                "audio_event_quality": audio_event_quality,
-                "transcript_backed": speech_quality.get("transcript_backed"),
-                "accepted": accepted,
-                "fallback_used": fallback_used,
-                "raw_model_output": raw_model_output,
-                "raw_judge_output": judge_raw_output,
-                "raw_verification_output": verification_raw_output,
-            }
-            proposed_count += 1
-
-        if "verification" not in record:
-            record = dict(record)
-            record["verification"] = _fallback_pair_verification(reason="existing record has no verification")
-            record["accepted"] = False
-            record["fallback_used"] = True
-            judge = dict(record.get("judge", {}))
-            judge["reject_reason"] = _compose_reject_reason(judge, record["verification"], record.get("quality"))
-            record["judge"] = judge
-        acceptance_issues = _pair_record_acceptance_issues(
-            root=layout["root"],
-            record=record,
-            reference_annotation=reference_annotation,
-            target_annotation=target_annotation,
-        )
-        if acceptance_issues:
-            record = dict(record)
-            judge = dict(record.get("judge", {}))
-            judge["accept"] = False
-            judge["reject_reason"] = "; ".join(acceptance_issues)
-            record["judge"] = judge
-            record["accepted"] = False
-            quality = dict(record.get("quality", {}))
-            if any("single clip" in issue for issue in acceptance_issues):
-                quality["intraclip_change_conflict"] = 1.0
-            record["quality"] = quality
-        if bool(record.get("fallback_used")):
-            fallback_count += 1
-        if bool(record.get("accepted")):
-            accepted_total_count += 1
-        else:
-            rejected_count += 1
-        output_records.append(record)
-
-    accepted_records = _select_final_accepted_records(output_records, max_accepted_pairs=max_accepted_pairs)
-    _write_jsonl(output, output_records)
-    _write_jsonl(accepted_output, accepted_records)
-    verification_counts = _pair_verification_counts(output_records)
-    return {
-        "clip_annotations_path": str(annotations_path),
-        "pair_seeds_path": str(pair_seeds_manifest),
-        "output_path": str(output),
-        "accepted_output_path": str(accepted_output),
-        "seed_count": len(pair_seeds),
-        "candidate_count": candidate_count,
-        "proposal_count": len(output_records),
-        "accepted_count": len(accepted_records),
-        "accepted_total_count": accepted_total_count,
-        "rejected_count": rejected_count,
-        "skipped_seed_count": skipped_seed_count,
         "proposed_count": proposed_count,
         "reused_count": reused_count,
         "fallback_count": fallback_count,
@@ -2672,204 +2270,6 @@ def _score_ordered_pair(
         "hard_negative_paths": hard_negative_paths,
     }
 
-
-def _score_seeded_pair(
-    *,
-    root: Path,
-    reference_annotation: dict[str, Any],
-    target_annotation: dict[str, Any],
-    annotations: list[dict[str, Any]],
-    seed: dict[str, Any],
-) -> dict[str, Any] | None:
-    if reference_annotation["clip_id"] == target_annotation["clip_id"]:
-        return None
-
-    semantic_context_score = _same_context_score(reference_annotation, target_annotation)
-    source_context = _seed_source_context(seed, reference_annotation, target_annotation)
-    same_context_score = _pair_context_score(
-        semantic_context_score=semantic_context_score,
-        source_context=source_context,
-    )
-    priority_order = _difference_priority_order(same_context_score=same_context_score)
-    primary_difference = _detect_primary_difference(
-        reference_annotation,
-        target_annotation,
-        priority_order=priority_order,
-    )
-    if primary_difference is None:
-        return None
-    changed_types = primary_difference.pop("changed_types")
-    if same_context_score < MIN_PAIR_CONTEXT_SCORE:
-        return None
-    if len(changed_types) > MAX_PAIR_CHANGED_TYPES:
-        return None
-
-    edit_match_score = _edit_match_score(
-        same_context_score=same_context_score,
-        primary_difference_type=primary_difference["type"],
-        changed_types=changed_types,
-    )
-    if edit_match_score < MIN_PAIR_EDIT_MATCH_SCORE:
-        return None
-
-    hard_negative_annotations = _select_hard_negative_annotations(
-        reference_annotation=reference_annotation,
-        target_annotation=target_annotation,
-        annotations=annotations,
-        primary_difference=primary_difference,
-    )
-    if len(hard_negative_annotations) < 2:
-        return None
-
-    target_uniqueness_score = _target_uniqueness_score(
-        reference_annotation=reference_annotation,
-        target_annotation=target_annotation,
-        annotations=annotations,
-        primary_difference=primary_difference,
-    )
-    visual_near_duplicate_score = _visual_near_duplicate_score(
-        _resolve_under_root(root, reference_annotation["output_path"]),
-        _resolve_under_root(root, target_annotation["output_path"]),
-    )
-    hard_negative_paths = [
-        _display_path(root, _resolve_under_root(root, annotation["output_path"])) for annotation in hard_negative_annotations[:3]
-    ]
-    if len(hard_negative_paths) < 2:
-        return None
-
-    reference_path = _display_path(root, _resolve_under_root(root, reference_annotation["output_path"]))
-    target_path = _display_path(root, _resolve_under_root(root, target_annotation["output_path"]))
-    if reference_path in hard_negative_paths or target_path in hard_negative_paths:
-        return None
-
-    quality = {
-        "same_context_score": round(same_context_score, 3),
-        "semantic_context_score": round(semantic_context_score, 3),
-        "edit_match_score": round(edit_match_score, 3),
-        "target_uniqueness_score": round(target_uniqueness_score, 3),
-        "difference_strength_score": round(
-            _difference_strength_score(
-                reference_annotation=reference_annotation,
-                target_annotation=target_annotation,
-                primary_difference=primary_difference,
-                changed_types=changed_types,
-            ),
-            3,
-        ),
-        "difference_type": primary_difference["type"],
-    }
-    if primary_difference["type"] == "action":
-        quality["action_evidence_score"] = _action_evidence_score(reference_annotation, target_annotation)
-    if primary_difference["type"] == "speech":
-        quality["speech_evidence_score"] = _speech_evidence_score(reference_annotation, target_annotation)
-        quality["speech_specificity_score"] = _speech_specificity_score(reference_annotation, target_annotation)
-        quality["speech_transcript_backed"] = 1.0 if _speech_is_transcript_backed(reference_annotation, target_annotation) else 0.0
-        quality["has_audio_modality"] = 1.0
-    if primary_difference["type"] == "audio_event":
-        quality["non_speech_audio_event_score"] = _non_speech_audio_event_score(reference_annotation, target_annotation)
-        quality["has_audio_modality"] = 1.0
-    if visual_near_duplicate_score is not None:
-        quality["visual_near_duplicate_score"] = round(visual_near_duplicate_score, 3)
-
-    return {
-        "proposal_id": _build_proposal_id(reference_path, target_path),
-        "reference_annotation": _sanitize_annotation_for_output(reference_annotation, root),
-        "target_annotation": _sanitize_annotation_for_output(target_annotation, root),
-        "primary_difference": primary_difference,
-        "changed_difference_types": list(changed_types),
-        "quality": quality,
-        "composite_score": _candidate_composite_score(quality, source_context),
-        "source_context": source_context,
-        "difference_evidence": _difference_evidence_from_annotations(
-            reference_annotation=reference_annotation,
-            target_annotation=target_annotation,
-            primary_difference=primary_difference,
-        ),
-        "hard_negative_annotations": [_sanitize_annotation_for_output(annotation, root) for annotation in hard_negative_annotations[:3]],
-        "hard_negative_paths": hard_negative_paths,
-    }
-
-
-def _seed_source_context(
-    seed: dict[str, Any],
-    reference_annotation: dict[str, Any],
-    target_annotation: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "relation": "webvid_covr_seed_pair",
-        "score": round(_seed_similarity_score(seed), 3),
-        "dataset": str(reference_annotation.get("dataset") or target_annotation.get("dataset") or WEBVID_COVR_NAME).strip()
-        or WEBVID_COVR_NAME,
-        "split": _normalize_split_value(seed.get("split")),
-    }
-
-
-def _seed_similarity_score(seed: dict[str, Any]) -> float:
-    sim_txt = _score_float(seed.get("sim_txt"))
-    sim_vid = _score_float(seed.get("sim_vid"))
-    if sim_txt <= 0 and sim_vid <= 0:
-        return 0.0
-    return (sim_txt * 0.5) + (sim_vid * 0.5)
-
-
-def _annotations_by_video_identity(*, root: Path, annotations: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    indexed: dict[str, dict[str, Any]] = {}
-    for annotation in annotations:
-        for key in _annotation_video_identities(root=root, annotation=annotation):
-            indexed.setdefault(key, annotation)
-    return indexed
-
-
-def _annotation_video_identities(*, root: Path, annotation: dict[str, Any]) -> list[str]:
-    identities: list[str] = []
-    source_path = str(annotation.get("source_path", "")).strip()
-    if source_path:
-        identities.append(_path_identity(_resolve_under_root(root, source_path)))
-    output_path = str(annotation.get("output_path", "")).strip()
-    if output_path:
-        identities.append(_path_identity(_resolve_under_root(root, output_path)))
-    unique: list[str] = []
-    seen: set[str] = set()
-    for item in identities:
-        if item and item not in seen:
-            seen.add(item)
-            unique.append(item)
-    return unique
-
-
-def _seed_annotation_pool(*, annotations: list[dict[str, Any]], dataset: str, split: str) -> list[dict[str, Any]]:
-    normalized_dataset = str(dataset).strip()
-    normalized_split = _normalize_split_value(split)
-    pool = [
-        annotation
-        for annotation in annotations
-        if str(annotation.get("dataset", "")).strip() == normalized_dataset
-        and _normalize_split_value(annotation.get("split")) == normalized_split
-        and not bool(annotation.get("fallback_used"))
-    ]
-    return pool or [annotation for annotation in annotations if not bool(annotation.get("fallback_used"))]
-
-
-def _seed_prompt_metadata(seed: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "pair_seed_id": str(seed.get("pair_seed_id", "")).strip(),
-        "dataset": str(seed.get("dataset", WEBVID_COVR_NAME)).strip() or WEBVID_COVR_NAME,
-        "split": _normalize_split_value(seed.get("split")),
-        "txt1": str(seed.get("txt1", "")).strip(),
-        "txt2": str(seed.get("txt2", "")).strip(),
-        "edit": str(seed.get("edit", "")).strip(),
-        "sim_txt": _score_or_raw(seed.get("sim_txt")),
-        "sim_vid": _score_or_raw(seed.get("sim_vid")),
-        "scores": seed.get("scores"),
-        "person_prob": _score_or_raw(seed.get("person_prob")),
-    }
-
-
-def _seed_record_metadata(seed: dict[str, Any]) -> dict[str, Any]:
-    metadata = _seed_prompt_metadata(seed)
-    metadata["reference_video_path"] = str(seed.get("reference_video_path", "")).strip()
-    metadata["target_video_path"] = str(seed.get("target_video_path", "")).strip()
-    return metadata
 
 def _candidate_composite_score(quality: dict[str, Any], source_context: dict[str, Any]) -> float:
     composite_score = round(
@@ -4384,11 +3784,7 @@ def _pair_record_acceptance_issues(
     ):
         issues.append("the proposed difference appears inside a single clip instead of between reference and target")
     difference = record.get("difference", {})
-    difference_type = str(difference.get("type", "")).strip()
-    record_dataset = _record_dataset_name(record, target_annotation=target_annotation)
-    if record_dataset == WEBVID_COVR_NAME and difference_type not in WEBVID_COVR_ALLOWED_ACCEPT_TYPES:
-        issues.append(f"webvid_covr only allows visual difference types in accepted pairs; got {difference_type or 'unknown'}")
-    if difference_type == "audio_event":
+    if str(difference.get("type", "")).strip() == "audio_event":
         from_value = str(difference.get("from", "")).strip()
         to_value = str(difference.get("to", "")).strip()
         if _is_speech_only_audio_phrase(from_value) or _is_speech_only_audio_phrase(to_value):
@@ -4491,7 +3887,6 @@ def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str
         "transcript_backed": record.get("transcript_backed"),
         "group_id": record.get("group_id", ""),
         "group_reason": record.get("group_reason", ""),
-        "seed_metadata": dict(record.get("seed_metadata", {})),
     }
 
 
@@ -4503,12 +3898,10 @@ def _build_source_metadata(
 ) -> dict[str, str]:
     asset_id = str(target_annotation.get("source_asset_id", "")).strip()
     raw_asset = raw_index.get(asset_id, {})
-    platform = str(raw_asset.get("dataset") or target_annotation.get("dataset") or "unknown").strip()
+    platform = str(raw_asset.get("dataset") or "unknown").strip()
     raw_path = str(raw_asset.get("path", "")).strip()
     if raw_path:
         resolved_path = Path(raw_path)
-    elif str(target_annotation.get("source_path", "")).strip():
-        resolved_path = _resolve_under_root(root, str(target_annotation.get("source_path", "")).strip())
     else:
         resolved_path = _resolve_under_root(root, target_annotation["output_path"])
     url = resolved_path.resolve().as_uri() if resolved_path.is_absolute() or resolved_path.exists() else ""
@@ -4560,38 +3953,6 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def _record_dataset_name(record: dict[str, Any], *, target_annotation: dict[str, Any]) -> str:
-    source = record.get("source", {})
-    if isinstance(source, dict):
-        platform = str(source.get("platform", "")).strip()
-        if platform:
-            return platform
-    return str(target_annotation.get("dataset", "")).strip()
-
-
-def _normalize_split_value(value: Any) -> str:
-    normalized = str(value).strip().lower()
-    if normalized in {"val", "valid"}:
-        return "validation"
-    if normalized == "dev":
-        return "test"
-    return normalized or "unknown"
-
-
-def _score_or_raw(value: Any) -> Any:
-    try:
-        return round(float(value), 6)
-    except (TypeError, ValueError):
-        return value
-
-
-def _path_identity(path: Path) -> str:
-    try:
-        return str(path.resolve())
-    except OSError:
-        return str(path)
 
 
 def _resolve_under_root(root: Path, raw_path: str | Path) -> Path:
@@ -4736,15 +4097,6 @@ def build_parser() -> argparse.ArgumentParser:
     plan_detective_parser.add_argument("--min-clip-seconds", type=float, default=3.0)
     plan_detective_parser.add_argument("--max-clip-seconds", type=float, default=15.0)
 
-    build_seeded_pair_slice_parser = subparsers.add_parser("build-seeded-pair-slice")
-    build_seeded_pair_slice_parser.add_argument("--pair-seeds-path", required=True)
-    build_seeded_pair_slice_parser.add_argument("--source-clips-path", required=True)
-    build_seeded_pair_slice_parser.add_argument("--output-seeds-path", required=True)
-    build_seeded_pair_slice_parser.add_argument("--output-clips-path", required=True)
-    build_seeded_pair_slice_parser.add_argument("--split", default="train")
-    build_seeded_pair_slice_parser.add_argument("--max-seed-rows", type=int)
-    build_seeded_pair_slice_parser.add_argument("--seed-offset", type=int, default=0)
-
     annotate_clips_parser = subparsers.add_parser("annotate-clips")
     annotate_clips_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
     annotate_clips_parser.add_argument("--clips-manifest-path", required=True)
@@ -4789,19 +4141,6 @@ def build_parser() -> argparse.ArgumentParser:
     propose_group_pairs_parser.add_argument("--timeout-seconds", type=float, default=180.0)
     propose_group_pairs_parser.add_argument("--max-accepted-pairs", type=int, default=10)
     propose_group_pairs_parser.add_argument("--overwrite", action="store_true")
-
-    propose_seeded_pairs_parser = subparsers.add_parser("propose-seeded-pairs")
-    propose_seeded_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
-    propose_seeded_pairs_parser.add_argument("--clip-annotations-path", required=True)
-    propose_seeded_pairs_parser.add_argument("--pair-seeds-path", required=True)
-    propose_seeded_pairs_parser.add_argument("--output-path")
-    propose_seeded_pairs_parser.add_argument("--accepted-output-path")
-    propose_seeded_pairs_parser.add_argument("--base-url", required=True)
-    propose_seeded_pairs_parser.add_argument("--api-key", required=True)
-    propose_seeded_pairs_parser.add_argument("--model", required=True)
-    propose_seeded_pairs_parser.add_argument("--timeout-seconds", type=float, default=180.0)
-    propose_seeded_pairs_parser.add_argument("--max-accepted-pairs", type=int, default=10)
-    propose_seeded_pairs_parser.add_argument("--overwrite", action="store_true")
 
     validate_pilot_parser = subparsers.add_parser("validate-pilot")
     validate_pilot_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -4867,19 +4206,6 @@ def main() -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
-    if args.command == "build-seeded-pair-slice":
-        result = build_seeded_pair_slice(
-            pair_seeds_path=args.pair_seeds_path,
-            source_clips_path=args.source_clips_path,
-            output_seeds_path=args.output_seeds_path,
-            output_clips_path=args.output_clips_path,
-            split=args.split,
-            max_seed_rows=args.max_seed_rows,
-            seed_offset=args.seed_offset,
-        )
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return
-
     if args.command == "detective-annotate-clips":
         result = detective_annotate_clips(
             root=args.root,
@@ -4917,23 +4243,6 @@ def main() -> None:
             output_path=args.output_path,
             accepted_output_path=args.accepted_output_path,
             raw_index_path=args.raw_index_path,
-            base_url=args.base_url,
-            api_key=args.api_key,
-            model=args.model,
-            timeout_seconds=args.timeout_seconds,
-            max_accepted_pairs=args.max_accepted_pairs,
-            overwrite=args.overwrite,
-        )
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-        return
-
-    if args.command == "propose-seeded-pairs":
-        result = propose_seeded_pairs(
-            root=args.root,
-            clip_annotations_path=args.clip_annotations_path,
-            pair_seeds_path=args.pair_seeds_path,
-            output_path=args.output_path,
-            accepted_output_path=args.accepted_output_path,
             base_url=args.base_url,
             api_key=args.api_key,
             model=args.model,
