@@ -1026,6 +1026,16 @@ def propose_pairs(
                 raw_model_output = {"error": f"{type(exc).__name__}: {exc}"}
                 fallback_used = True
 
+            candidate, model_fields, direction_corrected = _maybe_reorient_candidate_for_model_fields(
+                root=layout["root"],
+                candidate=candidate,
+                model_fields=model_fields,
+                annotations=annotations,
+            )
+            if direction_corrected:
+                proposal_id = candidate["proposal_id"]
+                reference_annotation = candidate["reference_annotation"]
+                target_annotation = candidate["target_annotation"]
             source = _build_source_metadata(
                 root=layout["root"],
                 target_annotation=target_annotation,
@@ -1049,6 +1059,7 @@ def propose_pairs(
                 "source_context": dict(candidate["source_context"]),
                 "source": source,
                 "proposal_reason": model_fields["proposal_reason"],
+                "direction_corrected": direction_corrected,
                 "fallback_used": fallback_used,
                 "raw_model_output": raw_model_output,
             }
@@ -1175,6 +1186,22 @@ def propose_group_pairs(
                     reference_annotation=reference_annotation,
                     target_annotation=target_annotation,
                 )
+                direction_corrected = False
+                oriented_candidate, model_fields, direction_corrected = _maybe_reorient_candidate_for_model_fields(
+                    root=layout["root"],
+                    candidate=candidate,
+                    model_fields=model_fields,
+                    annotations=group_annotations,
+                )
+                if direction_corrected:
+                    seen_proposal_ids.discard(proposal_id)
+                    proposal_id = oriented_candidate["proposal_id"]
+                    if proposal_id in seen_proposal_ids:
+                        continue
+                    seen_proposal_ids.add(proposal_id)
+                    candidate = oriented_candidate
+                    reference_annotation = candidate["reference_annotation"]
+                    target_annotation = candidate["target_annotation"]
                 source = _build_source_metadata(
                     root=layout["root"],
                     target_annotation=target_annotation,
@@ -1295,6 +1322,7 @@ def propose_group_pairs(
                     "source_context": dict(candidate["source_context"]),
                     "source": source,
                     "proposal_reason": model_fields["proposal_reason"],
+                    "direction_corrected": direction_corrected,
                     "evidence": _evidence_from_annotations(
                         reference_annotation,
                         target_annotation,
@@ -2630,6 +2658,113 @@ def _retarget_pair_candidate(candidate: dict[str, Any], difference_type: str) ->
         primary_difference=primary_difference,
     )
     return retargeted
+
+
+def _maybe_reorient_candidate_for_model_fields(
+    *,
+    root: Path,
+    candidate: dict[str, Any],
+    model_fields: dict[str, Any],
+    annotations: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    difference = model_fields.get("difference", {})
+    if not isinstance(difference, dict):
+        return candidate, model_fields, False
+    if not _model_difference_prefers_reverse_direction(
+        difference=difference,
+        reference_annotation=candidate["reference_annotation"],
+        target_annotation=candidate["target_annotation"],
+    ):
+        return candidate, model_fields, False
+
+    swapped = _score_ordered_pair(
+        root=root,
+        reference_annotation=candidate["target_annotation"],
+        target_annotation=candidate["reference_annotation"],
+        annotations=annotations,
+    )
+    if swapped is None:
+        return candidate, model_fields, False
+    difference_type = str(difference.get("type", "")).strip()
+    if swapped["primary_difference"]["type"] != difference_type and difference_type in swapped.get("changed_difference_types", []):
+        retargeted = _retarget_pair_candidate(swapped, difference_type)
+        if retargeted is not None:
+            swapped = retargeted
+    if swapped["primary_difference"]["type"] != difference_type:
+        return candidate, model_fields, False
+
+    oriented_fields = dict(model_fields)
+    oriented_fields["reference_caption"] = str(swapped["reference_annotation"].get("summary", "")).strip() or str(
+        model_fields.get("target_caption", "")
+    ).strip()
+    oriented_fields["target_caption"] = str(swapped["target_annotation"].get("summary", "")).strip() or str(
+        model_fields.get("reference_caption", "")
+    ).strip()
+    reason = str(oriented_fields.get("proposal_reason", "")).strip()
+    correction_reason = "direction corrected because difference.from/to matched target-to-reference evidence"
+    oriented_fields["proposal_reason"] = f"{reason} {correction_reason}".strip()
+    return swapped, oriented_fields, True
+
+
+def _model_difference_prefers_reverse_direction(
+    *,
+    difference: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> bool:
+    forward_score = _difference_direction_alignment_score(difference, reference_annotation, target_annotation)
+    reverse_score = _difference_direction_alignment_score(difference, target_annotation, reference_annotation)
+    return reverse_score >= 0.72 and reverse_score >= forward_score + 0.20
+
+
+def _difference_direction_alignment_score(
+    difference: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> float:
+    difference_type = str(difference.get("type", "")).strip()
+    if not difference_type:
+        return 0.0
+    priority_order = (difference_type,) + tuple(item for item in PAIR_PRIORITY if item != difference_type)
+    detected = _detect_primary_difference(
+        reference_annotation,
+        target_annotation,
+        priority_order=priority_order,
+    )
+    if not detected or detected.get("type") != difference_type:
+        return 0.0
+    from_score = _difference_value_similarity(
+        str(difference.get("from", "")),
+        str(detected.get("from", "")),
+    )
+    to_score = _difference_value_similarity(
+        str(difference.get("to", "")),
+        str(detected.get("to", "")),
+    )
+    return round((from_score + to_score) / 2.0, 3)
+
+
+def _difference_value_similarity(left: str, right: str) -> float:
+    left_norm = _normalized_phrase(left)
+    right_norm = _normalized_phrase(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    if left_norm == right_norm:
+        return 1.0
+    if left_norm in right_norm or right_norm in left_norm:
+        return 0.95
+    left_absent = left_norm.startswith("no ") or left_norm in {"none", "no distinctive audio event"}
+    right_absent = right_norm.startswith("no ") or right_norm in {"none", "no distinctive audio event"}
+    if left_absent != right_absent:
+        return 0.0
+    if left_absent and right_absent:
+        return 1.0
+    left_tokens = _tokenize_text(_strip_presence_prefix(left_norm))
+    right_tokens = _tokenize_text(_strip_presence_prefix(right_norm))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = len(left_tokens & right_tokens)
+    return overlap / max(1, min(len(left_tokens), len(right_tokens)))
 
 
 def _repair_pair_model_fields(
@@ -5003,6 +5138,7 @@ def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str
         "source": dict(record["source"]),
         "generation": dict(record.get("generation", {})),
         "source_context": dict(record.get("source_context", {})),
+        "direction_corrected": bool(record.get("direction_corrected")),
         "evidence": dict(record.get("evidence", {})),
         "judge": dict(record.get("judge", {})),
         "verification": dict(record.get("verification", {})),

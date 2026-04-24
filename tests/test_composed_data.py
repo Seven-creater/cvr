@@ -26,6 +26,8 @@ from app.composed_data import (
     _pair_record_acceptance_issues,
     _pair_context_score,
     _pair_verification_counts,
+    _maybe_reorient_candidate_for_model_fields,
+    _model_difference_prefers_reverse_direction,
     _prepare_record_for_acceptance,
     _repair_pair_model_fields,
     _select_final_accepted_records,
@@ -2103,6 +2105,131 @@ class ComposedDataTests(unittest.TestCase):
         self.assertFalse(prepared["verification"]["passed"])
         self.assertFalse(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
         self.assertIn("edit_text_quality_check", _compose_reject_reason(prepared["judge"], prepared["verification"], prepared["quality"]))
+
+    def test_model_difference_direction_detects_reversed_reference_target(self) -> None:
+        reference_annotation = {
+            "summary": "A woman speaks in a room.",
+            "object_counts": {"woman": 1, "room": 1},
+            "actions": ["speaking"],
+        }
+        target_annotation = {
+            "summary": "An empty room.",
+            "object_counts": {"room": 1},
+            "actions": [],
+        }
+        reversed_difference = {
+            "type": "object_presence",
+            "from": "no woman",
+            "to": "1 woman",
+            "description": "a woman appears",
+        }
+        forward_difference = {
+            "type": "object_presence",
+            "from": "1 woman",
+            "to": "no woman",
+            "description": "a woman disappears",
+        }
+
+        self.assertTrue(
+            _model_difference_prefers_reverse_direction(
+                difference=reversed_difference,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            )
+        )
+        self.assertFalse(
+            _model_difference_prefers_reverse_direction(
+                difference=forward_difference,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            )
+        )
+
+    def test_reorient_candidate_swaps_reference_and_target_for_reversed_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clips = root / "clips"
+            clips.mkdir(parents=True)
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4"):
+                (clips / name).write_bytes(b"x")
+            reference_annotation = {
+                "clip_id": "ref",
+                "output_path": "clips/ref.mp4",
+                "summary": "A woman speaks in a room.",
+                "object_counts": {"woman": 1, "room": 1},
+                "subjects": ["woman"],
+                "scene": "room",
+                "actions": ["speaking"],
+            }
+            target_annotation = {
+                "clip_id": "target",
+                "output_path": "clips/target.mp4",
+                "summary": "An empty room.",
+                "object_counts": {"room": 1},
+                "subjects": ["room"],
+                "scene": "room",
+                "actions": [],
+            }
+            neg1 = {
+                "clip_id": "neg1",
+                "output_path": "clips/neg1.mp4",
+                "summary": "A man speaks in a room.",
+                "object_counts": {"man": 1, "room": 1},
+                "subjects": ["man"],
+                "scene": "room",
+                "actions": ["speaking"],
+            }
+            neg2 = {
+                "clip_id": "neg2",
+                "output_path": "clips/neg2.mp4",
+                "summary": "A room with a chair.",
+                "object_counts": {"chair": 1, "room": 1},
+                "subjects": ["chair"],
+                "scene": "room",
+                "actions": [],
+            }
+            candidate = {
+                "proposal_id": "proposal__forward",
+                "reference_annotation": reference_annotation,
+                "target_annotation": target_annotation,
+                "primary_difference": {
+                    "type": "object_presence",
+                    "from": "1 woman",
+                    "to": "no woman",
+                    "description": "woman disappears",
+                },
+                "changed_difference_types": ["object_presence"],
+                "quality": {"same_context_score": 0.9, "edit_match_score": 0.9, "target_uniqueness_score": 0.9},
+                "source_context": {"relation": "same_source_video", "score": 0.9},
+                "hard_negative_annotations": [neg1, neg2],
+                "hard_negative_paths": ["clips/neg1.mp4", "clips/neg2.mp4"],
+            }
+            model_fields = {
+                "edit_text": "add a woman to the scene",
+                "modalities": ["visual"],
+                "reference_caption": "An empty room.",
+                "target_caption": "A woman speaks in a room.",
+                "difference": {
+                    "type": "object_presence",
+                    "from": "no woman",
+                    "to": "1 woman",
+                    "description": "woman appears",
+                },
+                "proposal_reason": "model chose the reverse direction",
+            }
+
+            oriented, oriented_fields, swapped = _maybe_reorient_candidate_for_model_fields(
+                root=root,
+                candidate=candidate,
+                model_fields=model_fields,
+                annotations=[reference_annotation, target_annotation, neg1, neg2],
+            )
+
+        self.assertTrue(swapped)
+        self.assertEqual("target", oriented["reference_annotation"]["clip_id"])
+        self.assertEqual("ref", oriented["target_annotation"]["clip_id"])
+        self.assertEqual("An empty room.", oriented_fields["reference_caption"])
+        self.assertEqual("A woman speaks in a room.", oriented_fields["target_caption"])
 
     def test_pair_record_acceptance_issues_rejects_missing_target_and_intraclip_audio_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
