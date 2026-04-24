@@ -488,6 +488,79 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("edit-required difference", request_body["messages"][1]["content"][0]["text"])
         self.assertIn("edit_text_quality_check", request_body["messages"][1]["content"][0]["text"])
 
+    def test_verify_pair_difference_materializes_reference_and_target_videos(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "caption_delta": {
+                                    "caption_equivalent": False,
+                                    "has_concrete_difference": True,
+                                    "difference_matches_edit": True,
+                                },
+                                "edit_projection": {
+                                    "projected_target_caption": "a dollhouse appears in the background",
+                                    "target_matches_projection": True,
+                                    "score": 0.9,
+                                },
+                                "edit_necessity": {
+                                    "edit_needed": True,
+                                    "reference_satisfies_edit": False,
+                                    "target_satisfies_edit": True,
+                                    "score": 0.9,
+                                },
+                                "edit_text_quality_check": {
+                                    "not_caption_like": True,
+                                    "matches_modality": True,
+                                    "single_primary_difference": True,
+                                    "reference_does_not_satisfy": True,
+                                    "target_satisfies": True,
+                                    "score": 0.9,
+                                },
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8093/v1",
+            api_key="EMPTY",
+            model="qwen3-omni",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "reference.mp4"
+            target_path = Path(temp_dir) / "target.mp4"
+            reference_path.write_bytes(b"reference-video")
+            target_path.write_bytes(b"target-video")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                client.verify_pair_difference(
+                    proposal={"edit_text": "add a dollhouse to the background"},
+                    reference_annotation={"clip_id": "ref", "summary": "a woman speaks"},
+                    target_annotation={"clip_id": "target", "summary": "a woman speaks near a dollhouse"},
+                    reference_clip_path=str(reference_path),
+                    target_clip_path=str(target_path),
+                )
+
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        content = request_body["messages"][1]["content"]
+        self.assertEqual("Reference video for final verification:", content[0]["text"])
+        self.assertTrue(content[1]["video_url"]["url"].startswith("data:video/mp4;base64,"))
+        self.assertEqual("Target video for final verification:", content[2]["text"])
+        self.assertTrue(content[3]["video_url"]["url"].startswith("data:video/mp4;base64,"))
+        verification_prompt = content[4]["text"]
+        self.assertIn("actual videos as the primary evidence", verification_prompt)
+        self.assertIn("reference video already contains or satisfies", verification_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

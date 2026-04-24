@@ -1282,6 +1282,8 @@ def propose_group_pairs(
                         proposal=proposal_view,
                         reference_annotation=_annotation_prompt_view(reference_annotation),
                         target_annotation=_annotation_prompt_view(target_annotation),
+                        reference_clip_path=str(_resolve_under_root(layout["root"], reference_annotation["output_path"])),
+                        target_clip_path=str(_resolve_under_root(layout["root"], target_annotation["output_path"])),
                     )
                     verification_fallback_used = False
                 except Exception as exc:
@@ -1608,6 +1610,8 @@ def validate_known_pairs(
                     proposal=proposal_view,
                     reference_annotation=_annotation_prompt_view(reference_annotation),
                     target_annotation=_annotation_prompt_view(target_annotation),
+                    reference_clip_path=str(_resolve_under_root(layout["root"], reference_video)),
+                    target_clip_path=str(_resolve_under_root(layout["root"], target_video)),
                 )
                 verification_fallback_used = False
             except Exception as exc:

@@ -573,9 +573,13 @@ def _build_pair_verification_user_content(
     proposal: dict[str, Any],
     reference_annotation: dict[str, Any],
     target_annotation: dict[str, Any],
+    reference_clip_path: str | None = None,
+    target_clip_path: str | None = None,
 ) -> list[dict[str, Any]]:
     prompt = (
         "Task: verify whether this pair has a real edit-required difference.\n"
+        "If reference and target videos are attached, use the actual videos as the primary evidence, "
+        "then use the annotations as supporting evidence. Do not accept a pair only because caption wording differs.\n"
         f"Pair proposal JSON:\n{json.dumps(proposal, ensure_ascii=False)}\n"
         f"Reference annotation JSON:\n{json.dumps(reference_annotation, ensure_ascii=False)}\n"
         f"Target annotation JSON:\n{json.dumps(target_annotation, ensure_ascii=False)}\n"
@@ -586,6 +590,9 @@ def _build_pair_verification_user_content(
         "Step 3 edit_necessity: decide whether the edit is needed. "
         "The reference must not satisfy the edit, and the target must satisfy it. "
         "Use concrete visual, audio, speech, visible-text, object-count, action, and event/timeline evidence. "
+        "Reject if the actual reference video already contains or satisfies the requested edit, even when the reference annotation omits it. "
+        "For object_presence/background edits, check whether the object is already visible in the reference and whether it is materially visible in the target, "
+        "not just present in a boundary frame or described by loose caption wording. "
         "For action edit_text, set difference_matches_edit=false unless the reference and target have different concrete actions "
         "supported by action/storyline/event evidence. "
         "For speech edit_text, explicitly check: what transcript-backed speech does the reference contain, what transcript-backed speech does the target contain, "
@@ -597,7 +604,23 @@ def _build_pair_verification_user_content(
         "matches_modality=false if audio_event edit_text mentions visual subjects or speech; single_primary_difference=false if it mixes modalities. "
         "Do not use edit_text_quality_check to duplicate edit_necessity; reference/target satisfaction belongs in edit_necessity."
     )
-    return [{"type": "text", "text": prompt}]
+    content: list[dict[str, Any]] = []
+    if reference_clip_path:
+        content.extend(
+            [
+                {"type": "text", "text": "Reference video for final verification:"},
+                {"type": "video_url", "video_url": {"url": reference_clip_path}},
+            ]
+        )
+    if target_clip_path:
+        content.extend(
+            [
+                {"type": "text", "text": "Target video for final verification:"},
+                {"type": "video_url", "video_url": {"url": target_clip_path}},
+            ]
+        )
+    content.append({"type": "text", "text": prompt})
+    return content
 
 
 class OpenAIComposedDataClient:
@@ -710,15 +733,19 @@ class OpenAIComposedDataClient:
         proposal: dict[str, Any],
         reference_annotation: dict[str, Any],
         target_annotation: dict[str, Any],
+        reference_clip_path: str | None = None,
+        target_clip_path: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         raw_payload = self._request_json(
             user_content=_build_pair_verification_user_content(
                 proposal=proposal,
                 reference_annotation=reference_annotation,
                 target_annotation=target_annotation,
+                reference_clip_path=reference_clip_path,
+                target_clip_path=target_clip_path,
             ),
             system_prompt=_pair_verification_system_prompt(),
-            max_tokens=1100,
+            max_tokens=1300,
         )
         return _normalize_pair_verification_payload(raw_payload), raw_payload
 

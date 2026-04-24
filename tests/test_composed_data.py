@@ -841,6 +841,15 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(all(record["judge"]["target_satisfies_edit"] for record in accepted_records))
             self.assertTrue(all(record["verification"]["caption_delta"]["difference_matches_edit"] for record in accepted_records))
             self.assertTrue(all(record["group_id"] == "group_cat_room" for record in accepted_records))
+            verification_calls = client_cls.return_value.verify_pair_difference.call_args_list
+            self.assertGreaterEqual(len(verification_calls), 1)
+            for call in verification_calls:
+                reference_clip_path = Path(call.kwargs["reference_clip_path"])
+                target_clip_path = Path(call.kwargs["target_clip_path"])
+                self.assertTrue(reference_clip_path.is_absolute())
+                self.assertTrue(target_clip_path.is_absolute())
+                self.assertTrue(reference_clip_path.exists())
+                self.assertTrue(target_clip_path.exists())
 
     def test_propose_group_pairs_rejects_caption_equivalent_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
