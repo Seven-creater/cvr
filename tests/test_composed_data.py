@@ -2105,6 +2105,88 @@ class ComposedDataTests(unittest.TestCase):
         self.assertEqual(0.9, prepared["quality"]["edit_match_score"])
         self.assertTrue(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
 
+    def test_prepare_record_syncs_observable_difference_failure_into_verification(self) -> None:
+        record = {
+            "edit_text": "add 20 control room personnel to the scene",
+            "modalities": ["visual"],
+            "reference_caption": "A busy control room followed by a space station.",
+            "target_caption": "A space station followed by a busy control room.",
+            "difference": {
+                "type": "object_presence",
+                "from": "no control room personnel",
+                "to": "20 control room personnel",
+            },
+            "judge": {
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "single_main_difference": True,
+                "same_context_score": 0.9,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "audio_required": False,
+                "hard_negative_quality": "good",
+                "accept": True,
+            },
+            "verification": {
+                "caption_delta": {
+                    "caption_equivalent": False,
+                    "has_concrete_difference": True,
+                    "difference_matches_edit": True,
+                    "reason": "The target has more personnel.",
+                },
+                "edit_projection": {
+                    "target_matches_projection": True,
+                    "score": 0.9,
+                    "reason": "The target matches the projected edit.",
+                },
+                "edit_necessity": {
+                    "edit_needed": True,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.9,
+                    "reason": "The reference lacks the edit.",
+                },
+            },
+            "quality": {"same_context_score": 0.9, "edit_match_score": 0.9, "target_uniqueness_score": 0.9},
+            "heuristic_quality": {
+                "same_context_score": 0.9,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "difference_type": "object_presence",
+                "edit_text_quality_score": 1.0,
+                "observable_difference_passed": 0.0,
+            },
+            "edit_text_quality": {
+                "score": 1.0,
+                "is_imperative_edit": True,
+                "matches_difference_type": True,
+                "single_change": True,
+                "not_caption_like": True,
+                "no_modality_leakage": True,
+                "bad_patterns": [],
+            },
+            "observable_difference": {
+                "passed": False,
+                "failure_reason": "reference already appears to contain control room personnel",
+            },
+        }
+
+        prepared = _prepare_record_for_acceptance(
+            record,
+            reference_annotation={"summary": "A busy control room with people working at desks."},
+            target_annotation={"summary": "A space station followed by a busy control room with personnel."},
+        )
+
+        self.assertFalse(prepared["verification"]["passed"])
+        self.assertFalse(prepared["verification"]["caption_delta"]["has_concrete_difference"])
+        self.assertFalse(prepared["verification"]["edit_necessity"]["edit_needed"])
+        self.assertTrue(prepared["verification"]["edit_necessity"]["reference_satisfies_edit"])
+        self.assertTrue(
+            any("observable_difference gate failed" in failure for failure in prepared["verification"]["failures"])
+        )
+        self.assertFalse(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
+
     def test_prepare_record_keeps_local_bad_edit_text_rejected(self) -> None:
         record = {
             "edit_text": "A woman with blonde hair speaks in a room",

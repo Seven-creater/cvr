@@ -3281,6 +3281,10 @@ def _ensure_structured_gate_fields(
             "score": local_check["score"],
             "failure_reason": failure_reason,
         }
+        _sync_observable_difference_failure(
+            verification,
+            observable_difference=observable_difference,
+        )
         verification["passed"] = _verification_accepts(verification)
         verification["failures"] = _verification_failures(verification)
         record["verification"] = verification
@@ -3288,6 +3292,39 @@ def _ensure_structured_gate_fields(
     record["edit_text_quality"] = edit_text_quality
     record["observable_difference"] = observable_difference
     return record
+
+
+def _sync_observable_difference_failure(
+    verification: dict[str, Any],
+    *,
+    observable_difference: dict[str, Any],
+) -> None:
+    if _boolish(observable_difference.get("passed", True)):
+        return
+    reason = str(observable_difference.get("failure_reason", "")).strip()
+    if not reason:
+        reason = "observable_difference gate found no concrete visual delta evidence"
+    reason = f"observable_difference gate failed: {reason}"
+    verification["observable_difference_failure"] = reason
+
+    caption_delta = verification.setdefault("caption_delta", {})
+    caption_delta["has_concrete_difference"] = False
+    caption_delta["difference_matches_edit"] = False
+    caption_delta["reason"] = _append_reason(caption_delta.get("reason"), reason)
+
+    edit_projection = verification.setdefault("edit_projection", {})
+    edit_projection["target_matches_projection"] = False
+    edit_projection["score"] = min(_score_float(edit_projection.get("score")), 0.0)
+    edit_projection["reason"] = _append_reason(edit_projection.get("reason"), reason)
+
+    edit_necessity = verification.setdefault("edit_necessity", {})
+    edit_necessity["edit_needed"] = False
+    if "reference already appears to contain" in reason:
+        edit_necessity["reference_satisfies_edit"] = True
+    if "target still appears to contain" in reason:
+        edit_necessity["target_satisfies_edit"] = False
+    edit_necessity["score"] = min(_score_float(edit_necessity.get("score")), 0.0)
+    edit_necessity["reason"] = _append_reason(edit_necessity.get("reason"), reason)
 
 
 def _prepare_record_for_acceptance(
@@ -4970,6 +5007,9 @@ def _verification_failures(verification: dict[str, Any]) -> list[str]:
     edit_projection = verification.get("edit_projection", {})
     edit_necessity = verification.get("edit_necessity", {})
     edit_text_quality_check = verification.get("edit_text_quality_check", {})
+    observable_difference_failure = str(verification.get("observable_difference_failure", "")).strip()
+    if observable_difference_failure:
+        failures.append(observable_difference_failure)
     if _boolish(caption_delta.get("caption_equivalent")):
         failures.append("caption_delta says reference and target are equivalent")
     if not _boolish(caption_delta.get("has_concrete_difference")):
