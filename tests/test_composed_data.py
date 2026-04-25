@@ -1971,6 +1971,84 @@ class ComposedDataTests(unittest.TestCase):
         self.assertFalse(gate["passed"])
         self.assertIn("reference already appears to contain", gate["failure_reason"])
 
+    def test_observable_difference_gate_rejects_dollhouse_toy_house_alias(self) -> None:
+        gate = _observable_difference_gate(
+            reference_annotation={
+                "summary": "A woman speaks in a classroom playroom with toys behind her.",
+                "subjects": ["woman", "toy house"],
+                "object_counts": {"toy house": 1, "teddy bear": 1},
+                "actions": ["speaking"],
+                "visible_text": [],
+            },
+            target_annotation={
+                "summary": "A woman speaks in a room with a dollhouse and teddy bear behind her.",
+                "subjects": ["woman", "dollhouse"],
+                "object_counts": {"dollhouse": 1, "teddy bear": 1},
+                "actions": ["speaking"],
+                "visible_text": [],
+            },
+            difference={
+                "type": "object_presence",
+                "from": "no dollhouse",
+                "to": "1 dollhouse",
+            },
+            visual_near_duplicate_score=0.52,
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("equivalent object", gate["failure_reason"])
+
+    def test_observable_difference_gate_rejects_background_decor_without_frame_evidence(self) -> None:
+        gate = _observable_difference_gate(
+            reference_annotation={
+                "summary": "A man and a woman argue in a living room.",
+                "object_counts": {"woman": 1, "man": 1},
+                "actions": ["arguing", "gesturing"],
+                "storyline": ["The woman gestures while the man stands nearby."],
+                "visible_text": ["MAKE WRONG"],
+            },
+            target_annotation={
+                "summary": "A man enters a living room and interacts with a woman near a table.",
+                "object_counts": {"woman": 1, "man": 1, "framed picture": 2},
+                "actions": ["entering", "walking", "placing hands on"],
+                "storyline": ["A man enters the room and places his hands on the woman's shoulders."],
+                "visible_text": ["HUSTLE", "WORK"],
+            },
+            difference={
+                "type": "object_presence",
+                "from": "no framed picture",
+                "to": "2 framed picture",
+            },
+            visual_near_duplicate_score=0.86,
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("background decor object lacks frame-level evidence", gate["failure_reason"])
+        self.assertIn("competing stronger action difference", gate["failure_reason"])
+
+    def test_observable_difference_gate_rejects_visible_text_with_competing_action_delta(self) -> None:
+        gate = _observable_difference_gate(
+            reference_annotation={
+                "summary": "A man and a woman argue in a living room.",
+                "actions": ["arguing", "gesturing", "turning away"],
+                "visible_text": ["MAKE WRONG"],
+            },
+            target_annotation={
+                "summary": "A man and a woman have a serious conversation in a living room.",
+                "actions": ["talking", "listening", "gesturing"],
+                "visible_text": ["PROTECT WHAT'S RIGHT"],
+            },
+            difference={
+                "type": "visible_text",
+                "from": "MAKE WRONG",
+                "to": "PROTECT WHAT'S RIGHT",
+            },
+            visual_near_duplicate_score=0.93,
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("competing stronger action difference", gate["failure_reason"])
+
     def test_verification_edit_text_quality_check_blocks_override(self) -> None:
         judge = {
             "reference_satisfies_edit": False,
@@ -2438,6 +2516,120 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertTrue(any("speech-only" in issue for issue in issues))
 
+    def test_prepare_record_rejects_audio_event_with_stronger_visible_text_delta(self) -> None:
+        record = {
+            "edit_text": "add whoosh to the audio",
+            "modalities": ["audio"],
+            "reference_caption": "A man speaks to camera with on-screen text.",
+            "target_caption": "A man speaks to camera with different on-screen text and a whoosh.",
+            "difference": {"type": "audio_event", "from": "no distinctive audio event", "to": "whoosh"},
+            "judge": {
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "single_main_difference": True,
+                "same_context_score": 0.9,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "audio_required": True,
+                "hard_negative_quality": "good",
+                "accept": True,
+            },
+            "verification": {
+                "caption_delta": {
+                    "caption_equivalent": False,
+                    "has_concrete_difference": True,
+                    "difference_matches_edit": True,
+                },
+                "edit_projection": {"target_matches_projection": True, "score": 0.9},
+                "edit_necessity": {
+                    "edit_needed": True,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.9,
+                },
+            },
+            "quality": {"same_context_score": 0.9, "edit_match_score": 0.9, "target_uniqueness_score": 0.9},
+            "heuristic_quality": {
+                "same_context_score": 0.9,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "difference_type": "audio_event",
+                "non_speech_audio_event_score": 0.92,
+            },
+        }
+
+        prepared = _prepare_record_for_acceptance(
+            record,
+            reference_annotation={
+                "audio_events": [],
+                "visible_text": ["you're sending out mass emails"],
+                "actions": ["speaking", "gesturing"],
+            },
+            target_annotation={
+                "audio_events": ["whoosh"],
+                "visible_text": ["here's the email subject line", "40% open rate"],
+                "actions": ["speaking", "gesturing"],
+            },
+        )
+
+        self.assertFalse(prepared["verification"]["passed"])
+        self.assertFalse(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
+        self.assertIn("competing stronger difference", _compose_reject_reason(prepared["judge"], prepared["verification"], prepared["quality"]))
+
+    def test_prepare_record_rejects_audio_event_without_independent_audio_evidence(self) -> None:
+        record = {
+            "edit_text": "add whoosh to the audio",
+            "modalities": ["audio"],
+            "reference_caption": "A quiet visual scene.",
+            "target_caption": "The same scene with a whoosh mentioned by caption only.",
+            "difference": {"type": "audio_event", "from": "no distinctive audio event", "to": "whoosh"},
+            "judge": {
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "single_main_difference": True,
+                "same_context_score": 0.9,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "audio_required": True,
+                "hard_negative_quality": "good",
+                "accept": True,
+            },
+            "verification": {
+                "caption_delta": {
+                    "caption_equivalent": False,
+                    "has_concrete_difference": True,
+                    "difference_matches_edit": True,
+                },
+                "edit_projection": {"target_matches_projection": True, "score": 0.9},
+                "edit_necessity": {
+                    "edit_needed": True,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.9,
+                },
+            },
+            "quality": {"same_context_score": 0.9, "edit_match_score": 0.9, "target_uniqueness_score": 0.9},
+            "heuristic_quality": {
+                "same_context_score": 0.9,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "difference_type": "audio_event",
+                "non_speech_audio_event_score": 0.92,
+            },
+        }
+
+        prepared = _prepare_record_for_acceptance(
+            record,
+            reference_annotation={"audio_events": [], "events": []},
+            target_annotation={"audio_events": [], "events": []},
+        )
+
+        self.assertFalse(prepared["verification"]["passed"])
+        self.assertFalse(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
+        self.assertIn("audio_event lacks independent", _compose_reject_reason(prepared["judge"], prepared["verification"], prepared["quality"]))
+
     def test_select_final_accepted_records_dedupes_repeated_group_audio_events(self) -> None:
         base_record = {
             "accepted": True,
@@ -2528,6 +2720,62 @@ class ComposedDataTests(unittest.TestCase):
         self.assertEqual(1, sum(1 for record in accepted if record["difference"]["type"] == "audio_event"))
         self.assertIn("action", {record["difference"]["type"] for record in accepted})
         self.assertIn("object_presence", {record["difference"]["type"] for record in accepted})
+
+    def test_select_final_accepted_records_dedupes_reused_target_video(self) -> None:
+        base_record = {
+            "accepted": True,
+            "group_id": "group_text",
+            "source_context": {"relation": "same_source_video"},
+            "modalities": ["visual"],
+            "target_video": "clips/shared_target.mp4",
+            "target_caption": "target",
+            "hard_negatives": ["clips/neg.mp4"],
+            "source": {"platform": "unknown", "url": "file:///tmp/target.mp4", "license_note": "internal"},
+            "evidence": {},
+            "judge": {},
+            "verification": {"passed": True},
+            "speech_quality": {},
+            "audio_event_quality": {},
+            "transcript_backed": None,
+            "group_reason": "same_source_video",
+            "quality": {
+                "difference_type": "visible_text",
+                "difference_strength_score": 0.85,
+                "same_context_score": 0.9,
+                "target_uniqueness_score": 0.8,
+                "edit_match_score": 0.9,
+            },
+        }
+        records = [
+            {
+                **base_record,
+                "proposal_id": "proposal__text_a",
+                "reference_video": "clips/ref_a.mp4",
+                "reference_caption": "ref a",
+                "edit_text": "change on-screen text from A to B",
+                "difference": {"type": "visible_text", "from": "A", "to": "B"},
+            },
+            {
+                **base_record,
+                "proposal_id": "proposal__text_b",
+                "reference_video": "clips/ref_b.mp4",
+                "reference_caption": "ref b",
+                "edit_text": "change on-screen text from C to D",
+                "difference": {"type": "visible_text", "from": "C", "to": "D"},
+                "quality": {
+                    "difference_type": "visible_text",
+                    "difference_strength_score": 0.8,
+                    "same_context_score": 0.9,
+                    "target_uniqueness_score": 0.8,
+                    "edit_match_score": 0.9,
+                },
+            },
+        ]
+
+        accepted = _select_final_accepted_records(records, max_accepted_pairs=2)
+
+        self.assertEqual(1, len(accepted))
+        self.assertEqual("clips/shared_target.mp4", accepted[0]["target_video"])
 
     def test_difference_strength_scores_concrete_object_changes(self) -> None:
         reference = {

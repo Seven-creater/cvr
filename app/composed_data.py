@@ -258,6 +258,55 @@ GENERIC_HUMAN_GROUP_TOKENS = {
     "team",
     "workers",
 }
+OBJECT_ALIAS_GROUPS = (
+    (
+        "dollhouse",
+        "toy house",
+        "toy home",
+        "play house",
+        "playhouse",
+    ),
+    (
+        "framed picture",
+        "framed pictures",
+        "picture",
+        "pictures",
+        "painting",
+        "paintings",
+        "poster",
+        "posters",
+        "wall art",
+        "artwork",
+        "frame",
+        "frames",
+    ),
+    (
+        "personnel",
+        "people",
+        "staff",
+        "crowd",
+        "workers",
+        "persons",
+        "team",
+        "crew",
+        "operators",
+        "controllers",
+        "employees",
+    ),
+)
+BACKGROUND_DECOR_OBJECTS = {"framed picture"}
+OBJECT_LABEL_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "present",
+    "visible",
+    "appears",
+    "appear",
+    "shown",
+    "showing",
+}
+MIN_COMPETING_DIFFERENCE_STRENGTH = 0.72
 NON_SPEECH_AUDIO_TOKENS = {
     "ambient",
     "ambience",
@@ -1968,12 +2017,23 @@ def _empty_pair_verification_counts() -> dict[str, int]:
         "caption_like_edit_rejected_count": 0,
         "modality_leakage_rejected_count": 0,
         "near_duplicate_without_delta_rejected_count": 0,
+        "visual_presence_contradiction_reject_count": 0,
+        "visible_text_without_ocr_reject_count": 0,
+        "audio_event_without_independent_audio_evidence_reject_count": 0,
+        "competing_difference_reject_count": 0,
+        "duplicate_target_reject_count": 0,
         "accepted_after_verification_count": 0,
     }
 
 
 def _pair_verification_counts(records: list[dict[str, Any]]) -> dict[str, int]:
     counts = _empty_pair_verification_counts()
+    accepted_target_counts = Counter(
+        str(record.get("target_video", "")).strip()
+        for record in records
+        if bool(record.get("accepted")) and str(record.get("target_video", "")).strip()
+    )
+    counts["duplicate_target_reject_count"] = sum(max(0, count - 1) for count in accepted_target_counts.values())
     for record in records:
         verification = record.get("verification")
         if not isinstance(verification, dict):
@@ -2017,6 +2077,17 @@ def _pair_verification_counts(records: list[dict[str, Any]]) -> dict[str, int]:
                 counts["modality_leakage_rejected_count"] += 1
             if _observable_difference_rejects(quality):
                 counts["near_duplicate_without_delta_rejected_count"] += 1
+            observable = record.get("observable_difference", {})
+            if isinstance(observable, dict):
+                observable_reason = str(observable.get("failure_reason", "")).strip().lower()
+                if "already appears to contain equivalent object" in observable_reason:
+                    counts["visual_presence_contradiction_reject_count"] += 1
+                if "visible_text lacks" in observable_reason:
+                    counts["visible_text_without_ocr_reject_count"] += 1
+            if _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0:
+                counts["audio_event_without_independent_audio_evidence_reject_count"] += 1
+            if _score_float(quality.get("competing_difference_passed", 1.0)) < 1.0:
+                counts["competing_difference_reject_count"] += 1
         caption_delta = verification.get("caption_delta", {})
         edit_projection = verification.get("edit_projection", {})
         edit_necessity = verification.get("edit_necessity", {})
@@ -2429,6 +2500,11 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
             "caption_like_edit_rejected_count",
             "modality_leakage_rejected_count",
             "near_duplicate_without_delta_rejected_count",
+            "visual_presence_contradiction_reject_count",
+            "visible_text_without_ocr_reject_count",
+            "audio_event_without_independent_audio_evidence_reject_count",
+            "competing_difference_reject_count",
+            "duplicate_target_reject_count",
         ):
             lines.append(f"- `{key}`: `{verification_counts.get(key, 0)}`")
         lines.extend(["", "## Verification Reject Counts"])
@@ -3033,6 +3109,7 @@ def _observable_difference_gate(
         return {
             "passed": True,
             "type": difference_type,
+            "frame_backed": False,
             "reference_missing": [],
             "target_present": [],
             "reference_value": from_value,
@@ -3046,6 +3123,8 @@ def _observable_difference_gate(
     supporting_fields: list[str] = []
     reference_missing: list[str] = []
     target_present: list[str] = []
+    reference_evidence: list[str] = []
+    target_evidence: list[str] = []
     reference_counts = _normalize_object_counts(reference_annotation.get("object_counts", {}))
     target_counts = _normalize_object_counts(target_annotation.get("object_counts", {}))
     reference_actions = _normalize_list(reference_annotation.get("actions", []))
@@ -3056,30 +3135,49 @@ def _observable_difference_gate(
 
     if difference_type in {"object_count", "object_presence"}:
         label = _strip_presence_prefix(to_value) or _strip_presence_prefix(from_value)
+        canonical_label = _canonical_object_label(label)
         reference_mentions_label = _annotation_mentions_presence_label(reference_annotation, label)
         target_mentions_label = _annotation_mentions_presence_label(target_annotation, label)
-        if reference_counts != target_counts:
+        reference_label_count = _object_count_for_label(reference_counts, label)
+        target_label_count = _object_count_for_label(target_counts, label)
+        if label and reference_label_count != target_label_count:
             supporting_fields.append("object_counts")
+            reference_evidence.append(f"object_counts:{reference_label_count}")
+            target_evidence.append(f"object_counts:{target_label_count}")
         if label and not reference_mentions_label and target_mentions_label:
             reference_missing.append(label)
             target_present.append(label)
             supporting_fields.append("summary")
-        if label and _object_count_for_label(reference_counts, label) != _object_count_for_label(target_counts, label):
-            supporting_fields.append("object_counts")
         if label and _presence_value_claims_absent(from_value) and reference_mentions_label:
-            conflict_reasons.append(f"reference already appears to contain {label}")
+            conflict_reasons.append(f"reference already appears to contain equivalent object: {label}")
         if label and _presence_value_claims_absent(to_value) and target_mentions_label:
             conflict_reasons.append(f"target still appears to contain {label}")
+        if (
+            canonical_label in BACKGROUND_DECOR_OBJECTS
+            and target_mentions_label
+            and not _annotation_has_label_frame_evidence(target_annotation, label)
+        ):
+            conflict_reasons.append(f"background decor object lacks frame-level evidence: {label}")
     elif difference_type == "action":
         if _first_unique(reference_actions, target_actions) or _first_unique(target_actions, reference_actions):
             supporting_fields.append("actions")
+            reference_evidence.append(_first_unique(reference_actions, target_actions))
+            target_evidence.append(_first_unique(target_actions, reference_actions))
         if from_value and _text_mentions_phrase(reference_text, from_value):
             supporting_fields.append("storyline")
         if to_value and _text_mentions_phrase(target_text, to_value):
             supporting_fields.append("events")
     elif difference_type == "visible_text":
-        if _normalize_list(reference_annotation.get("visible_text", [])) != _normalize_list(target_annotation.get("visible_text", [])):
+        reference_visible_text = _visible_text_values(reference_annotation)
+        target_visible_text = _visible_text_values(target_annotation)
+        if reference_visible_text != target_visible_text:
             supporting_fields.append("visible_text")
+        if from_value and not _text_collection_mentions_phrase(reference_visible_text, from_value):
+            conflict_reasons.append(f"visible_text lacks reference OCR/frame evidence for {from_value}")
+        if to_value and not _text_collection_mentions_phrase(target_visible_text, to_value):
+            conflict_reasons.append(f"visible_text lacks target OCR/frame evidence for {to_value}")
+        reference_evidence.extend(reference_visible_text)
+        target_evidence.extend(target_visible_text)
     elif difference_type == "attribute":
         if _normalize_list(reference_annotation.get("attributes", [])) != _normalize_list(target_annotation.get("attributes", [])):
             supporting_fields.append("attributes")
@@ -3090,7 +3188,14 @@ def _observable_difference_gate(
             supporting_fields.append("scene")
 
     supporting_fields = _dedupe_strings(supporting_fields)
+    competing_reasons = _competing_difference_reasons(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        primary_difference_type=difference_type,
+    )
+    conflict_reasons.extend(competing_reasons)
     hard_fields = {"object_counts", "actions", "events", "visible_text", "attributes", "scene"}
+    frame_backed = bool(set(supporting_fields) & hard_fields)
     passed = bool(supporting_fields)
     if conflict_reasons:
         passed = False
@@ -3105,8 +3210,11 @@ def _observable_difference_gate(
     return {
         "passed": passed,
         "type": difference_type,
+        "frame_backed": frame_backed,
         "reference_missing": _dedupe_strings(reference_missing),
         "target_present": _dedupe_strings(target_present),
+        "reference_evidence": _dedupe_strings(reference_evidence),
+        "target_evidence": _dedupe_strings(target_evidence),
         "reference_value": from_value,
         "target_value": to_value,
         "supporting_fields": supporting_fields,
@@ -3134,6 +3242,71 @@ def _annotation_observable_text(annotation: dict[str, Any]) -> str:
     return " ".join(texts)
 
 
+def _visible_text_values(annotation: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for field in ("visible_text", "on_screen_text", "ocr_text"):
+        values.extend(_normalize_list(annotation.get(field, [])))
+    for event in annotation.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        values.extend(_normalize_list(event.get("visible_text", [])))
+        values.extend(_normalize_list(event.get("on_screen_text", [])))
+        values.extend(_normalize_list(event.get("ocr_text", [])))
+    return _dedupe_strings(values)
+
+
+def _text_collection_mentions_phrase(values: list[str], phrase: str) -> bool:
+    if not phrase:
+        return True
+    return any(_text_mentions_phrase(value, phrase) for value in values)
+
+
+def _competing_difference_reasons(
+    *,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    primary_difference_type: str,
+) -> list[str]:
+    reasons: list[str] = []
+    if primary_difference_type != "action" and _strong_action_delta(reference_annotation, target_annotation):
+        reasons.append("single_main_difference failed: competing stronger action difference")
+    if primary_difference_type not in {"visible_text", "speech"} and _strong_visible_text_delta(reference_annotation, target_annotation):
+        reasons.append("single_main_difference failed: competing stronger visible_text difference")
+    if primary_difference_type not in {"speech", "visible_text"} and _strong_speech_delta(reference_annotation, target_annotation):
+        reasons.append("single_main_difference failed: competing stronger speech difference")
+    return reasons
+
+
+def _strong_action_delta(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> bool:
+    reference_actions = _action_terms_from_annotation(reference_annotation)
+    target_actions = _action_terms_from_annotation(target_annotation)
+    if not reference_actions or not target_actions:
+        return False
+    if not _first_unique(reference_actions, target_actions) or not _first_unique(target_actions, reference_actions):
+        return False
+    return _list_delta_strength(reference_actions, target_actions) >= MIN_COMPETING_DIFFERENCE_STRENGTH
+
+
+def _strong_visible_text_delta(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> bool:
+    reference_text = _visible_text_values(reference_annotation)
+    target_text = _visible_text_values(target_annotation)
+    if not reference_text or not target_text:
+        return False
+    if not _first_unique(reference_text, target_text) or not _first_unique(target_text, reference_text):
+        return False
+    return _list_delta_strength(reference_text, target_text) >= MIN_COMPETING_DIFFERENCE_STRENGTH
+
+
+def _strong_speech_delta(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> bool:
+    reference_speech = _speech_texts_from_annotation(reference_annotation)
+    target_speech = _speech_texts_from_annotation(target_annotation)
+    if not reference_speech or not target_speech:
+        return False
+    if not _first_unique(reference_speech, target_speech) or not _first_unique(target_speech, reference_speech):
+        return False
+    return _list_delta_strength(reference_speech, target_speech) >= MIN_COMPETING_DIFFERENCE_STRENGTH
+
+
 def _annotation_mentions_value(annotation: dict[str, Any], value: str) -> bool:
     if not value:
         return False
@@ -3150,6 +3323,9 @@ def _annotation_mentions_presence_label(annotation: dict[str, Any], label: str) 
         return False
     if _annotation_mentions_value(annotation, label):
         return True
+    for alias in _object_label_aliases(label):
+        if alias != _normalized_object_label(label) and _annotation_mentions_value(annotation, alias):
+            return True
     label_tokens = _tokenize_text(label)
     if not label_tokens or not (label_tokens & GENERIC_HUMAN_GROUP_TOKENS):
         return False
@@ -3169,6 +3345,67 @@ def _annotation_mentions_presence_label(annotation: dict[str, Any], label: str) 
     return not context_tokens or bool(context_tokens & annotation_tokens)
 
 
+def _normalized_object_label(value: str) -> str:
+    label = _strip_presence_prefix(value)
+    normalized_tokens: list[str] = []
+    for token in TOKEN_PATTERN.findall(label.lower()):
+        if token.isdigit() or token in OBJECT_LABEL_STOPWORDS:
+            continue
+        normalized_tokens.append(_singular_object_token(token))
+    return " ".join(normalized_tokens)
+
+
+def _singular_object_token(token: str) -> str:
+    if token.endswith("ies") and len(token) > 4:
+        return f"{token[:-3]}y"
+    if token.endswith("s") and not token.endswith("ss") and len(token) > 3:
+        return token[:-1]
+    return token
+
+
+def _canonical_object_label(value: str) -> str:
+    normalized = _normalized_object_label(value)
+    if not normalized:
+        return ""
+    for alias_group in OBJECT_ALIAS_GROUPS:
+        normalized_group = [_normalized_object_label(alias) for alias in alias_group]
+        if normalized in normalized_group:
+            return normalized_group[0]
+    return normalized
+
+
+def _object_label_aliases(label: str) -> list[str]:
+    normalized = _normalized_object_label(label)
+    canonical = _canonical_object_label(label)
+    aliases = [normalized, canonical]
+    for alias_group in OBJECT_ALIAS_GROUPS:
+        normalized_group = [_normalized_object_label(alias) for alias in alias_group]
+        if canonical in normalized_group or normalized in normalized_group:
+            aliases.extend(normalized_group)
+    return _dedupe_strings([alias for alias in aliases if alias])
+
+
+def _annotation_has_label_frame_evidence(annotation: dict[str, Any], label: str) -> bool:
+    aliases = _object_label_aliases(label)
+    if not aliases:
+        return False
+    for container_name in ("events", "storyline"):
+        container = annotation.get(container_name, [])
+        if not isinstance(container, list):
+            continue
+        for item in container:
+            if isinstance(item, dict):
+                values = [item.get("visual", ""), item.get("description", "")]
+                values.extend(_normalize_list(item.get("objects", [])))
+                values.extend(_normalize_list(item.get("actions", [])))
+            else:
+                values = [item]
+            text = " ".join(str(value) for value in values)
+            if any(_text_mentions_phrase(text, alias) for alias in aliases):
+                return True
+    return False
+
+
 def _presence_value_claims_absent(value: str) -> bool:
     normalized = _normalized_phrase(value)
     if normalized.startswith("no "):
@@ -3179,7 +3416,10 @@ def _presence_value_claims_absent(value: str) -> bool:
 
 def _object_count_for_label(counts: dict[str, int], label: str) -> int:
     label_tokens = _tokenize_text(label)
+    canonical_label = _canonical_object_label(label)
     for key, count in counts.items():
+        if canonical_label and _canonical_object_label(key) == canonical_label:
+            return count
         key_tokens = _tokenize_text(key)
         if label_tokens and key_tokens and (label_tokens <= key_tokens or key_tokens <= label_tokens):
             return count
@@ -3208,7 +3448,76 @@ def _apply_structured_gate_quality(
     quality["edit_text_not_caption_like"] = 1.0 if edit_text_quality.get("not_caption_like") else 0.0
     quality["edit_text_no_modality_leakage"] = 1.0 if edit_text_quality.get("no_modality_leakage") else 0.0
     quality["observable_difference_passed"] = 1.0 if observable_difference.get("passed") else 0.0
+    quality["observable_difference_frame_backed"] = 1.0 if observable_difference.get("frame_backed") else 0.0
     quality["near_duplicate_without_delta"] = 1.0 if observable_difference.get("near_duplicate_risk") == "high" and not observable_difference.get("passed") else 0.0
+
+
+def _competing_difference_gate(
+    *,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    difference: dict[str, Any],
+) -> dict[str, Any]:
+    reasons = _competing_difference_reasons(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        primary_difference_type=str(difference.get("type", "")).strip(),
+    )
+    return {
+        "passed": not reasons,
+        "failure_reason": "; ".join(_dedupe_strings(reasons)),
+    }
+
+
+def _audio_event_independent_evidence_gate(
+    *,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    difference: dict[str, Any],
+) -> dict[str, Any]:
+    if str(difference.get("type", "")).strip() != "audio_event":
+        return {
+            "passed": True,
+            "reference_evidence": [],
+            "target_evidence": [],
+            "supporting_fields": [],
+            "failure_reason": "",
+        }
+    reference_terms = _non_speech_audio_terms(reference_annotation)
+    target_terms = _non_speech_audio_terms(target_annotation)
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    reference_supported = _is_non_speech_absence_audio_phrase(from_value) or _audio_terms_match(reference_terms, from_value)
+    target_supported = _is_non_speech_absence_audio_phrase(to_value) or _audio_terms_match(target_terms, to_value)
+    terms_differ = bool(_first_unique(reference_terms, target_terms) or _first_unique(target_terms, reference_terms))
+    passed = bool(reference_terms or target_terms) and reference_supported and target_supported and terms_differ
+    failure_reason = ""
+    if not passed:
+        failure_reason = "audio_event lacks independent non-speech audio evidence"
+    return {
+        "passed": passed,
+        "reference_evidence": reference_terms,
+        "target_evidence": target_terms,
+        "supporting_fields": ["audio_events"] if reference_terms or target_terms else [],
+        "failure_reason": failure_reason,
+    }
+
+
+def _audio_terms_match(terms: list[str], phrase: str) -> bool:
+    if not phrase:
+        return True
+    phrase_tokens = _tokenize_text(phrase)
+    if not phrase_tokens:
+        return False
+    for term in terms:
+        term_tokens = _tokenize_text(term)
+        if not term_tokens:
+            continue
+        if _text_mentions_phrase(term, phrase) or _text_mentions_phrase(phrase, term):
+            return True
+        if _jaccard(phrase_tokens, term_tokens) >= 0.5:
+            return True
+    return False
 
 
 def _ensure_structured_gate_fields(
@@ -3241,6 +3550,22 @@ def _ensure_structured_gate_fields(
         edit_text_quality=edit_text_quality,
         observable_difference=observable_difference,
     )
+    competing_difference = dict(record.get("competing_difference") or {})
+    if not competing_difference:
+        competing_difference = _competing_difference_gate(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            difference=record.get("difference", {}),
+        )
+    audio_event_evidence = dict(record.get("audio_event_evidence") or {})
+    if not audio_event_evidence:
+        audio_event_evidence = _audio_event_independent_evidence_gate(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            difference=record.get("difference", {}),
+        )
+    quality["competing_difference_passed"] = 1.0 if competing_difference.get("passed") else 0.0
+    quality["audio_event_independent_evidence_passed"] = 1.0 if audio_event_evidence.get("passed") else 0.0
     verification = dict(record.get("verification", {}))
     if verification:
         existing_check = dict(verification.get("edit_text_quality_check", {}))
@@ -3285,12 +3610,24 @@ def _ensure_structured_gate_fields(
             verification,
             observable_difference=observable_difference,
         )
+        _sync_local_gate_failure(
+            verification,
+            passed=bool(competing_difference.get("passed", True)),
+            reason=str(competing_difference.get("failure_reason", "")).strip(),
+        )
+        _sync_local_gate_failure(
+            verification,
+            passed=bool(audio_event_evidence.get("passed", True)),
+            reason=str(audio_event_evidence.get("failure_reason", "")).strip(),
+        )
         verification["passed"] = _verification_accepts(verification)
         verification["failures"] = _verification_failures(verification)
         record["verification"] = verification
     record["quality"] = quality
     record["edit_text_quality"] = edit_text_quality
     record["observable_difference"] = observable_difference
+    record["competing_difference"] = competing_difference
+    record["audio_event_evidence"] = audio_event_evidence
     return record
 
 
@@ -3305,7 +3642,23 @@ def _sync_observable_difference_failure(
     if not reason:
         reason = "observable_difference gate found no concrete visual delta evidence"
     reason = f"observable_difference gate failed: {reason}"
-    verification["observable_difference_failure"] = reason
+    _sync_local_gate_failure(verification, passed=False, reason=reason)
+
+
+def _sync_local_gate_failure(
+    verification: dict[str, Any],
+    *,
+    passed: bool,
+    reason: str,
+) -> None:
+    if passed:
+        return
+    reason = reason.strip() or "local quality gate failed"
+    existing_reason = str(verification.get("observable_difference_failure", "")).strip()
+    if existing_reason:
+        verification["observable_difference_failure"] = _append_reason(existing_reason, reason)
+    else:
+        verification["observable_difference_failure"] = reason
 
     caption_delta = verification.setdefault("caption_delta", {})
     caption_delta["has_concrete_difference"] = False
@@ -3343,8 +3696,28 @@ def _prepare_record_for_acceptance(
     heuristic_quality = record.get("heuristic_quality")
     if not isinstance(heuristic_quality, dict) or not heuristic_quality:
         heuristic_quality = record.get("quality", {})
+    local_gate_quality = dict(record.get("quality", {}))
     record["quality"] = _effective_pair_quality(judge, verification, heuristic_quality)
+    _carry_local_gate_quality(record["quality"], local_gate_quality)
     return record
+
+
+def _carry_local_gate_quality(target_quality: dict[str, Any], source_quality: dict[str, Any]) -> None:
+    for key in (
+        "edit_text_quality_score",
+        "edit_text_is_imperative",
+        "edit_text_matches_difference_type",
+        "edit_text_single_change",
+        "edit_text_not_caption_like",
+        "edit_text_no_modality_leakage",
+        "observable_difference_passed",
+        "observable_difference_frame_backed",
+        "near_duplicate_without_delta",
+        "competing_difference_passed",
+        "audio_event_independent_evidence_passed",
+    ):
+        if key in source_quality:
+            target_quality[key] = source_quality[key]
 
 
 def _quality_for_model_fields(
@@ -4908,6 +5281,10 @@ def _compose_reject_reason(
     failures.extend(_structured_edit_text_failures(quality))
     if _observable_difference_rejects(quality):
         failures.append("observable_difference gate found no concrete visual delta evidence")
+    if _score_float(quality.get("competing_difference_passed", 1.0)) < 1.0:
+        failures.append("single_main_difference failed: competing stronger difference")
+    if _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0:
+        failures.append("audio_event lacks independent non-speech audio evidence")
     if verification is not None:
         failures.extend(_verification_failures(verification))
     if not judge.get("accept"):
@@ -4969,6 +5346,8 @@ def _judge_accepts(
         and _score_float(quality.get("intraclip_change_conflict")) < 1.0
         and not _structured_edit_text_failures(quality)
         and not _observable_difference_rejects(quality)
+        and _score_float(quality.get("competing_difference_passed", 1.0)) >= 1.0
+        and _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) >= 1.0
     )
     if verification is None:
         return bool(judge.get("accept")) and judge_accepted
@@ -5233,6 +5612,10 @@ def _pair_record_acceptance_issues(
         issues.extend(_structured_edit_text_failures(quality))
         if _observable_difference_rejects(quality):
             issues.append("observable_difference gate found no concrete visual delta evidence")
+        if _score_float(quality.get("competing_difference_passed", 1.0)) < 1.0:
+            issues.append("single_main_difference failed: competing stronger difference")
+        if _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0:
+            issues.append("audio_event lacks independent non-speech audio evidence")
     return issues
 
 
@@ -5277,15 +5660,21 @@ def _select_final_accepted_records(
     selected: list[dict[str, Any]] = []
     seen_signatures: set[tuple[str, str, str, str, str]] = set()
     selected_ids: set[str] = set()
+    selected_target_videos: set[str] = set()
 
     def try_select(record: dict[str, Any]) -> bool:
         signature = _accepted_record_signature(record)
         proposal_id = str(record.get("proposal_id", "")).strip()
+        target_video = str(record.get("target_video", "")).strip()
         if signature in seen_signatures or proposal_id in selected_ids:
+            return False
+        if target_video and target_video in selected_target_videos:
             return False
         selected.append(record)
         seen_signatures.add(signature)
         selected_ids.add(proposal_id)
+        if target_video:
+            selected_target_videos.add(target_video)
         return True
 
     for difference_type, target_count in FINAL_ACCEPT_BUCKET_TARGETS.items():
@@ -5333,6 +5722,8 @@ def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str
         "verification": dict(record.get("verification", {})),
         "edit_text_quality": dict(record.get("edit_text_quality", {})),
         "observable_difference": dict(record.get("observable_difference", {})),
+        "competing_difference": dict(record.get("competing_difference", {})),
+        "audio_event_evidence": dict(record.get("audio_event_evidence", {})),
         "speech_quality": dict(record.get("speech_quality", {})),
         "audio_event_quality": dict(record.get("audio_event_quality", {})),
         "transcript_backed": record.get("transcript_backed"),
