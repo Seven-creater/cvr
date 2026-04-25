@@ -27,6 +27,8 @@ DEFAULT_ACCEPTED_PAIRS_NAME = "accepted_pairs.jsonl"
 DEFAULT_SYNTHETIC_JUDGED_PAIRS_NAME = "judged_synthetic_pair_proposals.jsonl"
 DEFAULT_SYNTHETIC_ACCEPTED_PAIRS_NAME = "accepted_synthetic_pairs.jsonl"
 DEFAULT_SYNTHETIC_PILOT_REVIEW_NAME = "synthetic_pilot_review.md"
+DEFAULT_VIDEO_EDIT_PLAN_NAME = "video_edit_plan.jsonl"
+DEFAULT_AUDIO_EDIT_PLAN_NAME = "audio_edit_plan.jsonl"
 DEFAULT_LICENSE_NOTE = "internal research pilot only"
 VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
 ALLOWED_MODALITIES = {"visual", "audio"}
@@ -76,8 +78,12 @@ MIN_ACCEPT_SPEECH_EVIDENCE_SCORE = 0.75
 MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE = 0.70
 MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE = 0.70
 MIN_ACCEPT_EDIT_TEXT_QUALITY_SCORE = 0.75
+MIN_SYNTHETIC_VISUAL_CONTEXT_SCORE = 0.85
+MIN_SYNTHETIC_AUDIO_VISUAL_CONTEXT_SCORE = 0.95
 MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE = 0.995
 VISUAL_DIFFERENCE_TYPES = {"object_count", "object_presence", "attribute", "action", "scene", "visible_text"}
+SYNTHETIC_VISUAL_ROUTES = {"vace_controlled", "ltx2_retake", "tokenflow_style"}
+SYNTHETIC_AUDIO_ROUTES = {"deterministic_overlay", "foleycrafter_temporal", "frieren_benchmark", "audio_deterministic"}
 INTRACLIP_CHANGE_MARKERS = (
     "change from",
     "changes from",
@@ -379,6 +385,21 @@ SPEECH_ONLY_AUDIO_PATTERNS = (
     "talking only",
     "only voiceover",
     "voiceover only",
+)
+SPEECH_CONTENT_EDIT_PATTERNS = (
+    "speech",
+    "spoken content",
+    "transcript",
+    "narration",
+    "narrator",
+    "voiceover",
+    "says",
+    "say ",
+    "topic",
+    "talks about",
+    "talk about",
+    "discussing",
+    "discussion",
 )
 NON_SPEECH_AUDIO_ABSENCE_PATTERNS = (
     "no background music",
@@ -1437,12 +1458,7 @@ def propose_group_pairs(
                 target_annotation=target_annotation,
             )
             if acceptance_issues:
-                record = dict(record)
-                judge = dict(record.get("judge", {}))
-                judge["accept"] = False
-                judge["reject_reason"] = "; ".join(acceptance_issues)
-                record["judge"] = judge
-                record["accepted"] = False
+                record = _reject_record_with_acceptance_issues(record, acceptance_issues)
                 quality = dict(record.get("quality", {}))
                 if any("single clip" in issue for issue in acceptance_issues):
                     quality["intraclip_change_conflict"] = 1.0
@@ -1486,6 +1502,211 @@ def propose_group_pairs(
             "speech_specificity_score_for_speech_edits": MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE,
             "non_speech_audio_event_score_for_audio_event_edits": MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE,
         },
+    }
+
+
+def plan_video_edits(
+    *,
+    root: str | Path,
+    pair_candidates_path: str | Path,
+    clip_annotations_path: str | Path,
+    output_path: str | Path | None = None,
+    max_plans: int = 10,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    candidates = list(_load_jsonl(Path(pair_candidates_path)))
+    annotations = list(_load_jsonl(Path(clip_annotations_path)))
+    if not candidates:
+        raise ValueError("pair candidates file is empty")
+    if not annotations:
+        raise ValueError("clip annotations are empty")
+
+    annotation_lookup = _annotation_lookup(root=layout["root"], annotations=annotations)
+    output = Path(output_path) if output_path else layout["pairs"] / DEFAULT_VIDEO_EDIT_PLAN_NAME
+
+    plans: list[dict[str, Any]] = []
+    skipped_by_type: Counter[str] = Counter()
+    skipped_reasons: Counter[str] = Counter()
+    seen_sources: set[str] = set()
+    for candidate in candidates:
+        if len(plans) >= max_plans:
+            break
+        difference = dict(candidate.get("difference") or {})
+        difference_type = str(difference.get("type", "")).strip()
+        route = _video_edit_model_route(difference_type)
+        if route is None:
+            skipped_by_type[difference_type or "unknown"] += 1
+            skipped_reasons["unsupported_difference_type"] += 1
+            continue
+
+        reference_video = str(candidate.get("reference_video", "")).strip()
+        if not reference_video:
+            skipped_by_type[difference_type or "unknown"] += 1
+            skipped_reasons["missing_reference_video"] += 1
+            continue
+        if reference_video in seen_sources and route != "audio_deterministic":
+            skipped_reasons["duplicate_reference_video"] += 1
+            continue
+
+        reference_annotation = _annotation_for_video_edit_plan(
+            root=layout["root"],
+            lookup=annotation_lookup,
+            record=candidate,
+            video_field="reference_video",
+            caption_field="reference_caption",
+        )
+        edit_text = str(candidate.get("edit_text", "")).strip() or _build_fallback_edit_text(difference)
+        edit_token = _video_edit_token(difference, edit_text)
+        edit_region = _video_edit_region(edit_text, difference, reference_annotation, route)
+        if difference_type in {"object_presence", "object_count"} and (not edit_token or not edit_region):
+            skipped_by_type[difference_type or "unknown"] += 1
+            skipped_reasons["missing_object_edit_token_or_region"] += 1
+            continue
+
+        source_prompt = _video_edit_source_prompt(reference_annotation, candidate)
+        target_prompt = _video_edit_target_prompt(
+            source_prompt=source_prompt,
+            edit_text=edit_text,
+            difference=difference,
+        )
+        preserve_tokens = _video_edit_preserve_tokens(reference_annotation, difference, edit_token)
+        control_plan = _video_edit_control_plan(route)
+        plan = {
+            "plan_id": str(candidate.get("proposal_id", "")).strip()
+            or f"video_edit_plan_{_stable_hash(reference_video + edit_text)}",
+            "reference_video": reference_video,
+            "edit_text": edit_text,
+            "planner": {
+                "stage": "strongest_omni_prompt_planner",
+                "input": "short_clip_reference_video",
+                "output": "source_prompt_target_prompt_edit_token_preserve_constraints",
+            },
+            "source_prompt": source_prompt,
+            "target_prompt": target_prompt,
+            "edit_token": edit_token,
+            "preserve_tokens": preserve_tokens,
+            "negative_prompt": _video_edit_negative_prompt(preserve_tokens),
+            "edit_region": edit_region,
+            "mask_plan": "none" if route == "audio_deterministic" else "local_roi",
+            "control_plan": control_plan,
+            "model_route": route,
+            "difference": difference,
+            "generation_defaults": _video_edit_generation_defaults(route),
+            "validation_requirements": {
+                "visual_near_duplicate_min": MIN_SYNTHETIC_VISUAL_CONTEXT_SCORE,
+                "preserve_reference_audio": route != "audio_deterministic",
+                "single_edit_token": True,
+            },
+        }
+        plans.append(plan)
+        if route != "audio_deterministic":
+            seen_sources.add(reference_video)
+
+    _write_jsonl(output, plans)
+    return {
+        "candidate_count": len(candidates),
+        "plan_count": len(plans),
+        "output_path": str(output),
+        "skipped_by_type": dict(skipped_by_type),
+        "skipped_reasons": dict(skipped_reasons),
+    }
+
+
+def plan_audio_edits(
+    *,
+    root: str | Path,
+    pair_candidates_path: str | Path,
+    clip_annotations_path: str | Path,
+    output_path: str | Path | None = None,
+    max_plans: int = 10,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    candidates = list(_load_jsonl(Path(pair_candidates_path)))
+    annotations = list(_load_jsonl(Path(clip_annotations_path)))
+    if not candidates:
+        raise ValueError("pair candidates file is empty")
+    if not annotations:
+        raise ValueError("clip annotations are empty")
+
+    annotation_lookup = _annotation_lookup(root=layout["root"], annotations=annotations)
+    output = Path(output_path) if output_path else layout["pairs"] / DEFAULT_AUDIO_EDIT_PLAN_NAME
+    plans: list[dict[str, Any]] = []
+    skipped_by_type: Counter[str] = Counter()
+    skipped_reasons: Counter[str] = Counter()
+    for candidate in candidates:
+        if len(plans) >= max_plans:
+            break
+        difference = dict(candidate.get("difference") or {})
+        difference_type = str(difference.get("type", "")).strip()
+        edit_text = str(candidate.get("edit_text", "")).strip() or _build_fallback_edit_text(difference)
+        if difference_type != "audio_event":
+            skipped_by_type[difference_type or "unknown"] += 1
+            skipped_reasons["not_audio_event"] += 1
+            continue
+        speech_issues = _speech_content_edit_issues(edit_text=edit_text, difference=difference)
+        if speech_issues:
+            skipped_by_type[difference_type] += 1
+            skipped_reasons["speech_content_or_speech_only_audio"] += 1
+            continue
+
+        reference_video = str(candidate.get("reference_video", "")).strip()
+        if not reference_video:
+            skipped_by_type[difference_type] += 1
+            skipped_reasons["missing_reference_video"] += 1
+            continue
+        reference_annotation = _annotation_for_video_edit_plan(
+            root=layout["root"],
+            lookup=annotation_lookup,
+            record=candidate,
+            video_field="reference_video",
+            caption_field="reference_caption",
+        )
+        expected_event = _audio_expected_event(difference, edit_text)
+        if not expected_event:
+            skipped_by_type[difference_type] += 1
+            skipped_reasons["missing_expected_audio_event"] += 1
+            continue
+        plan_id = str(candidate.get("proposal_id", "")).strip() or f"audio_edit_plan_{_stable_hash(reference_video + edit_text)}"
+        route = _audio_edit_route(expected_event, reference_annotation)
+        target_video = str(candidate.get("target_video", "")).strip() or f"clips/synthetic_audio/{plan_id}.mp4"
+        audio_plan = {
+            "route": route,
+            "audio_prompt": _audio_edit_prompt(expected_event, reference_annotation, edit_text),
+            "negative_audio_prompt": "speech, narration, talking, voiceover, crowd chatter, unrelated music",
+            "timing_strategy": _audio_timing_strategy(expected_event, reference_annotation),
+            "preserve_video": True,
+            "mixing": "overlay",
+            "expected_event": expected_event,
+        }
+        plans.append(
+            {
+                "plan_id": plan_id,
+                "reference_video": reference_video,
+                "target_video": target_video,
+                "edit_text": edit_text,
+                "difference": difference,
+                "planner": {
+                    "stage": "strongest_omni_audio_prompt_planner",
+                    "input": "short_clip_reference_video",
+                    "output": "non_speech_audio_event_plan",
+                },
+                "audio_edit_plan": audio_plan,
+                "generation_defaults": {
+                    "preserve_video_stream": True,
+                    "generate_video": False,
+                    "visual_near_duplicate_min": MIN_SYNTHETIC_AUDIO_VISUAL_CONTEXT_SCORE,
+                    "duration_drift_max": 0.10,
+                },
+            }
+        )
+
+    _write_jsonl(output, plans)
+    return {
+        "candidate_count": len(candidates),
+        "plan_count": len(plans),
+        "output_path": str(output),
+        "skipped_by_type": dict(skipped_by_type),
+        "skipped_reasons": dict(skipped_reasons),
     }
 
 
@@ -1759,12 +1980,7 @@ def validate_known_pairs(
         )
         acceptance_issues.extend(_known_pair_generation_issues(record))
         if acceptance_issues:
-            record = dict(record)
-            judge = dict(record.get("judge", {}))
-            judge["accept"] = False
-            judge["reject_reason"] = "; ".join(acceptance_issues)
-            record["judge"] = judge
-            record["accepted"] = False
+            record = _reject_record_with_acceptance_issues(record, acceptance_issues)
         if bool(record.get("fallback_used")):
             fallback_count += 1
         if bool(record.get("accepted")):
@@ -2022,6 +2238,18 @@ def _empty_pair_verification_counts() -> dict[str, int]:
         "audio_event_without_independent_audio_evidence_reject_count": 0,
         "competing_difference_reject_count": 0,
         "duplicate_target_reject_count": 0,
+        "synthetic_context_override_count": 0,
+        "synthetic_visual_count": 0,
+        "synthetic_audio_count": 0,
+        "deterministic_audio_count": 0,
+        "foleycrafter_audio_count": 0,
+        "frieren_audio_count": 0,
+        "speech_content_reject_count": 0,
+        "audio_stream_missing_reject_count": 0,
+        "visual_changed_in_audio_sample_reject_count": 0,
+        "audio_event_not_detected_reject_count": 0,
+        "audio_remux_count": 0,
+        "missing_target_audio_reject_count": 0,
         "accepted_after_verification_count": 0,
     }
 
@@ -2043,6 +2271,35 @@ def _pair_verification_counts(records: list[dict[str, Any]]) -> dict[str, int]:
             quality = {}
         if bool(record.get("accepted")) and not _structured_edit_text_failures(quality):
             counts["good_edit_text_count"] += 1
+        if _score_float(quality.get("synthetic_context_override")) >= 1.0:
+            counts["synthetic_context_override_count"] += 1
+        generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
+        route = _synthetic_generation_route(generation)
+        if str(record.get("source_type", "")).strip() == "synthetic_edit" and bool(record.get("accepted")):
+            if route in SYNTHETIC_AUDIO_ROUTES:
+                counts["synthetic_audio_count"] += 1
+                if route in {"deterministic_overlay", "audio_deterministic"}:
+                    counts["deterministic_audio_count"] += 1
+                elif route == "foleycrafter_temporal":
+                    counts["foleycrafter_audio_count"] += 1
+                elif route == "frieren_benchmark":
+                    counts["frieren_audio_count"] += 1
+            else:
+                counts["synthetic_visual_count"] += 1
+        postprocess = generation.get("postprocess", {}) if isinstance(generation.get("postprocess"), dict) else {}
+        if postprocess.get("audio_copied_from_reference"):
+            counts["audio_remux_count"] += 1
+        reject_reason_text = str(record.get("judge", {}).get("reject_reason", "")).lower() if isinstance(record.get("judge"), dict) else ""
+        if "missing audio copied from the reference" in reject_reason_text:
+            counts["missing_target_audio_reject_count"] += 1
+        if "missing audio" in reject_reason_text:
+            counts["audio_stream_missing_reject_count"] += 1
+        if "speech content edits are disabled" in reject_reason_text or "speech difference type is disabled" in reject_reason_text:
+            counts["speech_content_reject_count"] += 1
+        if "audio synthetic target changed visual stream" in reject_reason_text:
+            counts["visual_changed_in_audio_sample_reject_count"] += 1
+        if "audio_event target sound was not detected" in reject_reason_text:
+            counts["audio_event_not_detected_reject_count"] += 1
         verification_passed = _verification_accepts(verification)
         if verification_passed:
             counts["verification_passed_count"] += 1
@@ -2493,6 +2750,20 @@ def _build_pilot_report(summary: dict[str, Any]) -> str:
         lines.append(f"- `{key}`: `{'PASS' if value else 'FAIL'}`")
     verification_counts = summary.get("verification_counts", {})
     if verification_counts:
+        lines.extend(["", "## Synthetic Route Counts"])
+        for key in (
+            "synthetic_visual_count",
+            "synthetic_audio_count",
+            "deterministic_audio_count",
+            "foleycrafter_audio_count",
+            "frieren_audio_count",
+            "audio_remux_count",
+            "speech_content_reject_count",
+            "audio_stream_missing_reject_count",
+            "visual_changed_in_audio_sample_reject_count",
+            "audio_event_not_detected_reject_count",
+        ):
+            lines.append(f"- `{key}`: `{verification_counts.get(key, 0)}`")
         lines.extend(["", "## Edit Text / Difference Gate Counts"])
         for key in (
             "good_edit_text_count",
@@ -2543,13 +2814,7 @@ def _validate_pilot_record(root: Path, record: dict[str, Any], line_number: int)
     if source_type not in ALLOWED_SOURCE_TYPES:
         errors.append(f"pilot line {line_number}: unsupported source_type={source_type!r}")
     if source_type == "synthetic_edit":
-        generation = record.get("generation")
-        if not isinstance(generation, dict) or not generation:
-            errors.append(f"pilot line {line_number}: synthetic_edit sample requires generation metadata")
-        else:
-            for field_name in ("model", "prompt", "source_video"):
-                if not str(generation.get(field_name, "")).strip():
-                    errors.append(f"pilot line {line_number}: generation.{field_name} is required")
+        errors.extend(f"pilot line {line_number}: {issue}" for issue in _known_pair_generation_issues(record))
 
     for field_name, value in (
         ("reference_video", reference_video),
@@ -2585,6 +2850,8 @@ def _validate_pilot_record(root: Path, record: dict[str, Any], line_number: int)
         difference_type = str(difference.get("type", "")).strip()
         if difference_type not in ALLOWED_DIFFERENCE_TYPES:
             errors.append(f"pilot line {line_number}: unsupported difference.type={difference_type!r}")
+        if difference_type == "speech":
+            errors.append(f"pilot line {line_number}: speech difference type is disabled for final Omni-CVR samples")
         if not any(str(difference.get(key, "")).strip() for key in ("from", "to", "description")):
             errors.append(f"pilot line {line_number}: difference must include from/to/description")
 
@@ -3715,6 +3982,7 @@ def _carry_local_gate_quality(target_quality: dict[str, Any], source_quality: di
         "near_duplicate_without_delta",
         "competing_difference_passed",
         "audio_event_independent_evidence_passed",
+        "synthetic_context_override",
     ):
         if key in source_quality:
             target_quality[key] = source_quality[key]
@@ -4040,7 +4308,7 @@ def _source_context(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
 def _pair_context_score(*, semantic_context_score: float, source_context: dict[str, Any]) -> float:
     source_score = _score_float(source_context.get("score"))
     relation = str(source_context.get("relation", "")).strip()
-    if relation in {"shared_source_row", "same_source_video"}:
+    if relation in {"shared_source_row", "same_source_video", "synthetic_from_reference"}:
         return max(semantic_context_score, source_score)
     return semantic_context_score
 
@@ -4592,6 +4860,35 @@ def _is_speech_only_audio_phrase(value: str) -> bool:
     if not normalized:
         return False
     return any(pattern in normalized for pattern in SPEECH_ONLY_AUDIO_PATTERNS)
+
+
+def _speech_content_edit_issues(*, edit_text: str, difference: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    difference_type = str(difference.get("type", "")).strip()
+    if difference_type == "speech":
+        issues.append("speech difference type is disabled for final Omni-CVR samples")
+
+    text_parts = [
+        edit_text,
+        str(difference.get("from", "")),
+        str(difference.get("to", "")),
+        str(difference.get("description", "")),
+    ]
+    normalized = _normalized_phrase(" ".join(text_parts))
+    if normalized and any(pattern in normalized for pattern in SPEECH_CONTENT_EDIT_PATTERNS):
+        issues.append("speech content edits are disabled for final Omni-CVR samples")
+
+    if difference_type == "audio_event":
+        from_value = str(difference.get("from", "")).strip()
+        to_value = str(difference.get("to", "")).strip()
+        if _is_speech_only_audio_phrase(from_value) or _is_speech_only_audio_phrase(to_value):
+            issues.append("audio_event must not use speech-only or narration-only text as the main difference")
+
+    deduped: list[str] = []
+    for issue in issues:
+        if issue not in deduped:
+            deduped.append(issue)
+    return deduped
 
 
 def _normalize_audio_event_model_fields(model_fields: dict[str, Any]) -> dict[str, Any]:
@@ -5173,7 +5470,9 @@ def _effective_pair_quality(
         "edit_text_not_caption_like",
         "edit_text_no_modality_leakage",
         "observable_difference_passed",
+        "observable_difference_frame_backed",
         "near_duplicate_without_delta",
+        "synthetic_context_override",
     ):
         if key in heuristic_quality:
             result[key] = _score_float(heuristic_quality.get(key))
@@ -5576,6 +5875,25 @@ def _has_intraclip_difference_conflict(
     return any(_has_intraclip_change_description(text, from_value, to_value) for text in texts_to_check)
 
 
+def _reject_record_with_acceptance_issues(record: dict[str, Any], acceptance_issues: list[str]) -> dict[str, Any]:
+    updated = dict(record)
+    judge = dict(updated.get("judge", {}))
+    judge["accept"] = False
+    judge["reject_reason"] = "; ".join(acceptance_issues)
+    updated["judge"] = judge
+    verification = dict(updated.get("verification", {})) if isinstance(updated.get("verification"), dict) else {}
+    failures = [str(item) for item in verification.get("failures", []) if str(item).strip()]
+    for issue in acceptance_issues:
+        failure = f"acceptance gate failed: {issue}"
+        if failure not in failures:
+            failures.append(failure)
+    verification["failures"] = failures
+    verification["passed"] = False
+    updated["verification"] = verification
+    updated["accepted"] = False
+    return updated
+
+
 def _pair_record_acceptance_issues(
     *,
     root: Path,
@@ -5602,6 +5920,7 @@ def _pair_record_acceptance_issues(
     ):
         issues.append("the proposed difference appears inside a single clip instead of between reference and target")
     difference = record.get("difference", {})
+    issues.extend(_speech_content_edit_issues(edit_text=str(record.get("edit_text", "")), difference=difference))
     if str(difference.get("type", "")).strip() == "audio_event":
         from_value = str(difference.get("from", "")).strip()
         to_value = str(difference.get("to", "")).strip()
@@ -5616,6 +5935,83 @@ def _pair_record_acceptance_issues(
             issues.append("single_main_difference failed: competing stronger difference")
         if _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0:
             issues.append("audio_event lacks independent non-speech audio evidence")
+    issues.extend(
+        _synthetic_edit_record_issues(
+            root=root,
+            record=record,
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+        )
+    )
+    return issues
+
+
+def _synthetic_edit_record_issues(
+    *,
+    root: Path,
+    record: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> list[str]:
+    if str(record.get("source_type", "natural")).strip() != "synthetic_edit":
+        return []
+    issues: list[str] = []
+    quality = record.get("quality", {}) if isinstance(record.get("quality"), dict) else {}
+    difference_type = str(record.get("difference", {}).get("type", "")).strip()
+    generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
+    route = _synthetic_generation_route(generation)
+    is_audio_route = _is_audio_synthetic_route(route)
+    source_context = record.get("source_context", {}) if isinstance(record.get("source_context"), dict) else {}
+    relation = str(source_context.get("relation", "")).strip()
+    visual_score = _score_float(quality.get("visual_near_duplicate_score"))
+    if (
+        relation == "synthetic_from_reference"
+        and difference_type in VISUAL_DIFFERENCE_TYPES
+        and not is_audio_route
+        and visual_score < MIN_SYNTHETIC_VISUAL_CONTEXT_SCORE
+    ):
+        issues.append(
+            f"synthetic target does not preserve reference visual context: visual_near_duplicate_score {visual_score:.3f} is below {MIN_SYNTHETIC_VISUAL_CONTEXT_SCORE:.2f}"
+        )
+    if is_audio_route and visual_score < MIN_SYNTHETIC_AUDIO_VISUAL_CONTEXT_SCORE:
+        issues.append(
+            f"audio synthetic target changed visual stream: visual_near_duplicate_score {visual_score:.3f} is below {MIN_SYNTHETIC_AUDIO_VISUAL_CONTEXT_SCORE:.2f}"
+        )
+
+    reference_path = _resolve_under_root(root, str(record.get("reference_video", "")).strip())
+    target_path = _resolve_under_root(root, str(record.get("target_video", "")).strip())
+    reference_media = probe_media(reference_path)
+    target_media = probe_media(target_path)
+    if "error" not in target_media and not target_media.get("has_video"):
+        issues.append("synthetic target is missing a video stream")
+    if "error" not in reference_media and "error" not in target_media:
+        reference_duration = float(reference_media.get("duration_seconds") or 0.0)
+        target_duration = float(target_media.get("duration_seconds") or 0.0)
+        if reference_media.get("has_audio") and not target_media.get("has_audio"):
+            issues.append("synthetic target is missing audio copied from the reference")
+        if reference_duration > 0 and target_duration > 0:
+            ratio = abs(reference_duration - target_duration) / reference_duration
+            if ratio > 0.10:
+                issues.append(
+                    f"synthetic target duration drift {ratio:.3f} exceeds 0.10 from the reference"
+                )
+    postprocess = generation.get("postprocess", {}) if isinstance(generation.get("postprocess"), dict) else {}
+    if (
+        difference_type in VISUAL_DIFFERENCE_TYPES
+        and not is_audio_route
+        and "error" not in reference_media
+        and reference_media.get("has_audio")
+        and not postprocess.get("audio_copied_from_reference")
+    ):
+        issues.append("visual synthetic edits must record generation.postprocess.audio_copied_from_reference=true")
+    if is_audio_route:
+        expected_event = _synthetic_audio_expected_event(record)
+        if not expected_event:
+            issues.append("audio_event target sound was not detected by audio observer: expected_event is missing")
+        elif not _audio_terms_mention_event(_non_speech_audio_terms(target_annotation), expected_event):
+            issues.append(f"audio_event target sound was not detected by audio observer: {expected_event}")
+        elif _audio_terms_mention_event(_non_speech_audio_terms(reference_annotation), expected_event):
+            issues.append(f"reference audio already contains requested audio event: {expected_event}")
     return issues
 
 
@@ -5811,6 +6207,257 @@ def _path_lookup_keys(root: Path, resolved_path: Path, raw_path: str | Path) -> 
     return keys
 
 
+def _annotation_for_video_edit_plan(
+    *,
+    root: Path,
+    lookup: dict[str, dict[str, Any]],
+    record: dict[str, Any],
+    video_field: str,
+    caption_field: str,
+) -> dict[str, Any]:
+    raw_path = str(record.get(video_field, "")).strip()
+    if raw_path:
+        resolved = _resolve_under_root(root, raw_path)
+        for key in _path_lookup_keys(root, resolved, raw_path):
+            if key in lookup:
+                return lookup[key]
+    caption = str(record.get(caption_field, "")).strip()
+    return {
+        "clip_id": _safe_id(raw_path or caption or "unknown_clip"),
+        "output_path": raw_path,
+        "summary": caption,
+        "subjects": [],
+        "object_counts": {},
+        "actions": [],
+        "scene": "",
+        "attributes": [],
+        "visible_text": [],
+        "speech": [],
+        "audio_events": [],
+        "modalities": ["visual"],
+    }
+
+
+def _video_edit_model_route(difference_type: str) -> str | None:
+    difference_type = str(difference_type).strip()
+    if difference_type in {"object_presence", "object_count"}:
+        return "vace_controlled"
+    if difference_type == "attribute":
+        return "tokenflow_style"
+    if difference_type == "action":
+        return "ltx2_retake"
+    return None
+
+
+def _video_edit_token(difference: dict[str, Any], edit_text: str) -> str:
+    for field_name in ("to", "description", "from"):
+        value = str(difference.get(field_name, "")).strip()
+        if value and not _absence_like_phrase(value):
+            return value[:120]
+    tokens = TOKEN_PATTERN.findall(edit_text.lower())
+    if not tokens:
+        return ""
+    return " ".join(tokens[-5:])[:120]
+
+
+def _absence_like_phrase(value: str) -> bool:
+    normalized = _normalized_phrase(value)
+    return bool(
+        not normalized
+        or normalized.startswith("no ")
+        or normalized.startswith("none")
+        or normalized in {"absent", "missing", "nothing", "no distinctive audio event"}
+    )
+
+
+def _video_edit_region(
+    edit_text: str,
+    difference: dict[str, Any],
+    annotation: dict[str, Any],
+    route: str,
+) -> str:
+    if route == "audio_deterministic":
+        return "audio track"
+    text = " ".join(
+        str(value).strip()
+        for value in (
+            edit_text,
+            difference.get("description", ""),
+            difference.get("to", ""),
+            annotation.get("summary", ""),
+        )
+        if str(value).strip()
+    ).lower()
+    region_patterns = (
+        ("top-right", "top-right region"),
+        ("top right", "top-right region"),
+        ("top-left", "top-left region"),
+        ("top left", "top-left region"),
+        ("bottom-right", "bottom-right region"),
+        ("bottom right", "bottom-right region"),
+        ("bottom-left", "bottom-left region"),
+        ("bottom left", "bottom-left region"),
+        ("background", "background"),
+        ("foreground", "foreground"),
+        ("wall", "wall area"),
+        ("paper", "paper surface"),
+        ("desk", "desk surface"),
+        ("table", "table surface"),
+        ("floor", "floor area"),
+        ("center", "center region"),
+        ("left", "left side"),
+        ("right", "right side"),
+    )
+    for marker, region in region_patterns:
+        if marker in text:
+            return region
+    edit_token = _video_edit_token(difference, edit_text)
+    if edit_token:
+        return f"localized region around {edit_token}"
+    return ""
+
+
+def _video_edit_source_prompt(annotation: dict[str, Any], record: dict[str, Any]) -> str:
+    summary = str(annotation.get("summary") or record.get("reference_caption", "")).strip()
+    scene = str(annotation.get("scene", "")).strip()
+    subjects = _dedupe_strings(_normalize_list(annotation.get("subjects", [])))[:4]
+    actions = _dedupe_strings(_normalize_list(annotation.get("actions", [])))[:3]
+    clauses = [summary or "the reference video"]
+    if scene:
+        clauses.append(f"scene: {scene}")
+    if subjects:
+        clauses.append("main subjects: " + ", ".join(subjects))
+    if actions:
+        clauses.append("actions: " + ", ".join(actions))
+    return ". ".join(clauses).strip().rstrip(".") + "."
+
+
+def _video_edit_target_prompt(*, source_prompt: str, edit_text: str, difference: dict[str, Any]) -> str:
+    difference_type = str(difference.get("type", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    if difference_type == "object_presence" and to_value:
+        edit_clause = f"Add only {to_value}."
+    elif difference_type == "object_count" and to_value:
+        edit_clause = f"Change only the count to {to_value}."
+    elif difference_type == "attribute":
+        edit_clause = f"Change only the specified attribute: {edit_text}."
+    elif difference_type == "action":
+        edit_clause = f"Change only the action: {edit_text}."
+    elif difference_type == "audio_event":
+        edit_clause = f"Change only the audio event: {edit_text}."
+    else:
+        edit_clause = f"Apply only this edit: {edit_text}."
+    return f"{source_prompt} {edit_clause}".strip()
+
+
+def _video_edit_preserve_tokens(
+    annotation: dict[str, Any],
+    difference: dict[str, Any],
+    edit_token: str,
+) -> list[str]:
+    values: list[str] = []
+    values.extend(_normalize_list(annotation.get("subjects", [])))
+    values.extend(list(_normalize_object_counts(annotation.get("object_counts", {})).keys()))
+    values.extend(_normalize_list(annotation.get("actions", [])))
+    scene = str(annotation.get("scene", "")).strip()
+    if scene:
+        values.append(scene)
+    values.extend(["camera motion", "lighting", "timing"])
+    normalized_edit = _normalized_phrase(edit_token)
+    preserved = [
+        item
+        for item in _dedupe_strings([str(value).strip() for value in values if str(value).strip()])
+        if not normalized_edit or _normalized_phrase(item) != normalized_edit
+    ]
+    return preserved[:8]
+
+
+def _video_edit_negative_prompt(preserve_tokens: list[str]) -> str:
+    protected = ", ".join(preserve_tokens[:6]) if preserve_tokens else "the original subject, scene, camera, timing"
+    return (
+        f"Do not change {protected}. Do not add extra people, change the scene, alter visible text, "
+        "reorder shots, or introduce additional edits."
+    )
+
+
+def _video_edit_control_plan(route: str) -> list[str]:
+    if route == "vace_controlled":
+        return ["first_frame_reference", "local_roi_mask", "depth_or_lineart_control"]
+    if route == "tokenflow_style":
+        return ["first_frame_reference", "tokenflow_consistency", "local_roi_mask"]
+    if route == "ltx2_retake":
+        return ["first_frame_reference", "retake_reference", "motion_consistency_check"]
+    return []
+
+
+def _video_edit_generation_defaults(route: str) -> dict[str, Any]:
+    return {
+        "gpu_ids": "0,1",
+        "offload_model": False,
+        "frame_count": 49,
+        "steps": 25,
+        "resolution": "832x480",
+        "postprocess": {"audio_copied_from_reference": True},
+    }
+
+
+def _audio_expected_event(difference: dict[str, Any], edit_text: str) -> str:
+    for field_name in ("to", "description", "from"):
+        value = str(difference.get(field_name, "")).strip()
+        if value and not _absence_like_phrase(value) and not _is_speech_only_audio_phrase(value):
+            return value[:120]
+    tokens = [token for token in TOKEN_PATTERN.findall(edit_text.lower()) if token in NON_SPEECH_AUDIO_TOKENS]
+    return " ".join(tokens[:4])[:120]
+
+
+def _synthetic_audio_expected_event(record: dict[str, Any]) -> str:
+    generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
+    audio_plan = generation.get("audio_edit_plan", {}) if isinstance(generation.get("audio_edit_plan"), dict) else {}
+    expected_event = str(audio_plan.get("expected_event", "")).strip()
+    if expected_event:
+        return expected_event
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    return _audio_expected_event(difference, str(record.get("edit_text", "")))
+
+
+def _audio_terms_mention_event(terms: list[str], expected_event: str) -> bool:
+    expected_tokens = _tokenize_text(expected_event) - {"audio", "event", "sound", "sounds", "noise", "no"}
+    if not expected_tokens:
+        return False
+    for term in terms:
+        if _text_mentions_phrase(term, expected_event):
+            return True
+        term_tokens = _tokenize_text(term)
+        if expected_tokens.issubset(term_tokens):
+            return True
+        if _jaccard(expected_tokens, term_tokens) >= 0.5:
+            return True
+    return False
+
+
+def _audio_edit_route(expected_event: str, annotation: dict[str, Any]) -> str:
+    event = _normalized_phrase(expected_event)
+    if any(token in event for token in ("footstep", "walking", "scratch", "writing", "whoosh", "splash")):
+        return "foleycrafter_temporal"
+    return "deterministic_overlay"
+
+
+def _audio_edit_prompt(expected_event: str, annotation: dict[str, Any], edit_text: str) -> str:
+    actions = _dedupe_strings(_normalize_list(annotation.get("actions", [])))[:3]
+    if actions:
+        return f"{expected_event}, synchronized with {', '.join(actions)}"
+    return f"{expected_event}. {edit_text}".strip()
+
+
+def _audio_timing_strategy(expected_event: str, annotation: dict[str, Any]) -> str:
+    event = _normalized_phrase(expected_event)
+    if any(token in event for token in ("ambient", "wind", "rain", "waves", "hum", "music")):
+        return "whole_clip_ambience"
+    if annotation.get("events") or annotation.get("actions"):
+        return "visual_sync"
+    return "fixed_timestamp"
+
+
 def _annotation_for_known_pair(
     *,
     root: Path,
@@ -5877,6 +6524,27 @@ def _known_pair_model_fields(
     }
 
 
+def _synthetic_pair_source_matches_reference(pair: dict[str, Any]) -> bool:
+    if str(pair.get("source_type", "synthetic_edit")).strip() != "synthetic_edit":
+        return False
+    generation = pair.get("generation")
+    if not isinstance(generation, dict):
+        return False
+    source_video = _normalized_path_text(generation.get("source_video", ""))
+    reference_video = _normalized_path_text(pair.get("reference_video", ""))
+    if not source_video or not reference_video:
+        return False
+    return bool(
+        source_video == reference_video
+        or source_video.endswith("/" + reference_video)
+        or reference_video.endswith("/" + source_video)
+    )
+
+
+def _normalized_path_text(value: Any) -> str:
+    return str(value).replace("\\", "/").strip().lstrip("./")
+
+
 def _known_pair_source_context(pair: dict[str, Any]) -> dict[str, Any]:
     source_context = pair.get("source_context")
     if isinstance(source_context, dict) and source_context:
@@ -5884,6 +6552,12 @@ def _known_pair_source_context(pair: dict[str, Any]) -> dict[str, Any]:
         normalized.setdefault("relation", "known_pair")
         normalized.setdefault("score", 0.9)
         return normalized
+    if _synthetic_pair_source_matches_reference(pair):
+        return {
+            "relation": "synthetic_from_reference",
+            "score": 0.95,
+            "generation_source_video": str(pair.get("generation", {}).get("source_video", "")).strip(),
+        }
     return {"relation": "synthetic_edit", "score": 0.9}
 
 
@@ -5959,6 +6633,9 @@ def _known_pair_base_quality(
         semantic_context_score=semantic_context_score,
         source_context=source_context,
     )
+    synthetic_context_override = str(source_context.get("relation", "")).strip() == "synthetic_from_reference"
+    if synthetic_context_override:
+        same_context_score = max(same_context_score, _score_float(source_context.get("score")))
     detected_difference = _detect_primary_difference(reference_annotation, target_annotation)
     changed_types = list(detected_difference.get("changed_types", [])) if detected_difference else [str(difference.get("type", "")).strip()]
     quality: dict[str, Any] = {
@@ -5995,7 +6672,23 @@ def _known_pair_base_quality(
         )
     if visual_score is not None:
         quality["visual_near_duplicate_score"] = _score_float(visual_score)
+    if synthetic_context_override:
+        quality["synthetic_context_override"] = 1.0
     return quality
+
+
+def _synthetic_generation_route(generation: dict[str, Any]) -> str:
+    route = str(generation.get("model_route", "")).strip()
+    if route:
+        return route
+    audio_plan = generation.get("audio_edit_plan", {})
+    if isinstance(audio_plan, dict):
+        return str(audio_plan.get("route", "")).strip()
+    return ""
+
+
+def _is_audio_synthetic_route(route: str) -> bool:
+    return route in SYNTHETIC_AUDIO_ROUTES
 
 
 def _known_pair_generation_issues(record: dict[str, Any]) -> list[str]:
@@ -6008,9 +6701,31 @@ def _known_pair_generation_issues(record: dict[str, Any]) -> list[str]:
     if not isinstance(generation, dict) or not generation:
         return ["synthetic_edit pair is missing generation metadata"]
     issues: list[str] = []
-    for field_name in ("model", "prompt", "source_video"):
+    route = _synthetic_generation_route(generation)
+    for field_name in ("model", "source_video", "model_route"):
         if not str(generation.get(field_name, "")).strip():
             issues.append(f"generation.{field_name} is required for synthetic_edit pairs")
+    if _is_audio_synthetic_route(route):
+        audio_plan = generation.get("audio_edit_plan")
+        if not isinstance(audio_plan, dict) or not audio_plan:
+            issues.append("generation.audio_edit_plan is required for synthetic audio pairs")
+        else:
+            for field_name in ("audio_prompt", "expected_event"):
+                if not str(audio_plan.get(field_name, "")).strip():
+                    issues.append(f"generation.audio_edit_plan.{field_name} is required for synthetic audio pairs")
+            if not _boolish(audio_plan.get("preserve_video")):
+                issues.append("generation.audio_edit_plan.preserve_video=true is required for synthetic audio pairs")
+        return issues
+
+    for field_name in ("prompt", "source_prompt", "target_prompt"):
+        if not str(generation.get(field_name, "")).strip():
+            issues.append(f"generation.{field_name} is required for synthetic visual pairs")
+    preserve_tokens = generation.get("preserve_tokens")
+    if not isinstance(preserve_tokens, list) or not [item for item in preserve_tokens if str(item).strip()]:
+        issues.append("generation.preserve_tokens is required for synthetic visual pairs")
+    postprocess = generation.get("postprocess")
+    if not isinstance(postprocess, dict) or "audio_copied_from_reference" not in postprocess:
+        issues.append("generation.postprocess.audio_copied_from_reference is required for synthetic visual pairs")
     return issues
 
 
@@ -6222,6 +6937,20 @@ def build_parser() -> argparse.ArgumentParser:
     propose_group_pairs_parser.add_argument("--max-accepted-pairs", type=int, default=10)
     propose_group_pairs_parser.add_argument("--overwrite", action="store_true")
 
+    plan_video_edits_parser = subparsers.add_parser("plan-video-edits")
+    plan_video_edits_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    plan_video_edits_parser.add_argument("--pair-candidates-path", required=True)
+    plan_video_edits_parser.add_argument("--clip-annotations-path", required=True)
+    plan_video_edits_parser.add_argument("--output-path")
+    plan_video_edits_parser.add_argument("--max-plans", type=int, default=10)
+
+    plan_audio_edits_parser = subparsers.add_parser("plan-audio-edits")
+    plan_audio_edits_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    plan_audio_edits_parser.add_argument("--pair-candidates-path", required=True)
+    plan_audio_edits_parser.add_argument("--clip-annotations-path", required=True)
+    plan_audio_edits_parser.add_argument("--output-path")
+    plan_audio_edits_parser.add_argument("--max-plans", type=int, default=10)
+
     validate_known_pairs_parser = subparsers.add_parser("validate-known-pairs")
     validate_known_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
     validate_known_pairs_parser.add_argument("--known-pairs-path", required=True)
@@ -6343,6 +7072,28 @@ def main() -> None:
             timeout_seconds=args.timeout_seconds,
             max_accepted_pairs=args.max_accepted_pairs,
             overwrite=args.overwrite,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "plan-video-edits":
+        result = plan_video_edits(
+            root=args.root,
+            pair_candidates_path=args.pair_candidates_path,
+            clip_annotations_path=args.clip_annotations_path,
+            output_path=args.output_path,
+            max_plans=args.max_plans,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "plan-audio-edits":
+        result = plan_audio_edits(
+            root=args.root,
+            pair_candidates_path=args.pair_candidates_path,
+            clip_annotations_path=args.clip_annotations_path,
+            output_path=args.output_path,
+            max_plans=args.max_plans,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

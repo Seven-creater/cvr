@@ -69,6 +69,34 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("one Omni model per run", script)
         self.assertIn("refusing to run with GPU_COUNT", script)
 
+    def test_dual_route_download_script_targets_visual_and_audio_models(self) -> None:
+        script = Path("scripts/download_dual_route_models.sh").read_text(encoding="utf-8")
+
+        self.assertIn("LTX-2", script)
+        self.assertIn("LTX-Video", script)
+        self.assertIn("FoleyCrafter", script)
+        self.assertIn("Frieren-V2A", script)
+        self.assertIn("modelscope download", script)
+        self.assertIn("omni_src", script)
+
+    def test_deterministic_audio_smoke_preserves_video_with_ffmpeg(self) -> None:
+        script = Path("scripts/run_deterministic_audio_synthetic_smoke.sh").read_text(encoding="utf-8")
+
+        self.assertIn("deterministic audio only", script)
+        self.assertIn("-map 0:v:0", script)
+        self.assertIn("ffmpeg", script)
+        self.assertIn("synthetic_candidate_pairs.jsonl", script)
+        self.assertIn("deterministic_overlay", script)
+
+    def test_dual_route_validation_script_uses_synthetic_validation_entrypoint(self) -> None:
+        script = Path("scripts/run_synthetic_dual_route_validation.sh").read_text(encoding="utf-8")
+
+        self.assertIn("one Omni model per run", script)
+        self.assertIn("--known-pairs", script)
+        self.assertIn("validate-known-pairs", script)
+        self.assertIn("accepted_synthetic_pairs.jsonl", script)
+        self.assertIn("synthetic_pilot_review.md", script)
+
 
 if __name__ == "__main__":
     unittest.main()

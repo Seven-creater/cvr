@@ -44,7 +44,9 @@ from app.composed_data import (
     extract_clips,
     index_raw_sources,
     main as composed_data_main,
+    plan_audio_edits,
     plan_detective_event_clips,
+    plan_video_edits,
     propose_group_pairs,
     propose_pairs,
     validate_known_pairs,
@@ -3446,11 +3448,17 @@ class ComposedDataTests(unittest.TestCase):
                             "to": "red backpack",
                             "description": "a red backpack is added to the chair",
                         },
+                        "quality": {"visual_near_duplicate_score": 0.9},
                         "hard_negatives": ["clips/neg1.mp4", "clips/neg2.mp4"],
                         "generation": {
                             "model": "Wan2.1-VACE-1.3B",
+                            "model_route": "vace_controlled",
                             "source_video": "clips/ref.mp4",
                             "prompt": "Only add a red backpack on the chair.",
+                            "source_prompt": "a chair without a backpack",
+                            "target_prompt": "a chair with a red backpack",
+                            "preserve_tokens": ["chair", "room", "camera motion"],
+                            "postprocess": {"audio_copied_from_reference": True},
                             "seed": 1234,
                         },
                     }
@@ -3611,6 +3619,210 @@ class ComposedDataTests(unittest.TestCase):
                 if line.strip()
             ]
             self.assertIn("generation", judged[0]["judge"]["reject_reason"])
+
+    def test_plan_video_edits_uses_omni_prompt_planner_and_excludes_audio_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a person holds a mobile phone at a desk",
+                        "subjects": ["person", "mobile phone", "desk"],
+                        "object_counts": {"person": 1, "mobile phone": 1, "desk": 1},
+                        "actions": ["holding"],
+                        "scene": "desk",
+                    },
+                    {
+                        "clip_id": "ref_audio",
+                        "output_path": "clips/ref_audio.mp4",
+                        "summary": "a person jumps",
+                        "subjects": ["person"],
+                        "actions": ["jumping"],
+                        "audio_events": [],
+                    },
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "visual_1",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "reference_caption": "a person holds a mobile phone at a desk",
+                        "edit_text": "replace the mobile phone with a tablet",
+                        "difference": {"type": "object_presence", "from": "mobile phone", "to": "tablet"},
+                    },
+                    {
+                        "proposal_id": "audio_1",
+                        "reference_video": "clips/ref_audio.mp4",
+                        "edit_text": "add whoosh to the audio",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                    },
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("visual_1", plans[0]["plan_id"])
+            self.assertEqual("strongest_omni_prompt_planner", plans[0]["planner"]["stage"])
+            self.assertIn("mobile phone", plans[0]["source_prompt"])
+            self.assertIn("tablet", plans[0]["target_prompt"])
+            self.assertEqual(1, summary["skipped_by_type"]["audio_event"])
+
+    def test_plan_audio_edits_only_allows_non_speech_audio_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref",
+                        "output_path": "clips/ref.mp4",
+                        "summary": "a person jumps across a small platform",
+                        "actions": ["jumping"],
+                        "audio_events": [],
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "audio_ok",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "add whoosh to the audio",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                    },
+                    {
+                        "proposal_id": "speech_bad",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "change the speech topic to marketing",
+                        "difference": {"type": "speech", "from": "sports", "to": "marketing"},
+                    },
+                    {
+                        "proposal_id": "audio_speech_bad",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "change the audio to only speech",
+                        "difference": {"type": "audio_event", "from": "no distinctive audio event", "to": "only speech"},
+                    },
+                ],
+            )
+
+            summary = plan_audio_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("audio_ok", plans[0]["plan_id"])
+            self.assertEqual("strongest_omni_audio_prompt_planner", plans[0]["planner"]["stage"])
+            self.assertEqual("whoosh", plans[0]["audio_edit_plan"]["expected_event"])
+            self.assertEqual(1, summary["skipped_by_type"]["speech"])
+            self.assertEqual(1, summary["skipped_reasons"]["speech_content_or_speech_only_audio"])
+
+    def test_pair_record_acceptance_issues_rejects_speech_difference_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            issues = _pair_record_acceptance_issues(
+                root=root,
+                record={
+                    "reference_video": "ref.mp4",
+                    "target_video": "target.mp4",
+                    "edit_text": "change the speech topic to marketing",
+                    "difference": {"type": "speech", "from": "sales", "to": "marketing"},
+                },
+                reference_annotation={"speech": ["sales"]},
+                target_annotation={"speech": ["marketing"]},
+            )
+
+            self.assertTrue(any("speech difference type is disabled" in issue for issue in issues))
+
+    def test_synthetic_audio_rejects_visual_drift_and_missing_target_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={"duration_seconds": 8.0, "has_audio": True, "has_video": True},
+            ):
+                issues = _pair_record_acceptance_issues(
+                    root=root,
+                    record={
+                        "source_type": "synthetic_edit",
+                        "reference_video": "ref.mp4",
+                        "target_video": "target.mp4",
+                        "edit_text": "add whoosh to the audio",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                        "quality": {"visual_near_duplicate_score": 0.80},
+                        "source_context": {"relation": "synthetic_from_reference"},
+                        "generation": {
+                            "model_route": "deterministic_overlay",
+                            "audio_edit_plan": {"route": "deterministic_overlay", "expected_event": "whoosh"},
+                        },
+                    },
+                    reference_annotation={"audio_events": []},
+                    target_annotation={"audio_events": ["quiet room"]},
+                )
+
+            self.assertTrue(any("audio synthetic target changed visual stream" in issue for issue in issues))
+            self.assertTrue(any("target sound was not detected" in issue for issue in issues))
+
+    def test_synthetic_visual_requires_reference_audio_remux_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={"duration_seconds": 8.0, "has_audio": True, "has_video": True},
+            ):
+                issues = _pair_record_acceptance_issues(
+                    root=root,
+                    record={
+                        "source_type": "synthetic_edit",
+                        "reference_video": "ref.mp4",
+                        "target_video": "target.mp4",
+                        "edit_text": "add a red backpack",
+                        "difference": {"type": "object_presence", "from": "no red backpack", "to": "red backpack"},
+                        "quality": {"visual_near_duplicate_score": 0.90},
+                        "source_context": {"relation": "synthetic_from_reference"},
+                        "generation": {"model_route": "vace_controlled", "postprocess": {}},
+                    },
+                    reference_annotation={"object_counts": {"chair": 1}},
+                    target_annotation={"object_counts": {"chair": 1, "red backpack": 1}},
+                )
+
+            self.assertTrue(any("audio_copied_from_reference=true" in issue for issue in issues))
 
     def test_validate_pilot_dataset_builds_gallery_from_targets_and_negatives(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
