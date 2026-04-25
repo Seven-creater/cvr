@@ -1162,6 +1162,40 @@ class ComposedDataTests(unittest.TestCase):
         self.assertTrue(verification["passed"])
         self.assertEqual([], verification["failures"])
 
+    def test_finalize_pair_verification_rejects_order_only_difference(self) -> None:
+        verification = _finalize_pair_verification(
+            {
+                "caption_delta": {
+                    "caption_equivalent": False,
+                    "has_concrete_difference": True,
+                    "difference_matches_edit": True,
+                    "concrete_differences": [
+                        "Both clips show the same control room and space station shots, only in a different order."
+                    ],
+                    "reason": "The reference shows control room then space station, while the target reverses that sequence.",
+                },
+                "edit_projection": {
+                    "target_matches_projection": True,
+                    "score": 0.9,
+                    "reason": "The same scenes are present, but their shot order differs.",
+                },
+                "edit_necessity": {
+                    "edit_needed": True,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.9,
+                    "reason": "The videos share the same elements with different temporal order.",
+                },
+            }
+        )
+
+        self.assertFalse(verification["passed"])
+        self.assertTrue(verification["caption_delta"]["caption_equivalent"])
+        self.assertFalse(verification["caption_delta"]["has_concrete_difference"])
+        self.assertFalse(verification["edit_necessity"]["edit_needed"])
+        self.assertTrue(verification["edit_necessity"]["reference_satisfies_edit"])
+        self.assertIn("same content appears in a different shot/order sequence", verification["caption_delta"]["reason"])
+
     def test_difference_strength_gate_blocks_weak_changes(self) -> None:
         judge = {
             "reference_satisfies_edit": False,

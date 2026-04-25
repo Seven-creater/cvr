@@ -4604,9 +4604,93 @@ def _finalize_pair_verification(verification: dict[str, Any]) -> dict[str, Any]:
             "failure_reason": str(edit_text_quality_check.get("failure_reason", "")).strip(),
         },
     }
+    _apply_verification_semantic_rejections(normalized)
     normalized["passed"] = _verification_accepts(normalized)
     normalized["failures"] = _verification_failures(normalized)
     return normalized
+
+
+def _apply_verification_semantic_rejections(verification: dict[str, Any]) -> None:
+    if not _verification_describes_order_only_difference(verification):
+        return
+    reason = "same content appears in a different shot/order sequence, not an edit-required target difference"
+    caption_delta = verification.setdefault("caption_delta", {})
+    caption_delta["caption_equivalent"] = True
+    caption_delta["has_concrete_difference"] = False
+    caption_delta["difference_matches_edit"] = False
+    caption_delta["reason"] = _append_reason(caption_delta.get("reason"), reason)
+
+    edit_projection = verification.setdefault("edit_projection", {})
+    edit_projection["target_matches_projection"] = False
+    edit_projection["score"] = min(_score_float(edit_projection.get("score")), 0.0)
+    edit_projection["reason"] = _append_reason(edit_projection.get("reason"), reason)
+
+    edit_necessity = verification.setdefault("edit_necessity", {})
+    edit_necessity["edit_needed"] = False
+    edit_necessity["reference_satisfies_edit"] = True
+    edit_necessity["target_satisfies_edit"] = True
+    edit_necessity["score"] = min(_score_float(edit_necessity.get("score")), 0.0)
+    edit_necessity["reason"] = _append_reason(edit_necessity.get("reason"), reason)
+
+
+def _verification_describes_order_only_difference(verification: dict[str, Any]) -> bool:
+    text_parts: list[str] = []
+    for section_name in ("caption_delta", "edit_projection", "edit_necessity"):
+        section = verification.get(section_name, {})
+        if not isinstance(section, dict):
+            continue
+        text_parts.append(str(section.get("reason", "")))
+        text_parts.append(str(section.get("projected_target_caption", "")))
+        text_parts.extend(_normalize_list(section.get("concrete_differences", [])))
+        text_parts.extend(_normalize_list(section.get("missing_requirements", [])))
+    text = _normalized_phrase(" ".join(text_parts))
+    if not text:
+        return False
+    order_markers = (
+        "different order",
+        "different sequence",
+        "order differs",
+        "sequence differs",
+        "reordered",
+        "reverse order",
+        "reversed order",
+        "shot order",
+        "sequence order",
+        "temporal order",
+        "just the order",
+        "only the order",
+        "只是顺序",
+        "顺序不同",
+        "镜头顺序",
+    )
+    has_order_marker = any(marker in text for marker in order_markers)
+    if not has_order_marker:
+        return False
+    same_content_markers = (
+        "same shots",
+        "same elements",
+        "same scenes",
+        "same content",
+        "both videos",
+        "both clips",
+        "both contain",
+        "both show",
+        "only",
+        "just",
+        "merely",
+        "相同",
+        "只是",
+    )
+    return any(marker in text for marker in same_content_markers)
+
+
+def _append_reason(existing: Any, reason: str) -> str:
+    existing_text = str(existing or "").strip()
+    if not existing_text:
+        return reason
+    if reason in existing_text:
+        return existing_text
+    return f"{existing_text} {reason}"
 
 
 def _finalize_pair_judge(judge: dict[str, Any]) -> dict[str, Any]:
