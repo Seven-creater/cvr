@@ -13,7 +13,7 @@ MODEL_ROOT=${MODEL_ROOT:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_v
 WAN_ROOT=${WAN_ROOT:-$MODEL_ROOT/Wan2.1}
 WAN_CODE=${WAN_CODE:-$WAN_ROOT/code}
 WAN_CKPT=${WAN_CKPT:-$WAN_ROOT/Wan2.1-VACE-1.3B}
-CONDA_ENV=${CONDA_ENV:-omni_src}
+CONDA_ENV=${CONDA_ENV:-wan_vace}
 GPU_IDS=${GPU_IDS:-0,1}
 MAX_GPUS=${MAX_GPUS:-2}
 USE_TORCHRUN=${USE_TORCHRUN:-0}
@@ -24,6 +24,7 @@ SAMPLE_GUIDE_SCALE=${SAMPLE_GUIDE_SCALE:-5.0}
 OFFLOAD_MODEL=${OFFLOAD_MODEL:-False}
 T5_CPU=${T5_CPU:-0}
 OUT_ROOT=${OUT_ROOT:-$RUN_ROOT/visual_synthetic_smoke}
+ALLOW_CPU_OFFLOAD=${ALLOW_CPU_OFFLOAD:-0}
 
 usage() {
   cat <<'EOF'
@@ -38,14 +39,17 @@ Options:
   --wan-root PATH
   --wan-code PATH
   --wan-ckpt PATH
+  --conda-env NAME
   --gpu-ids IDS
   --use-torchrun 0|1
   --out-root PATH
+  --allow-cpu-offload 0|1
   -h, --help
 
 Generates one VACE visual synthetic target from video_edit_plan.jsonl.
 The target video is remuxed with reference audio and a known-pair JSONL is
 written for later validate-known-pairs. This script does not start Omni.
+By default this script is GPU-only: CPU offload and T5-on-CPU are refused.
 EOF
 }
 
@@ -59,9 +63,11 @@ while [[ $# -gt 0 ]]; do
     --wan-root) WAN_ROOT="$2"; WAN_CODE="$2/code"; WAN_CKPT="$2/Wan2.1-VACE-1.3B"; shift 2 ;;
     --wan-code) WAN_CODE="$2"; shift 2 ;;
     --wan-ckpt) WAN_CKPT="$2"; shift 2 ;;
+    --conda-env) CONDA_ENV="$2"; shift 2 ;;
     --gpu-ids) GPU_IDS="$2"; shift 2 ;;
     --use-torchrun) USE_TORCHRUN="$2"; shift 2 ;;
     --out-root) OUT_ROOT="$2"; shift 2 ;;
+    --allow-cpu-offload) ALLOW_CPU_OFFLOAD="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[vace-smoke] unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -75,6 +81,16 @@ PY
 if [[ "$GPU_COUNT" -gt "$MAX_GPUS" ]]; then
   echo "[vace-smoke] refusing to run with GPU_COUNT=$GPU_COUNT > MAX_GPUS=$MAX_GPUS" >&2
   exit 1
+fi
+if [[ "$ALLOW_CPU_OFFLOAD" != "1" ]]; then
+  if [[ "$OFFLOAD_MODEL" != "False" && "$OFFLOAD_MODEL" != "false" && "$OFFLOAD_MODEL" != "0" ]]; then
+    echo "[vace-smoke] refusing CPU offload: OFFLOAD_MODEL=$OFFLOAD_MODEL. Use GPU-only OFFLOAD_MODEL=False." >&2
+    exit 1
+  fi
+  if [[ "$T5_CPU" != "0" && "$T5_CPU" != "False" && "$T5_CPU" != "false" ]]; then
+    echo "[vace-smoke] refusing CPU text encoder: T5_CPU=$T5_CPU. Use GPU-only T5_CPU=0." >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "$OUT_ROOT/videos" "$OUT_ROOT/logs" "$OUT_ROOT/pairs" "$OUT_ROOT/metadata"
@@ -218,7 +234,8 @@ echo "[vace-smoke] raw_video=$RAW_VIDEO"
 echo "[vace-smoke] target_video=$TARGET_VIDEO"
 echo "[vace-smoke] wan_code=$WAN_CODE"
 echo "[vace-smoke] wan_ckpt=$WAN_CKPT"
-echo "[vace-smoke] gpu_ids=$GPU_IDS offload_model=$OFFLOAD_MODEL t5_cpu=$T5_CPU"
+echo "[vace-smoke] conda_env=$CONDA_ENV"
+echo "[vace-smoke] gpu_ids=$GPU_IDS offload_model=$OFFLOAD_MODEL t5_cpu=$T5_CPU allow_cpu_offload=$ALLOW_CPU_OFFLOAD"
 echo "[vace-smoke] prompt=$PROMPT"
 
 if [[ ! -d "$WAN_CODE" ]]; then
@@ -232,6 +249,22 @@ fi
 
 source /data02/usr/wangqihao/miniconda3/etc/profile.d/conda.sh
 conda activate "$CONDA_ENV"
+
+python - <<'PY'
+import importlib.util
+import sys
+
+import torch
+
+print("[vace-smoke] python", sys.executable)
+print("[vace-smoke] torch", torch.__version__, "cuda", torch.version.cuda)
+print("[vace-smoke] flash_attn", "ok" if importlib.util.find_spec("flash_attn") else "missing")
+if importlib.util.find_spec("flash_attn") is None:
+    raise SystemExit(
+        "flash_attn is missing in the active conda env. "
+        "Use CONDA_ENV=wan_vace or install a CUDA/PyTorch-compatible flash-attn build."
+    )
+PY
 
 GEN_ARGS=(
   "$WAN_CODE/generate.py"
