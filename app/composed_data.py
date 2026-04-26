@@ -1547,13 +1547,15 @@ def plan_video_edits(
             break
         difference = dict(candidate.get("difference") or {})
         difference_type = str(difference.get("type", "")).strip()
+        route = _video_edit_model_route(difference_type)
+        safe_visual_ideation_used = False
 
         reference_video = str(candidate.get("reference_video", "")).strip()
         if not reference_video:
             skipped_by_type[difference_type or "unknown"] += 1
             skipped_reasons["missing_reference_video"] += 1
             continue
-        if reference_video in seen_sources and route != "audio_deterministic":
+        if reference_video in seen_sources:
             skipped_reasons["duplicate_reference_video"] += 1
             continue
 
@@ -1564,7 +1566,6 @@ def plan_video_edits(
             video_field="reference_video",
             caption_field="reference_caption",
         )
-        route = _video_edit_model_route(difference_type)
         if route is None:
             ideation_candidate = (
                 _safe_visual_ideation_candidate(candidate, reference_annotation)
@@ -1579,12 +1580,15 @@ def plan_video_edits(
             difference = dict(candidate.get("difference") or {})
             difference_type = str(difference.get("type", "")).strip()
             route = _video_edit_model_route(difference_type)
+            safe_visual_ideation_used = True
             skipped_reasons["safe_visual_ideation_from_unsupported_type"] += 1
             if route is None:
                 skipped_by_type[difference_type or "unknown"] += 1
                 skipped_reasons["unsupported_difference_type"] += 1
                 continue
         risk = _video_edit_risk_assessment(reference_annotation, difference_type=difference_type)
+        if safe_visual_ideation_used:
+            risk = _relax_safe_visual_ideation_risk(risk, candidate)
         if not risk["allow_generation"]:
             skipped_by_type[difference_type or "unknown"] += 1
             skipped_reasons[f"high_risk_reference_{risk['risk_level']}"] += 1
@@ -1651,6 +1655,8 @@ def plan_video_edits(
                     difference_type = planned_difference_type
                     route = planned_difference_route
                     risk = _video_edit_risk_assessment(reference_annotation, difference_type=difference_type)
+                    if safe_visual_ideation_used:
+                        risk = _relax_safe_visual_ideation_risk(risk, candidate)
                     if not risk["allow_generation"]:
                         skipped_by_type[difference_type or "unknown"] += 1
                         skipped_reasons[f"model_planner_revised_to_high_risk_{risk['risk_level']}"] += 1
@@ -6494,6 +6500,54 @@ def _safe_visual_edit_anchor(annotation: dict[str, Any]) -> tuple[str, dict[str,
             }
             return edit_text, difference, f"reference has a stable {region} for localized VACE editing"
     return None
+
+
+def _relax_safe_visual_ideation_risk(risk: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    if str(candidate.get("candidate_source", "")) != "safe_visual_ideation_from_reference":
+        return risk
+    difference = candidate.get("difference") if isinstance(candidate.get("difference"), dict) else {}
+    if str(difference.get("type", "")).strip() != "object_presence":
+        return risk
+    edit_text = str(candidate.get("edit_text", "")).lower()
+    stable_surface_markers = {
+        "paper",
+        "desk",
+        "table",
+        "wall",
+        "background",
+        "sticker",
+        "cube",
+        "potted plant",
+    }
+    if not any(marker in edit_text for marker in stable_surface_markers):
+        return risk
+    risk_reasons = [str(reason) for reason in risk.get("risk_reasons", [])]
+    hard_reasons = {"scene_or_shot_change", "ui_or_text_heavy_scene", "many_subjects"}
+    if any(reason in hard_reasons for reason in risk_reasons):
+        return risk
+    relaxed = dict(risk)
+    relaxed["allow_generation"] = True
+    relaxed["risk_level"] = "medium" if risk_reasons else str(risk.get("risk_level", "low"))
+    relaxed["safe_visual_ideation_relaxed"] = True
+    relaxed["relaxed_risk_reasons"] = [
+        reason
+        for reason in risk_reasons
+        if reason in {"visible_text_present", "multiple_actions", "multi_event_timeline", "speaking_person", "long_storyline"}
+    ]
+    locks = [
+        str(item).strip()
+        for item in risk.get("locks", [])
+        if str(item).strip()
+    ]
+    extra_locks = [
+        "limit the edit to the named small object and local region only",
+        "preserve all text, hands, people, actions, motion order, and background content exactly",
+    ]
+    for lock in extra_locks:
+        if lock not in locks:
+            locks.append(lock)
+    relaxed["locks"] = locks
+    return relaxed
 
 
 def _normalize_model_planned_visual_difference(difference: dict[str, Any], *, edit_text: str) -> dict[str, Any]:

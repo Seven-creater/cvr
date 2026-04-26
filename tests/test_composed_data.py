@@ -4006,8 +4006,10 @@ class ComposedDataTests(unittest.TestCase):
                         "summary": "a hand writes on a white paper on a desk",
                         "subjects": ["hand", "paper", "desk"],
                         "object_counts": {"hand": 1, "paper": 1, "desk": 1},
-                        "actions": ["writing"],
+                        "actions": ["writing", "moving hand"],
                         "scene": "desk",
+                        "visible_text": ["chemical formula"],
+                        "on_screen_text": ["chemical formula"],
                     }
                 ],
             )
@@ -4068,6 +4070,8 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("add a small blue star sticker to the top-right corner of the paper", plans[0]["edit_text"])
             self.assertEqual("object_presence", plans[0]["difference"]["type"])
             self.assertEqual("vace_controlled", plans[0]["model_route"])
+            self.assertTrue(plans[0]["visual_edit_risk"]["safe_visual_ideation_relaxed"])
+            self.assertIn("visible_text_present", plans[0]["visual_edit_risk"]["relaxed_risk_reasons"])
             self.assertEqual(1, summary["skipped_reasons"]["safe_visual_ideation_from_unsupported_type"])
             call_kwargs = fake_client.plan_video_edit.call_args.kwargs
             self.assertEqual("add a small blue star sticker to the top-right corner of the paper", call_kwargs["candidate"]["edit_text"])
