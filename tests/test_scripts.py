@@ -96,6 +96,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("validate-known-pairs", script)
         self.assertIn("accepted_synthetic_pairs.jsonl", script)
         self.assertIn("synthetic_pilot_review.md", script)
+        self.assertIn("/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-instruct", script)
 
 
 if __name__ == "__main__":
