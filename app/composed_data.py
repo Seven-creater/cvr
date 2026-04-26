@@ -1547,11 +1547,6 @@ def plan_video_edits(
             break
         difference = dict(candidate.get("difference") or {})
         difference_type = str(difference.get("type", "")).strip()
-        route = _video_edit_model_route(difference_type)
-        if route is None:
-            skipped_by_type[difference_type or "unknown"] += 1
-            skipped_reasons["unsupported_difference_type"] += 1
-            continue
 
         reference_video = str(candidate.get("reference_video", "")).strip()
         if not reference_video:
@@ -1569,6 +1564,26 @@ def plan_video_edits(
             video_field="reference_video",
             caption_field="reference_caption",
         )
+        route = _video_edit_model_route(difference_type)
+        if route is None:
+            ideation_candidate = (
+                _safe_visual_ideation_candidate(candidate, reference_annotation)
+                if planner_client is not None
+                else None
+            )
+            if ideation_candidate is None:
+                skipped_by_type[difference_type or "unknown"] += 1
+                skipped_reasons["unsupported_difference_type"] += 1
+                continue
+            candidate = ideation_candidate
+            difference = dict(candidate.get("difference") or {})
+            difference_type = str(difference.get("type", "")).strip()
+            route = _video_edit_model_route(difference_type)
+            skipped_reasons["safe_visual_ideation_from_unsupported_type"] += 1
+            if route is None:
+                skipped_by_type[difference_type or "unknown"] += 1
+                skipped_reasons["unsupported_difference_type"] += 1
+                continue
         risk = _video_edit_risk_assessment(reference_annotation, difference_type=difference_type)
         if not risk["allow_generation"]:
             skipped_by_type[difference_type or "unknown"] += 1
@@ -1680,6 +1695,8 @@ def plan_video_edits(
             "plan_id": str(candidate.get("proposal_id", "")).strip()
             or f"video_edit_plan_{_stable_hash(reference_video + edit_text)}",
             "reference_video": reference_video,
+            "source_candidate_edit_text": str(candidate.get("source_candidate_edit_text", edit_text)).strip(),
+            "source_candidate_difference": candidate.get("source_candidate_difference", difference),
             "edit_text": edit_text,
             "planner": planner_metadata,
             "source_prompt": source_prompt,
@@ -6412,6 +6429,70 @@ def _video_edit_model_route(difference_type: str) -> str | None:
         return "tokenflow_style"
     if difference_type == "action":
         return "ltx2_retake"
+    return None
+
+
+def _safe_visual_ideation_candidate(candidate: dict[str, Any], annotation: dict[str, Any]) -> dict[str, Any] | None:
+    anchor = _safe_visual_edit_anchor(annotation)
+    if anchor is None:
+        return None
+    edit_text, difference, reason = anchor
+    source_edit_text = str(candidate.get("edit_text", "")).strip()
+    proposal_seed = str(candidate.get("proposal_id", "")) or str(candidate.get("reference_video", "")) + edit_text
+    revised = dict(candidate)
+    revised["proposal_id"] = f"{str(candidate.get('proposal_id', '')).strip() or 'candidate'}__visual_ideation_{_stable_hash(proposal_seed)[:8]}"
+    revised["edit_text"] = edit_text
+    revised["difference"] = difference
+    revised["source_candidate_edit_text"] = source_edit_text
+    revised["source_candidate_difference"] = candidate.get("difference", {})
+    revised["candidate_source"] = "safe_visual_ideation_from_reference"
+    revised["ideation_reason"] = reason
+    return revised
+
+
+def _safe_visual_edit_anchor(annotation: dict[str, Any]) -> tuple[str, dict[str, Any], str] | None:
+    values: list[str] = [
+        str(annotation.get("summary", "")),
+        str(annotation.get("scene", "")),
+    ]
+    values.extend(_normalize_list(annotation.get("subjects", [])))
+    values.extend(_normalize_object_counts(annotation.get("object_counts", {})).keys())
+    text = _normalized_phrase(" ".join(values))
+    anchors = (
+        (
+            ("paper", "page", "notebook", "sheet", "worksheet"),
+            "add a small blue star sticker to the top-right corner of the paper",
+            "small blue star sticker",
+            "paper surface",
+        ),
+        (
+            ("desk", "table", "counter", "workbench"),
+            "add a small red cube on the desk",
+            "small red cube",
+            "desk/table surface",
+        ),
+        (
+            ("wall", "whiteboard", "room"),
+            "add a small blue circular sticker on the wall",
+            "small blue circular sticker",
+            "wall area",
+        ),
+        (
+            ("background", "shelf", "studio"),
+            "add a small potted plant in the background",
+            "small potted plant",
+            "background",
+        ),
+    )
+    for markers, edit_text, edit_token, region in anchors:
+        if any(marker in text for marker in markers):
+            difference = {
+                "type": "object_presence",
+                "from": f"no {edit_token}",
+                "to": edit_token,
+                "description": f"{edit_token} is added to the {region}.",
+            }
+            return edit_text, difference, f"reference has a stable {region} for localized VACE editing"
     return None
 
 

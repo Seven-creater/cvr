@@ -3991,6 +3991,87 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("vace_controlled", plans[0]["model_route"])
             self.assertEqual("face, nose area", plans[0]["edit_region"])
 
+    def test_plan_video_edits_ideates_safe_visual_edit_from_audio_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "ref_audio.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_audio",
+                        "output_path": "clips/ref_audio.mp4",
+                        "summary": "a hand writes on a white paper on a desk",
+                        "subjects": ["hand", "paper", "desk"],
+                        "object_counts": {"hand": 1, "paper": 1, "desk": 1},
+                        "actions": ["writing"],
+                        "scene": "desk",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "audio_1",
+                        "reference_video": "clips/ref_audio.mp4",
+                        "reference_caption": "a hand writes on paper",
+                        "edit_text": "add whoosh to the audio",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "edit_text": "add a small blue star sticker to the top-right corner of the paper",
+                    "difference": {
+                        "type": "object_presence",
+                        "from": "no small blue star sticker",
+                        "to": "small blue star sticker",
+                    },
+                    "source_prompt": "A close-up video of a hand writing on white paper on a desk.",
+                    "target_prompt": "The same close-up video with a small blue star sticker added to the top-right corner of the paper.",
+                    "edit_token": "small blue star sticker",
+                    "preserve_tokens": ["hand", "paper", "desk", "writing", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the hand, paper, writing, desk, camera motion, lighting, timing, or visible text.",
+                    "edit_region": "paper surface",
+                    "model_route": "vace_controlled",
+                    "reason": "The paper is a stable local surface for editing.",
+                    "repaired_fields": [],
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client):
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("add whoosh to the audio", plans[0]["source_candidate_edit_text"])
+            self.assertEqual("add a small blue star sticker to the top-right corner of the paper", plans[0]["edit_text"])
+            self.assertEqual("object_presence", plans[0]["difference"]["type"])
+            self.assertEqual("vace_controlled", plans[0]["model_route"])
+            self.assertEqual(1, summary["skipped_reasons"]["safe_visual_ideation_from_unsupported_type"])
+            call_kwargs = fake_client.plan_video_edit.call_args.kwargs
+            self.assertEqual("add a small blue star sticker to the top-right corner of the paper", call_kwargs["candidate"]["edit_text"])
+
     def test_plan_video_edits_skips_high_risk_visible_text_and_motion_references(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
