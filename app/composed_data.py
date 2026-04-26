@@ -1626,6 +1626,7 @@ def plan_video_edits(
                     "fallback_used": False,
                     "model": model,
                     "reason": str(planned.get("reason", "")).strip(),
+                    "repaired_fields": list(planned.get("repaired_fields", [])),
                 }
             except Exception as exc:
                 raw_planner_output = {"error": f"{type(exc).__name__}: {exc}"}

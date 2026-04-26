@@ -3809,6 +3809,7 @@ class ComposedDataTests(unittest.TestCase):
                     "edit_region": "hand-held object",
                     "model_route": "vace_controlled",
                     "reason": "The object is visible and localized.",
+                    "repaired_fields": ["target_prompt"],
                 },
                 {"raw": "planner"},
             )
@@ -3834,6 +3835,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("strongest_omni_prompt_planner", plans[0]["planner"]["stage"])
             self.assertFalse(plans[0]["planner"]["fallback_used"])
             self.assertEqual("qwen3-omni", plans[0]["planner"]["model"])
+            self.assertEqual(["target_prompt"], plans[0]["planner"]["repaired_fields"])
             self.assertEqual("tablet", plans[0]["edit_token"])
             self.assertEqual("hand-held object", plans[0]["edit_region"])
             self.assertIn("replace only the phone", plans[0]["target_prompt"])

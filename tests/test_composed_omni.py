@@ -236,6 +236,62 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("Candidate edit JSON", user_content[1]["text"])
         self.assertEqual(44.0, request_holder["timeout"])
 
+    def test_plan_video_edit_repairs_empty_target_prompt_without_discarding_plan(self) -> None:
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_generate": True,
+                                "source_prompt": "A close-up video of a hand writing on white paper.",
+                                "target_prompt": "",
+                                "edit_token": "blue star sticker",
+                                "preserve_tokens": ["hand", "paper", "camera motion", "lighting"],
+                                "negative_prompt": "Do not change the hand, paper, writing, camera, timing, or lighting.",
+                                "edit_region": "top-right paper surface",
+                                "model_route": "vace_controlled",
+                                "reason": "The paper surface is visible and localized.",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-video-edit-plan-repair-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            clip_path = tmp_dir / "clip.mp4"
+            clip_path.write_bytes(b"fake-mp4-bytes")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.plan_video_edit(
+                    reference_clip_path=str(clip_path),
+                    reference_annotation={"summary": "a hand writes on white paper"},
+                    candidate={
+                        "edit_text": "add a blue star sticker to the top-right corner of the paper",
+                        "difference": {"type": "object_presence", "from": "no blue star sticker", "to": "blue star sticker"},
+                    },
+                    route_hint="vace_controlled",
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertIn("add a blue star sticker", normalized["target_prompt"])
+        self.assertIn("Preserve all other visible content", normalized["target_prompt"])
+        self.assertEqual(["target_prompt"], normalized["repaired_fields"])
+        self.assertEqual("blue star sticker", normalized["edit_token"])
+
     def test_detective_annotation_runs_observer_then_final_pass(self) -> None:
         requests = []
         observer_payload = {

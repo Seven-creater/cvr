@@ -830,7 +830,12 @@ class OpenAIComposedDataClient:
             system_prompt=_video_edit_planner_system_prompt(),
             max_tokens=1300,
         )
-        return _normalize_video_edit_plan_payload(raw_payload), raw_payload
+        repaired_payload = _repair_video_edit_plan_payload(
+            raw_payload,
+            candidate=candidate,
+            route_hint=route_hint,
+        )
+        return _normalize_video_edit_plan_payload(repaired_payload), raw_payload
 
     def _request_json(
         self,
@@ -1034,6 +1039,44 @@ def _normalize_pair_verification_payload(payload: dict[str, Any]) -> dict[str, A
     }
 
 
+def _repair_video_edit_plan_payload(
+    payload: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    route_hint: str,
+) -> dict[str, Any]:
+    repaired = dict(payload)
+    repaired_fields: list[str] = _string_list(repaired.get("repaired_fields"))
+    source_prompt = str(repaired.get("source_prompt", "")).strip()
+    edit_text = str(candidate.get("edit_text", "")).strip()
+    difference = candidate.get("difference") if isinstance(candidate.get("difference"), dict) else {}
+    edit_token = str(repaired.get("edit_token", "")).strip()
+    if not edit_token:
+        for field_name in ("to", "description", "from"):
+            value = str(difference.get(field_name, "")).strip()
+            if value and value.lower() not in {"none", "missing", "absent"} and not value.lower().startswith("no "):
+                edit_token = value
+                repaired["edit_token"] = edit_token
+                repaired_fields.append("edit_token")
+                break
+    if source_prompt and not str(repaired.get("target_prompt", "")).strip():
+        edit_instruction = edit_text or (f"add or change {edit_token}" if edit_token else "apply the requested edit")
+        repaired["target_prompt"] = (
+            f"{source_prompt.rstrip('.')} Apply exactly one localized edit: {edit_instruction}. "
+            "Preserve all other visible content, camera motion, lighting, timing, and layout."
+        )
+        repaired_fields.append("target_prompt")
+    if route_hint and not str(repaired.get("model_route", "")).strip():
+        repaired["model_route"] = route_hint
+        repaired_fields.append("model_route")
+    if not str(repaired.get("reason", "")).strip():
+        repaired["reason"] = "Planner response was repaired conservatively from the candidate edit."
+        repaired_fields.append("reason")
+    if repaired_fields:
+        repaired["repaired_fields"] = sorted(set(repaired_fields))
+    return repaired
+
+
 def _normalize_video_edit_plan_payload(payload: dict[str, Any]) -> dict[str, Any]:
     missing_fields = _missing_fields(payload, REQUIRED_VIDEO_EDIT_PLAN_FIELDS)
     if missing_fields:
@@ -1050,6 +1093,7 @@ def _normalize_video_edit_plan_payload(payload: dict[str, Any]) -> dict[str, Any
         "edit_region": str(payload.get("edit_region", "")).strip(),
         "model_route": str(payload.get("model_route", "")).strip(),
         "reason": str(payload.get("reason", "")).strip(),
+        "repaired_fields": _string_list(payload.get("repaired_fields")),
     }
     for field_name in ("source_prompt", "target_prompt", "edit_token", "negative_prompt", "edit_region", "reason"):
         if not normalized[field_name]:
