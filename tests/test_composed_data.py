@@ -49,6 +49,7 @@ from app.composed_data import (
     main as composed_data_main,
     plan_audio_edits,
     plan_detective_event_clips,
+    plan_video_masks,
     plan_video_edits,
     propose_group_pairs,
     propose_pairs,
@@ -4051,6 +4052,60 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("strongest_omni_prompt_planner", plans[0]["planner"]["stage"])
             self.assertFalse(plans[0]["planner"]["fallback_used"])
             self.assertEqual("existing_subject_attribute_edit", plans[0]["route_suitability"]["reason"])
+            self.assertEqual("robot body", plans[0]["mask_query"])
+            self.assertEqual("grounded_sam2_video_mask", plans[0]["mask_plan"])
+            self.assertEqual("vace14b_masked_v2v", plans[0]["route"])
+            self.assertEqual("to_be_generated", plans[0]["vace_inputs"]["src_mask"])
+            self.assertTrue(plans[0]["validation_requirements"]["requires_mask"])
+
+    def test_plan_video_masks_builds_grounded_sam_manifest_for_vace_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "robot_ref.mp4").write_bytes(b"video")
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "robot_color",
+                        "reference_video": "clips/robot_ref.mp4",
+                        "edit_text": "change the robot body color from black and gold to bright yellow",
+                        "difference": {"type": "attribute", "from": "black and gold robot body", "to": "bright yellow robot body"},
+                        "model_route": "vace_controlled",
+                        "edit_token": "bright yellow robot body",
+                        "edit_region": "robot body",
+                        "mask_query": "robot body",
+                        "preserve_tokens": ["platform", "dark studio", "camera motion"],
+                    }
+                ],
+            )
+
+            summary = plan_video_masks(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                output_path=root / "pairs" / "video_mask_plan.jsonl",
+                mask_manifest_path=root / "pairs" / "video_mask_manifest.jsonl",
+            )
+            mask_plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            mask_manifest = [
+                json.loads(line)
+                for line in Path(summary["mask_manifest_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["mask_plan_count"])
+            self.assertEqual("robot body", mask_plans[0]["mask_query"])
+            self.assertEqual("edit_masked_region", mask_plans[0]["mask_mode"])
+            self.assertEqual(0.02, mask_plans[0]["mask_gate"]["min_coverage_ratio"])
+            self.assertEqual(0.65, mask_plans[0]["mask_gate"]["max_coverage_ratio"])
+            self.assertEqual("SAM2.1_video_predictor", mask_plans[0]["toolchain"]["segmenter"])
+            self.assertEqual("robot_color", mask_manifest[0]["plan_id"])
+            self.assertTrue(mask_manifest[0]["mask_video"].endswith("robot_color_mask.mp4"))
 
     def test_plan_video_edits_rejects_tiny_additive_attribute_revision_for_vace(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

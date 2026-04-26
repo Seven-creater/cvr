@@ -28,6 +28,8 @@ DEFAULT_SYNTHETIC_JUDGED_PAIRS_NAME = "judged_synthetic_pair_proposals.jsonl"
 DEFAULT_SYNTHETIC_ACCEPTED_PAIRS_NAME = "accepted_synthetic_pairs.jsonl"
 DEFAULT_SYNTHETIC_PILOT_REVIEW_NAME = "synthetic_pilot_review.md"
 DEFAULT_VIDEO_EDIT_PLAN_NAME = "video_edit_plan.jsonl"
+DEFAULT_VIDEO_MASK_PLAN_NAME = "video_mask_plan.jsonl"
+DEFAULT_VIDEO_MASK_MANIFEST_NAME = "video_mask_manifest.jsonl"
 DEFAULT_AUDIO_EDIT_PLAN_NAME = "audio_edit_plan.jsonl"
 DEFAULT_LICENSE_NOTE = "internal research pilot only"
 VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
@@ -80,6 +82,9 @@ MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE = 0.70
 MIN_ACCEPT_EDIT_TEXT_QUALITY_SCORE = 0.75
 MIN_SYNTHETIC_VISUAL_CONTEXT_SCORE = 0.85
 MIN_SYNTHETIC_AUDIO_VISUAL_CONTEXT_SCORE = 0.95
+MIN_VIDEO_MASK_COVERAGE_RATIO = 0.02
+MAX_VIDEO_MASK_COVERAGE_RATIO = 0.65
+MIN_VIDEO_MASK_TEMPORAL_STABILITY = 0.75
 MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE = 0.995
 VISUAL_DIFFERENCE_TYPES = {"object_count", "object_presence", "attribute", "action", "scene", "visible_text"}
 SYNTHETIC_VISUAL_ROUTES = {"vace_controlled", "ltx2_retake", "tokenflow_style"}
@@ -1718,6 +1723,8 @@ def plan_video_edits(
             "fallback_used": True,
         }
         raw_planner_output: dict[str, Any] = {}
+        planned_mask_query = ""
+        planned_preserve_regions: list[str] = []
         if planner_client is not None:
             try:
                 planned, raw_planner_output = planner_client.plan_video_edit(
@@ -1770,6 +1777,12 @@ def plan_video_edits(
                 negative_prompt = str(planned["negative_prompt"]).strip()
                 negative_prompt = _merge_video_edit_locks(negative_prompt, risk)
                 edit_region = str(planned["edit_region"]).strip()
+                planned_mask_query = str(planned.get("mask_query", "")).strip()
+                planned_preserve_regions = [
+                    str(item).strip()
+                    for item in planned.get("preserve_regions", [])
+                    if str(item).strip()
+                ]
                 planned_route = str(planned.get("model_route", "")).strip()
                 if planned_route in SYNTHETIC_VISUAL_ROUTES and _planned_route_matches_difference(
                     planned_route,
@@ -1809,6 +1822,26 @@ def plan_video_edits(
             skipped_reasons[str(suitability["reason"])] += 1
             continue
         control_plan = _video_edit_control_plan(route)
+        mask_query = _video_mask_query(
+            difference=difference,
+            edit_text=edit_text,
+            edit_token=edit_token,
+            edit_region=edit_region,
+            route=route,
+            suitability=suitability,
+        )
+        if planned_mask_query:
+            mask_query = planned_mask_query
+        preserve_regions = _video_preserve_regions(
+            preserve_tokens=preserve_tokens,
+            edit_region=edit_region,
+            reference_annotation=reference_annotation,
+        )
+        if planned_preserve_regions:
+            preserve_regions = planned_preserve_regions
+        mask_plan_name = "grounded_sam2_video_mask" if route == "vace_controlled" else (
+            "none" if route == "audio_deterministic" else "local_roi"
+        )
         plan = {
             "plan_id": str(candidate.get("proposal_id", "")).strip()
             or f"video_edit_plan_{_stable_hash(reference_video + edit_text)}",
@@ -1823,9 +1856,17 @@ def plan_video_edits(
             "preserve_tokens": preserve_tokens,
             "negative_prompt": negative_prompt,
             "edit_region": edit_region,
-            "mask_plan": "none" if route == "audio_deterministic" else "local_roi",
+            "mask_query": mask_query,
+            "preserve_regions": preserve_regions,
+            "mask_plan": mask_plan_name,
             "control_plan": control_plan,
             "model_route": route,
+            "route": "vace14b_masked_v2v" if route == "vace_controlled" else route,
+            "vace_inputs": {
+                "src_video": reference_video,
+                "src_mask": "to_be_generated" if route == "vace_controlled" else "",
+                "src_ref_images": [],
+            },
             "difference": difference,
             "raw_planner_output": raw_planner_output,
             "reference_understanding": _video_edit_reference_understanding(reference_annotation),
@@ -1836,6 +1877,9 @@ def plan_video_edits(
                 "visual_near_duplicate_min": MIN_SYNTHETIC_VISUAL_CONTEXT_SCORE,
                 "preserve_reference_audio": route != "audio_deterministic",
                 "single_edit_token": True,
+                "requires_mask": route == "vace_controlled",
+                "outside_mask_visual_near_duplicate_min": MIN_SYNTHETIC_VISUAL_CONTEXT_SCORE,
+                "mask_gate": _video_mask_gate_defaults() if route == "vace_controlled" else {},
             },
         }
         plans.append(plan)
@@ -1975,6 +2019,99 @@ def plan_audio_edits(
         "plan_count": len(plans),
         "output_path": str(output),
         "skipped_by_type": dict(skipped_by_type),
+        "skipped_reasons": dict(skipped_reasons),
+    }
+
+
+def plan_video_masks(
+    *,
+    root: str | Path,
+    video_edit_plan_path: str | Path,
+    output_path: str | Path | None = None,
+    mask_manifest_path: str | Path | None = None,
+    max_masks: int | None = None,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    edit_plans = list(_load_jsonl(Path(video_edit_plan_path)))
+    if not edit_plans:
+        raise ValueError("video edit plan file is empty")
+
+    output = Path(output_path) if output_path else layout["pairs"] / DEFAULT_VIDEO_MASK_PLAN_NAME
+    manifest_output = Path(mask_manifest_path) if mask_manifest_path else output.with_name(DEFAULT_VIDEO_MASK_MANIFEST_NAME)
+    mask_dir = output.parent / "masks"
+    mask_dir.mkdir(parents=True, exist_ok=True)
+
+    mask_plans: list[dict[str, Any]] = []
+    mask_manifest: list[dict[str, Any]] = []
+    skipped_reasons: Counter[str] = Counter()
+    for edit_plan in edit_plans:
+        if max_masks is not None and max_masks > 0 and len(mask_plans) >= max_masks:
+            break
+        if str(edit_plan.get("model_route", "")).strip() != "vace_controlled":
+            skipped_reasons["non_vace_route"] += 1
+            continue
+        plan_id = str(edit_plan.get("plan_id", "")).strip()
+        if not plan_id:
+            skipped_reasons["missing_plan_id"] += 1
+            continue
+        mask_query = str(edit_plan.get("mask_query", "")).strip() or _video_mask_query(
+            difference=dict(edit_plan.get("difference") or {}),
+            edit_text=str(edit_plan.get("edit_text", "")).strip(),
+            edit_token=str(edit_plan.get("edit_token", "")).strip(),
+            edit_region=str(edit_plan.get("edit_region", "")).strip(),
+            route=str(edit_plan.get("model_route", "")).strip(),
+            suitability=edit_plan.get("route_suitability") if isinstance(edit_plan.get("route_suitability"), dict) else {},
+        )
+        if not mask_query:
+            skipped_reasons["missing_mask_query"] += 1
+            continue
+        reference_video = str(edit_plan.get("reference_video", "")).strip()
+        reference_path = _resolve_under_root(layout["root"], reference_video)
+        if not reference_video or not reference_path.exists():
+            skipped_reasons["missing_reference_video"] += 1
+            continue
+        safe_id = _safe_id(plan_id)
+        mask_video = mask_dir / f"{safe_id}_mask.mp4"
+        mask_record = {
+            "plan_id": plan_id,
+            "reference_video": reference_video,
+            "reference_video_absolute": str(reference_path),
+            "mask_video": str(mask_video),
+            "mask_query": mask_query,
+            "mask_mode": _video_mask_mode(edit_plan),
+            "edit_region": str(edit_plan.get("edit_region", "")).strip(),
+            "preserve_regions": _video_preserve_regions(
+                preserve_tokens=_normalize_list(edit_plan.get("preserve_tokens", [])),
+                edit_region=str(edit_plan.get("edit_region", "")).strip(),
+                reference_annotation={},
+            ),
+            "toolchain": {
+                "grounder": "GroundingDINO_or_Florence-2",
+                "segmenter": "SAM2.1_video_predictor",
+                "wrapper": "Grounded-SAM-2",
+            },
+            "mask_gate": _video_mask_gate_defaults(),
+            "status": "planned",
+        }
+        mask_plans.append(mask_record)
+        mask_manifest.append(
+            {
+                "plan_id": plan_id,
+                "reference_video": reference_video,
+                "mask_video": str(mask_video),
+                "mask_query": mask_query,
+                "mask_mode": mask_record["mask_mode"],
+                "status": "planned",
+            }
+        )
+
+    _write_jsonl(output, mask_plans)
+    _write_jsonl(manifest_output, mask_manifest)
+    return {
+        "video_edit_plan_path": str(video_edit_plan_path),
+        "mask_plan_count": len(mask_plans),
+        "output_path": str(output),
+        "mask_manifest_path": str(manifest_output),
         "skipped_reasons": dict(skipped_reasons),
     }
 
@@ -7008,6 +7145,91 @@ def _video_edit_route_suitability(
     }
 
 
+def _video_mask_query(
+    *,
+    difference: dict[str, Any],
+    edit_text: str,
+    edit_token: str,
+    edit_region: str,
+    route: str,
+    suitability: dict[str, Any],
+) -> str:
+    if route != "vace_controlled":
+        return ""
+    difference_type = str(difference.get("type", "")).strip()
+    reason = str(suitability.get("reason", "")).strip()
+    combined = _normalized_phrase(" ".join([edit_text, edit_token, edit_region, str(difference.get("description", ""))]))
+    if difference_type == "scene" or "background" in reason or "background" in combined:
+        return "background"
+    if any(marker in combined for marker in ("shirt", "jacket", "coat", "dress", "clothing", "outfit")):
+        return "clothing"
+    if any(marker in combined for marker in ("robot body", "robotic body", "robot shell")):
+        return "robot body"
+    if any(marker in combined for marker in ("vehicle body", "car body", "truck body", "bus body")):
+        return "vehicle body"
+    if difference_type == "object_presence" and _absence_like_phrase(str(difference.get("to", ""))):
+        from_value = str(difference.get("from", "")).strip()
+        if from_value and not _absence_like_phrase(from_value):
+            return from_value[:120]
+    if "replacement" in reason or difference_type in {"object_presence", "object_count"}:
+        from_value = str(difference.get("from", "")).strip()
+        if from_value and not _absence_like_phrase(from_value):
+            return from_value[:120]
+    if edit_region and not edit_region.startswith("localized region around"):
+        return edit_region[:120]
+    return (edit_token or str(difference.get("target", "")).strip() or edit_region)[:120]
+
+
+def _video_preserve_regions(
+    *,
+    preserve_tokens: list[str],
+    edit_region: str,
+    reference_annotation: dict[str, Any],
+) -> list[str]:
+    values = [str(item).strip() for item in preserve_tokens if str(item).strip()]
+    values.extend(_normalize_list(reference_annotation.get("subjects", [])))
+    scene = str(reference_annotation.get("scene", "")).strip()
+    if scene:
+        values.append(scene)
+    values.extend(["camera motion", "lighting", "timing"])
+    edit_key = _normalized_phrase(edit_region)
+    regions: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = _normalized_phrase(value)
+        if not key or key == edit_key or key in seen:
+            continue
+        seen.add(key)
+        regions.append(value)
+        if len(regions) >= 8:
+            break
+    return regions
+
+
+def _video_mask_mode(plan: dict[str, Any]) -> str:
+    difference = plan.get("difference") if isinstance(plan.get("difference"), dict) else {}
+    edit_region = _normalized_phrase(str(plan.get("edit_region", "")))
+    mask_query = _normalized_phrase(str(plan.get("mask_query", "")))
+    difference_type = str(difference.get("type", "")).strip()
+    if difference_type == "scene" or "background" in edit_region or mask_query == "background":
+        return "edit_background_inverse_subject"
+    if difference_type == "object_presence" and _absence_like_phrase(str(difference.get("to", ""))):
+        return "remove_or_inpaint_masked_object"
+    if difference_type in {"object_presence", "object_count"}:
+        return "replace_masked_object"
+    return "edit_masked_region"
+
+
+def _video_mask_gate_defaults() -> dict[str, Any]:
+    return {
+        "min_coverage_ratio": MIN_VIDEO_MASK_COVERAGE_RATIO,
+        "max_coverage_ratio": MAX_VIDEO_MASK_COVERAGE_RATIO,
+        "min_temporal_stability": MIN_VIDEO_MASK_TEMPORAL_STABILITY,
+        "mask_not_empty_all_frames": True,
+        "mask_target_matches_query": True,
+    }
+
+
 def _video_edit_reference_understanding(annotation: dict[str, Any]) -> dict[str, Any]:
     subjects = _dedupe_strings(_normalize_list(annotation.get("subjects", [])))[:6]
     actions = _dedupe_strings(_normalize_list(annotation.get("actions", [])))[:6]
@@ -8012,6 +8234,13 @@ def build_parser() -> argparse.ArgumentParser:
     plan_audio_edits_parser.add_argument("--output-path")
     plan_audio_edits_parser.add_argument("--max-plans", type=int, default=10)
 
+    plan_video_masks_parser = subparsers.add_parser("plan-video-masks")
+    plan_video_masks_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    plan_video_masks_parser.add_argument("--video-edit-plan-path", required=True)
+    plan_video_masks_parser.add_argument("--output-path")
+    plan_video_masks_parser.add_argument("--mask-manifest-path")
+    plan_video_masks_parser.add_argument("--max-masks", type=int)
+
     validate_known_pairs_parser = subparsers.add_parser("validate-known-pairs")
     validate_known_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
     validate_known_pairs_parser.add_argument("--known-pairs-path", required=True)
@@ -8167,6 +8396,17 @@ def main() -> None:
             clip_annotations_path=args.clip_annotations_path,
             output_path=args.output_path,
             max_plans=args.max_plans,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "plan-video-masks":
+        result = plan_video_masks(
+            root=args.root,
+            video_edit_plan_path=args.video_edit_plan_path,
+            output_path=args.output_path,
+            mask_manifest_path=args.mask_manifest_path,
+            max_masks=args.max_masks,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

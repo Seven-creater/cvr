@@ -454,7 +454,8 @@ def _video_edit_planner_system_prompt() -> str:
         'Required schema: {"should_generate": boolean, "edit_text": string, "difference": object, '
         '"source_prompt": string, "target_prompt": string, '
         '"edit_token": string, "preserve_tokens": [string], "negative_prompt": string, '
-        '"edit_region": string, "model_route": string, "reason": string}. '
+        '"edit_region": string, "mask_query": string, "preserve_regions": [string], '
+        '"model_route": string, "reason": string}. '
         "First understand the reference video: main subjects, stable scene, visible text, actions, editable attributes, and bad edits. "
         "If the candidate edit is unsuitable but the reference clip has a safer single visual edit, revise edit_text and difference to that safer edit instead of rejecting. "
         "Prefer VACE-friendly edits on existing content in this order: clothing/outfit changes, background replacement, video style changes, object replacement inside an existing maskable region, object removal/inpainting, large subject color/material changes, lighting/weather/time-of-day changes. "
@@ -463,7 +464,9 @@ def _video_edit_planner_system_prompt() -> str:
         "The source_prompt must faithfully describe the reference video. "
         "The target_prompt must preserve the same subject, scene, camera, lighting, timing, and layout, while applying exactly one visual edit. "
         "The edit_token is the one object, attribute, or action concept the editor should change. "
+        "mask_query is the visual target that Grounded-SAM-2 should segment, for example robot body, shirt, cup, glasses, or background. "
         "preserve_tokens are concepts that must stay unchanged. "
+        "preserve_regions are visual regions that must stay unchanged outside the mask. "
         "negative_prompt must explicitly forbid changing people, scene, camera, visible text, timing, and unrelated objects. "
         "edit_region should be localized when possible, such as top-right paper surface, wall area, desk surface, hand-held object, or background. "
         "For VACE, route clothing/background/style/object-replacement/removal/color/material edits to vace_controlled. "
@@ -1222,6 +1225,7 @@ def _normalize_video_edit_plan_payload(payload: dict[str, Any]) -> dict[str, Any
         raise ValueError(f"video edit plan missing fields: {missing_fields}")
 
     preserve_tokens = _string_list(payload.get("preserve_tokens"))
+    preserve_regions = _string_list(payload.get("preserve_regions"))
     normalized = {
         "should_generate": _bool_value(payload.get("should_generate")),
         "edit_text": str(payload.get("edit_text", "")).strip(),
@@ -1232,6 +1236,8 @@ def _normalize_video_edit_plan_payload(payload: dict[str, Any]) -> dict[str, Any
         "preserve_tokens": preserve_tokens,
         "negative_prompt": str(payload.get("negative_prompt", "")).strip(),
         "edit_region": str(payload.get("edit_region", "")).strip(),
+        "mask_query": str(payload.get("mask_query", "")).strip(),
+        "preserve_regions": preserve_regions,
         "model_route": str(payload.get("model_route", "")).strip(),
         "reason": str(payload.get("reason", "")).strip(),
         "repaired_fields": _string_list(payload.get("repaired_fields")),

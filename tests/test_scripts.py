@@ -79,6 +79,16 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("modelscope download", script)
         self.assertIn("omni_src", script)
 
+    def test_mask_edit_download_script_targets_grounded_sam_models(self) -> None:
+        script = Path("scripts/download_mask_edit_models.sh").read_text(encoding="utf-8")
+
+        self.assertIn("Grounded-SAM-2", script)
+        self.assertIn("GroundingDINO", script)
+        self.assertIn("SAM2.1", script)
+        self.assertIn("Florence-2", script)
+        self.assertIn("facebook/sam2.1-hiera-large", script)
+        self.assertIn("modelscope download", script)
+
     def test_deterministic_audio_smoke_preserves_video_with_ffmpeg(self) -> None:
         script = Path("scripts/run_deterministic_audio_synthetic_smoke.sh").read_text(encoding="utf-8")
 
@@ -136,6 +146,9 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("torchrun --nproc_per_node", script)
         self.assertIn("-map 0:v:0 -map 1:a?", script)
         self.assertIn("audio_copied_from_reference", script)
+        self.assertIn("--mask-manifest", script)
+        self.assertIn("--src_mask", script)
+        self.assertIn("src_mask", script)
         self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
         self.assertIn("synthetic_visual_target_manifest.jsonl", script)
 
@@ -145,9 +158,20 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("PLAN_IDS", script)
         self.assertIn("TOP_K", script)
         self.assertIn("run_vace_visual_synthetic_smoke.sh", script)
+        self.assertIn("MASK_MANIFEST", script)
+        self.assertIn("--mask-manifest", script)
         self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
         self.assertIn("synthetic_visual_target_manifest.jsonl", script)
         self.assertIn("batch_generation_report.md", script)
+        self.assertIn("This script does not start Omni", script)
+
+    def test_vace_masked_visual_batch_script_requires_mask_manifest(self) -> None:
+        script = Path("scripts/run_vace_masked_visual_batch_from_plan.sh").read_text(encoding="utf-8")
+
+        self.assertIn("video_mask_manifest.jsonl", script)
+        self.assertIn("missing mask manifest", script)
+        self.assertIn("run_vace_visual_batch_from_plan.sh", script)
+        self.assertIn("--mask-manifest", script)
         self.assertIn("This script does not start Omni", script)
 
     def test_manual_review_bundle_script_calls_review_bundle_command(self) -> None:

@@ -7,6 +7,7 @@ cd "$REPO_ROOT"
 DATA_ROOT=${DATA_ROOT:-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval}
 RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/vace_visual_synthetic_smoke}
 VIDEO_EDIT_PLAN=${VIDEO_EDIT_PLAN:-$RUN_ROOT/video_edit_plan.jsonl}
+MASK_MANIFEST=${MASK_MANIFEST:-}
 PLAN_INDEX=${PLAN_INDEX:-1}
 PLAN_ID=${PLAN_ID:-}
 MODEL_ROOT=${MODEL_ROOT:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone}
@@ -37,6 +38,7 @@ Options:
   --data-root PATH
   --run-root PATH
   --video-edit-plan PATH
+  --mask-manifest PATH
   --plan-index N
   --plan-id ID
   --wan-root PATH
@@ -64,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --data-root) DATA_ROOT="$2"; shift 2 ;;
     --run-root) RUN_ROOT="$2"; shift 2 ;;
     --video-edit-plan) VIDEO_EDIT_PLAN="$2"; shift 2 ;;
+    --mask-manifest) MASK_MANIFEST="$2"; shift 2 ;;
     --plan-index) PLAN_INDEX="$2"; shift 2 ;;
     --plan-id) PLAN_ID="$2"; shift 2 ;;
     --wan-root) WAN_ROOT="$2"; WAN_CODE="$2/code"; WAN_CKPT="$2/Wan2.1-VACE-1.3B"; shift 2 ;;
@@ -117,7 +120,7 @@ mkdir -p "$OUT_ROOT/videos" "$OUT_ROOT/logs" "$OUT_ROOT/pairs" "$OUT_ROOT/metada
 SELECTED_PLAN="$OUT_ROOT/metadata/selected_video_edit_plan.json"
 ENV_FILE="$OUT_ROOT/metadata/selected_video_edit_plan.env"
 
-python3 - "$DATA_ROOT" "$VIDEO_EDIT_PLAN" "$PLAN_INDEX" "$PLAN_ID" "$SELECTED_PLAN" "$ENV_FILE" "$OUT_ROOT" "$WAN_CKPT" <<'PY'
+python3 - "$DATA_ROOT" "$VIDEO_EDIT_PLAN" "$MASK_MANIFEST" "$PLAN_INDEX" "$PLAN_ID" "$SELECTED_PLAN" "$ENV_FILE" "$OUT_ROOT" "$WAN_CKPT" <<'PY'
 import json
 import os
 import re
@@ -127,12 +130,13 @@ from pathlib import Path
 
 data_root = Path(sys.argv[1])
 plan_path = Path(sys.argv[2])
-plan_index = int(sys.argv[3])
-plan_id_filter = sys.argv[4].strip()
-selected_plan_path = Path(sys.argv[5])
-env_path = Path(sys.argv[6])
-out_root = Path(sys.argv[7])
-wan_ckpt = Path(sys.argv[8])
+mask_manifest_path = Path(sys.argv[3]) if sys.argv[3].strip() else None
+plan_index = int(sys.argv[4])
+plan_id_filter = sys.argv[5].strip()
+selected_plan_path = Path(sys.argv[6])
+env_path = Path(sys.argv[7])
+out_root = Path(sys.argv[8])
+wan_ckpt = Path(sys.argv[9])
 
 rows = [json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 if not rows:
@@ -164,6 +168,21 @@ plan_id = str(plan.get("plan_id", "")).strip() or "visual_plan"
 safe_plan_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", plan_id)[:80]
 raw_video = out_root / "videos" / f"{safe_plan_id}_raw.mp4"
 target_video = out_root / "videos" / f"{safe_plan_id}_with_ref_audio.mp4"
+src_mask = ""
+if mask_manifest_path:
+    mask_rows = [json.loads(line) for line in mask_manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    mask_matches = [row for row in mask_rows if str(row.get("plan_id", "")) == plan_id]
+    if not mask_matches:
+        raise SystemExit(f"mask manifest has no row for plan_id: {plan_id}")
+    mask_raw = str(mask_matches[0].get("mask_video", "")).strip()
+    if not mask_raw:
+        raise SystemExit(f"mask manifest row is missing mask_video for plan_id: {plan_id}")
+    mask_path = Path(mask_raw)
+    if not mask_path.is_absolute():
+        mask_path = mask_manifest_path.parent / mask_path
+    if not mask_path.exists():
+        raise SystemExit(f"mask video does not exist for plan_id {plan_id}: {mask_path}")
+    src_mask = str(mask_path)
 
 target_prompt = str(plan.get("target_prompt", "")).strip()
 negative_prompt = str(plan.get("negative_prompt", "")).strip()
@@ -203,6 +222,8 @@ known_pair = {
         "preserve_tokens": preserve_tokens,
         "negative_prompt": negative_prompt,
         "edit_region": edit_region,
+        "mask_query": str(plan.get("mask_query", "")).strip(),
+        "src_mask": src_mask,
         "video_edit_plan_id": plan_id,
         "postprocess": {
             "audio_copied_from_reference": True,
@@ -237,6 +258,7 @@ env_values = {
     "REFERENCE_VIDEO": str(reference_path),
     "RAW_VIDEO": str(raw_video),
     "TARGET_VIDEO": str(target_video),
+    "SRC_MASK": src_mask,
     "PROMPT": prompt,
     "KNOWN_PAIRS": str(out_root / "pairs" / "synthetic_visual_candidate_pairs.jsonl"),
     "TARGET_MANIFEST": str(out_root / "metadata" / "synthetic_visual_target_manifest.jsonl"),
@@ -252,6 +274,7 @@ echo "[vace-smoke] plan_id=$PLAN_ID"
 echo "[vace-smoke] reference=$REFERENCE_VIDEO"
 echo "[vace-smoke] raw_video=$RAW_VIDEO"
 echo "[vace-smoke] target_video=$TARGET_VIDEO"
+echo "[vace-smoke] src_mask=${SRC_MASK:-none}"
 echo "[vace-smoke] wan_code=$WAN_CODE"
 echo "[vace-smoke] wan_ckpt=$WAN_CKPT"
 echo "[vace-smoke] vace_task=$VACE_TASK"
@@ -301,6 +324,9 @@ GEN_ARGS=(
   --offload_model "$OFFLOAD_MODEL"
   --save_file "$RAW_VIDEO"
 )
+if [[ -n "${SRC_MASK:-}" ]]; then
+  GEN_ARGS+=(--src_mask "$SRC_MASK")
+fi
 if [[ "$T5_CPU" == "1" ]]; then
   GEN_ARGS+=(--t5_cpu)
 fi
