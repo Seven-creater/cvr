@@ -7,33 +7,58 @@ cd "$REPO_ROOT"
 DATA_ROOT=${DATA_ROOT:-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval}
 RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/deterministic_audio_synthetic_smoke}
 REFERENCE_GLOB=${REFERENCE_GLOB:-$DATA_ROOT/clips/detective/daily_omni/*.mp4}
+MAX_AUDIO_SAMPLES=${MAX_AUDIO_SAMPLES:-3}
 mkdir -p "$RUN_ROOT/videos" "$RUN_ROOT/captions" "$RUN_ROOT/pairs"
 
 echo "[audio-smoke] start $(date)"
 echo "[audio-smoke] data_root=$DATA_ROOT"
 echo "[audio-smoke] run_root=$RUN_ROOT"
+echo "[audio-smoke] max_audio_samples=$MAX_AUDIO_SAMPLES"
 echo "[audio-smoke] deterministic audio only; no large model is loaded"
 
-mapfile -t REFERENCES < <(ls $REFERENCE_GLOB 2>/dev/null | head -3)
-if [[ "${#REFERENCES[@]}" -lt 3 ]]; then
-  echo "[audio-smoke] need at least 3 reference mp4 files from $REFERENCE_GLOB" >&2
+mapfile -t REFERENCES < <(ls $REFERENCE_GLOB 2>/dev/null | head -100)
+if [[ "${#REFERENCES[@]}" -lt 1 ]]; then
+  echo "[audio-smoke] need at least 1 reference mp4 file from $REFERENCE_GLOB" >&2
   exit 1
 fi
 
-EVENTS=("whoosh" "scratching sound" "low-frequency hum")
+EVENTS=(
+  "whoosh"
+  "scratching sound"
+  "low-frequency hum"
+  "wind noise"
+  "rain-like noise"
+  "high-pitched beep"
+  "mechanical buzz"
+  "static hiss"
+  "soft bell chime"
+  "water splash noise"
+)
 FILTERS=(
   "anoisesrc=color=pink:duration=12,highpass=f=500,lowpass=f=3500,afade=t=in:st=0:d=0.15,afade=t=out:st=1.0:d=0.4,volume=0.35"
   "anoisesrc=color=white:duration=12,highpass=f=1200,lowpass=f=6000,volume=0.12"
   "sine=frequency=120:duration=12,volume=0.18"
+  "anoisesrc=color=brown:duration=12,lowpass=f=900,volume=0.16"
+  "anoisesrc=color=white:duration=12,highpass=f=350,lowpass=f=4500,volume=0.10"
+  "sine=frequency=880:duration=12,volume=0.12"
+  "sine=frequency=240:duration=12,volume=0.14"
+  "anoisesrc=color=white:duration=12,highpass=f=2500,volume=0.08"
+  "sine=frequency=660:duration=12,afade=t=in:st=0:d=0.05,afade=t=out:st=1.4:d=0.5,volume=0.13"
+  "anoisesrc=color=pink:duration=12,highpass=f=250,lowpass=f=2200,afade=t=in:st=0:d=0.05,afade=t=out:st=0.7:d=0.3,volume=0.20"
 )
 
 ANNOTATIONS="$RUN_ROOT/synthetic_annotations.jsonl"
 PAIRS="$RUN_ROOT/synthetic_candidate_pairs.jsonl"
+if [[ "$MAX_AUDIO_SAMPLES" -gt "${#EVENTS[@]}" ]]; then
+  echo "[audio-smoke] refusing MAX_AUDIO_SAMPLES=$MAX_AUDIO_SAMPLES; only ${#EVENTS[@]} deterministic events are defined" >&2
+  exit 1
+fi
+
 : > "$ANNOTATIONS"
 : > "$PAIRS"
 
-for idx in 0 1 2; do
-  ref="${REFERENCES[$idx]}"
+for ((idx = 0; idx < MAX_AUDIO_SAMPLES; idx++)); do
+  ref="${REFERENCES[$((idx % ${#REFERENCES[@]}))]}"
   event="${EVENTS[$idx]}"
   filter="${FILTERS[$idx]}"
   sample_num=$(printf "%04d" $((idx + 1)))
@@ -41,11 +66,19 @@ for idx in 0 1 2; do
   wav="$RUN_ROOT/videos/synthetic_audio_${sample_num}.wav"
 
   ffmpeg -y -f lavfi -i "$filter" -t 12 -c:a pcm_s16le "$wav" >/dev/null 2>&1
-  ffmpeg -y -i "$ref" -i "$wav" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -shortest "$target" >/dev/null 2>&1
+  if ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "$ref" | grep -q audio; then
+    ffmpeg -y -i "$ref" -i "$wav" \
+      -filter_complex "[0:a:0][1:a:0]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]" \
+      -map 0:v:0 -map "[a]" -c:v copy -c:a aac -shortest "$target" >/dev/null 2>&1
+    audio_strategy="overlay_reference_audio"
+  else
+    ffmpeg -y -i "$ref" -i "$wav" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -shortest "$target" >/dev/null 2>&1
+    audio_strategy="replace_missing_reference_audio"
+  fi
 
   ref_rel="$ref"
   target_rel="$target"
-  python3 - "$ANNOTATIONS" "$PAIRS" "$idx" "$ref_rel" "$target_rel" "$event" <<'PY'
+  python3 - "$ANNOTATIONS" "$PAIRS" "$idx" "$ref_rel" "$target_rel" "$event" "$audio_strategy" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -56,6 +89,7 @@ idx = int(sys.argv[3])
 ref = sys.argv[4]
 target = sys.argv[5]
 event = sys.argv[6]
+audio_strategy = sys.argv[7]
 sample_num = f"{idx + 1:04d}"
 ref_id = f"det_audio_ref_{sample_num}"
 target_id = f"det_audio_target_{sample_num}"
@@ -121,10 +155,15 @@ write(pairs_path, {
             "audio_prompt": event,
             "negative_audio_prompt": "speech, narration, talking, voiceover",
             "preserve_video": True,
-            "mixing": "replace",
+            "mixing": "overlay",
             "expected_event": event,
+            "audio_strategy": audio_strategy,
         },
-        "postprocess": {"video_copied_from_reference": True, "audio_copied_from_reference": False},
+        "postprocess": {
+            "video_copied_from_reference": True,
+            "audio_copied_from_reference": audio_strategy == "overlay_reference_audio",
+            "audio_strategy": audio_strategy,
+        },
     },
 })
 PY

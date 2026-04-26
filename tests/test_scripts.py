@@ -83,6 +83,11 @@ class ScriptTests(unittest.TestCase):
         script = Path("scripts/run_deterministic_audio_synthetic_smoke.sh").read_text(encoding="utf-8")
 
         self.assertIn("deterministic audio only", script)
+        self.assertIn("MAX_AUDIO_SAMPLES", script)
+        self.assertIn("amix=inputs=2", script)
+        self.assertIn("overlay_reference_audio", script)
+        self.assertIn("wind noise", script)
+        self.assertIn("high-pitched beep", script)
         self.assertIn("-map 0:v:0", script)
         self.assertIn("ffmpeg", script)
         self.assertIn("synthetic_candidate_pairs.jsonl", script)
