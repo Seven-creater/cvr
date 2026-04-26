@@ -3757,10 +3757,87 @@ class ComposedDataTests(unittest.TestCase):
 
             self.assertEqual(1, summary["plan_count"])
             self.assertEqual("visual_1", plans[0]["plan_id"])
-            self.assertEqual("strongest_omni_prompt_planner", plans[0]["planner"]["stage"])
+            self.assertEqual("heuristic_prompt_planner", plans[0]["planner"]["stage"])
+            self.assertTrue(plans[0]["planner"]["fallback_used"])
             self.assertIn("mobile phone", plans[0]["source_prompt"])
             self.assertIn("tablet", plans[0]["target_prompt"])
             self.assertEqual(1, summary["skipped_by_type"]["audio_event"])
+
+    def test_plan_video_edits_uses_model_prompt_planner_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "ref_visual.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a person holds a mobile phone at a desk",
+                        "subjects": ["person", "mobile phone", "desk"],
+                        "object_counts": {"person": 1, "mobile phone": 1, "desk": 1},
+                        "actions": ["holding"],
+                        "scene": "desk",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "visual_1",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "reference_caption": "a person holds a mobile phone at a desk",
+                        "edit_text": "replace the mobile phone with a tablet",
+                        "difference": {"type": "object_presence", "from": "mobile phone", "to": "tablet"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "source_prompt": "Omni source prompt: a person holds a phone at a desk.",
+                    "target_prompt": "Omni target prompt: same shot, replace only the phone with a tablet.",
+                    "edit_token": "tablet",
+                    "preserve_tokens": ["person", "desk", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the person, desk, camera motion, lighting, timing, or visible text.",
+                    "edit_region": "hand-held object",
+                    "model_route": "vace_controlled",
+                    "reason": "The object is visible and localized.",
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client) as client_cls:
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["plan_count"])
+            client_cls.assert_called_once()
+            fake_client.plan_video_edit.assert_called_once()
+            self.assertEqual("strongest_omni_prompt_planner", plans[0]["planner"]["stage"])
+            self.assertFalse(plans[0]["planner"]["fallback_used"])
+            self.assertEqual("qwen3-omni", plans[0]["planner"]["model"])
+            self.assertEqual("tablet", plans[0]["edit_token"])
+            self.assertEqual("hand-held object", plans[0]["edit_region"])
+            self.assertIn("replace only the phone", plans[0]["target_prompt"])
+            self.assertEqual({"raw": "planner"}, plans[0]["raw_planner_output"])
 
     def test_plan_audio_edits_only_allows_non_speech_audio_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

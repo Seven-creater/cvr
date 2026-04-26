@@ -86,6 +86,18 @@ REQUIRED_PAIR_VERIFICATION_FIELDS = (
     "edit_necessity",
 )
 
+REQUIRED_VIDEO_EDIT_PLAN_FIELDS = (
+    "should_generate",
+    "source_prompt",
+    "target_prompt",
+    "edit_token",
+    "preserve_tokens",
+    "negative_prompt",
+    "edit_region",
+    "model_route",
+    "reason",
+)
+
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 NON_SPEECH_AUDIO_TOKENS = {
     "ambient",
@@ -434,6 +446,25 @@ def _pair_verification_system_prompt() -> str:
     )
 
 
+def _video_edit_planner_system_prompt() -> str:
+    return (
+        "You are the strongest Omni video-edit prompt planner for synthetic composed video retrieval. "
+        "Watch the short reference clip and use the candidate edit as a hint, not as something to blindly copy. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"should_generate": boolean, "source_prompt": string, "target_prompt": string, '
+        '"edit_token": string, "preserve_tokens": [string], "negative_prompt": string, '
+        '"edit_region": string, "model_route": string, "reason": string}. '
+        "The source_prompt must faithfully describe the reference video. "
+        "The target_prompt must preserve the same subject, scene, camera, lighting, timing, and layout, while applying exactly one visual edit. "
+        "The edit_token is the one object, attribute, or action concept the editor should change. "
+        "preserve_tokens are concepts that must stay unchanged. "
+        "negative_prompt must explicitly forbid changing people, scene, camera, visible text, timing, and unrelated objects. "
+        "edit_region should be localized when possible, such as top-right paper surface, wall area, desk surface, hand-held object, or background. "
+        "Reject by setting should_generate=false when the edit is audio-only, speech/topic, visible text/OCR, broad scene replacement, impossible for this reference, or likely to change the whole clip. "
+        "Do not write a caption as target_prompt; write an instruction-ready prompt for VACE/LTX style video editing."
+    )
+
+
 def _build_clip_annotation_user_content(clip_path: str) -> list[dict[str, Any]]:
     prompt = (
         "Task: describe this clip for composed retrieval dataset construction.\n"
@@ -626,6 +657,35 @@ def _build_pair_verification_user_content(
     return content
 
 
+def _build_video_edit_planner_user_content(
+    *,
+    reference_clip_path: str,
+    reference_annotation: dict[str, Any],
+    candidate: dict[str, Any],
+    route_hint: str,
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: build a controlled video-edit prompt plan for this reference clip.\n"
+        "The goal is to create a synthetic target video for composed video retrieval: reference video + edit_text -> target video.\n"
+        "The video editor must be used with purpose. First understand what is actually in the reference video, then decide whether the candidate edit is suitable.\n"
+        f"Route hint: {route_hint}\n"
+        f"Reference annotation JSON:\n{json.dumps(reference_annotation, ensure_ascii=False)}\n"
+        f"Candidate edit JSON:\n{json.dumps(candidate, ensure_ascii=False)}\n"
+        "Rules:\n"
+        "- Keep the clip short-context identity: same scene, subject identity, camera motion, timing, lighting, and layout.\n"
+        "- The target_prompt should add/replace exactly one visual concept, such as phone -> tablet, add a small sticker, change object color, or a localized appearance change.\n"
+        "- Do not plan visible-text edits unless OCR-backed text editing is explicitly available.\n"
+        "- Do not plan audio_event or speech edits for a video editor.\n"
+        "- Do not use a universal edit. The edit must fit objects/actions visible in this reference video.\n"
+        "- If the candidate edit is not suitable for this video, set should_generate=false and explain why.\n"
+        "Return JSON only."
+    )
+    return [
+        {"type": "video_url", "video_url": {"url": reference_clip_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
 class OpenAIComposedDataClient:
     def __init__(
         self,
@@ -751,6 +811,26 @@ class OpenAIComposedDataClient:
             max_tokens=1300,
         )
         return _normalize_pair_verification_payload(raw_payload), raw_payload
+
+    def plan_video_edit(
+        self,
+        *,
+        reference_clip_path: str,
+        reference_annotation: dict[str, Any],
+        candidate: dict[str, Any],
+        route_hint: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_video_edit_planner_user_content(
+                reference_clip_path=reference_clip_path,
+                reference_annotation=reference_annotation,
+                candidate=candidate,
+                route_hint=route_hint,
+            ),
+            system_prompt=_video_edit_planner_system_prompt(),
+            max_tokens=1300,
+        )
+        return _normalize_video_edit_plan_payload(raw_payload), raw_payload
 
     def _request_json(
         self,
@@ -952,6 +1032,31 @@ def _normalize_pair_verification_payload(payload: dict[str, Any]) -> dict[str, A
             "failure_reason": str(edit_text_quality_check.get("failure_reason", "")).strip(),
         },
     }
+
+
+def _normalize_video_edit_plan_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_VIDEO_EDIT_PLAN_FIELDS)
+    if missing_fields:
+        raise ValueError(f"video edit plan missing fields: {missing_fields}")
+
+    preserve_tokens = _string_list(payload.get("preserve_tokens"))
+    normalized = {
+        "should_generate": _bool_value(payload.get("should_generate")),
+        "source_prompt": str(payload.get("source_prompt", "")).strip(),
+        "target_prompt": str(payload.get("target_prompt", "")).strip(),
+        "edit_token": str(payload.get("edit_token", "")).strip(),
+        "preserve_tokens": preserve_tokens,
+        "negative_prompt": str(payload.get("negative_prompt", "")).strip(),
+        "edit_region": str(payload.get("edit_region", "")).strip(),
+        "model_route": str(payload.get("model_route", "")).strip(),
+        "reason": str(payload.get("reason", "")).strip(),
+    }
+    for field_name in ("source_prompt", "target_prompt", "edit_token", "negative_prompt", "edit_region", "reason"):
+        if not normalized[field_name]:
+            raise ValueError(f"video edit plan {field_name} is required")
+    if not normalized["preserve_tokens"]:
+        raise ValueError("video edit plan preserve_tokens is required")
+    return normalized
 
 
 def _score_value(value: Any) -> float:

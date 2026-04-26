@@ -169,6 +169,73 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertEqual("instruct-model", request_body["model"])
         self.assertEqual(22.0, request_holder["timeout"])
 
+    def test_plan_video_edit_materializes_reference_video_and_normalizes_plan(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_generate": True,
+                                "source_prompt": "A close-up video of a person holding a mobile phone at a desk.",
+                                "target_prompt": "A close-up video of the same person at the same desk holding a tablet instead of the mobile phone.",
+                                "edit_token": "tablet",
+                                "preserve_tokens": ["person", "desk", "camera motion", "lighting", "timing"],
+                                "negative_prompt": "Do not change the person, desk, camera, lighting, timing, or visible text.",
+                                "edit_region": "hand-held object",
+                                "model_route": "vace_controlled",
+                                "reason": "The phone is visible and can be locally replaced.",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            request_holder["timeout"] = timeout
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-video-edit-plan-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            clip_path = tmp_dir / "clip.mp4"
+            clip_path.write_bytes(b"fake-mp4-bytes")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+                timeout_seconds=44.0,
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.plan_video_edit(
+                    reference_clip_path=str(clip_path),
+                    reference_annotation={"summary": "a person holds a mobile phone at a desk"},
+                    candidate={
+                        "edit_text": "replace the mobile phone with a tablet",
+                        "difference": {"type": "object_presence", "from": "mobile phone", "to": "tablet"},
+                    },
+                    route_hint="vace_controlled",
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertTrue(normalized["should_generate"])
+        self.assertEqual("tablet", normalized["edit_token"])
+        self.assertEqual("vace_controlled", normalized["model_route"])
+        self.assertIn("camera motion", normalized["preserve_tokens"])
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        self.assertEqual({"type": "json_object"}, request_body["response_format"])
+        user_content = request_body["messages"][1]["content"]
+        self.assertEqual("video_url", user_content[0]["type"])
+        self.assertTrue(user_content[0]["video_url"]["url"].startswith("data:video/mp4;base64,"))
+        self.assertIn("Candidate edit JSON", user_content[1]["text"])
+        self.assertEqual(44.0, request_holder["timeout"])
+
     def test_detective_annotation_runs_observer_then_final_pass(self) -> None:
         requests = []
         observer_payload = {

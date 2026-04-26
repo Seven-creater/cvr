@@ -1512,6 +1512,10 @@ def plan_video_edits(
     clip_annotations_path: str | Path,
     output_path: str | Path | None = None,
     max_plans: int = 10,
+    base_url: str | None = None,
+    api_key: str = "EMPTY",
+    model: str | None = None,
+    timeout_seconds: float = 180.0,
 ) -> dict[str, Any]:
     layout = ensure_layout(root)
     candidates = list(_load_jsonl(Path(pair_candidates_path)))
@@ -1523,6 +1527,16 @@ def plan_video_edits(
 
     annotation_lookup = _annotation_lookup(root=layout["root"], annotations=annotations)
     output = Path(output_path) if output_path else layout["pairs"] / DEFAULT_VIDEO_EDIT_PLAN_NAME
+    planner_client = (
+        OpenAIComposedDataClient(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+        )
+        if base_url and model
+        else None
+    )
 
     plans: list[dict[str, Any]] = []
     skipped_by_type: Counter[str] = Counter()
@@ -1570,27 +1584,78 @@ def plan_video_edits(
             difference=difference,
         )
         preserve_tokens = _video_edit_preserve_tokens(reference_annotation, difference, edit_token)
+        negative_prompt = _video_edit_negative_prompt(preserve_tokens)
+        planner_metadata: dict[str, Any] = {
+            "stage": "heuristic_prompt_planner",
+            "input": "annotation_and_candidate_edit",
+            "output": "source_prompt_target_prompt_edit_token_preserve_constraints",
+            "fallback_used": True,
+        }
+        raw_planner_output: dict[str, Any] = {}
+        if planner_client is not None:
+            try:
+                planned, raw_planner_output = planner_client.plan_video_edit(
+                    reference_clip_path=str(_resolve_under_root(layout["root"], reference_video)),
+                    reference_annotation=_annotation_prompt_view(reference_annotation),
+                    candidate={
+                        "edit_text": edit_text,
+                        "difference": difference,
+                        "reference_video": reference_video,
+                        "reference_caption": str(candidate.get("reference_caption", "")).strip(),
+                        "model_route_hint": route,
+                    },
+                    route_hint=route,
+                )
+                if not bool(planned.get("should_generate")):
+                    skipped_by_type[difference_type or "unknown"] += 1
+                    skipped_reasons["model_planner_rejected"] += 1
+                    continue
+                source_prompt = str(planned["source_prompt"]).strip()
+                target_prompt = str(planned["target_prompt"]).strip()
+                edit_token = str(planned["edit_token"]).strip()
+                preserve_tokens = [str(item).strip() for item in planned["preserve_tokens"] if str(item).strip()]
+                negative_prompt = str(planned["negative_prompt"]).strip()
+                edit_region = str(planned["edit_region"]).strip()
+                planned_route = str(planned.get("model_route", "")).strip()
+                if planned_route in SYNTHETIC_VISUAL_ROUTES:
+                    route = planned_route
+                planner_metadata = {
+                    "stage": "strongest_omni_prompt_planner",
+                    "input": "short_clip_reference_video",
+                    "output": "source_prompt_target_prompt_edit_token_preserve_constraints",
+                    "fallback_used": False,
+                    "model": model,
+                    "reason": str(planned.get("reason", "")).strip(),
+                }
+            except Exception as exc:
+                raw_planner_output = {"error": f"{type(exc).__name__}: {exc}"}
+                skipped_reasons["model_planner_fallback"] += 1
+                planner_metadata = {
+                    "stage": "heuristic_prompt_planner",
+                    "input": "annotation_and_candidate_edit",
+                    "output": "source_prompt_target_prompt_edit_token_preserve_constraints",
+                    "fallback_used": True,
+                    "model": model,
+                    "fallback_reason": f"{type(exc).__name__}: {exc}",
+                }
         control_plan = _video_edit_control_plan(route)
         plan = {
             "plan_id": str(candidate.get("proposal_id", "")).strip()
             or f"video_edit_plan_{_stable_hash(reference_video + edit_text)}",
             "reference_video": reference_video,
             "edit_text": edit_text,
-            "planner": {
-                "stage": "strongest_omni_prompt_planner",
-                "input": "short_clip_reference_video",
-                "output": "source_prompt_target_prompt_edit_token_preserve_constraints",
-            },
+            "planner": planner_metadata,
             "source_prompt": source_prompt,
             "target_prompt": target_prompt,
             "edit_token": edit_token,
             "preserve_tokens": preserve_tokens,
-            "negative_prompt": _video_edit_negative_prompt(preserve_tokens),
+            "negative_prompt": negative_prompt,
             "edit_region": edit_region,
             "mask_plan": "none" if route == "audio_deterministic" else "local_roi",
             "control_plan": control_plan,
             "model_route": route,
             "difference": difference,
+            "raw_planner_output": raw_planner_output,
             "generation_defaults": _video_edit_generation_defaults(route),
             "validation_requirements": {
                 "visual_near_duplicate_min": MIN_SYNTHETIC_VISUAL_CONTEXT_SCORE,
@@ -7006,6 +7071,10 @@ def build_parser() -> argparse.ArgumentParser:
     plan_video_edits_parser.add_argument("--clip-annotations-path", required=True)
     plan_video_edits_parser.add_argument("--output-path")
     plan_video_edits_parser.add_argument("--max-plans", type=int, default=10)
+    plan_video_edits_parser.add_argument("--base-url")
+    plan_video_edits_parser.add_argument("--api-key", default="EMPTY")
+    plan_video_edits_parser.add_argument("--model")
+    plan_video_edits_parser.add_argument("--timeout-seconds", type=float, default=180.0)
 
     plan_audio_edits_parser = subparsers.add_parser("plan-audio-edits")
     plan_audio_edits_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -7146,6 +7215,10 @@ def main() -> None:
             clip_annotations_path=args.clip_annotations_path,
             output_path=args.output_path,
             max_plans=args.max_plans,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            timeout_seconds=args.timeout_seconds,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
