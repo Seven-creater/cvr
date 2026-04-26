@@ -1617,6 +1617,27 @@ def plan_video_edits(
                     skipped_by_type[difference_type or "unknown"] += 1
                     skipped_reasons["model_planner_rejected"] += 1
                     continue
+                planned_edit_text = str(planned.get("edit_text", "")).strip()
+                if planned_edit_text:
+                    edit_text = planned_edit_text
+                planned_difference = planned.get("difference")
+                if isinstance(planned_difference, dict) and str(planned_difference.get("type", "")).strip():
+                    planned_difference_type = str(planned_difference.get("type", "")).strip()
+                    planned_difference_route = _video_edit_model_route(planned_difference_type)
+                    if planned_difference_route is None:
+                        skipped_by_type[planned_difference_type or "unknown"] += 1
+                        skipped_reasons["model_planner_revised_to_unsupported_difference_type"] += 1
+                        continue
+                    difference = dict(planned_difference)
+                    difference_type = planned_difference_type
+                    route = planned_difference_route
+                    risk = _video_edit_risk_assessment(reference_annotation, difference_type=difference_type)
+                    if not risk["allow_generation"]:
+                        skipped_by_type[difference_type or "unknown"] += 1
+                        skipped_reasons[f"model_planner_revised_to_high_risk_{risk['risk_level']}"] += 1
+                        for reason in risk["risk_reasons"]:
+                            skipped_reasons[f"risk_{reason}"] += 1
+                        continue
                 source_prompt = str(planned["source_prompt"]).strip()
                 target_prompt = str(planned["target_prompt"]).strip()
                 edit_token = str(planned["edit_token"]).strip()

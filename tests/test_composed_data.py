@@ -3842,6 +3842,81 @@ class ComposedDataTests(unittest.TestCase):
             self.assertIn("replace only the phone", plans[0]["target_prompt"])
             self.assertEqual({"raw": "planner"}, plans[0]["raw_planner_output"])
 
+    def test_plan_video_edits_uses_model_revised_safe_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "ref_visual.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a hand writes on a white paper on a desk",
+                        "subjects": ["hand", "paper", "desk"],
+                        "object_counts": {"hand": 1, "paper": 1, "desk": 1},
+                        "actions": ["writing"],
+                        "scene": "desk",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "visual_1",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "reference_caption": "a hand writes on paper",
+                        "edit_text": "add a robot action figure",
+                        "difference": {"type": "object_presence", "from": "no robot action figure", "to": "robot action figure"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "edit_text": "add a small blue star sticker to the paper",
+                    "difference": {"type": "object_presence", "from": "no blue star sticker", "to": "blue star sticker"},
+                    "source_prompt": "A close-up video of a hand writing on white paper on a desk.",
+                    "target_prompt": "The same close-up video with a small blue star sticker added to the paper while everything else stays unchanged.",
+                    "edit_token": "blue star sticker",
+                    "preserve_tokens": ["hand", "paper", "desk", "writing", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the hand, paper, writing, desk, camera motion, lighting, timing, or visible text.",
+                    "edit_region": "paper surface",
+                    "model_route": "vace_controlled",
+                    "reason": "The candidate object is unsuitable, so the planner chose a safer local paper-surface edit.",
+                    "repaired_fields": [],
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client):
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("add a small blue star sticker to the paper", plans[0]["edit_text"])
+            self.assertEqual({"type": "object_presence", "from": "no blue star sticker", "to": "blue star sticker"}, plans[0]["difference"])
+            self.assertEqual("blue star sticker", plans[0]["edit_token"])
+            self.assertEqual("paper surface", plans[0]["edit_region"])
+            self.assertEqual("vace_controlled", plans[0]["model_route"])
+
     def test_plan_video_edits_skips_high_risk_visible_text_and_motion_references(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

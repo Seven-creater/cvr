@@ -451,9 +451,12 @@ def _video_edit_planner_system_prompt() -> str:
         "You are the strongest Omni video-edit prompt planner for synthetic composed video retrieval. "
         "Watch the short reference clip and use the candidate edit as a hint, not as something to blindly copy. "
         "Return exactly one JSON object and nothing else. "
-        'Required schema: {"should_generate": boolean, "source_prompt": string, "target_prompt": string, '
+        'Required schema: {"should_generate": boolean, "edit_text": string, "difference": object, '
+        '"source_prompt": string, "target_prompt": string, '
         '"edit_token": string, "preserve_tokens": [string], "negative_prompt": string, '
         '"edit_region": string, "model_route": string, "reason": string}. '
+        "If the candidate edit is unsuitable but the reference clip has a safer single local visual edit, revise edit_text and difference to that safer edit instead of rejecting. "
+        "Only revise to object_presence, object_count, attribute, or simple action edits that are visibly supported by the reference. "
         "The source_prompt must faithfully describe the reference video. "
         "The target_prompt must preserve the same subject, scene, camera, lighting, timing, and layout, while applying exactly one visual edit. "
         "The edit_token is the one object, attribute, or action concept the editor should change. "
@@ -674,10 +677,11 @@ def _build_video_edit_planner_user_content(
         "Rules:\n"
         "- Keep the clip short-context identity: same scene, subject identity, camera motion, timing, lighting, and layout.\n"
         "- The target_prompt should add/replace exactly one visual concept, such as phone -> tablet, add a small sticker, change object color, or a localized appearance change.\n"
+        "- If the candidate edit is not suitable but another local visual edit is suitable for this exact reference, output the safer revised edit_text and difference.\n"
         "- Do not plan visible-text edits unless OCR-backed text editing is explicitly available.\n"
         "- Do not plan audio_event or speech edits for a video editor.\n"
         "- Do not use a universal edit. The edit must fit objects/actions visible in this reference video.\n"
-        "- If the candidate edit is not suitable for this video, set should_generate=false and explain why.\n"
+        "- Set should_generate=false only when no safe single local visual edit is available for this video.\n"
         "Return JSON only."
     )
     return [
@@ -1213,6 +1217,8 @@ def _normalize_video_edit_plan_payload(payload: dict[str, Any]) -> dict[str, Any
     preserve_tokens = _string_list(payload.get("preserve_tokens"))
     normalized = {
         "should_generate": _bool_value(payload.get("should_generate")),
+        "edit_text": str(payload.get("edit_text", "")).strip(),
+        "difference": payload.get("difference") if isinstance(payload.get("difference"), dict) else {},
         "source_prompt": str(payload.get("source_prompt", "")).strip(),
         "target_prompt": str(payload.get("target_prompt", "")).strip(),
         "edit_token": str(payload.get("edit_token", "")).strip(),
