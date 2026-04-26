@@ -9,6 +9,7 @@ RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/deterministic_audio_synthetic_smoke}
 REFERENCE_GLOB=${REFERENCE_GLOB:-$DATA_ROOT/clips/detective/daily_omni/*.mp4}
 MAX_AUDIO_SAMPLES=${MAX_AUDIO_SAMPLES:-3}
 mkdir -p "$RUN_ROOT/videos" "$RUN_ROOT/captions" "$RUN_ROOT/pairs"
+mkdir -p "$RUN_ROOT/logs"
 
 echo "[audio-smoke] start $(date)"
 echo "[audio-smoke] data_root=$DATA_ROOT"
@@ -64,15 +65,17 @@ for ((idx = 0; idx < MAX_AUDIO_SAMPLES; idx++)); do
   sample_num=$(printf "%04d" $((idx + 1)))
   target="$RUN_ROOT/videos/synthetic_audio_${sample_num}.mp4"
   wav="$RUN_ROOT/videos/synthetic_audio_${sample_num}.wav"
+  wav_log="$RUN_ROOT/logs/synthetic_audio_${sample_num}_wav.log"
+  mux_log="$RUN_ROOT/logs/synthetic_audio_${sample_num}_mux.log"
 
-  ffmpeg -y -f lavfi -i "$filter" -t 12 -c:a pcm_s16le "$wav" >/dev/null 2>&1
+  ffmpeg -y -f lavfi -i "$filter" -t 12 -c:a pcm_s16le "$wav" >"$wav_log" 2>&1
   if ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of csv=p=0 "$ref" | grep -q audio; then
     ffmpeg -y -i "$ref" -i "$wav" \
-      -filter_complex "[0:a:0][1:a:0]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]" \
-      -map 0:v:0 -map "[a]" -c:v copy -c:a aac -shortest "$target" >/dev/null 2>&1
+      -filter_complex "[0:a:0][1:a:0]amix=inputs=2:duration=first:dropout_transition=0[a]" \
+      -map 0:v:0 -map "[a]" -c:v copy -c:a aac -shortest "$target" >"$mux_log" 2>&1
     audio_strategy="overlay_reference_audio"
   else
-    ffmpeg -y -i "$ref" -i "$wav" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -shortest "$target" >/dev/null 2>&1
+    ffmpeg -y -i "$ref" -i "$wav" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -shortest "$target" >"$mux_log" 2>&1
     audio_strategy="replace_missing_reference_audio"
   fi
 
