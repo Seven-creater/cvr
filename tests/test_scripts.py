@@ -98,6 +98,22 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("synthetic_pilot_review.md", script)
         self.assertIn("/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-instruct", script)
 
+    def test_vace_visual_synthetic_smoke_uses_plan_and_remuxes_audio(self) -> None:
+        script = Path("scripts/run_vace_visual_synthetic_smoke.sh").read_text(encoding="utf-8")
+
+        self.assertIn("video_edit_plan.jsonl", script)
+        self.assertIn("vace_controlled", script)
+        self.assertIn("Wan2.1-VACE-1.3B", script)
+        self.assertIn("--src_video", script)
+        self.assertIn("--prompt", script)
+        self.assertIn("--offload_model \"$OFFLOAD_MODEL\"", script)
+        self.assertIn("CUDA_VISIBLE_DEVICES=\"$GPU_IDS\"", script)
+        self.assertIn("torchrun --nproc_per_node", script)
+        self.assertIn("-map 0:v:0 -map 1:a?", script)
+        self.assertIn("audio_copied_from_reference", script)
+        self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
+        self.assertIn("synthetic_visual_target_manifest.jsonl", script)
+
 
 if __name__ == "__main__":
     unittest.main()
