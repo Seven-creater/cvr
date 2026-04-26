@@ -6467,26 +6467,26 @@ def _safe_visual_edit_anchor(annotation: dict[str, Any]) -> tuple[str, dict[str,
     anchors = (
         (
             ("paper", "page", "notebook", "sheet", "worksheet"),
-            "add a small blue star sticker to the top-right corner of the paper",
-            "small blue star sticker",
+            "add a bright red eraser to the top-right corner of the paper",
+            "bright red eraser",
             "paper surface",
         ),
         (
             ("desk", "table", "counter", "workbench"),
-            "add a small red cube on the desk",
-            "small red cube",
+            "add a bright red cube on the desk",
+            "bright red cube",
             "desk/table surface",
         ),
         (
             ("wall", "whiteboard", "room"),
-            "add a small blue circular sticker on the wall",
-            "small blue circular sticker",
+            "add a large plain blue poster on the wall",
+            "large plain blue poster",
             "wall area",
         ),
         (
             ("background", "shelf", "studio"),
-            "add a small potted plant in the background",
-            "small potted plant",
+            "add a medium green potted plant in the background",
+            "medium green potted plant",
             "background",
         ),
     )
@@ -6515,14 +6515,15 @@ def _relax_safe_visual_ideation_risk(risk: dict[str, Any], candidate: dict[str, 
         "table",
         "wall",
         "background",
-        "sticker",
+        "eraser",
         "cube",
+        "poster",
         "potted plant",
     }
     if not any(marker in edit_text for marker in stable_surface_markers):
         return risk
     risk_reasons = [str(reason) for reason in risk.get("risk_reasons", [])]
-    hard_reasons = {"scene_or_shot_change", "ui_or_text_heavy_scene", "many_subjects"}
+    hard_reasons = {"visible_text_present", "scene_or_shot_change", "ui_or_text_heavy_scene", "many_subjects"}
     if any(reason in hard_reasons for reason in risk_reasons):
         return risk
     relaxed = dict(risk)
@@ -6532,7 +6533,7 @@ def _relax_safe_visual_ideation_risk(risk: dict[str, Any], candidate: dict[str, 
     relaxed["relaxed_risk_reasons"] = [
         reason
         for reason in risk_reasons
-        if reason in {"visible_text_present", "multiple_actions", "multi_event_timeline", "speaking_person", "long_storyline"}
+        if reason in {"multiple_actions", "multi_event_timeline", "speaking_person", "long_storyline"}
     ]
     locks = [
         str(item).strip()
