@@ -13,6 +13,7 @@ MODEL_ROOT=${MODEL_ROOT:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_v
 WAN_ROOT=${WAN_ROOT:-$MODEL_ROOT/Wan2.1}
 WAN_CODE=${WAN_CODE:-$WAN_ROOT/code}
 WAN_CKPT=${WAN_CKPT:-$WAN_ROOT/Wan2.1-VACE-1.3B}
+VACE_TASK=${VACE_TASK:-}
 CONDA_ENV=${CONDA_ENV:-wan_vace}
 GPU_IDS=${GPU_IDS:-0,1}
 MAX_GPUS=${MAX_GPUS:-2}
@@ -39,6 +40,7 @@ Options:
   --wan-root PATH
   --wan-code PATH
   --wan-ckpt PATH
+  --vace-task vace-1.3B|vace-14B
   --conda-env NAME
   --gpu-ids IDS
   --use-torchrun 0|1
@@ -63,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --wan-root) WAN_ROOT="$2"; WAN_CODE="$2/code"; WAN_CKPT="$2/Wan2.1-VACE-1.3B"; shift 2 ;;
     --wan-code) WAN_CODE="$2"; shift 2 ;;
     --wan-ckpt) WAN_CKPT="$2"; shift 2 ;;
+    --vace-task) VACE_TASK="$2"; shift 2 ;;
     --conda-env) CONDA_ENV="$2"; shift 2 ;;
     --gpu-ids) GPU_IDS="$2"; shift 2 ;;
     --use-torchrun) USE_TORCHRUN="$2"; shift 2 ;;
@@ -93,12 +96,19 @@ if [[ "$ALLOW_CPU_OFFLOAD" != "1" ]]; then
   fi
 fi
 
+if [[ -z "$VACE_TASK" ]]; then
+  case "$(basename "$WAN_CKPT")" in
+    *14B*) VACE_TASK="vace-14B" ;;
+    *) VACE_TASK="vace-1.3B" ;;
+  esac
+fi
+
 mkdir -p "$OUT_ROOT/videos" "$OUT_ROOT/logs" "$OUT_ROOT/pairs" "$OUT_ROOT/metadata"
 
 SELECTED_PLAN="$OUT_ROOT/metadata/selected_video_edit_plan.json"
 ENV_FILE="$OUT_ROOT/metadata/selected_video_edit_plan.env"
 
-python3 - "$DATA_ROOT" "$VIDEO_EDIT_PLAN" "$PLAN_INDEX" "$PLAN_ID" "$SELECTED_PLAN" "$ENV_FILE" "$OUT_ROOT" <<'PY'
+python3 - "$DATA_ROOT" "$VIDEO_EDIT_PLAN" "$PLAN_INDEX" "$PLAN_ID" "$SELECTED_PLAN" "$ENV_FILE" "$OUT_ROOT" "$WAN_CKPT" <<'PY'
 import json
 import os
 import re
@@ -113,6 +123,7 @@ plan_id_filter = sys.argv[4].strip()
 selected_plan_path = Path(sys.argv[5])
 env_path = Path(sys.argv[6])
 out_root = Path(sys.argv[7])
+wan_ckpt = Path(sys.argv[8])
 
 rows = [json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 if not rows:
@@ -173,7 +184,7 @@ known_pair = {
     "hard_negatives": [],
     "quality": {"visual_near_duplicate_score": 0.90},
     "generation": {
-        "model": "Wan2.1-VACE-1.3B",
+        "model": wan_ckpt.name or str(wan_ckpt),
         "model_route": route,
         "source_video": str(reference_path),
         "prompt": prompt,
@@ -234,6 +245,7 @@ echo "[vace-smoke] raw_video=$RAW_VIDEO"
 echo "[vace-smoke] target_video=$TARGET_VIDEO"
 echo "[vace-smoke] wan_code=$WAN_CODE"
 echo "[vace-smoke] wan_ckpt=$WAN_CKPT"
+echo "[vace-smoke] vace_task=$VACE_TASK"
 echo "[vace-smoke] conda_env=$CONDA_ENV"
 echo "[vace-smoke] gpu_ids=$GPU_IDS offload_model=$OFFLOAD_MODEL t5_cpu=$T5_CPU allow_cpu_offload=$ALLOW_CPU_OFFLOAD"
 echo "[vace-smoke] prompt=$PROMPT"
@@ -268,7 +280,7 @@ PY
 
 GEN_ARGS=(
   "$WAN_CODE/generate.py"
-  --task vace-1.3B
+  --task "$VACE_TASK"
   --size "$SIZE"
   --ckpt_dir "$WAN_CKPT"
   --src_video "$REFERENCE_VIDEO"
