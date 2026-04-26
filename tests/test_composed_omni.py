@@ -351,6 +351,71 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertEqual(["edit_region"], normalized["repaired_fields"])
         self.assertEqual("robot action figure", normalized["edit_token"])
 
+    def test_plan_video_edit_repairs_missing_preserve_tokens_without_discarding_plan(self) -> None:
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_generate": True,
+                                "source_prompt": "A product showcase of a rotating platform in a dark studio.",
+                                "target_prompt": "A product showcase of a rotating platform in a dark studio with a robot action figure in the background.",
+                                "edit_token": "robot action figure",
+                                "edit_region": "background",
+                                "model_route": "vace_controlled",
+                                "reason": "The background can be edited locally while preserving the platform.",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-video-edit-plan-preserve-repair-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            clip_path = tmp_dir / "clip.mp4"
+            clip_path.write_bytes(b"fake-mp4-bytes")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.plan_video_edit(
+                    reference_clip_path=str(clip_path),
+                    reference_annotation={
+                        "summary": "a rotating platform in a dark studio",
+                        "subjects": ["rotating platform"],
+                        "object_counts": {"platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
+                    },
+                    candidate={
+                        "edit_text": "add a robot action figure to the background",
+                        "difference": {
+                            "type": "object_presence",
+                            "from": "no robot action figure",
+                            "to": "robot action figure",
+                        },
+                    },
+                    route_hint="vace_controlled",
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertIn("rotating platform", normalized["preserve_tokens"])
+        self.assertIn("camera motion", normalized["preserve_tokens"])
+        self.assertNotIn("robot action figure", normalized["preserve_tokens"])
+        self.assertIn("Do not change rotating platform", normalized["negative_prompt"])
+        self.assertEqual(["negative_prompt", "preserve_tokens"], normalized["repaired_fields"])
+
     def test_detective_annotation_runs_observer_then_final_pass(self) -> None:
         requests = []
         observer_payload = {

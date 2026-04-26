@@ -833,6 +833,7 @@ class OpenAIComposedDataClient:
         repaired_payload = _repair_video_edit_plan_payload(
             raw_payload,
             candidate=candidate,
+            reference_annotation=reference_annotation,
             route_hint=route_hint,
         )
         return _normalize_video_edit_plan_payload(repaired_payload), raw_payload
@@ -1043,6 +1044,7 @@ def _repair_video_edit_plan_payload(
     payload: dict[str, Any],
     *,
     candidate: dict[str, Any],
+    reference_annotation: dict[str, Any] | None = None,
     route_hint: str,
 ) -> dict[str, Any]:
     repaired = dict(payload)
@@ -1059,6 +1061,17 @@ def _repair_video_edit_plan_payload(
                 repaired["edit_token"] = edit_token
                 repaired_fields.append("edit_token")
                 break
+    preserve_tokens = _string_list(repaired.get("preserve_tokens"))
+    if not preserve_tokens:
+        preserve_tokens = _infer_video_edit_preserve_tokens(
+            reference_annotation=reference_annotation or {},
+            payload=repaired,
+            difference=difference,
+            edit_token=edit_token,
+        )
+        if preserve_tokens:
+            repaired["preserve_tokens"] = preserve_tokens
+            repaired_fields.append("preserve_tokens")
     if source_prompt and not str(repaired.get("target_prompt", "")).strip():
         edit_instruction = edit_text or (f"add or change {edit_token}" if edit_token else "apply the requested edit")
         repaired["target_prompt"] = (
@@ -1066,6 +1079,13 @@ def _repair_video_edit_plan_payload(
             "Preserve all other visible content, camera motion, lighting, timing, and layout."
         )
         repaired_fields.append("target_prompt")
+    if not str(repaired.get("negative_prompt", "")).strip() and preserve_tokens:
+        protected = ", ".join(preserve_tokens[:6])
+        repaired["negative_prompt"] = (
+            f"Do not change {protected}. Do not change people, scene, camera, lighting, visible text, "
+            "timing, or unrelated objects."
+        )
+        repaired_fields.append("negative_prompt")
     if route_hint and not str(repaired.get("model_route", "")).strip():
         repaired["model_route"] = route_hint
         repaired_fields.append("model_route")
@@ -1085,6 +1105,64 @@ def _repair_video_edit_plan_payload(
     if repaired_fields:
         repaired["repaired_fields"] = sorted(set(repaired_fields))
     return repaired
+
+
+def _infer_video_edit_preserve_tokens(
+    *,
+    reference_annotation: dict[str, Any],
+    payload: dict[str, Any],
+    difference: dict[str, Any],
+    edit_token: str,
+) -> list[str]:
+    values: list[str] = []
+    if isinstance(reference_annotation, dict):
+        values.extend(_string_list(reference_annotation.get("subjects")))
+        values.extend(_normalize_object_counts(reference_annotation.get("object_counts")).keys())
+        values.extend(_string_list(reference_annotation.get("actions")))
+        scene = str(reference_annotation.get("scene", "")).strip()
+        if scene:
+            values.append(scene)
+        values.extend(_string_list(reference_annotation.get("on_screen_text")))
+
+    source_prompt = str(payload.get("source_prompt", "")).strip()
+    if source_prompt:
+        for phrase in (
+            "camera motion",
+            "camera angle",
+            "lighting",
+            "timing",
+            "layout",
+            "background",
+            "foreground",
+        ):
+            if phrase in source_prompt.lower():
+                values.append(phrase)
+
+    for field_name in ("from", "description"):
+        value = str(difference.get(field_name, "")).strip()
+        if value and value.lower() not in {"none", "missing", "absent"} and not value.lower().startswith("no "):
+            values.append(value)
+
+    values.extend(["camera motion", "lighting", "timing", "layout"])
+    edit_key = _phrase_key(edit_token)
+    preserve_tokens: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value).strip()
+        key = _phrase_key(item)
+        if not item or not key or key == edit_key or key in seen:
+            continue
+        seen.add(key)
+        preserve_tokens.append(item)
+        if len(preserve_tokens) >= 8:
+            break
+    if not preserve_tokens:
+        preserve_tokens = ["original subject", "scene", "camera motion", "lighting", "timing", "layout"]
+    return preserve_tokens
+
+
+def _phrase_key(value: str) -> str:
+    return " ".join(TOKEN_PATTERN.findall(str(value).lower()))
 
 
 def _infer_video_edit_region(
