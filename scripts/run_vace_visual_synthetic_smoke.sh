@@ -18,6 +18,8 @@ CONDA_ENV=${CONDA_ENV:-wan_vace}
 GPU_IDS=${GPU_IDS:-0,1}
 MAX_GPUS=${MAX_GPUS:-2}
 USE_TORCHRUN=${USE_TORCHRUN:-0}
+ULYSSES_SIZE=${ULYSSES_SIZE:-}
+RING_SIZE=${RING_SIZE:-0}
 SIZE=${SIZE:-832*480}
 FRAME_NUM=${FRAME_NUM:-49}
 SAMPLE_STEPS=${SAMPLE_STEPS:-25}
@@ -44,6 +46,8 @@ Options:
   --conda-env NAME
   --gpu-ids IDS
   --use-torchrun 0|1
+  --ulysses-size N
+  --ring-size N
   --out-root PATH
   --allow-cpu-offload 0|1
   -h, --help
@@ -69,6 +73,8 @@ while [[ $# -gt 0 ]]; do
     --conda-env) CONDA_ENV="$2"; shift 2 ;;
     --gpu-ids) GPU_IDS="$2"; shift 2 ;;
     --use-torchrun) USE_TORCHRUN="$2"; shift 2 ;;
+    --ulysses-size) ULYSSES_SIZE="$2"; shift 2 ;;
+    --ring-size) RING_SIZE="$2"; shift 2 ;;
     --out-root) OUT_ROOT="$2"; shift 2 ;;
     --allow-cpu-offload) ALLOW_CPU_OFFLOAD="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -101,6 +107,9 @@ if [[ -z "$VACE_TASK" ]]; then
     *14B*) VACE_TASK="vace-14B" ;;
     *) VACE_TASK="vace-1.3B" ;;
   esac
+fi
+if [[ -z "$ULYSSES_SIZE" ]]; then
+  ULYSSES_SIZE="$GPU_COUNT"
 fi
 
 mkdir -p "$OUT_ROOT/videos" "$OUT_ROOT/logs" "$OUT_ROOT/pairs" "$OUT_ROOT/metadata"
@@ -248,6 +257,7 @@ echo "[vace-smoke] wan_ckpt=$WAN_CKPT"
 echo "[vace-smoke] vace_task=$VACE_TASK"
 echo "[vace-smoke] conda_env=$CONDA_ENV"
 echo "[vace-smoke] gpu_ids=$GPU_IDS offload_model=$OFFLOAD_MODEL t5_cpu=$T5_CPU allow_cpu_offload=$ALLOW_CPU_OFFLOAD"
+echo "[vace-smoke] ulysses_size=$ULYSSES_SIZE ring_size=$RING_SIZE"
 echo "[vace-smoke] prompt=$PROMPT"
 
 if [[ ! -d "$WAN_CODE" ]]; then
@@ -298,8 +308,15 @@ fi
 export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 if [[ "$USE_TORCHRUN" == "1" ]]; then
   echo "[vace-smoke] running with torchrun on $GPU_COUNT process(es)"
+  DIST_ARGS=(--dit_fsdp --t5_fsdp)
+  if [[ "$ULYSSES_SIZE" != "0" ]]; then
+    DIST_ARGS+=(--ulysses_size "$ULYSSES_SIZE")
+  fi
+  if [[ "$RING_SIZE" != "0" ]]; then
+    DIST_ARGS+=(--ring_size "$RING_SIZE")
+  fi
   torchrun --nproc_per_node="$GPU_COUNT" "${GEN_ARGS[@]}" \
-    --dit_fsdp --t5_fsdp --ulysses_size "$GPU_COUNT" \
+    "${DIST_ARGS[@]}" \
     > "$OUT_ROOT/logs/vace_generate.log" 2>&1
 else
   echo "[vace-smoke] running single process with CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
