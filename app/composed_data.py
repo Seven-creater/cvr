@@ -1622,6 +1622,10 @@ def plan_video_edits(
                     edit_text = planned_edit_text
                 planned_difference = planned.get("difference")
                 if isinstance(planned_difference, dict) and str(planned_difference.get("type", "")).strip():
+                    planned_difference = _normalize_model_planned_visual_difference(
+                        dict(planned_difference),
+                        edit_text=edit_text,
+                    )
                     planned_difference_type = str(planned_difference.get("type", "")).strip()
                     planned_difference_route = _video_edit_model_route(planned_difference_type)
                     if planned_difference_route is None:
@@ -1646,7 +1650,10 @@ def plan_video_edits(
                 negative_prompt = _merge_video_edit_locks(negative_prompt, risk)
                 edit_region = str(planned["edit_region"]).strip()
                 planned_route = str(planned.get("model_route", "")).strip()
-                if planned_route in SYNTHETIC_VISUAL_ROUTES:
+                if planned_route in SYNTHETIC_VISUAL_ROUTES and _planned_route_matches_difference(
+                    planned_route,
+                    difference_type,
+                ):
                     route = planned_route
                 planner_metadata = {
                     "stage": "strongest_omni_prompt_planner",
@@ -6406,6 +6413,33 @@ def _video_edit_model_route(difference_type: str) -> str | None:
     if difference_type == "action":
         return "ltx2_retake"
     return None
+
+
+def _normalize_model_planned_visual_difference(difference: dict[str, Any], *, edit_text: str) -> dict[str, Any]:
+    normalized = dict(difference)
+    difference_type = str(normalized.get("type", "")).strip()
+    from_value = str(normalized.get("from", "")).strip()
+    to_value = str(normalized.get("to", "")).strip()
+    edit_phrase = _normalized_phrase(edit_text)
+    is_additive_edit = edit_phrase.startswith(("add ", "introduce ", "place ", "attach "))
+    if (
+        difference_type == "attribute"
+        and to_value
+        and (_absence_like_phrase(from_value) or is_additive_edit)
+    ):
+        normalized["type"] = "object_presence"
+        if not from_value or not _absence_like_phrase(from_value):
+            normalized["from"] = f"no {to_value}"
+        normalized["to"] = to_value
+        description = str(normalized.get("description", "")).strip()
+        if not description:
+            normalized["description"] = f"{to_value} is added as a localized visible object."
+    return normalized
+
+
+def _planned_route_matches_difference(route: str, difference_type: str) -> bool:
+    expected_route = _video_edit_model_route(difference_type)
+    return bool(expected_route and route == expected_route)
 
 
 def _video_edit_token(difference: dict[str, Any], edit_text: str) -> str:

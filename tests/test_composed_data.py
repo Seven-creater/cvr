@@ -3917,6 +3917,80 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("paper surface", plans[0]["edit_region"])
             self.assertEqual("vace_controlled", plans[0]["model_route"])
 
+    def test_plan_video_edits_routes_additive_attribute_revision_to_vace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "ref_visual.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a woman speaks to camera in a room",
+                        "subjects": ["woman", "room"],
+                        "object_counts": {"woman": 1},
+                        "actions": ["speaking"],
+                        "scene": "room",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "visual_1",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "reference_caption": "a woman speaks to camera",
+                        "edit_text": "change the attribute from no nose ring to nose ring",
+                        "difference": {"type": "attribute", "from": "no nose ring", "to": "nose ring"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "edit_text": "add a nose ring to the woman",
+                    "difference": {"type": "attribute", "from": "no nose ring", "to": "nose ring"},
+                    "source_prompt": "A woman speaks to camera in the same room.",
+                    "target_prompt": "The same woman speaks to camera in the same room with a small nose ring added.",
+                    "edit_token": "nose ring",
+                    "preserve_tokens": ["woman", "room", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the woman, room, camera motion, lighting, timing, or visible text.",
+                    "edit_region": "face, nose area",
+                    "model_route": "tokenflow_style",
+                    "reason": "A nose ring is a localized accessory addition.",
+                    "repaired_fields": [],
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client):
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("object_presence", plans[0]["difference"]["type"])
+            self.assertEqual("nose ring", plans[0]["difference"]["to"])
+            self.assertEqual("vace_controlled", plans[0]["model_route"])
+            self.assertEqual("face, nose area", plans[0]["edit_region"])
+
     def test_plan_video_edits_skips_high_risk_visible_text_and_motion_references(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
