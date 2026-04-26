@@ -2059,8 +2059,9 @@ def validate_pilot_dataset(
         reference_video = str(record.get("reference_video", "")).strip()
         target_video = str(record.get("target_video", "")).strip()
         if reference_video and target_video:
+            record_source_type = str(record.get("source_type", "natural")).strip() or "natural"
             expected_proposal_id = _build_proposal_id(reference_video, target_video)
-            if proposal_id and proposal_id != expected_proposal_id:
+            if record_source_type != "synthetic_edit" and proposal_id and proposal_id != expected_proposal_id:
                 errors.append(
                     f"pilot line {index}: proposal_id={proposal_id} does not match expected {expected_proposal_id}"
                 )

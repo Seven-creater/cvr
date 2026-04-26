@@ -4053,6 +4053,67 @@ class ComposedDataTests(unittest.TestCase):
                 {record["video_path"] for record in gallery_records},
             )
 
+    def test_validate_pilot_dataset_allows_synthetic_plan_proposal_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("ref.mp4", "target.mp4", "neg.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            pilot_path = root / "pilot.jsonl"
+            self._write_jsonl(
+                pilot_path,
+                [
+                    {
+                        "sample_id": "covr_omni_synth_0001",
+                        "proposal_id": "synthetic_audio_pair_0001",
+                        "source_type": "synthetic_edit",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": "clips/target.mp4",
+                        "edit_text": "add whoosh to the audio",
+                        "modalities": ["audio"],
+                        "reference_caption": "same visual clip without whoosh",
+                        "target_caption": "same visual clip with whoosh",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                        "hard_negatives": ["clips/neg.mp4"],
+                        "quality": {
+                            "same_context_score": 0.98,
+                            "edit_match_score": 0.9,
+                            "target_uniqueness_score": 0.9,
+                            "difference_strength_score": 0.8,
+                            "non_speech_audio_event_score": 0.9,
+                        },
+                        "source_context": {"relation": "synthetic_from_reference"},
+                        "source": {
+                            "platform": "synthetic",
+                            "url": "file:///tmp/target.mp4",
+                            "license_note": "internal research pilot only",
+                        },
+                        "generation": {
+                            "model": "ffmpeg-deterministic-audio",
+                            "model_route": "deterministic_overlay",
+                            "source_video": "clips/ref.mp4",
+                            "audio_edit_plan": {
+                                "route": "deterministic_overlay",
+                                "audio_prompt": "whoosh",
+                                "expected_event": "whoosh",
+                                "preserve_video": True,
+                            },
+                        },
+                    }
+                ],
+            )
+
+            summary = validate_pilot_dataset(
+                root=root,
+                pilot_jsonl_path=pilot_path,
+                gallery_output_path=root / "gallery.jsonl",
+                report_output_path=root / "review.md",
+            )
+
+            self.assertEqual(1, summary["sample_count"])
+            self.assertEqual({"synthetic_edit": 1}, summary["source_type_counts"])
+
     def test_validate_pilot_dataset_rejects_duplicate_proposals(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
