@@ -1569,6 +1569,13 @@ def plan_video_edits(
             video_field="reference_video",
             caption_field="reference_caption",
         )
+        risk = _video_edit_risk_assessment(reference_annotation, difference_type=difference_type)
+        if not risk["allow_generation"]:
+            skipped_by_type[difference_type or "unknown"] += 1
+            skipped_reasons[f"high_risk_reference_{risk['risk_level']}"] += 1
+            for reason in risk["risk_reasons"]:
+                skipped_reasons[f"risk_{reason}"] += 1
+            continue
         edit_text = str(candidate.get("edit_text", "")).strip() or _build_fallback_edit_text(difference)
         edit_token = _video_edit_token(difference, edit_text)
         edit_region = _video_edit_region(edit_text, difference, reference_annotation, route)
@@ -1584,7 +1591,7 @@ def plan_video_edits(
             difference=difference,
         )
         preserve_tokens = _video_edit_preserve_tokens(reference_annotation, difference, edit_token)
-        negative_prompt = _video_edit_negative_prompt(preserve_tokens)
+        negative_prompt = _video_edit_negative_prompt(preserve_tokens, risk=risk)
         planner_metadata: dict[str, Any] = {
             "stage": "heuristic_prompt_planner",
             "input": "annotation_and_candidate_edit",
@@ -1615,6 +1622,7 @@ def plan_video_edits(
                 edit_token = str(planned["edit_token"]).strip()
                 preserve_tokens = [str(item).strip() for item in planned["preserve_tokens"] if str(item).strip()]
                 negative_prompt = str(planned["negative_prompt"]).strip()
+                negative_prompt = _merge_video_edit_locks(negative_prompt, risk)
                 edit_region = str(planned["edit_region"]).strip()
                 planned_route = str(planned.get("model_route", "")).strip()
                 if planned_route in SYNTHETIC_VISUAL_ROUTES:
@@ -1657,6 +1665,7 @@ def plan_video_edits(
             "model_route": route,
             "difference": difference,
             "raw_planner_output": raw_planner_output,
+            "visual_edit_risk": risk,
             "generation_defaults": _video_edit_generation_defaults(route),
             "validation_requirements": {
                 "visual_near_duplicate_min": MIN_SYNTHETIC_VISUAL_CONTEXT_SCORE,
@@ -6501,12 +6510,88 @@ def _video_edit_preserve_tokens(
     return preserved[:8]
 
 
-def _video_edit_negative_prompt(preserve_tokens: list[str]) -> str:
+def _video_edit_risk_assessment(annotation: dict[str, Any], *, difference_type: str) -> dict[str, Any]:
+    visible_text = _dedupe_strings(
+        _normalize_list(annotation.get("visible_text", []))
+        + _normalize_list(annotation.get("on_screen_text", []))
+    )
+    actions = _dedupe_strings(_normalize_list(annotation.get("actions", [])))
+    subjects = _dedupe_strings(_normalize_list(annotation.get("subjects", [])))
+    storyline = _dedupe_strings(_normalize_list(annotation.get("storyline", [])))
+    events = annotation.get("events", [])
+    event_count = len(events) if isinstance(events, list) else 0
+    summary_tokens = _tokenize_text(str(annotation.get("summary", "")))
+    scene_text = _normalized_phrase(str(annotation.get("scene", "")))
+    risk_reasons: list[str] = []
+    if visible_text:
+        risk_reasons.append("visible_text_present")
+    if difference_type != "action" and len(actions) >= 2:
+        risk_reasons.append("multiple_actions")
+    if difference_type != "action" and event_count >= 2:
+        risk_reasons.append("multi_event_timeline")
+    if len(subjects) >= 4:
+        risk_reasons.append("many_subjects")
+    if any(token in summary_tokens for token in {"speaks", "speaking", "talks", "talking", "vlogging", "interview"}):
+        risk_reasons.append("speaking_person")
+    if any(token in summary_tokens for token in {"transition", "transitions", "followed", "split", "screen", "cut"}):
+        risk_reasons.append("scene_or_shot_change")
+    if any(token in scene_text for token in ("ui", "screen", "interface", "control room")):
+        risk_reasons.append("ui_or_text_heavy_scene")
+    if storyline and len(storyline) >= 3 and difference_type != "action":
+        risk_reasons.append("long_storyline")
+
+    score = min(1.0, 0.18 * len(risk_reasons))
+    allow_generation = not any(
+        reason in set(risk_reasons)
+        for reason in {
+            "visible_text_present",
+            "multiple_actions",
+            "multi_event_timeline",
+            "scene_or_shot_change",
+            "ui_or_text_heavy_scene",
+        }
+    )
+    risk_level = "low"
+    if score >= 0.55 or not allow_generation:
+        risk_level = "high"
+    elif score >= 0.25:
+        risk_level = "medium"
+    locks = ["preserve camera motion, lighting, timing, and layout exactly"]
+    if visible_text:
+        locks.append("preserve all visible text exactly; do not alter letters, captions, labels, signs, subtitles, or UI text")
+    if actions and difference_type != "action":
+        locks.append("preserve the exact action and motion timing; do not change gestures, pose, order, or movement")
+    if subjects:
+        locks.append("preserve all existing people, subjects, and object identities")
+    return {
+        "score": round(score, 3),
+        "risk_level": risk_level,
+        "risk_reasons": risk_reasons,
+        "allow_generation": allow_generation,
+        "locks": locks,
+    }
+
+
+def _merge_video_edit_locks(negative_prompt: str, risk: dict[str, Any] | None = None) -> str:
+    prompt = str(negative_prompt).strip()
+    locks = [
+        str(item).strip()
+        for item in (risk or {}).get("locks", [])
+        if str(item).strip()
+    ]
+    for lock in locks:
+        if lock.lower() not in prompt.lower():
+            prompt = f"{prompt} {lock}." if prompt else f"{lock}."
+    return prompt.strip()
+
+
+def _video_edit_negative_prompt(preserve_tokens: list[str], *, risk: dict[str, Any] | None = None) -> str:
     protected = ", ".join(preserve_tokens[:6]) if preserve_tokens else "the original subject, scene, camera, timing"
-    return (
+    prompt = (
         f"Do not change {protected}. Do not add extra people, change the scene, alter visible text, "
         "reorder shots, or introduce additional edits."
     )
+    return _merge_video_edit_locks(prompt, risk)
 
 
 def _video_edit_control_plan(route: str) -> list[str]:

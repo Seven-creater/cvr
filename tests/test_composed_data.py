@@ -37,6 +37,7 @@ from app.composed_data import (
     _speech_specificity_score,
     _source_context,
     _target_uniqueness_score,
+    _video_edit_risk_assessment,
     annotate_clips,
     build_ffmpeg_extract_command,
     detective_annotate_clips,
@@ -3840,6 +3841,82 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("hand-held object", plans[0]["edit_region"])
             self.assertIn("replace only the phone", plans[0]["target_prompt"])
             self.assertEqual({"raw": "planner"}, plans[0]["raw_planner_output"])
+
+    def test_plan_video_edits_skips_high_risk_visible_text_and_motion_references(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "text_ref",
+                        "output_path": "clips/text_ref.mp4",
+                        "summary": "a person speaks while a lower-third caption is visible",
+                        "subjects": ["person", "caption"],
+                        "object_counts": {"person": 1},
+                        "actions": ["speaking", "gesturing"],
+                        "scene": "indoor room",
+                        "visible_text": ["MAKE WRONG"],
+                        "on_screen_text": ["MAKE WRONG"],
+                    },
+                    {
+                        "clip_id": "motion_ref",
+                        "output_path": "clips/motion_ref.mp4",
+                        "summary": "a person runs, jumps, and then waves",
+                        "subjects": ["person"],
+                        "object_counts": {"person": 1},
+                        "actions": ["running", "jumping", "waving"],
+                        "scene": "outdoor track",
+                    },
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "text_risky",
+                        "reference_video": "clips/text_ref.mp4",
+                        "edit_text": "add a pen-like device",
+                        "difference": {"type": "object_presence", "from": "no pen-like device", "to": "pen-like device"},
+                    },
+                    {
+                        "proposal_id": "motion_risky",
+                        "reference_video": "clips/motion_ref.mp4",
+                        "edit_text": "add a small backpack",
+                        "difference": {"type": "object_presence", "from": "no backpack", "to": "backpack"},
+                    },
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["risk_visible_text_present"])
+            self.assertGreaterEqual(summary["skipped_reasons"]["risk_multiple_actions"], 1)
+
+    def test_video_edit_risk_adds_text_and_motion_locks(self) -> None:
+        risk = _video_edit_risk_assessment(
+            {
+                "summary": "a person speaks to camera",
+                "subjects": ["person"],
+                "actions": ["speaking", "gesturing"],
+                "visible_text": ["hello"],
+            },
+            difference_type="object_presence",
+        )
+
+        self.assertFalse(risk["allow_generation"])
+        self.assertIn("visible_text_present", risk["risk_reasons"])
+        self.assertTrue(any("visible text" in lock for lock in risk["locks"]))
+        self.assertTrue(any("motion timing" in lock for lock in risk["locks"]))
 
     def test_plan_audio_edits_only_allows_non_speech_audio_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
