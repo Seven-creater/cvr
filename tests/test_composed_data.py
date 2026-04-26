@@ -39,6 +39,7 @@ from app.composed_data import (
     _target_uniqueness_score,
     _video_edit_risk_assessment,
     annotate_clips,
+    build_manual_review_bundle,
     build_ffmpeg_extract_command,
     detective_annotate_clips,
     discover_raw_sources,
@@ -4498,6 +4499,51 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual([], plans)
             self.assertEqual(0, summary["plan_count"])
             self.assertEqual(1, summary["skipped_reasons"]["reference_already_has_expected_audio_event"])
+
+    def test_build_manual_review_bundle_copies_videos_and_writes_descriptions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "clips").mkdir(parents=True)
+            (root / "synthetic").mkdir(parents=True)
+            (root / "clips" / "ref.mp4").write_bytes(b"reference-video")
+            (root / "synthetic" / "target.mp4").write_bytes(b"target-video")
+            pairs_path = root / "accepted.jsonl"
+            self._write_jsonl(
+                pairs_path,
+                [
+                    {
+                        "sample_id": "sample_1",
+                        "proposal_id": "proposal__abc",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": "synthetic/target.mp4",
+                        "edit_text": "change the robot body color from black and gold to bright yellow",
+                        "difference": {"type": "attribute", "from": "black and gold", "to": "bright yellow"},
+                        "reference_caption": "A black and gold robot rotates on a platform.",
+                        "target_caption": "A bright yellow robot rotates on the same platform.",
+                        "verification": {"passed": True},
+                        "observable_difference": {"passed": True},
+                        "competing_difference": {"passed": True},
+                    }
+                ],
+            )
+            output_dir = root / "manual_review"
+
+            summary = build_manual_review_bundle(
+                root=root,
+                pairs_path=pairs_path,
+                output_dir=output_dir,
+            )
+
+            self.assertEqual(1, summary["bundle_count"])
+            item_dir = output_dir / "0001_sample_1"
+            self.assertTrue((item_dir / "reference.mp4").exists())
+            self.assertTrue((item_dir / "target.mp4").exists())
+            review_text = (item_dir / "review.md").read_text(encoding="utf-8")
+            self.assertIn("change the robot body color", review_text)
+            self.assertIn("A black and gold robot", review_text)
+            self.assertIn("A bright yellow robot", review_text)
+            self.assertTrue((item_dir / "metadata.json").exists())
+            self.assertIn("sample_1", (output_dir / "index.md").read_text(encoding="utf-8"))
 
     def test_pair_record_acceptance_issues_rejects_speech_difference_type(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

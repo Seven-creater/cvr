@@ -1979,6 +1979,125 @@ def plan_audio_edits(
     }
 
 
+def build_manual_review_bundle(
+    *,
+    root: str | Path,
+    pairs_path: str | Path,
+    output_dir: str | Path,
+    clip_annotations_path: str | Path | None = None,
+    limit: int | None = None,
+    copy_videos: bool = True,
+) -> dict[str, Any]:
+    root_path = Path(root)
+    pairs = list(_load_jsonl(Path(pairs_path)))
+    annotations = list(_load_jsonl(Path(clip_annotations_path))) if clip_annotations_path else []
+    annotation_lookup = _annotation_lookup(root=root_path, annotations=annotations) if annotations else {}
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    items: list[dict[str, Any]] = []
+    missing_videos: list[str] = []
+    selected_pairs = pairs[: limit if limit and limit > 0 else None]
+    for index, record in enumerate(selected_pairs, start=1):
+        sample_id = str(record.get("sample_id") or record.get("proposal_id") or f"sample_{index:04d}").strip()
+        safe_sample_id = _safe_id(sample_id)
+        item_dir = output_root / f"{index:04d}_{safe_sample_id}"
+        item_dir.mkdir(parents=True, exist_ok=True)
+
+        reference_video_raw = str(record.get("reference_video", "")).strip()
+        target_video_raw = str(record.get("target_video", "")).strip()
+        reference_path = _resolve_under_root(root_path, reference_video_raw) if reference_video_raw else Path()
+        target_path = _resolve_under_root(root_path, target_video_raw) if target_video_raw else Path()
+        reference_annotation = _review_annotation_for_record(
+            root=root_path,
+            lookup=annotation_lookup,
+            record=record,
+            video_field="reference_video",
+            clip_id_field="reference_clip_id",
+        )
+        target_annotation = _review_annotation_for_record(
+            root=root_path,
+            lookup=annotation_lookup,
+            record=record,
+            video_field="target_video",
+            clip_id_field="target_clip_id",
+        )
+        reference_caption = (
+            str(record.get("reference_caption", "")).strip()
+            or str(reference_annotation.get("summary", "")).strip()
+            or str(reference_annotation.get("caption", "")).strip()
+        )
+        target_caption = (
+            str(record.get("target_caption", "")).strip()
+            or str(target_annotation.get("summary", "")).strip()
+            or str(target_annotation.get("caption", "")).strip()
+        )
+        reference_copy = item_dir / "reference.mp4"
+        target_copy = item_dir / "target.mp4"
+        if copy_videos:
+            if reference_path.exists():
+                shutil.copy2(reference_path, reference_copy)
+            else:
+                missing_videos.append(str(reference_path or reference_video_raw))
+            if target_path.exists():
+                shutil.copy2(target_path, target_copy)
+            else:
+                missing_videos.append(str(target_path or target_video_raw))
+
+        metadata = {
+            "index": index,
+            "sample_id": sample_id,
+            "proposal_id": record.get("proposal_id"),
+            "difference": record.get("difference", {}),
+            "edit_text": str(record.get("edit_text", "")).strip(),
+            "reference_video": reference_video_raw,
+            "target_video": target_video_raw,
+            "reference_video_absolute": str(reference_path) if reference_video_raw else "",
+            "target_video_absolute": str(target_path) if target_video_raw else "",
+            "reference_caption": reference_caption,
+            "target_caption": target_caption,
+            "verification": record.get("verification", {}),
+            "observable_difference": record.get("observable_difference", {}),
+            "competing_difference": record.get("competing_difference", {}),
+            "generation": record.get("generation", {}),
+        }
+        (item_dir / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        review_md = _manual_review_item_markdown(
+            metadata=metadata,
+            reference_filename="reference.mp4" if copy_videos and reference_copy.exists() else "",
+            target_filename="target.mp4" if copy_videos and target_copy.exists() else "",
+        )
+        (item_dir / "review.md").write_text(review_md, encoding="utf-8")
+        items.append(
+            {
+                "index": index,
+                "sample_id": sample_id,
+                "difference_type": (record.get("difference") or {}).get("type") if isinstance(record.get("difference"), dict) else "",
+                "edit_text": str(record.get("edit_text", "")).strip(),
+                "item_dir": str(item_dir),
+                "review_md": str(item_dir / "review.md"),
+                "reference_video": str(reference_copy if copy_videos and reference_copy.exists() else reference_path),
+                "target_video": str(target_copy if copy_videos and target_copy.exists() else target_path),
+            }
+        )
+
+    _write_jsonl(output_root / "review_items.jsonl", items)
+    index_md = _manual_review_index_markdown(items=items, source_pairs_path=str(pairs_path), missing_videos=missing_videos)
+    (output_root / "index.md").write_text(index_md, encoding="utf-8")
+    return {
+        "pair_count": len(pairs),
+        "bundle_count": len(items),
+        "output_dir": str(output_root),
+        "index_path": str(output_root / "index.md"),
+        "items_path": str(output_root / "review_items.jsonl"),
+        "missing_video_count": len(missing_videos),
+        "missing_videos": missing_videos,
+    }
+
+
 def validate_known_pairs(
     *,
     root: str | Path,
@@ -6570,6 +6689,103 @@ def _annotation_for_video_edit_plan(
     }
 
 
+def _review_annotation_for_record(
+    *,
+    root: Path,
+    lookup: dict[str, dict[str, Any]],
+    record: dict[str, Any],
+    video_field: str,
+    clip_id_field: str,
+) -> dict[str, Any]:
+    clip_id = str(record.get(clip_id_field, "")).strip()
+    if clip_id and clip_id in lookup:
+        return lookup[clip_id]
+    raw_path = str(record.get(video_field, "")).strip()
+    if raw_path:
+        resolved = _resolve_under_root(root, raw_path)
+        for key in _path_lookup_keys(root, resolved, raw_path):
+            if key in lookup:
+                return lookup[key]
+    return {}
+
+
+def _manual_review_item_markdown(
+    *,
+    metadata: dict[str, Any],
+    reference_filename: str,
+    target_filename: str,
+) -> str:
+    difference = metadata.get("difference") if isinstance(metadata.get("difference"), dict) else {}
+    verification = metadata.get("verification") if isinstance(metadata.get("verification"), dict) else {}
+    observable = metadata.get("observable_difference") if isinstance(metadata.get("observable_difference"), dict) else {}
+    competing = metadata.get("competing_difference") if isinstance(metadata.get("competing_difference"), dict) else {}
+    lines = [
+        f"# {metadata.get('index')}. {metadata.get('sample_id')} | {difference.get('type', '')}",
+        "",
+        f"- 修改文本: {metadata.get('edit_text', '')}",
+        f"- 参考视频描述: {metadata.get('reference_caption', '')}",
+        f"- 目标视频描述: {metadata.get('target_caption', '')}",
+        f"- difference: `{json.dumps(difference, ensure_ascii=False)}`",
+        f"- verification.passed: `{verification.get('passed')}`",
+        f"- observable_difference.passed: `{observable.get('passed')}`",
+        f"- competing_difference.passed: `{competing.get('passed')}`",
+        "",
+        "## 视频文件",
+        "",
+    ]
+    if reference_filename:
+        lines.append(f"- 参考视频本地副本: `{reference_filename}`")
+    lines.append(f"- 参考视频原路径: `{metadata.get('reference_video_absolute', '')}`")
+    if target_filename:
+        lines.append(f"- 目标视频本地副本: `{target_filename}`")
+    lines.append(f"- 目标视频原路径: `{metadata.get('target_video_absolute', '')}`")
+    lines.extend(
+        [
+            "",
+            "## 人工核验问题",
+            "",
+            "- reference 和 target 是否还是同一视频上下文？",
+            "- target 是否只体现 edit_text 的一个主差异？",
+            "- edit_text 方向是否正确？",
+            "- 是否有额外换场景、换动作、换文字、换主体？",
+            "- 如果是视觉 synthetic，target 是否保留 reference audio？",
+            "- 如果是音频 synthetic，画面是否完全一致，差异是否只来自音频？",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _manual_review_index_markdown(
+    *,
+    items: list[dict[str, Any]],
+    source_pairs_path: str,
+    missing_videos: list[str],
+) -> str:
+    lines = [
+        "# Manual Review Bundle",
+        "",
+        f"- Source pairs: `{source_pairs_path}`",
+        f"- Sample count: `{len(items)}`",
+        f"- Missing video count: `{len(missing_videos)}`",
+        "",
+        "## Samples",
+        "",
+        "| # | sample_id | type | edit_text | folder |",
+        "|---|-----------|------|-----------|--------|",
+    ]
+    for item in items:
+        lines.append(
+            f"| {item['index']} | `{item['sample_id']}` | `{item.get('difference_type', '')}` | "
+            f"{item.get('edit_text', '')} | `{Path(item['item_dir']).name}` |"
+        )
+    if missing_videos:
+        lines.extend(["", "## Missing Videos", ""])
+        lines.extend(f"- `{path}`" for path in missing_videos)
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _video_edit_model_route(difference_type: str) -> str | None:
     difference_type = str(difference_type).strip()
     if difference_type == "object_presence":
@@ -7815,6 +8031,14 @@ def build_parser() -> argparse.ArgumentParser:
     validate_pilot_parser.add_argument("--pilot-jsonl-path", required=True)
     validate_pilot_parser.add_argument("--gallery-output-path", required=True)
     validate_pilot_parser.add_argument("--report-output-path", required=True)
+
+    review_bundle_parser = subparsers.add_parser("build-review-bundle")
+    review_bundle_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    review_bundle_parser.add_argument("--pairs-path", required=True)
+    review_bundle_parser.add_argument("--output-dir", required=True)
+    review_bundle_parser.add_argument("--clip-annotations-path")
+    review_bundle_parser.add_argument("--limit", type=int)
+    review_bundle_parser.add_argument("--no-copy-videos", action="store_true")
     return parser
 
 
@@ -7961,6 +8185,18 @@ def main() -> None:
             timeout_seconds=args.timeout_seconds,
             max_accepted_pairs=args.max_accepted_pairs,
             overwrite=args.overwrite,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "build-review-bundle":
+        result = build_manual_review_bundle(
+            root=args.root,
+            pairs_path=args.pairs_path,
+            output_dir=args.output_dir,
+            clip_annotations_path=args.clip_annotations_path,
+            limit=args.limit,
+            copy_videos=not args.no_copy_videos,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

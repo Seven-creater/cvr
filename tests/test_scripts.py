@@ -139,6 +139,25 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
         self.assertIn("synthetic_visual_target_manifest.jsonl", script)
 
+    def test_vace_visual_batch_script_runs_plan_ids_and_collects_pairs(self) -> None:
+        script = Path("scripts/run_vace_visual_batch_from_plan.sh").read_text(encoding="utf-8")
+
+        self.assertIn("PLAN_IDS", script)
+        self.assertIn("TOP_K", script)
+        self.assertIn("run_vace_visual_synthetic_smoke.sh", script)
+        self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
+        self.assertIn("synthetic_visual_target_manifest.jsonl", script)
+        self.assertIn("batch_generation_report.md", script)
+        self.assertIn("This script does not start Omni", script)
+
+    def test_manual_review_bundle_script_calls_review_bundle_command(self) -> None:
+        script = Path("scripts/build_synthetic_manual_review_bundle.sh").read_text(encoding="utf-8")
+
+        self.assertIn("build-review-bundle", script)
+        self.assertIn("--pairs-path", script)
+        self.assertIn("--output-dir", script)
+        self.assertIn("reference.mp4, target.mp4, review.md, and metadata.json", script)
+
 
 if __name__ == "__main__":
     unittest.main()
