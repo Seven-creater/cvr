@@ -21,6 +21,7 @@ from app.composed_data import (
     _finalize_pair_verification,
     _has_intraclip_difference_conflict,
     _judge_accepts,
+    _audio_event_independent_evidence_gate,
     _non_speech_audio_event_score,
     _observable_difference_gate,
     _pair_record_acceptance_issues,
@@ -1606,6 +1607,81 @@ class ComposedDataTests(unittest.TestCase):
         target = {"audio_events": ["chainsaw noise", "machine buzzing"]}
 
         self.assertGreaterEqual(_non_speech_audio_event_score(reference, target), 0.70)
+
+    def test_audio_event_independent_evidence_accepts_specific_absence_phrase(self) -> None:
+        evidence = _audio_event_independent_evidence_gate(
+            reference_annotation={"audio_events": []},
+            target_annotation={"audio_events": ["whoosh"]},
+            difference={"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+        )
+
+        self.assertTrue(evidence["passed"])
+        self.assertEqual(["whoosh"], evidence["target_evidence"])
+
+    def test_synthetic_audio_evidence_corrects_contradictory_verification(self) -> None:
+        record = {
+            "source_type": "synthetic_edit",
+            "reference_video": "clips/ref.mp4",
+            "target_video": "clips/target.mp4",
+            "edit_text": "add whoosh to the audio",
+            "modalities": ["audio"],
+            "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+            "quality": {
+                "same_context_score": 0.98,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "visual_near_duplicate_score": 0.99,
+                "difference_type": "audio_event",
+                "non_speech_audio_event_score": 0.7,
+            },
+            "generation": {
+                "model": "ffmpeg-deterministic-audio",
+                "model_route": "deterministic_overlay",
+                "source_video": "clips/ref.mp4",
+                "audio_edit_plan": {
+                    "route": "deterministic_overlay",
+                    "expected_event": "whoosh",
+                    "audio_prompt": "whoosh",
+                    "preserve_video": True,
+                },
+            },
+            "judge": {
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "single_main_difference": True,
+                "same_context_score": 0.98,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "hard_negative_quality": "good",
+                "accept": True,
+            },
+            "verification": {
+                "caption_delta": {
+                    "caption_equivalent": True,
+                    "has_concrete_difference": False,
+                    "difference_matches_edit": False,
+                    "concrete_differences": ["target contains whoosh, reference does not"],
+                },
+                "edit_projection": {"target_matches_projection": False, "score": 0.0},
+                "edit_necessity": {
+                    "edit_needed": False,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.0,
+                },
+            },
+        }
+
+        prepared = _prepare_record_for_acceptance(
+            record,
+            reference_annotation={"audio_events": []},
+            target_annotation={"audio_events": ["whoosh"]},
+        )
+
+        self.assertEqual(1.0, prepared["quality"]["audio_event_independent_evidence_passed"])
+        self.assertTrue(prepared["verification"]["passed"])
+        self.assertTrue(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
 
     def test_audio_event_gate_accepts_timeline_audio_delta_without_top_level_audio_events(self) -> None:
         reference = {"events": [{"audio": "quiet forest ambience"}]}

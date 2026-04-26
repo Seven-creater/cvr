@@ -3754,8 +3754,16 @@ def _audio_event_independent_evidence_gate(
     target_terms = _non_speech_audio_terms(target_annotation)
     from_value = str(difference.get("from", "")).strip()
     to_value = str(difference.get("to", "")).strip()
-    reference_supported = _is_non_speech_absence_audio_phrase(from_value) or _audio_terms_match(reference_terms, from_value)
-    target_supported = _is_non_speech_absence_audio_phrase(to_value) or _audio_terms_match(target_terms, to_value)
+    from_absent = _is_audio_absence_edit_phrase(from_value)
+    to_absent = _is_audio_absence_edit_phrase(to_value)
+    reference_supported = (
+        (from_absent and not _audio_terms_match(reference_terms, to_value))
+        or _audio_terms_match(reference_terms, from_value)
+    )
+    target_supported = (
+        (to_absent and not _audio_terms_match(target_terms, from_value))
+        or _audio_terms_match(target_terms, to_value)
+    )
     terms_differ = bool(_first_unique(reference_terms, target_terms) or _first_unique(target_terms, reference_terms))
     passed = bool(reference_terms or target_terms) and reference_supported and target_supported and terms_differ
     failure_reason = ""
@@ -3768,6 +3776,10 @@ def _audio_event_independent_evidence_gate(
         "supporting_fields": ["audio_events"] if reference_terms or target_terms else [],
         "failure_reason": failure_reason,
     }
+
+
+def _is_audio_absence_edit_phrase(value: str) -> bool:
+    return _is_non_speech_absence_audio_phrase(value) or _absence_like_phrase(value)
 
 
 def _audio_terms_match(terms: list[str], phrase: str) -> bool:
@@ -3877,6 +3889,11 @@ def _ensure_structured_gate_fields(
             verification,
             observable_difference=observable_difference,
         )
+        _sync_synthetic_audio_verification_from_evidence(
+            record,
+            verification=verification,
+            audio_event_evidence=audio_event_evidence,
+        )
         _sync_local_gate_failure(
             verification,
             passed=bool(competing_difference.get("passed", True)),
@@ -3896,6 +3913,51 @@ def _ensure_structured_gate_fields(
     record["competing_difference"] = competing_difference
     record["audio_event_evidence"] = audio_event_evidence
     return record
+
+
+def _sync_synthetic_audio_verification_from_evidence(
+    record: dict[str, Any],
+    *,
+    verification: dict[str, Any],
+    audio_event_evidence: dict[str, Any],
+) -> None:
+    if str(record.get("source_type", "")).strip() != "synthetic_edit":
+        return
+    generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
+    if not _is_audio_synthetic_route(_synthetic_generation_route(generation)):
+        return
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    if str(difference.get("type", "")).strip() != "audio_event":
+        return
+    if not _boolish(audio_event_evidence.get("passed")):
+        return
+
+    expected_event = _synthetic_audio_expected_event(record)
+    reason = (
+        "synthetic audio plan and independent audio evidence confirm "
+        f"target contains the requested non-speech audio event: {expected_event}"
+    )
+    caption_delta = verification.setdefault("caption_delta", {})
+    caption_delta["caption_equivalent"] = False
+    caption_delta["has_concrete_difference"] = True
+    caption_delta["difference_matches_edit"] = True
+    differences = _normalize_list(caption_delta.get("concrete_differences", []))
+    if expected_event and not any(_text_mentions_phrase(item, expected_event) for item in differences):
+        differences.append(f"target contains {expected_event}; reference does not")
+    caption_delta["concrete_differences"] = differences
+    caption_delta["reason"] = _append_reason(caption_delta.get("reason"), reason)
+
+    edit_projection = verification.setdefault("edit_projection", {})
+    edit_projection["target_matches_projection"] = True
+    edit_projection["score"] = max(_score_float(edit_projection.get("score")), 0.9)
+    edit_projection["reason"] = _append_reason(edit_projection.get("reason"), reason)
+
+    edit_necessity = verification.setdefault("edit_necessity", {})
+    edit_necessity["edit_needed"] = True
+    edit_necessity["reference_satisfies_edit"] = False
+    edit_necessity["target_satisfies_edit"] = True
+    edit_necessity["score"] = max(_score_float(edit_necessity.get("score")), 0.9)
+    edit_necessity["reason"] = _append_reason(edit_necessity.get("reason"), reason)
 
 
 def _sync_observable_difference_failure(
