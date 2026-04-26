@@ -3970,6 +3970,87 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("paper surface", plans[0]["edit_region"])
             self.assertEqual("vace_controlled", plans[0]["model_route"])
 
+    def test_plan_video_edits_prefers_reference_attribute_ideation_over_action_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "robot_ref.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "robot_ref",
+                        "output_path": "clips/robot_ref.mp4",
+                        "summary": "a black and gold robotic action figure rotates on a reflective platform in a dark studio",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "robot_action",
+                        "reference_video": "clips/robot_ref.mp4",
+                        "reference_caption": "a robot rotates on a platform",
+                        "edit_text": "change the action from rotating to hovering",
+                        "difference": {"type": "action", "from": "rotating", "to": "hovering"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "edit_text": "change the robot body color from black and gold to bright yellow",
+                    "difference": {
+                        "type": "attribute",
+                        "from": "black and gold robot body",
+                        "to": "bright yellow robot body",
+                    },
+                    "source_prompt": "A black and gold robotic action figure rotates on a reflective platform in a dark studio.",
+                    "target_prompt": "The same robotic action figure rotates on the same platform in the same dark studio, but the robot body is bright yellow.",
+                    "edit_token": "bright yellow robot body",
+                    "preserve_tokens": ["yellow visor", "platform", "dark studio", "rotation", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the platform, camera motion, lighting, timing, background, or visible text.",
+                    "edit_region": "robot body",
+                    "model_route": "vace_controlled",
+                    "reason": "The robot body color is a safer VACE edit than changing the action.",
+                    "repaired_fields": [],
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client):
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["safe_visual_ideation_from_non_vace_candidate"])
+            self.assertEqual("change the action from rotating to hovering", plans[0]["source_candidate_edit_text"])
+            self.assertEqual("attribute", plans[0]["difference"]["type"])
+            self.assertEqual("vace_controlled", plans[0]["model_route"])
+            self.assertEqual("strongest_omni_prompt_planner", plans[0]["planner"]["stage"])
+            self.assertFalse(plans[0]["planner"]["fallback_used"])
+            self.assertEqual("existing_subject_attribute_edit", plans[0]["route_suitability"]["reason"])
+
     def test_plan_video_edits_rejects_tiny_additive_attribute_revision_for_vace(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

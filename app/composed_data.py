@@ -1657,6 +1657,15 @@ def plan_video_edits(
             video_field="reference_video",
             caption_field="reference_caption",
         )
+        if route not in {None, "vace_controlled"} and planner_client is not None:
+            ideation_candidate = _safe_visual_ideation_candidate(candidate, reference_annotation)
+            if ideation_candidate is not None:
+                candidate = ideation_candidate
+                difference = dict(candidate.get("difference") or {})
+                difference_type = str(difference.get("type", "")).strip()
+                route = _video_edit_model_route(difference_type)
+                safe_visual_ideation_used = True
+                skipped_reasons["safe_visual_ideation_from_non_vace_candidate"] += 1
         if route is None:
             ideation_candidate = (
                 _safe_visual_ideation_candidate(candidate, reference_annotation)
