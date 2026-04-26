@@ -1069,12 +1069,62 @@ def _repair_video_edit_plan_payload(
     if route_hint and not str(repaired.get("model_route", "")).strip():
         repaired["model_route"] = route_hint
         repaired_fields.append("model_route")
+    if not str(repaired.get("edit_region", "")).strip():
+        edit_region = _infer_video_edit_region(
+            payload=repaired,
+            candidate=candidate,
+            difference=difference,
+            edit_token=edit_token,
+        )
+        if edit_region:
+            repaired["edit_region"] = edit_region
+            repaired_fields.append("edit_region")
     if not str(repaired.get("reason", "")).strip():
         repaired["reason"] = "Planner response was repaired conservatively from the candidate edit."
         repaired_fields.append("reason")
     if repaired_fields:
         repaired["repaired_fields"] = sorted(set(repaired_fields))
     return repaired
+
+
+def _infer_video_edit_region(
+    *,
+    payload: dict[str, Any],
+    candidate: dict[str, Any],
+    difference: dict[str, Any],
+    edit_token: str,
+) -> str:
+    text_parts = [
+        candidate.get("edit_text", ""),
+        payload.get("target_prompt", ""),
+        payload.get("source_prompt", ""),
+        difference.get("description", ""),
+        difference.get("to", ""),
+        difference.get("from", ""),
+    ]
+    text = " ".join(str(part) for part in text_parts if part).lower()
+    region_patterns = (
+        (r"\btop[- ]right\b|\bupper[- ]right\b", "top-right region"),
+        (r"\btop[- ]left\b|\bupper[- ]left\b", "top-left region"),
+        (r"\bbottom[- ]right\b|\blower[- ]right\b", "bottom-right region"),
+        (r"\bbottom[- ]left\b|\blower[- ]left\b", "bottom-left region"),
+        (r"\bbackground\b|\bbackdrop\b|\bin the back\b", "background"),
+        (r"\bforeground\b|\bfront\b", "foreground"),
+        (r"\bwall\b|\bposter\b|\bpainting\b|\bframed picture\b|\bwall art\b", "wall area"),
+        (r"\bpaper\b|\bpage\b|\bnotebook\b|\bworksheet\b", "paper surface"),
+        (r"\bdesk\b|\btable\b|\bcounter\b|\bsurface\b", "desk/table surface"),
+        (r"\bfloor\b|\bground\b", "floor area"),
+        (r"\bhand[- ]held\b|\bin (?:the )?hand\b|\bholding\b|\bheld\b", "hand-held object"),
+        (r"\bcenter\b|\bmiddle\b", "center region"),
+        (r"\bleft side\b|\bon the left\b", "left side"),
+        (r"\bright side\b|\bon the right\b", "right side"),
+    )
+    for pattern, region in region_patterns:
+        if re.search(pattern, text):
+            return region
+    if edit_token:
+        return f"localized region around {edit_token}"
+    return ""
 
 
 def _normalize_video_edit_plan_payload(payload: dict[str, Any]) -> dict[str, Any]:
