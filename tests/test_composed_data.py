@@ -3842,6 +3842,59 @@ class ComposedDataTests(unittest.TestCase):
             self.assertIn("replace only the phone", plans[0]["target_prompt"])
             self.assertEqual({"raw": "planner"}, plans[0]["raw_planner_output"])
 
+    def test_plan_video_edits_rejects_clean_naked_object_insertion_for_vace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "robot_ref",
+                        "output_path": "clips/robot_ref.mp4",
+                        "summary": "a black and gold robotic action figure rotates on a reflective platform",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "plant_insert",
+                        "reference_video": "clips/robot_ref.mp4",
+                        "reference_caption": "a robot rotates on a platform",
+                        "edit_text": "add a medium green potted plant in the background",
+                        "difference": {
+                            "type": "object_presence",
+                            "from": "no medium green potted plant",
+                            "to": "medium green potted plant",
+                        },
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual([], plans)
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["vace_rejects_tiny_or_naked_object_edit"])
+
     def test_plan_video_edits_uses_model_revised_safe_edit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3880,16 +3933,16 @@ class ComposedDataTests(unittest.TestCase):
             fake_client.plan_video_edit.return_value = (
                 {
                     "should_generate": True,
-                    "edit_text": "add a small blue star sticker to the paper",
-                    "difference": {"type": "object_presence", "from": "no blue star sticker", "to": "blue star sticker"},
+                    "edit_text": "change the paper color from white to pale blue",
+                    "difference": {"type": "attribute", "from": "white paper", "to": "pale blue paper"},
                     "source_prompt": "A close-up video of a hand writing on white paper on a desk.",
-                    "target_prompt": "The same close-up video with a small blue star sticker added to the paper while everything else stays unchanged.",
-                    "edit_token": "blue star sticker",
+                    "target_prompt": "The same close-up video of the same hand writing on the same desk, but the paper surface is pale blue while everything else stays unchanged.",
+                    "edit_token": "pale blue paper",
                     "preserve_tokens": ["hand", "paper", "desk", "writing", "camera motion", "lighting"],
                     "negative_prompt": "Do not change the hand, paper, writing, desk, camera motion, lighting, timing, or visible text.",
                     "edit_region": "paper surface",
                     "model_route": "vace_controlled",
-                    "reason": "The candidate object is unsuitable, so the planner chose a safer local paper-surface edit.",
+                    "reason": "The candidate object insertion is unsuitable, so the planner chose a safer large visible color edit.",
                     "repaired_fields": [],
                 },
                 {"raw": "planner"},
@@ -3911,13 +3964,13 @@ class ComposedDataTests(unittest.TestCase):
                 if line.strip()
             ]
             self.assertEqual(1, summary["plan_count"])
-            self.assertEqual("add a small blue star sticker to the paper", plans[0]["edit_text"])
-            self.assertEqual({"type": "object_presence", "from": "no blue star sticker", "to": "blue star sticker"}, plans[0]["difference"])
-            self.assertEqual("blue star sticker", plans[0]["edit_token"])
+            self.assertEqual("change the paper color from white to pale blue", plans[0]["edit_text"])
+            self.assertEqual({"type": "attribute", "from": "white paper", "to": "pale blue paper"}, plans[0]["difference"])
+            self.assertEqual("pale blue paper", plans[0]["edit_token"])
             self.assertEqual("paper surface", plans[0]["edit_region"])
             self.assertEqual("vace_controlled", plans[0]["model_route"])
 
-    def test_plan_video_edits_routes_additive_attribute_revision_to_vace(self) -> None:
+    def test_plan_video_edits_rejects_tiny_additive_attribute_revision_for_vace(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             ensure_layout(root)
@@ -3985,11 +4038,9 @@ class ComposedDataTests(unittest.TestCase):
                 for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            self.assertEqual(1, summary["plan_count"])
-            self.assertEqual("object_presence", plans[0]["difference"]["type"])
-            self.assertEqual("nose ring", plans[0]["difference"]["to"])
-            self.assertEqual("vace_controlled", plans[0]["model_route"])
-            self.assertEqual("face, nose area", plans[0]["edit_region"])
+            self.assertEqual([], plans)
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["vace_rejects_tiny_or_naked_object_edit"])
 
     def test_plan_video_edits_ideates_safe_visual_edit_from_audio_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4003,11 +4054,11 @@ class ComposedDataTests(unittest.TestCase):
                     {
                         "clip_id": "ref_audio",
                         "output_path": "clips/ref_audio.mp4",
-                        "summary": "a hand writes on a white paper on a desk",
-                        "subjects": ["hand", "paper", "desk"],
-                        "object_counts": {"hand": 1, "paper": 1, "desk": 1},
-                        "actions": ["writing", "moving hand"],
-                        "scene": "desk",
+                        "summary": "a black and gold robotic action figure rotates on a reflective platform in a dark studio",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating", "turning"],
+                        "scene": "dark studio",
                     }
                 ],
             )
@@ -4029,20 +4080,20 @@ class ComposedDataTests(unittest.TestCase):
             fake_client.plan_video_edit.return_value = (
                 {
                     "should_generate": True,
-                    "edit_text": "add a bright red eraser to the top-right corner of the paper",
+                    "edit_text": "change the robot body color from black and gold to bright yellow",
                     "difference": {
-                        "type": "object_presence",
-                        "from": "no bright red eraser",
-                        "to": "bright red eraser",
+                        "type": "attribute",
+                        "from": "black and gold robot body",
+                        "to": "bright yellow robot body",
                     },
-                    "source_prompt": "A close-up video of a hand writing on white paper on a desk.",
-                    "target_prompt": "The same close-up video with a bright red eraser added to the top-right corner of the paper.",
-                    "edit_token": "bright red eraser",
-                    "preserve_tokens": ["hand", "paper", "desk", "writing", "camera motion", "lighting"],
-                    "negative_prompt": "Do not change the hand, paper, writing, desk, camera motion, lighting, timing, or visible text.",
-                    "edit_region": "paper surface",
+                    "source_prompt": "A black and gold robotic action figure rotates on a reflective platform in a dark studio.",
+                    "target_prompt": "The same robotic action figure rotates on the same platform in the same dark studio, but the robot body is bright yellow.",
+                    "edit_token": "bright yellow robot body",
+                    "preserve_tokens": ["yellow visor", "platform", "dark studio", "rotation", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the platform, camera motion, lighting, timing, background, or visible text.",
+                    "edit_region": "robot body",
                     "model_route": "vace_controlled",
-                    "reason": "The paper is a stable local surface for editing.",
+                    "reason": "The robot body color is a large existing attribute suitable for VACE.",
                     "repaired_fields": [],
                 },
                 {"raw": "planner"},
@@ -4065,14 +4116,14 @@ class ComposedDataTests(unittest.TestCase):
             ]
             self.assertEqual(1, summary["plan_count"])
             self.assertEqual("add whoosh to the audio", plans[0]["source_candidate_edit_text"])
-            self.assertEqual("add a bright red eraser to the top-right corner of the paper", plans[0]["edit_text"])
-            self.assertEqual("object_presence", plans[0]["difference"]["type"])
+            self.assertEqual("change the robot body color from black and gold to bright yellow", plans[0]["edit_text"])
+            self.assertEqual("attribute", plans[0]["difference"]["type"])
             self.assertEqual("vace_controlled", plans[0]["model_route"])
             self.assertTrue(plans[0]["visual_edit_risk"]["safe_visual_ideation_relaxed"])
             self.assertIn("multiple_actions", plans[0]["visual_edit_risk"]["relaxed_risk_reasons"])
             self.assertEqual(1, summary["skipped_reasons"]["safe_visual_ideation_from_unsupported_type"])
             call_kwargs = fake_client.plan_video_edit.call_args.kwargs
-            self.assertEqual("add a bright red eraser to the top-right corner of the paper", call_kwargs["candidate"]["edit_text"])
+            self.assertEqual("change the robot body color from black and gold to bright yellow", call_kwargs["candidate"]["edit_text"])
 
     def test_plan_video_edits_keeps_visible_text_hard_risk_for_safe_ideation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4086,11 +4137,11 @@ class ComposedDataTests(unittest.TestCase):
                     {
                         "clip_id": "ref_audio",
                         "output_path": "clips/ref_audio.mp4",
-                        "summary": "a hand writes on a white paper with visible chemical text",
-                        "subjects": ["hand", "paper", "desk"],
-                        "object_counts": {"hand": 1, "paper": 1, "desk": 1},
-                        "actions": ["writing"],
-                        "scene": "desk",
+                        "summary": "a black and gold robotic action figure rotates on a platform with visible chemical text",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
                         "visible_text": ["chemical formula"],
                         "on_screen_text": ["chemical formula"],
                     }

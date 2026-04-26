@@ -84,6 +84,97 @@ MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE = 0.995
 VISUAL_DIFFERENCE_TYPES = {"object_count", "object_presence", "attribute", "action", "scene", "visible_text"}
 SYNTHETIC_VISUAL_ROUTES = {"vace_controlled", "ltx2_retake", "tokenflow_style"}
 SYNTHETIC_AUDIO_ROUTES = {"deterministic_overlay", "foleycrafter_temporal", "frieren_benchmark", "audio_deterministic"}
+VACE_ATTRIBUTE_MARKERS = {
+    "attribute",
+    "color",
+    "colour",
+    "bright",
+    "yellow",
+    "red",
+    "blue",
+    "green",
+    "silver",
+    "gold",
+    "black",
+    "white",
+    "body",
+    "shell",
+    "surface",
+    "material",
+    "metal",
+    "metallic",
+    "matte",
+    "plastic",
+    "texture",
+    "style",
+    "visor",
+    "light",
+    "clothing",
+    "shirt",
+    "jacket",
+    "dress",
+    "vehicle",
+    "car",
+    "robot",
+    "background",
+    "backdrop",
+    "room",
+    "street",
+    "office",
+    "kitchen",
+    "laboratory",
+    "lab",
+    "cyberpunk",
+    "anime",
+    "cinematic",
+    "neon",
+    "weather",
+    "rain",
+    "night",
+    "day",
+}
+VACE_TINY_OR_INSERTION_MARKERS = {
+    "sticker",
+    "poster",
+    "plant",
+    "potted",
+    "badge",
+    "button",
+    "logo",
+    "label",
+    "sign",
+    "text",
+    "caption",
+    "nose ring",
+    "earring",
+    "ear ring",
+    "necklace",
+    "bracelet",
+    "watch",
+    "flower",
+    "cube",
+    "eraser",
+}
+VACE_BACKGROUND_STYLE_MARKERS = {
+    "background",
+    "backdrop",
+    "room",
+    "street",
+    "office",
+    "kitchen",
+    "laboratory",
+    "lab",
+    "cyberpunk",
+    "anime",
+    "oil painting",
+    "cinematic",
+    "neon",
+    "night",
+    "day",
+    "rain",
+    "sunset",
+    "studio",
+}
 INTRACLIP_CHANGE_MARKERS = (
     "change from",
     "changes from",
@@ -1696,6 +1787,18 @@ def plan_video_edits(
                     "model": model,
                     "fallback_reason": f"{type(exc).__name__}: {exc}",
                 }
+        suitability = _video_edit_route_suitability(
+            route=route,
+            difference=difference,
+            edit_text=edit_text,
+            edit_token=edit_token,
+            edit_region=edit_region,
+            reference_annotation=reference_annotation,
+        )
+        if not suitability["allow_generation"]:
+            skipped_by_type[difference_type or "unknown"] += 1
+            skipped_reasons[str(suitability["reason"])] += 1
+            continue
         control_plan = _video_edit_control_plan(route)
         plan = {
             "plan_id": str(candidate.get("proposal_id", "")).strip()
@@ -1716,6 +1819,8 @@ def plan_video_edits(
             "model_route": route,
             "difference": difference,
             "raw_planner_output": raw_planner_output,
+            "reference_understanding": _video_edit_reference_understanding(reference_annotation),
+            "route_suitability": suitability,
             "visual_edit_risk": risk,
             "generation_defaults": _video_edit_generation_defaults(route),
             "validation_requirements": {
@@ -6429,10 +6534,12 @@ def _annotation_for_video_edit_plan(
 
 def _video_edit_model_route(difference_type: str) -> str | None:
     difference_type = str(difference_type).strip()
-    if difference_type in {"object_presence", "object_count"}:
+    if difference_type == "object_presence":
         return "vace_controlled"
     if difference_type == "attribute":
-        return "tokenflow_style"
+        return "vace_controlled"
+    if difference_type == "scene":
+        return "vace_controlled"
     if difference_type == "action":
         return "ltx2_retake"
     return None
@@ -6466,39 +6573,43 @@ def _safe_visual_edit_anchor(annotation: dict[str, Any]) -> tuple[str, dict[str,
     text = _normalized_phrase(" ".join(values))
     anchors = (
         (
-            ("paper", "page", "notebook", "sheet", "worksheet"),
-            "add a bright red eraser to the top-right corner of the paper",
-            "bright red eraser",
-            "paper surface",
+            ("robot", "robotic", "action figure"),
+            "change the robot body color from black and gold to bright yellow",
+            "black and gold robot body",
+            "bright yellow robot body",
+            "robot body",
         ),
         (
-            ("desk", "table", "counter", "workbench"),
-            "add a bright red cube on the desk",
-            "bright red cube",
-            "desk/table surface",
+            ("car", "vehicle", "truck", "bus"),
+            "change the vehicle color to bright red",
+            "original vehicle color",
+            "bright red vehicle body",
+            "vehicle body",
         ),
         (
-            ("wall", "whiteboard", "room"),
-            "add a large plain blue poster on the wall",
-            "large plain blue poster",
-            "wall area",
+            ("shirt", "jacket", "coat", "dress", "clothing"),
+            "change the clothing color to bright blue",
+            "original clothing color",
+            "bright blue clothing",
+            "clothing",
         ),
         (
-            ("background", "shelf", "studio"),
-            "add a medium green potted plant in the background",
-            "medium green potted plant",
+            ("room", "office", "kitchen", "street"),
+            "change the background to a futuristic laboratory",
+            "original background",
+            "futuristic laboratory background",
             "background",
         ),
     )
-    for markers, edit_text, edit_token, region in anchors:
+    for markers, edit_text, from_value, to_value, region in anchors:
         if any(marker in text for marker in markers):
             difference = {
-                "type": "object_presence",
-                "from": f"no {edit_token}",
-                "to": edit_token,
-                "description": f"{edit_token} is added to the {region}.",
+                "type": "attribute",
+                "from": from_value,
+                "to": to_value,
+                "description": f"The existing {region} changes from {from_value} to {to_value}.",
             }
-            return edit_text, difference, f"reference has a stable {region} for localized VACE editing"
+            return edit_text, difference, f"reference has a stable existing {region} for attribute-based VACE editing"
     return None
 
 
@@ -6506,19 +6617,23 @@ def _relax_safe_visual_ideation_risk(risk: dict[str, Any], candidate: dict[str, 
     if str(candidate.get("candidate_source", "")) != "safe_visual_ideation_from_reference":
         return risk
     difference = candidate.get("difference") if isinstance(candidate.get("difference"), dict) else {}
-    if str(difference.get("type", "")).strip() != "object_presence":
+    if str(difference.get("type", "")).strip() != "attribute":
         return risk
     edit_text = str(candidate.get("edit_text", "")).lower()
     stable_surface_markers = {
-        "paper",
-        "desk",
-        "table",
-        "wall",
+        "robot",
+        "vehicle",
+        "clothing",
+        "shirt",
+        "jacket",
+        "body",
+        "color",
+        "colour",
         "background",
-        "eraser",
-        "cube",
-        "poster",
-        "potted plant",
+        "laboratory",
+        "lab",
+        "style",
+        "cyberpunk",
     }
     if not any(marker in edit_text for marker in stable_surface_markers):
         return risk
@@ -6541,7 +6656,7 @@ def _relax_safe_visual_ideation_risk(risk: dict[str, Any], candidate: dict[str, 
         if str(item).strip()
     ]
     extra_locks = [
-        "limit the edit to the named small object and local region only",
+        "limit the edit to the named existing subject attribute only",
         "preserve all text, hands, people, actions, motion order, and background content exactly",
     ]
     for lock in extra_locks:
@@ -6552,25 +6667,145 @@ def _relax_safe_visual_ideation_risk(risk: dict[str, Any], candidate: dict[str, 
 
 
 def _normalize_model_planned_visual_difference(difference: dict[str, Any], *, edit_text: str) -> dict[str, Any]:
-    normalized = dict(difference)
-    difference_type = str(normalized.get("type", "")).strip()
-    from_value = str(normalized.get("from", "")).strip()
-    to_value = str(normalized.get("to", "")).strip()
-    edit_phrase = _normalized_phrase(edit_text)
-    is_additive_edit = edit_phrase.startswith(("add ", "introduce ", "place ", "attach "))
-    if (
-        difference_type == "attribute"
-        and to_value
-        and (_absence_like_phrase(from_value) or is_additive_edit)
-    ):
-        normalized["type"] = "object_presence"
-        if not from_value or not _absence_like_phrase(from_value):
-            normalized["from"] = f"no {to_value}"
-        normalized["to"] = to_value
-        description = str(normalized.get("description", "")).strip()
-        if not description:
-            normalized["description"] = f"{to_value} is added as a localized visible object."
-    return normalized
+    return dict(difference)
+
+
+def _video_edit_route_suitability(
+    *,
+    route: str,
+    difference: dict[str, Any],
+    edit_text: str,
+    edit_token: str,
+    edit_region: str,
+    reference_annotation: dict[str, Any],
+) -> dict[str, Any]:
+    if route != "vace_controlled":
+        return {"allow_generation": True, "reason": "route_supported"}
+
+    difference_type = str(difference.get("type", "")).strip()
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    combined_text = _normalized_phrase(" ".join([edit_text, edit_token, from_value, to_value, edit_region]))
+    combined_tokens = set(TOKEN_PATTERN.findall(combined_text))
+    tiny_markers = {_normalized_phrase(marker) for marker in VACE_TINY_OR_INSERTION_MARKERS}
+    if any(marker and marker in combined_text for marker in tiny_markers):
+        return {
+            "allow_generation": False,
+            "reason": "vace_rejects_tiny_or_naked_object_edit",
+            "priority": "D",
+        }
+
+    if difference_type == "object_presence":
+        if _absence_like_phrase(from_value) and not _absence_like_phrase(to_value):
+            return {
+                "allow_generation": False,
+                "reason": "vace_rejects_naked_object_insertion",
+                "priority": "D",
+            }
+        if _absence_like_phrase(to_value) and not _absence_like_phrase(from_value):
+            return {
+                "allow_generation": True,
+                "reason": "object_removal_or_inpainting",
+                "priority": "S",
+            }
+        return {
+            "allow_generation": True,
+            "reason": "existing_object_replacement",
+            "priority": "S",
+        }
+
+    if difference_type == "attribute":
+        if _absence_like_phrase(from_value) or _absence_like_phrase(to_value):
+            return {
+                "allow_generation": False,
+                "reason": "vace_rejects_absence_based_attribute",
+                "priority": "D",
+            }
+        if not (combined_tokens & VACE_ATTRIBUTE_MARKERS):
+            return {
+                "allow_generation": False,
+                "reason": "vace_attribute_lacks_large_visible_property",
+                "priority": "C",
+            }
+        priority = "S" if any(marker in combined_text for marker in ("clothing", "shirt", "jacket", "dress", "background", "style", "robot body", "vehicle")) else "A"
+        return {
+            "allow_generation": True,
+            "reason": "existing_subject_attribute_edit",
+            "priority": priority,
+        }
+
+    if difference_type == "scene":
+        if not any(marker in combined_text for marker in VACE_BACKGROUND_STYLE_MARKERS):
+            return {
+                "allow_generation": False,
+                "reason": "vace_scene_edit_lacks_background_or_style_target",
+                "priority": "C",
+            }
+        return {
+            "allow_generation": True,
+            "reason": "background_or_style_edit",
+            "priority": "S",
+        }
+
+    return {
+        "allow_generation": False,
+        "reason": f"vace_rejects_{difference_type or 'unknown'}_edit",
+        "priority": "D",
+    }
+
+
+def _video_edit_reference_understanding(annotation: dict[str, Any]) -> dict[str, Any]:
+    subjects = _dedupe_strings(_normalize_list(annotation.get("subjects", [])))[:6]
+    actions = _dedupe_strings(_normalize_list(annotation.get("actions", [])))[:6]
+    visible_text = _dedupe_strings(
+        _normalize_list(annotation.get("visible_text", []))
+        + _normalize_list(annotation.get("on_screen_text", []))
+    )[:6]
+    object_names = list(_normalize_object_counts(annotation.get("object_counts", {})).keys())[:6]
+    summary = str(annotation.get("summary", "")).strip()
+    scene = str(annotation.get("scene", "")).strip()
+    editable_attributes: list[dict[str, Any]] = []
+    text = _normalized_phrase(" ".join([summary, scene, " ".join(subjects), " ".join(object_names)]))
+    if any(marker in text for marker in ("robot", "robotic", "action figure")):
+        editable_attributes.append(
+            {
+                "type": "color",
+                "target": "robot body",
+                "current": "black and gold",
+                "safe_targets": ["bright yellow", "silver", "red"],
+            }
+        )
+    if any(marker in text for marker in ("car", "vehicle", "truck", "bus")):
+        editable_attributes.append(
+            {
+                "type": "color",
+                "target": "vehicle body",
+                "current": "original vehicle color",
+                "safe_targets": ["bright red", "blue", "silver"],
+            }
+        )
+    if any(marker in text for marker in ("shirt", "jacket", "coat", "dress", "clothing")):
+        editable_attributes.append(
+            {
+                "type": "color",
+                "target": "clothing",
+                "current": "original clothing color",
+                "safe_targets": ["bright blue", "red", "green"],
+            }
+        )
+    return {
+        "main_subjects": subjects or object_names,
+        "stable_scene": scene or summary,
+        "visible_text": visible_text,
+        "actions": actions,
+        "editable_attributes": editable_attributes,
+        "bad_edits": [
+            "add small background object",
+            "add text",
+            "add tiny accessory",
+            "change exact object count",
+        ],
+    }
 
 
 def _planned_route_matches_difference(route: str, difference_type: str) -> bool:
@@ -6632,6 +6867,14 @@ def _video_edit_region(
         ("paper", "paper surface"),
         ("desk", "desk surface"),
         ("table", "table surface"),
+        ("robot body", "robot body"),
+        ("robot", "robot body"),
+        ("vehicle", "vehicle body"),
+        ("car", "vehicle body"),
+        ("clothing", "clothing"),
+        ("shirt", "clothing"),
+        ("jacket", "clothing"),
+        ("visor", "visor"),
         ("floor", "floor area"),
         ("center", "center region"),
         ("left", "left side"),
@@ -6670,6 +6913,8 @@ def _video_edit_target_prompt(*, source_prompt: str, edit_text: str, difference:
         edit_clause = f"Change only the count to {to_value}."
     elif difference_type == "attribute":
         edit_clause = f"Change only the specified attribute: {edit_text}."
+    elif difference_type == "scene":
+        edit_clause = f"Change only the background or visual style: {edit_text}."
     elif difference_type == "action":
         edit_clause = f"Change only the action: {edit_text}."
     elif difference_type == "audio_event":

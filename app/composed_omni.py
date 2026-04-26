@@ -455,14 +455,19 @@ def _video_edit_planner_system_prompt() -> str:
         '"source_prompt": string, "target_prompt": string, '
         '"edit_token": string, "preserve_tokens": [string], "negative_prompt": string, '
         '"edit_region": string, "model_route": string, "reason": string}. '
-        "If the candidate edit is unsuitable but the reference clip has a safer single local visual edit, revise edit_text and difference to that safer edit instead of rejecting. "
-        "Only revise to object_presence, object_count, attribute, or simple action edits that are visibly supported by the reference. "
+        "First understand the reference video: main subjects, stable scene, visible text, actions, editable attributes, and bad edits. "
+        "If the candidate edit is unsuitable but the reference clip has a safer single visual edit, revise edit_text and difference to that safer edit instead of rejecting. "
+        "Prefer VACE-friendly edits on existing content in this order: clothing/outfit changes, background replacement, video style changes, object replacement inside an existing maskable region, object removal/inpainting, large subject color/material changes, lighting/weather/time-of-day changes. "
+        "Do not revise to naked small-object insertion, tiny accessories, exact count edits, or precise text edits. "
+        "Only revise to attribute/color/material edits, existing-object replacements, or simple action edits that are visibly supported by the reference. "
         "The source_prompt must faithfully describe the reference video. "
         "The target_prompt must preserve the same subject, scene, camera, lighting, timing, and layout, while applying exactly one visual edit. "
         "The edit_token is the one object, attribute, or action concept the editor should change. "
         "preserve_tokens are concepts that must stay unchanged. "
         "negative_prompt must explicitly forbid changing people, scene, camera, visible text, timing, and unrelated objects. "
         "edit_region should be localized when possible, such as top-right paper surface, wall area, desk surface, hand-held object, or background. "
+        "For VACE, route clothing/background/style/object-replacement/removal/color/material edits to vace_controlled. "
+        "Do not route no-object -> object insertion such as stickers, plants, badges, nose rings, posters, text, or labels to VACE unless a deterministic mask/overlay editor is explicitly available. "
         "Reject by setting should_generate=false when the edit is audio-only, speech/topic, visible text/OCR, broad scene replacement, impossible for this reference, or likely to change the whole clip. "
         "Do not write a caption as target_prompt; write an instruction-ready prompt for VACE/LTX style video editing."
     )
@@ -676,8 +681,10 @@ def _build_video_edit_planner_user_content(
         f"Candidate edit JSON:\n{json.dumps(candidate, ensure_ascii=False)}\n"
         "Rules:\n"
         "- Keep the clip short-context identity: same scene, subject identity, camera motion, timing, lighting, and layout.\n"
-        "- The target_prompt should add/replace exactly one visual concept, such as phone -> tablet, add a small sticker, change object color, or a localized appearance change.\n"
+        "- Prefer VACE edits in this order: change clothing/outfit, replace background, style transfer, replace an existing object, remove/inpaint an object, change large color/material, change lighting/weather/time.\n"
+        "- Do not propose naked small-object insertion such as a sticker, plant, badge, nose ring, poster, label, logo, or text unless a deterministic mask/overlay editor is explicitly available.\n"
         "- If the candidate edit is not suitable but another local visual edit is suitable for this exact reference, output the safer revised edit_text and difference.\n"
+        "- The safest VACE edit is usually a large, visible attribute change on the main subject, not adding a new object to the background.\n"
         "- Do not plan visible-text edits unless OCR-backed text editing is explicitly available.\n"
         "- Do not plan audio_event or speech edits for a video editor.\n"
         "- Do not use a universal edit. The edit must fit objects/actions visible in this reference video.\n"
