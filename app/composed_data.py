@@ -1879,16 +1879,6 @@ def plan_audio_edits(
         difference = dict(candidate.get("difference") or {})
         difference_type = str(difference.get("type", "")).strip()
         edit_text = str(candidate.get("edit_text", "")).strip() or _build_fallback_edit_text(difference)
-        if difference_type != "audio_event":
-            skipped_by_type[difference_type or "unknown"] += 1
-            skipped_reasons["not_audio_event"] += 1
-            continue
-        speech_issues = _speech_content_edit_issues(edit_text=edit_text, difference=difference)
-        if speech_issues:
-            skipped_by_type[difference_type] += 1
-            skipped_reasons["speech_content_or_speech_only_audio"] += 1
-            continue
-
         reference_video = str(candidate.get("reference_video", "")).strip()
         if not reference_video:
             skipped_by_type[difference_type] += 1
@@ -1901,6 +1891,31 @@ def plan_audio_edits(
             video_field="reference_video",
             caption_field="reference_caption",
         )
+        source_candidate_edit_text = str(candidate.get("source_candidate_edit_text", edit_text)).strip()
+        source_candidate_difference = candidate.get("source_candidate_difference", difference)
+        speech_issues = _speech_content_edit_issues(edit_text=edit_text, difference=difference)
+        if speech_issues or difference_type == "speech":
+            skipped_by_type[difference_type or "unknown"] += 1
+            skipped_reasons["speech_content_or_speech_only_audio"] += 1
+            continue
+        if difference_type != "audio_event":
+            ideation_candidate = _safe_audio_ideation_candidate(candidate, reference_annotation)
+            if ideation_candidate is None:
+                skipped_by_type[difference_type or "unknown"] += 1
+                skipped_reasons["not_audio_event"] += 1
+                continue
+            candidate = ideation_candidate
+            difference = dict(candidate.get("difference") or {})
+            difference_type = str(difference.get("type", "")).strip()
+            edit_text = str(candidate.get("edit_text", "")).strip()
+            source_candidate_edit_text = str(candidate.get("source_candidate_edit_text", source_candidate_edit_text)).strip()
+            source_candidate_difference = candidate.get("source_candidate_difference", source_candidate_difference)
+            skipped_reasons["safe_audio_ideation_from_non_audio_candidate"] += 1
+        speech_issues = _speech_content_edit_issues(edit_text=edit_text, difference=difference)
+        if speech_issues:
+            skipped_by_type[difference_type] += 1
+            skipped_reasons["speech_content_or_speech_only_audio"] += 1
+            continue
         expected_event = _audio_expected_event(difference, edit_text)
         if not expected_event:
             skipped_by_type[difference_type] += 1
@@ -1908,6 +1923,16 @@ def plan_audio_edits(
             continue
         plan_id = str(candidate.get("proposal_id", "")).strip() or f"audio_edit_plan_{_stable_hash(reference_video + edit_text)}"
         route = _audio_edit_route(expected_event, reference_annotation)
+        suitability = _audio_edit_route_suitability(
+            expected_event=expected_event,
+            difference=difference,
+            edit_text=edit_text,
+            reference_annotation=reference_annotation,
+        )
+        if not suitability["allow_generation"]:
+            skipped_by_type[difference_type] += 1
+            skipped_reasons[str(suitability["reason"])] += 1
+            continue
         target_video = str(candidate.get("target_video", "")).strip() or f"clips/synthetic_audio/{plan_id}.mp4"
         audio_plan = {
             "route": route,
@@ -1923,13 +1948,17 @@ def plan_audio_edits(
                 "plan_id": plan_id,
                 "reference_video": reference_video,
                 "target_video": target_video,
+                "source_candidate_edit_text": source_candidate_edit_text,
+                "source_candidate_difference": source_candidate_difference,
                 "edit_text": edit_text,
                 "difference": difference,
                 "planner": {
                     "stage": "strongest_omni_audio_prompt_planner",
-                    "input": "short_clip_reference_video",
+                    "input": "short_clip_reference_video_and_audio_understanding",
                     "output": "non_speech_audio_event_plan",
                 },
+                "audio_reference_understanding": _audio_edit_reference_understanding(reference_annotation),
+                "route_suitability": suitability,
                 "audio_edit_plan": audio_plan,
                 "generation_defaults": {
                     "preserve_video_stream": True,
@@ -7099,6 +7128,159 @@ def _audio_edit_route(expected_event: str, annotation: dict[str, Any]) -> str:
     if any(token in event for token in ("footstep", "walking", "scratch", "writing", "whoosh", "splash")):
         return "foleycrafter_temporal"
     return "deterministic_overlay"
+
+
+def _safe_audio_ideation_candidate(candidate: dict[str, Any], annotation: dict[str, Any]) -> dict[str, Any] | None:
+    suggestion = _audio_edit_suggestion(annotation)
+    if suggestion is None:
+        return None
+    source_edit_text = str(candidate.get("edit_text", "")).strip()
+    event = str(suggestion["expected_event"]).strip()
+    edit_text = str(suggestion["edit_text"]).strip()
+    proposal_seed = str(candidate.get("proposal_id", "")) or str(candidate.get("reference_video", "")) + edit_text
+    revised = dict(candidate)
+    revised["proposal_id"] = f"{str(candidate.get('proposal_id', '')).strip() or 'candidate'}__audio_ideation_{_stable_hash(proposal_seed)[:8]}"
+    revised["edit_text"] = edit_text
+    revised["difference"] = {
+        "type": "audio_event",
+        "from": f"no {event}",
+        "to": event,
+        "description": str(suggestion["description"]).strip(),
+    }
+    revised["source_candidate_edit_text"] = source_edit_text
+    revised["source_candidate_difference"] = candidate.get("difference", {})
+    revised["candidate_source"] = "safe_audio_ideation_from_reference"
+    revised["ideation_reason"] = str(suggestion["reason"]).strip()
+    return revised
+
+
+def _audio_edit_suggestion(annotation: dict[str, Any]) -> dict[str, str] | None:
+    actions = _dedupe_strings(_normalize_list(annotation.get("actions", [])))
+    subjects = _dedupe_strings(_normalize_list(annotation.get("subjects", [])))
+    scene = str(annotation.get("scene", "")).strip()
+    summary = str(annotation.get("summary", "")).strip()
+    text = _normalized_phrase(" ".join([summary, scene, " ".join(actions), " ".join(subjects)]))
+    suggestions = (
+        (
+            ("writing", "write", "pen", "pencil"),
+            "scratching sound",
+            "add a scratching sound synchronized with the writing",
+            "A pen scratching sound is synchronized with the visible writing motion.",
+            "visible writing motion can support a synchronized Foley sound",
+        ),
+        (
+            ("jumping", "jump", "launched", "launch", "flying", "gliding"),
+            "whoosh",
+            "add a whoosh sound synchronized with the jump or launch",
+            "A short whoosh sound is synchronized with the visible jump or launch.",
+            "visible jump or launch motion can support a synchronized Foley sound",
+        ),
+        (
+            ("walking", "walk", "running", "run", "foot", "steps"),
+            "footsteps",
+            "add footsteps synchronized with the walking or running",
+            "Footsteps are synchronized with the visible walking or running.",
+            "visible walking or running can support synchronized footsteps",
+        ),
+        (
+            ("clapping", "clap", "applaud", "applause"),
+            "applause",
+            "add applause to the audio",
+            "Applause is added to match the visible clapping or audience context.",
+            "visible clapping or audience context can support applause",
+        ),
+        (
+            ("water", "river", "ocean", "waves", "splash"),
+            "water splash",
+            "add a water splash sound",
+            "A water splash sound is added to match the visible water context.",
+            "visible water context can support a water Foley sound",
+        ),
+        (
+            ("forest", "trees", "outdoor", "wind"),
+            "wind ambience",
+            "add soft wind ambience to the audio",
+            "Wind ambience is added while preserving the video stream.",
+            "outdoor or forest context can support ambient wind",
+        ),
+    )
+    for markers, expected_event, edit_text, description, reason in suggestions:
+        if any(marker in text for marker in markers):
+            return {
+                "expected_event": expected_event,
+                "edit_text": edit_text,
+                "description": description,
+                "reason": reason,
+            }
+    return None
+
+
+def _audio_edit_reference_understanding(annotation: dict[str, Any]) -> dict[str, Any]:
+    actions = _dedupe_strings(_normalize_list(annotation.get("actions", [])))[:6]
+    subjects = _dedupe_strings(_normalize_list(annotation.get("subjects", [])))[:6]
+    audio_events = _dedupe_strings(_non_speech_audio_terms(annotation))[:6]
+    visible_text = _dedupe_strings(
+        _normalize_list(annotation.get("visible_text", []))
+        + _normalize_list(annotation.get("on_screen_text", []))
+    )[:6]
+    suggestion = _audio_edit_suggestion(annotation)
+    suggested_events: list[dict[str, Any]] = []
+    if suggestion is not None:
+        suggested_events.append(
+            {
+                "expected_event": suggestion["expected_event"],
+                "edit_text": suggestion["edit_text"],
+                "reason": suggestion["reason"],
+                "route": _audio_edit_route(suggestion["expected_event"], annotation),
+                "timing_strategy": _audio_timing_strategy(suggestion["expected_event"], annotation),
+            }
+        )
+    return {
+        "main_subjects": subjects,
+        "visible_actions": actions,
+        "existing_non_speech_audio_events": audio_events,
+        "visible_text": visible_text,
+        "scene": str(annotation.get("scene", "")).strip(),
+        "suggested_non_speech_audio_events": suggested_events,
+        "bad_audio_edits": [
+            "speech topic change",
+            "transcript change",
+            "narration-only change",
+            "voiceover-only change",
+            "unrelated music that conflicts with visible context",
+        ],
+    }
+
+
+def _audio_edit_route_suitability(
+    *,
+    expected_event: str,
+    difference: dict[str, Any],
+    edit_text: str,
+    reference_annotation: dict[str, Any],
+) -> dict[str, Any]:
+    issues = _speech_content_edit_issues(edit_text=edit_text, difference=difference)
+    if issues:
+        return {
+            "allow_generation": False,
+            "reason": "speech_content_or_speech_only_audio",
+            "issues": issues,
+        }
+    if _audio_terms_mention_event(_non_speech_audio_terms(reference_annotation), expected_event):
+        return {
+            "allow_generation": False,
+            "reason": "reference_already_has_expected_audio_event",
+        }
+    route = _audio_edit_route(expected_event, reference_annotation)
+    timing = _audio_timing_strategy(expected_event, reference_annotation)
+    priority = "S" if route == "foleycrafter_temporal" and timing == "visual_sync" else "A"
+    return {
+        "allow_generation": True,
+        "reason": "contextual_non_speech_audio_edit",
+        "route": route,
+        "timing_strategy": timing,
+        "priority": priority,
+    }
 
 
 def _audio_edit_prompt(expected_event: str, annotation: dict[str, Any], edit_text: str) -> str:

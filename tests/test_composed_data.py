@@ -4392,9 +4392,112 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(1, summary["plan_count"])
             self.assertEqual("audio_ok", plans[0]["plan_id"])
             self.assertEqual("strongest_omni_audio_prompt_planner", plans[0]["planner"]["stage"])
+            self.assertEqual("short_clip_reference_video_and_audio_understanding", plans[0]["planner"]["input"])
             self.assertEqual("whoosh", plans[0]["audio_edit_plan"]["expected_event"])
+            self.assertEqual("visual_sync", plans[0]["audio_edit_plan"]["timing_strategy"])
+            self.assertEqual("contextual_non_speech_audio_edit", plans[0]["route_suitability"]["reason"])
+            self.assertEqual("S", plans[0]["route_suitability"]["priority"])
+            self.assertEqual("whoosh", plans[0]["audio_reference_understanding"]["suggested_non_speech_audio_events"][0]["expected_event"])
             self.assertEqual(1, summary["skipped_by_type"]["speech"])
-            self.assertEqual(1, summary["skipped_reasons"]["speech_content_or_speech_only_audio"])
+            self.assertEqual(2, summary["skipped_reasons"]["speech_content_or_speech_only_audio"])
+
+    def test_plan_audio_edits_ideates_contextual_sound_from_action_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref",
+                        "output_path": "clips/ref.mp4",
+                        "summary": "a character is launched from a cliff and glides through the air",
+                        "subjects": ["character", "cliff"],
+                        "actions": ["launched", "gliding"],
+                        "audio_events": [],
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "action_hint",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "change the action from running to launched",
+                        "difference": {"type": "action", "from": "running", "to": "launched"},
+                    }
+                ],
+            )
+
+            summary = plan_audio_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["safe_audio_ideation_from_non_audio_candidate"])
+            self.assertEqual("change the action from running to launched", plans[0]["source_candidate_edit_text"])
+            self.assertEqual("audio_event", plans[0]["difference"]["type"])
+            self.assertEqual("whoosh", plans[0]["audio_edit_plan"]["expected_event"])
+            self.assertEqual("foleycrafter_temporal", plans[0]["audio_edit_plan"]["route"])
+            self.assertEqual("visual_sync", plans[0]["route_suitability"]["timing_strategy"])
+            self.assertEqual("S", plans[0]["route_suitability"]["priority"])
+
+    def test_plan_audio_edits_rejects_event_already_present_in_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref",
+                        "output_path": "clips/ref.mp4",
+                        "summary": "a person jumps with a whoosh sound",
+                        "actions": ["jumping"],
+                        "audio_events": ["whoosh"],
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "audio_dup",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "add whoosh to the audio",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                    }
+                ],
+            )
+
+            summary = plan_audio_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual([], plans)
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["reference_already_has_expected_audio_event"])
 
     def test_pair_record_acceptance_issues_rejects_speech_difference_type(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
