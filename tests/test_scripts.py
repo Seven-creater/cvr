@@ -188,6 +188,16 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("mask_temporal_stability", helper)
         self.assertIn("edit_background_inverse_subject", helper)
 
+    def test_prepare_grounded_sam2_env_script_installs_expected_packages(self) -> None:
+        script = Path("scripts/prepare_grounded_sam2_env.sh").read_text(encoding="utf-8")
+
+        self.assertIn("grounded_sam2", script)
+        self.assertIn("conda create", script)
+        self.assertIn("download.pytorch.org/whl/cu121", script)
+        self.assertIn("SAM2.1/code", script)
+        self.assertIn("GroundingDINO/code", script)
+        self.assertIn("torch.cuda.is_available", script)
+
     def test_manual_review_bundle_script_calls_review_bundle_command(self) -> None:
         script = Path("scripts/build_synthetic_manual_review_bundle.sh").read_text(encoding="utf-8")
 
