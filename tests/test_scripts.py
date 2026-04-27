@@ -230,6 +230,22 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--output-dir", script)
         self.assertIn("reference.mp4, target.mp4, review.md, and metadata.json", script)
 
+    def test_masked_vace_pipeline_queue_keeps_omni_and_splits_gpus(self) -> None:
+        script = Path("scripts/run_masked_vace_pipeline_queue.sh").read_text(encoding="utf-8")
+
+        self.assertIn("never starts or stops Omni", script)
+        self.assertIn("MASK_GPU_IDS=${MASK_GPU_IDS:-6}", script)
+        self.assertIn("VACE_GPU_IDS=${VACE_GPU_IDS:-2,3,4,5}", script)
+        self.assertIn("plan-video-edits", script)
+        self.assertIn("plan-video-masks", script)
+        self.assertIn("run_grounded_sam2_video_masks.sh", script)
+        self.assertIn("run_vace_masked_visual_batch_from_plan.sh", script)
+        self.assertIn("detective-annotate-clips", script)
+        self.assertIn("validate-known-pairs", script)
+        self.assertIn("build_synthetic_manual_review_bundle.sh", script)
+        self.assertIn("florence2", script)
+        self.assertIn("vace-14B", script)
+
 
 if __name__ == "__main__":
     unittest.main()
