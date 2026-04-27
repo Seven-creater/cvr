@@ -17,6 +17,7 @@ fi
 
 source /data02/usr/wangqihao/miniconda3/etc/profile.d/conda.sh
 conda activate "$CONDA_ENV"
+export FLORENCE_MODEL
 
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install "transformers>=4.45,<4.50" "tokenizers<0.22" accelerate safetensors

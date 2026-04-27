@@ -189,6 +189,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--grounder", script)
         self.assertIn("--florence-model", script)
         self.assertIn("florence2", helper)
+        self.assertNotIn("torch_dtype=torch.float16", helper)
         self.assertIn("mask_temporal_stability", helper)
         self.assertIn("edit_background_inverse_subject", helper)
 
@@ -217,6 +218,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("grounded_sam2", script)
         self.assertIn("transformers>=4.45,<4.50", script)
         self.assertIn("trust_remote_code=True", script)
+        self.assertIn("export FLORENCE_MODEL", script)
         self.assertIn("AutoProcessor.from_pretrained", script)
         self.assertIn("AutoModelForCausalLM.from_pretrained", script)
 

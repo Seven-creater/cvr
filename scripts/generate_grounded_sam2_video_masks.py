@@ -241,7 +241,6 @@ def _florence_boxes(
     device: str,
 ) -> tuple[Any, list[str]]:
     import numpy as np
-    import torch
     from PIL import Image
     from transformers import AutoModelForCausalLM, AutoProcessor
 
@@ -250,7 +249,6 @@ def _florence_boxes(
     model = AutoModelForCausalLM.from_pretrained(
         str(florence_model_dir),
         trust_remote_code=True,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     ).eval().to(device)
     task = "<OPEN_VOCABULARY_DETECTION>"
     prompt = task + mask_query
