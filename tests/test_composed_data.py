@@ -3594,9 +3594,53 @@ class ComposedDataTests(unittest.TestCase):
                 for line in (root / "pairs" / "accepted_synthetic_pairs.jsonl").read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            self.assertEqual("covr_omni_synth_0001", accepted_records[0]["sample_id"])
+            self.assertRegex(accepted_records[0]["sample_id"], r"^covr_omni_synth_[0-9a-f]{8}$")
             self.assertEqual("synthetic_edit", accepted_records[0]["source_type"])
             self.assertEqual("Wan2.1-VACE-1.3B", accepted_records[0]["generation"]["model"])
+
+    def test_synthetic_sample_ids_are_stable_per_proposal_not_batch_index(self) -> None:
+        first = _accepted_sample_from_record(
+            {
+                "source_type": "synthetic_edit",
+                "proposal_id": "synthetic_visual_pair_plan_a",
+                "reference_video": "clips/ref_a.mp4",
+                "target_video": "clips/target_a.mp4",
+                "edit_text": "change robot body color to yellow",
+                "modalities": ["visual"],
+                "difference": {"type": "attribute"},
+                "reference_caption": "",
+                "target_caption": "",
+                "hard_negatives": [],
+                "quality": {},
+                "source": {},
+                "judge": {},
+                "verification": {},
+            },
+            1,
+        )
+        second = _accepted_sample_from_record(
+            {
+                "source_type": "synthetic_edit",
+                "proposal_id": "synthetic_visual_pair_plan_b",
+                "reference_video": "clips/ref_b.mp4",
+                "target_video": "clips/target_b.mp4",
+                "edit_text": "change robot body color to yellow",
+                "modalities": ["visual"],
+                "difference": {"type": "attribute"},
+                "reference_caption": "",
+                "target_caption": "",
+                "hard_negatives": [],
+                "quality": {},
+                "source": {},
+                "judge": {},
+                "verification": {},
+            },
+            1,
+        )
+
+        self.assertRegex(first["sample_id"], r"^covr_omni_synth_[0-9a-f]{8}$")
+        self.assertRegex(second["sample_id"], r"^covr_omni_synth_[0-9a-f]{8}$")
+        self.assertNotEqual(first["sample_id"], second["sample_id"])
 
     def test_validate_known_pairs_rejects_missing_generation_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

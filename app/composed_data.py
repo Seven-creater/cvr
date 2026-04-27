@@ -6681,9 +6681,13 @@ def _select_final_accepted_records(
 
 def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str, Any]:
     source_type = str(record.get("source_type", "natural")).strip() or "natural"
-    sample_prefix = "covr_omni_synth" if source_type == "synthetic_edit" else "covr_omni_pilot"
+    if source_type == "synthetic_edit":
+        identity = str(record.get("proposal_id") or record.get("target_video") or record.get("edit_text") or index)
+        sample_id = f"covr_omni_synth_{_stable_hash(identity)[:8]}"
+    else:
+        sample_id = f"covr_omni_pilot_{index:04d}"
     return {
-        "sample_id": f"{sample_prefix}_{index:04d}",
+        "sample_id": sample_id,
         "proposal_id": record["proposal_id"],
         "reference_clip_id": record.get("reference_clip_id", ""),
         "target_clip_id": record.get("target_clip_id", ""),
