@@ -211,6 +211,15 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--no-build-isolation -e .", script)
         self.assertIn("groundingdino.groundingdino.util.inference", script)
 
+    def test_repair_florence2_env_script_pins_transformers_compat(self) -> None:
+        script = Path("scripts/repair_florence2_env.sh").read_text(encoding="utf-8")
+
+        self.assertIn("grounded_sam2", script)
+        self.assertIn("transformers>=4.45,<4.50", script)
+        self.assertIn("trust_remote_code=True", script)
+        self.assertIn("AutoProcessor.from_pretrained", script)
+        self.assertIn("AutoModelForCausalLM.from_pretrained", script)
+
     def test_manual_review_bundle_script_calls_review_bundle_command(self) -> None:
         script = Path("scripts/build_synthetic_manual_review_bundle.sh").read_text(encoding="utf-8")
 
