@@ -135,6 +135,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("CONDA_ENV=${CONDA_ENV:-wan_vace}", script)
         self.assertIn("--conda-env", script)
         self.assertIn("flash_attn", script)
+        self.assertIn("--max-gpus", script)
+        self.assertIn('MAX_GPUS="$2"', script)
         self.assertIn("ALLOW_CPU_OFFLOAD=${ALLOW_CPU_OFFLOAD:-0}", script)
         self.assertIn("refusing CPU offload", script)
         self.assertIn("refusing CPU text encoder", script)

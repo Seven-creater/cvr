@@ -47,6 +47,7 @@ Options:
   --vace-task vace-1.3B|vace-14B
   --conda-env NAME
   --gpu-ids IDS
+  --max-gpus N
   --use-torchrun 0|1
   --ulysses-size N
   --ring-size N
@@ -75,6 +76,7 @@ while [[ $# -gt 0 ]]; do
     --vace-task) VACE_TASK="$2"; shift 2 ;;
     --conda-env) CONDA_ENV="$2"; shift 2 ;;
     --gpu-ids) GPU_IDS="$2"; shift 2 ;;
+    --max-gpus) MAX_GPUS="$2"; shift 2 ;;
     --use-torchrun) USE_TORCHRUN="$2"; shift 2 ;;
     --ulysses-size) ULYSSES_SIZE="$2"; shift 2 ;;
     --ring-size) RING_SIZE="$2"; shift 2 ;;
