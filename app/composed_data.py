@@ -6614,12 +6614,22 @@ def _accepted_record_sort_key(record: dict[str, Any]) -> tuple[float, float, flo
     )
 
 
-def _accepted_record_signature(record: dict[str, Any]) -> tuple[str, str, str, str, str]:
+def _accepted_record_signature(record: dict[str, Any]) -> tuple[str, ...]:
     difference = record.get("difference", {})
     from_value = _normalized_phrase(str(difference.get("from", "")).strip())
     to_value = _normalized_phrase(str(difference.get("to", "")).strip())
     if not from_value and not to_value:
         from_value = _normalized_phrase(str(record.get("edit_text", "")).strip())
+    if str(record.get("source_type", "natural")).strip() == "synthetic_edit":
+        return (
+            "synthetic_edit",
+            str(record.get("proposal_id", "")).strip(),
+            str(record.get("reference_video", "")).strip(),
+            str(record.get("target_video", "")).strip(),
+            str(difference.get("type", "")).strip(),
+            from_value,
+            to_value,
+        )
     return (
         str(record.get("group_id", "")).strip(),
         str(difference.get("type", "")).strip(),
@@ -6642,7 +6652,7 @@ def _select_final_accepted_records(
         return []
 
     selected: list[dict[str, Any]] = []
-    seen_signatures: set[tuple[str, str, str, str, str]] = set()
+    seen_signatures: set[tuple[str, ...]] = set()
     selected_ids: set[str] = set()
     selected_target_videos: set[str] = set()
 

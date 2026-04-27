@@ -2858,6 +2858,58 @@ class ComposedDataTests(unittest.TestCase):
         self.assertEqual(1, len(accepted))
         self.assertEqual("clips/shared_target.mp4", accepted[0]["target_video"])
 
+    def test_select_final_accepted_records_keeps_distinct_synthetic_edits_with_same_delta(self) -> None:
+        base_record = {
+            "accepted": True,
+            "source_type": "synthetic_edit",
+            "group_id": "synthetic_robot_color",
+            "source_context": {"relation": "synthetic_edit"},
+            "modalities": ["visual"],
+            "reference_caption": "a black and gold robot rotates on a platform",
+            "target_caption": "a bright yellow robot rotates on the same platform",
+            "hard_negatives": ["clips/neg.mp4"],
+            "source": {"platform": "synthetic", "url": "file:///tmp/target.mp4", "license_note": "internal"},
+            "evidence": {},
+            "judge": {},
+            "verification": {"passed": True},
+            "speech_quality": {},
+            "audio_event_quality": {},
+            "transcript_backed": None,
+            "group_reason": "synthetic_edit",
+            "edit_text": "change robot body color from black and gold to bright yellow",
+            "difference": {"type": "attribute", "from": "black and gold robot body", "to": "bright yellow robot body"},
+            "quality": {
+                "difference_type": "attribute",
+                "difference_strength_score": 0.8,
+                "same_context_score": 0.95,
+                "target_uniqueness_score": 0.98,
+                "edit_match_score": 0.9,
+            },
+        }
+        records = [
+            {
+                **base_record,
+                "proposal_id": "synthetic_visual_pair_plan_a",
+                "reference_video": "clips/robot_seg_003.mp4",
+                "target_video": "clips/synth_robot_seg_003_yellow.mp4",
+            },
+            {
+                **base_record,
+                "proposal_id": "synthetic_visual_pair_plan_b",
+                "reference_video": "clips/robot_seg_004.mp4",
+                "target_video": "clips/synth_robot_seg_004_yellow.mp4",
+            },
+        ]
+
+        accepted = _select_final_accepted_records(records, max_accepted_pairs=5)
+
+        self.assertEqual(2, len(accepted))
+        self.assertEqual(
+            {"clips/synth_robot_seg_003_yellow.mp4", "clips/synth_robot_seg_004_yellow.mp4"},
+            {record["target_video"] for record in accepted},
+        )
+        self.assertEqual(2, len({record["sample_id"] for record in accepted}))
+
     def test_difference_strength_scores_concrete_object_changes(self) -> None:
         reference = {
             "object_counts": {"cat": 1},
