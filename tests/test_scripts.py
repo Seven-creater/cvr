@@ -174,6 +174,20 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--mask-manifest", script)
         self.assertIn("This script does not start Omni", script)
 
+    def test_grounded_sam2_mask_script_generates_manifest(self) -> None:
+        script = Path("scripts/run_grounded_sam2_video_masks.sh").read_text(encoding="utf-8")
+        helper = Path("scripts/generate_grounded_sam2_video_masks.py").read_text(encoding="utf-8")
+
+        self.assertIn("video_mask_plan.jsonl", script)
+        self.assertIn("video_mask_manifest.generated.jsonl", script)
+        self.assertIn("Grounded-SAM-2", script)
+        self.assertIn("CUDA_VISIBLE_DEVICES", script)
+        self.assertIn("generate_grounded_sam2_video_masks.py", script)
+        self.assertIn("build_sam2_video_predictor", helper)
+        self.assertIn("GroundingDINO found no box", helper)
+        self.assertIn("mask_temporal_stability", helper)
+        self.assertIn("edit_background_inverse_subject", helper)
+
     def test_manual_review_bundle_script_calls_review_bundle_command(self) -> None:
         script = Path("scripts/build_synthetic_manual_review_bundle.sh").read_text(encoding="utf-8")
 

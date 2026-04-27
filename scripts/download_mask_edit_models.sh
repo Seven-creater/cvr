@@ -24,10 +24,22 @@ mkdir -p \
 clone_or_pull() {
   local repo="$1"
   local out="$2"
+  local attempt
   if [ ! -d "$out/.git" ]; then
-    git clone "$repo" "$out" || echo "[mask-download] clone failed $repo"
+    for attempt in 1 2 3 4 5; do
+      echo "[mask-download] clone attempt $attempt repo=$repo"
+      git -c http.version=HTTP/1.1 clone --depth 1 "$repo" "$out" && return 0
+      rm -rf "$out"
+      sleep $((attempt * 10))
+    done
+    echo "[mask-download] clone failed $repo"
   else
-    git -C "$out" pull --ff-only || true
+    for attempt in 1 2 3; do
+      echo "[mask-download] pull attempt $attempt repo=$repo"
+      git -C "$out" pull --ff-only && return 0
+      sleep $((attempt * 10))
+    done
+    echo "[mask-download] pull failed $repo"
   fi
 }
 
