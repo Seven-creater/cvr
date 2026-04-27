@@ -198,6 +198,15 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("GroundingDINO/code", script)
         self.assertIn("torch.cuda.is_available", script)
 
+    def test_repair_groundingdino_env_script_uses_no_build_isolation(self) -> None:
+        script = Path("scripts/repair_groundingdino_env.sh").read_text(encoding="utf-8")
+
+        self.assertIn("grounded_sam2", script)
+        self.assertIn("GROUNDINGDINO_USE_CUDA", script)
+        self.assertIn("FORCE_CUDA", script)
+        self.assertIn("--no-build-isolation -e .", script)
+        self.assertIn("groundingdino.groundingdino.util.inference", script)
+
     def test_manual_review_bundle_script_calls_review_bundle_command(self) -> None:
         script = Path("scripts/build_synthetic_manual_review_bundle.sh").read_text(encoding="utf-8")
 
