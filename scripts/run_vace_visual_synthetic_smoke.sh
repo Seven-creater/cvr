@@ -8,6 +8,7 @@ DATA_ROOT=${DATA_ROOT:-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni
 RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/vace_visual_synthetic_smoke}
 VIDEO_EDIT_PLAN=${VIDEO_EDIT_PLAN:-$RUN_ROOT/video_edit_plan.jsonl}
 MASK_MANIFEST=${MASK_MANIFEST:-}
+SRC_REF_SELECTION=${SRC_REF_SELECTION:-}
 PLAN_INDEX=${PLAN_INDEX:-1}
 PLAN_ID=${PLAN_ID:-}
 MODEL_ROOT=${MODEL_ROOT:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone}
@@ -39,6 +40,7 @@ Options:
   --run-root PATH
   --video-edit-plan PATH
   --mask-manifest PATH
+  --src-ref-selection PATH
   --plan-index N
   --plan-id ID
   --wan-root PATH
@@ -68,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --run-root) RUN_ROOT="$2"; shift 2 ;;
     --video-edit-plan) VIDEO_EDIT_PLAN="$2"; shift 2 ;;
     --mask-manifest) MASK_MANIFEST="$2"; shift 2 ;;
+    --src-ref-selection) SRC_REF_SELECTION="$2"; shift 2 ;;
     --plan-index) PLAN_INDEX="$2"; shift 2 ;;
     --plan-id) PLAN_ID="$2"; shift 2 ;;
     --wan-root) WAN_ROOT="$2"; WAN_CODE="$2/code"; WAN_CKPT="$2/Wan2.1-VACE-1.3B"; shift 2 ;;
@@ -122,7 +125,7 @@ mkdir -p "$OUT_ROOT/videos" "$OUT_ROOT/logs" "$OUT_ROOT/pairs" "$OUT_ROOT/metada
 SELECTED_PLAN="$OUT_ROOT/metadata/selected_video_edit_plan.json"
 ENV_FILE="$OUT_ROOT/metadata/selected_video_edit_plan.env"
 
-python3 - "$DATA_ROOT" "$VIDEO_EDIT_PLAN" "$MASK_MANIFEST" "$PLAN_INDEX" "$PLAN_ID" "$SELECTED_PLAN" "$ENV_FILE" "$OUT_ROOT" "$WAN_CKPT" <<'PY'
+python3 - "$DATA_ROOT" "$VIDEO_EDIT_PLAN" "$MASK_MANIFEST" "$SRC_REF_SELECTION" "$PLAN_INDEX" "$PLAN_ID" "$SELECTED_PLAN" "$ENV_FILE" "$OUT_ROOT" "$WAN_CKPT" <<'PY'
 import json
 import os
 import re
@@ -133,12 +136,13 @@ from pathlib import Path
 data_root = Path(sys.argv[1])
 plan_path = Path(sys.argv[2])
 mask_manifest_path = Path(sys.argv[3]) if sys.argv[3].strip() else None
-plan_index = int(sys.argv[4])
-plan_id_filter = sys.argv[5].strip()
-selected_plan_path = Path(sys.argv[6])
-env_path = Path(sys.argv[7])
-out_root = Path(sys.argv[8])
-wan_ckpt = Path(sys.argv[9])
+src_ref_selection_path = Path(sys.argv[4]) if sys.argv[4].strip() else None
+plan_index = int(sys.argv[5])
+plan_id_filter = sys.argv[6].strip()
+selected_plan_path = Path(sys.argv[7])
+env_path = Path(sys.argv[8])
+out_root = Path(sys.argv[9])
+wan_ckpt = Path(sys.argv[10])
 
 rows = [json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 if not rows:
@@ -186,6 +190,30 @@ if mask_manifest_path:
         raise SystemExit(f"mask video does not exist for plan_id {plan_id}: {mask_path}")
     src_mask = str(mask_path)
 
+src_ref_images = []
+if src_ref_selection_path:
+    selection_rows = [json.loads(line) for line in src_ref_selection_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    selection_matches = [row for row in selection_rows if str(row.get("plan_id", "")) == plan_id]
+    if selection_matches:
+        for raw_image in selection_matches[0].get("selected_src_ref_images", []):
+            image_path = Path(str(raw_image))
+            if not image_path.is_absolute():
+                image_path = src_ref_selection_path.parent / image_path
+            if not image_path.exists():
+                raise SystemExit(f"selected src_ref_image does not exist for plan_id {plan_id}: {image_path}")
+            src_ref_images.append(str(image_path))
+    elif (plan.get("src_ref_requirements") or {}).get("required"):
+        raise SystemExit(f"src_ref selection has no row for required plan_id: {plan_id}")
+else:
+    for raw_image in ((plan.get("vace_inputs") or {}).get("src_ref_images") or []):
+        image_path = Path(str(raw_image))
+        if not image_path.is_absolute():
+            image_path = data_root / image_path
+        if image_path.exists():
+            src_ref_images.append(str(image_path))
+if (plan.get("src_ref_requirements") or {}).get("required") and not src_ref_images:
+    raise SystemExit(f"plan_id {plan_id} requires src_ref_images but none were selected")
+
 target_prompt = str(plan.get("target_prompt", "")).strip()
 negative_prompt = str(plan.get("negative_prompt", "")).strip()
 edit_region = str(plan.get("edit_region", "")).strip()
@@ -226,6 +254,8 @@ known_pair = {
         "edit_region": edit_region,
         "mask_query": str(plan.get("mask_query", "")).strip(),
         "src_mask": src_mask,
+        "src_ref_images": src_ref_images,
+        "src_ref_requirements": plan.get("src_ref_requirements", {}),
         "video_edit_plan_id": plan_id,
         "postprocess": {
             "audio_copied_from_reference": True,
@@ -261,6 +291,7 @@ env_values = {
     "RAW_VIDEO": str(raw_video),
     "TARGET_VIDEO": str(target_video),
     "SRC_MASK": src_mask,
+    "SRC_REF_IMAGES": ",".join(src_ref_images),
     "PROMPT": prompt,
     "KNOWN_PAIRS": str(out_root / "pairs" / "synthetic_visual_candidate_pairs.jsonl"),
     "TARGET_MANIFEST": str(out_root / "metadata" / "synthetic_visual_target_manifest.jsonl"),
@@ -277,6 +308,7 @@ echo "[vace-smoke] reference=$REFERENCE_VIDEO"
 echo "[vace-smoke] raw_video=$RAW_VIDEO"
 echo "[vace-smoke] target_video=$TARGET_VIDEO"
 echo "[vace-smoke] src_mask=${SRC_MASK:-none}"
+echo "[vace-smoke] src_ref_images=${SRC_REF_IMAGES:-none}"
 echo "[vace-smoke] wan_code=$WAN_CODE"
 echo "[vace-smoke] wan_ckpt=$WAN_CKPT"
 echo "[vace-smoke] vace_task=$VACE_TASK"
@@ -328,6 +360,9 @@ GEN_ARGS=(
 )
 if [[ -n "${SRC_MASK:-}" ]]; then
   GEN_ARGS+=(--src_mask "$SRC_MASK")
+fi
+if [[ -n "${SRC_REF_IMAGES:-}" ]]; then
+  GEN_ARGS+=(--src_ref_images "$SRC_REF_IMAGES")
 fi
 if [[ "$T5_CPU" == "1" ]]; then
   GEN_ARGS+=(--t5_cpu)

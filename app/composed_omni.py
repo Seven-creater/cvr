@@ -476,6 +476,38 @@ def _video_edit_planner_system_prompt() -> str:
     )
 
 
+def _stable_clip_selector_system_prompt() -> str:
+    return (
+        "You select short stable clips for synthetic video editing. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"start_sec": number, "end_sec": number, "stability_score": number, '
+        '"camera_motion": "static"|"slow_pan"|"unstable"|"unknown", "main_subjects": [string], '
+        '"visible_text_risk": boolean, "recommended_for_vace": boolean, "reason": string}. '
+        "Choose a 5-8 second window with one clear subject, stable camera, minimal scene cuts, minimal visible text, "
+        "and an edit-friendly visual structure. Prefer windows suitable for masked VACE editing."
+    )
+
+
+def _build_stable_clip_selector_user_content(
+    *,
+    source_video_path: str,
+    media_info: dict[str, Any],
+    min_clip_seconds: float,
+    max_clip_seconds: float,
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: choose one stable short window from this source video for later VACE editing.\n"
+        f"Media info JSON:\n{json.dumps(media_info, ensure_ascii=False)}\n"
+        f"Window length must be between {min_clip_seconds:.1f} and {max_clip_seconds:.1f} seconds.\n"
+        "Prefer a window with a single main subject, no/low visible text risk, no rapid cuts, and a maskable object or subject.\n"
+        "If no good window exists, set recommended_for_vace=false and still return the least bad 5-8 second window."
+    )
+    return [
+        {"type": "video_url", "video_url": {"url": source_video_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
 def _build_clip_annotation_user_content(clip_path: str) -> list[dict[str, Any]]:
     prompt = (
         "Task: describe this clip for composed retrieval dataset construction.\n"
@@ -851,6 +883,31 @@ class OpenAIComposedDataClient:
             route_hint=route_hint,
         )
         return _normalize_video_edit_plan_payload(repaired_payload), raw_payload
+
+    def select_stable_clip_window(
+        self,
+        *,
+        source_video_path: str,
+        media_info: dict[str, Any],
+        min_clip_seconds: float,
+        max_clip_seconds: float,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_stable_clip_selector_user_content(
+                source_video_path=source_video_path,
+                media_info=media_info,
+                min_clip_seconds=min_clip_seconds,
+                max_clip_seconds=max_clip_seconds,
+            ),
+            system_prompt=_stable_clip_selector_system_prompt(),
+            max_tokens=700,
+        )
+        return _normalize_stable_clip_selection_payload(
+            raw_payload,
+            min_clip_seconds=min_clip_seconds,
+            max_clip_seconds=max_clip_seconds,
+            duration_seconds=float(media_info.get("duration_seconds") or 0.0),
+        ), raw_payload
 
     def _request_json(
         self,
@@ -1248,6 +1305,36 @@ def _normalize_video_edit_plan_payload(payload: dict[str, Any]) -> dict[str, Any
     if not normalized["preserve_tokens"]:
         raise ValueError("video edit plan preserve_tokens is required")
     return normalized
+
+
+def _normalize_stable_clip_selection_payload(
+    payload: dict[str, Any],
+    *,
+    min_clip_seconds: float,
+    max_clip_seconds: float,
+    duration_seconds: float,
+) -> dict[str, Any]:
+    start = _score_or_zero(payload.get("start_sec"))
+    try:
+        end = float(payload.get("end_sec"))
+    except (TypeError, ValueError):
+        end = start + min_clip_seconds
+    start = max(0.0, min(start, max(0.0, duration_seconds)))
+    end = max(start, min(end, duration_seconds if duration_seconds > 0 else end))
+    if end - start < min_clip_seconds:
+        end = min(duration_seconds if duration_seconds > 0 else start + min_clip_seconds, start + min_clip_seconds)
+    if end - start > max_clip_seconds:
+        end = start + max_clip_seconds
+    return {
+        "start_sec": round(start, 3),
+        "end_sec": round(end, 3),
+        "stability_score": _score_value(payload.get("stability_score")),
+        "camera_motion": str(payload.get("camera_motion", "unknown")).strip() or "unknown",
+        "main_subjects": _string_list(payload.get("main_subjects")),
+        "visible_text_risk": _bool_value(payload.get("visible_text_risk")),
+        "recommended_for_vace": _bool_value(payload.get("recommended_for_vace", True)),
+        "reason": str(payload.get("reason", "")).strip(),
+    }
 
 
 def _score_value(value: Any) -> float:

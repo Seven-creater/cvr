@@ -28,7 +28,8 @@ Options:
   -h, --help
 
 Builds a manual review folder with one subdirectory per pair:
-reference.mp4, target.mp4, review.md, and metadata.json.
+reference.mp4, target.mp4, review.md, metadata.json, optional src_ref_images,
+and optional mask.mp4.
 EOF
 }
 

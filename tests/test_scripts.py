@@ -150,6 +150,9 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("audio_copied_from_reference", script)
         self.assertIn("--mask-manifest", script)
         self.assertIn("--src_mask", script)
+        self.assertIn("--src_ref_images", script)
+        self.assertIn("SRC_REF_IMAGES", script)
+        self.assertIn("--src-ref-selection", script)
         self.assertIn("src_mask", script)
         self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
         self.assertIn("synthetic_visual_target_manifest.jsonl", script)
@@ -164,6 +167,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("< /dev/null", script)
         self.assertIn("MASK_MANIFEST", script)
         self.assertIn("--mask-manifest", script)
+        self.assertIn("SRC_REF_SELECTION", script)
+        self.assertIn("--src-ref-selection", script)
         self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
         self.assertIn("synthetic_visual_target_manifest.jsonl", script)
         self.assertIn("batch_generation_report.md", script)
@@ -176,6 +181,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("missing mask manifest", script)
         self.assertIn("run_vace_visual_batch_from_plan.sh", script)
         self.assertIn("--mask-manifest", script)
+        self.assertIn("--src-ref-selection", script)
         self.assertIn("This script does not start Omni", script)
 
     def test_grounded_sam2_mask_script_generates_manifest(self) -> None:
@@ -232,7 +238,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("build-review-bundle", script)
         self.assertIn("--pairs-path", script)
         self.assertIn("--output-dir", script)
-        self.assertIn("reference.mp4, target.mp4, review.md, and metadata.json", script)
+        self.assertIn("reference.mp4, target.mp4, review.md, metadata.json", script)
 
     def test_masked_vace_pipeline_queue_keeps_omni_and_splits_gpus(self) -> None:
         script = Path("scripts/run_masked_vace_pipeline_queue.sh").read_text(encoding="utf-8")
@@ -240,6 +246,11 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("never starts or stops Omni", script)
         self.assertIn("MASK_GPU_IDS=${MASK_GPU_IDS:-6}", script)
         self.assertIn("VACE_GPU_IDS=${VACE_GPU_IDS:-2,3,4,5}", script)
+        self.assertIn("plan-stable-omni-clips", script)
+        self.assertIn("cache-reference-understandings", script)
+        self.assertIn("plan-src-ref-images", script)
+        self.assertIn("run_src_ref_image_generation_from_plan.sh", script)
+        self.assertIn("select-src-ref-images", script)
         self.assertIn("PLANNING_MODE=${PLANNING_MODE:-production}", script)
         self.assertIn("plan-video-edits", script)
         self.assertIn("--planning-mode \"$PLANNING_MODE\"", script)
@@ -252,6 +263,27 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("build_synthetic_manual_review_bundle.sh", script)
         self.assertIn("florence2", script)
         self.assertIn("vace-14B", script)
+
+    def test_download_image_generation_models_script_uses_modelscope(self) -> None:
+        script = Path("scripts/download_image_generation_models.sh").read_text(encoding="utf-8")
+
+        self.assertIn("ImageGen", script)
+        self.assertIn("modelscope download --model", script)
+        self.assertIn("Qwen/Qwen-Image-2512", script)
+        self.assertIn("Qwen/Qwen-Image-Edit-2511", script)
+        self.assertIn("Qwen/Qwen-Image-Edit-2509", script)
+        self.assertIn("nohup bash -lc", script)
+
+    def test_src_ref_image_generation_script_uses_diffusers_model(self) -> None:
+        script = Path("scripts/run_src_ref_image_generation_from_plan.sh").read_text(encoding="utf-8")
+        helper = Path("scripts/generate_src_ref_images_from_plan.py").read_text(encoding="utf-8")
+
+        self.assertIn("Qwen-Image-2512", script)
+        self.assertIn("CUDA_VISIBLE_DEVICES", script)
+        self.assertIn("generate_src_ref_images_from_plan.py", script)
+        self.assertIn("DiffusionPipeline.from_pretrained", helper)
+        self.assertIn('f"candidate_{candidate_index:03d}.png"', helper)
+        self.assertIn("src_ref_image_generation_manifest", script)
 
 
 if __name__ == "__main__":

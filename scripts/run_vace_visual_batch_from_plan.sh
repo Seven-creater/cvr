@@ -8,6 +8,7 @@ DATA_ROOT=${DATA_ROOT:-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni
 RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/vace_visual_batch}
 VIDEO_EDIT_PLAN=${VIDEO_EDIT_PLAN:-$RUN_ROOT/video_edit_plan.jsonl}
 MASK_MANIFEST=${MASK_MANIFEST:-}
+SRC_REF_SELECTION=${SRC_REF_SELECTION:-}
 PLAN_IDS=${PLAN_IDS:-}
 TOP_K=${TOP_K:-3}
 GPU_IDS=${GPU_IDS:-0,1,2,3}
@@ -29,6 +30,7 @@ Options:
   --run-root PATH
   --video-edit-plan PATH
   --mask-manifest PATH
+  --src-ref-selection PATH
   --plan-ids ID1,ID2
   --top-k N
   --gpu-ids IDS
@@ -54,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --run-root) RUN_ROOT="$2"; shift 2 ;;
     --video-edit-plan) VIDEO_EDIT_PLAN="$2"; shift 2 ;;
     --mask-manifest) MASK_MANIFEST="$2"; shift 2 ;;
+    --src-ref-selection) SRC_REF_SELECTION="$2"; shift 2 ;;
     --plan-ids) PLAN_IDS="$2"; shift 2 ;;
     --top-k) TOP_K="$2"; shift 2 ;;
     --gpu-ids) GPU_IDS="$2"; shift 2 ;;
@@ -141,11 +144,16 @@ PY
   if [[ -n "$MASK_MANIFEST" ]]; then
     MASK_ARGS=(--mask-manifest "$MASK_MANIFEST")
   fi
+  SRC_REF_ARGS=()
+  if [[ -n "$SRC_REF_SELECTION" ]]; then
+    SRC_REF_ARGS=(--src-ref-selection "$SRC_REF_SELECTION")
+  fi
   if scripts/run_vace_visual_synthetic_smoke.sh \
       --data-root "$DATA_ROOT" \
       --run-root "$RUN_ROOT" \
       --video-edit-plan "$VIDEO_EDIT_PLAN" \
       "${MASK_ARGS[@]}" \
+      "${SRC_REF_ARGS[@]}" \
       --plan-id "$PLAN_ID" \
       --out-root "$ITEM_ROOT" \
       --wan-ckpt "$WAN_CKPT" \

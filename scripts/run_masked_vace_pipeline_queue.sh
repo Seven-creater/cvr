@@ -16,6 +16,17 @@ VIDEO_EDIT_PLANNER_CACHE=${VIDEO_EDIT_PLANNER_CACHE:-$RUN_ROOT/video_edit_planne
 VIDEO_MASK_PLAN=${VIDEO_MASK_PLAN:-$RUN_ROOT/video_mask_plan.jsonl}
 VIDEO_MASK_MANIFEST=${VIDEO_MASK_MANIFEST:-$RUN_ROOT/video_mask_manifest.jsonl}
 GENERATED_MASK_MANIFEST=${GENERATED_MASK_MANIFEST:-$RUN_ROOT/video_mask_manifest.generated.jsonl}
+STABLE_CLIP_PLAN=${STABLE_CLIP_PLAN:-$RUN_ROOT/omni_stable_clip_plan.jsonl}
+STABLE_CLIP_MANIFEST=${STABLE_CLIP_MANIFEST:-$RUN_ROOT/omni_stable_clips.jsonl}
+STABLE_CLIP_SELECTION_CACHE=${STABLE_CLIP_SELECTION_CACHE:-$RUN_ROOT/omni_stable_clip_selection_cache.jsonl}
+STABLE_CLIP_ANNOTATIONS=${STABLE_CLIP_ANNOTATIONS:-$RUN_ROOT/omni_stable_clip_annotations.jsonl}
+REFERENCE_UNDERSTANDING_CACHE=${REFERENCE_UNDERSTANDING_CACHE:-$RUN_ROOT/reference_understanding_cache.jsonl}
+SRC_REF_IMAGE_PLAN=${SRC_REF_IMAGE_PLAN:-$RUN_ROOT/src_ref_image_plan.jsonl}
+SRC_REF_IMAGE_SELECTION=${SRC_REF_IMAGE_SELECTION:-$RUN_ROOT/src_ref_image_selection.jsonl}
+SRC_REF_IMAGE_GENERATION_MANIFEST=${SRC_REF_IMAGE_GENERATION_MANIFEST:-$RUN_ROOT/src_ref_image_generation_manifest.jsonl}
+SRC_REF_IMAGE_ROOT=${SRC_REF_IMAGE_ROOT:-$RUN_ROOT/src_ref_images}
+SRC_REF_IMAGE_MODEL_DIR=${SRC_REF_IMAGE_MODEL_DIR:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/ImageGen/Qwen-Image-2512}
+IMAGE_GEN_CONDA_ENV=${IMAGE_GEN_CONDA_ENV:-omni_src}
 VACE_RUN_ROOT=${VACE_RUN_ROOT:-$RUN_ROOT/vace_batch}
 TARGET_ANNOTATIONS=${TARGET_ANNOTATIONS:-$RUN_ROOT/synthetic_target_annotations.jsonl}
 ALL_ANNOTATIONS=${ALL_ANNOTATIONS:-$RUN_ROOT/synthetic_all_annotations.jsonl}
@@ -31,6 +42,10 @@ MAX_MASKS=${MAX_MASKS:-}
 VACE_TOP_K=${VACE_TOP_K:-5}
 MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-20}
 PLANNING_MODE=${PLANNING_MODE:-production}
+MAX_SOURCE_VIDEOS=${MAX_SOURCE_VIDEOS:-50}
+MIN_STABLE_CLIP_SECONDS=${MIN_STABLE_CLIP_SECONDS:-5}
+MAX_STABLE_CLIP_SECONDS=${MAX_STABLE_CLIP_SECONDS:-8}
+SRC_REF_NUM_CANDIDATES=${SRC_REF_NUM_CANDIDATES:-4}
 
 MASK_GPU_IDS=${MASK_GPU_IDS:-6}
 VACE_GPU_IDS=${VACE_GPU_IDS:-2,3,4,5}
@@ -49,13 +64,20 @@ usage() {
 Usage: run_masked_vace_pipeline_queue.sh [options]
 
 Stages:
+  select-clips  Ask Omni to select stable 5-8 second windows from raw assets.
+  extract-clips  Extract the selected windows.
+  understand  Annotate selected stable clips and write reference understanding cache.
   plan      Run Omni prompt planning and mask planning.
+  refplan   Plan src_ref_images requirements for VACE plans.
+  refgen    Generate src_ref_images from src_ref_image_plan.jsonl.
+  refselect Select generated src_ref_images from candidate folders.
   mask      Generate video masks from video_mask_plan.jsonl.
   vace      Run masked VACE batch generation.
   annotate  Annotate generated target videos with existing Omni service.
   validate  Validate generated known pairs with existing Omni service.
   bundle    Build manual review bundle from accepted pairs.
   all       Run plan, mask, vace, annotate, validate, bundle sequentially.
+  overnight Run select-clips, extract-clips, understand, plan, refplan.
 
 Options:
   --stage STAGE
@@ -68,6 +90,7 @@ Options:
   --api-key KEY
   --model MODEL_ID
   --max-plans N
+  --max-source-videos N
   --max-masks N
   --vace-top-k N
   --planning-mode production|exploration
@@ -96,6 +119,7 @@ while [[ $# -gt 0 ]]; do
     --api-key) API_KEY="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
     --max-plans) MAX_PLANS="$2"; shift 2 ;;
+    --max-source-videos) MAX_SOURCE_VIDEOS="$2"; shift 2 ;;
     --max-masks) MAX_MASKS="$2"; shift 2 ;;
     --vace-top-k) VACE_TOP_K="$2"; shift 2 ;;
     --planning-mode) PLANNING_MODE="$2"; shift 2 ;;
@@ -113,6 +137,15 @@ VIDEO_EDIT_PLANNER_CACHE="$RUN_ROOT/video_edit_planner_cache.jsonl"
 VIDEO_MASK_PLAN="$RUN_ROOT/video_mask_plan.jsonl"
 VIDEO_MASK_MANIFEST="$RUN_ROOT/video_mask_manifest.jsonl"
 GENERATED_MASK_MANIFEST="$RUN_ROOT/video_mask_manifest.generated.jsonl"
+STABLE_CLIP_PLAN="$RUN_ROOT/omni_stable_clip_plan.jsonl"
+STABLE_CLIP_MANIFEST="$RUN_ROOT/omni_stable_clips.jsonl"
+STABLE_CLIP_SELECTION_CACHE="$RUN_ROOT/omni_stable_clip_selection_cache.jsonl"
+STABLE_CLIP_ANNOTATIONS="$RUN_ROOT/omni_stable_clip_annotations.jsonl"
+REFERENCE_UNDERSTANDING_CACHE="$RUN_ROOT/reference_understanding_cache.jsonl"
+SRC_REF_IMAGE_PLAN="$RUN_ROOT/src_ref_image_plan.jsonl"
+SRC_REF_IMAGE_SELECTION="$RUN_ROOT/src_ref_image_selection.jsonl"
+SRC_REF_IMAGE_GENERATION_MANIFEST="$RUN_ROOT/src_ref_image_generation_manifest.jsonl"
+SRC_REF_IMAGE_ROOT="$RUN_ROOT/src_ref_images"
 VACE_RUN_ROOT="$RUN_ROOT/vace_batch"
 TARGET_ANNOTATIONS="$RUN_ROOT/synthetic_target_annotations.jsonl"
 ALL_ANNOTATIONS="$RUN_ROOT/synthetic_all_annotations.jsonl"
@@ -128,6 +161,53 @@ require_file() {
     echo "[masked-vace-queue] missing $label: $path" >&2
     exit 1
   fi
+}
+
+run_select_clips() {
+  echo "[masked-vace-queue] stage=select-clips max_source_videos=$MAX_SOURCE_VIDEOS"
+  python -m app.composed_data plan-stable-omni-clips \
+    --root "$DATA_ROOT" \
+    --output-path "$STABLE_CLIP_PLAN" \
+    --cache-path "$STABLE_CLIP_SELECTION_CACHE" \
+    --max-source-videos "$MAX_SOURCE_VIDEOS" \
+    --min-clip-seconds "$MIN_STABLE_CLIP_SECONDS" \
+    --max-clip-seconds "$MAX_STABLE_CLIP_SECONDS" \
+    --base-url "$BASE_URL" \
+    --api-key "$API_KEY" \
+    --model "$MODEL" \
+    --timeout-seconds "$TIMEOUT_SECONDS" \
+    | tee "$RUN_ROOT/logs/plan_stable_omni_clips.json"
+}
+
+run_extract_clips() {
+  require_file "$STABLE_CLIP_PLAN" "stable clip plan"
+  echo "[masked-vace-queue] stage=extract-clips"
+  python -m app.composed_data extract-clips \
+    --root "$DATA_ROOT" \
+    --plan-path "$STABLE_CLIP_PLAN" \
+    --output-manifest-path "$STABLE_CLIP_MANIFEST" \
+    --overwrite \
+    | tee "$RUN_ROOT/logs/extract_stable_clips.json"
+}
+
+run_understand() {
+  require_file "$STABLE_CLIP_MANIFEST" "stable clip manifest"
+  echo "[masked-vace-queue] stage=understand"
+  python -m app.composed_data detective-annotate-clips \
+    --root "$DATA_ROOT" \
+    --clips-manifest-path "$STABLE_CLIP_MANIFEST" \
+    --output-path "$STABLE_CLIP_ANNOTATIONS" \
+    --base-url "$BASE_URL" \
+    --api-key "$API_KEY" \
+    --model "$MODEL" \
+    --timeout-seconds "$TIMEOUT_SECONDS" \
+    --overwrite \
+    | tee "$RUN_ROOT/logs/annotate_stable_clips.json"
+  python -m app.composed_data cache-reference-understandings \
+    --root "$DATA_ROOT" \
+    --clip-annotations-path "$STABLE_CLIP_ANNOTATIONS" \
+    --output-path "$REFERENCE_UNDERSTANDING_CACHE" \
+    | tee "$RUN_ROOT/logs/cache_reference_understandings.json"
 }
 
 run_plan() {
@@ -161,6 +241,47 @@ run_plan() {
     | tee "$RUN_ROOT/logs/plan_video_masks.json"
 }
 
+run_refplan() {
+  require_file "$VIDEO_EDIT_PLAN" "video edit plan"
+  echo "[masked-vace-queue] stage=refplan"
+  python -m app.composed_data plan-src-ref-images \
+    --root "$DATA_ROOT" \
+    --video-edit-plan-path "$VIDEO_EDIT_PLAN" \
+    --output-path "$SRC_REF_IMAGE_PLAN" \
+    --image-root "$SRC_REF_IMAGE_ROOT" \
+    --num-candidates "$SRC_REF_NUM_CANDIDATES" \
+    | tee "$RUN_ROOT/logs/plan_src_ref_images.json"
+}
+
+run_refselect() {
+  if [[ ! -s "$SRC_REF_IMAGE_PLAN" ]]; then
+    echo "[masked-vace-queue] stage=refselect no src_ref image plan; writing empty selection"
+    : > "$SRC_REF_IMAGE_SELECTION"
+    return
+  fi
+  echo "[masked-vace-queue] stage=refselect"
+  python -m app.composed_data select-src-ref-images \
+    --root "$DATA_ROOT" \
+    --src-ref-image-plan-path "$SRC_REF_IMAGE_PLAN" \
+    --output-path "$SRC_REF_IMAGE_SELECTION" \
+    | tee "$RUN_ROOT/logs/select_src_ref_images.json"
+}
+
+run_refgen() {
+  if [[ ! -s "$SRC_REF_IMAGE_PLAN" ]]; then
+    echo "[masked-vace-queue] stage=refgen no src_ref image plan; skip"
+    return
+  fi
+  echo "[masked-vace-queue] stage=refgen model_dir=$SRC_REF_IMAGE_MODEL_DIR"
+  scripts/run_src_ref_image_generation_from_plan.sh \
+    --src-ref-image-plan "$SRC_REF_IMAGE_PLAN" \
+    --model-dir "$SRC_REF_IMAGE_MODEL_DIR" \
+    --output-manifest "$SRC_REF_IMAGE_GENERATION_MANIFEST" \
+    --conda-env "$IMAGE_GEN_CONDA_ENV" \
+    --gpu-ids "$MASK_GPU_IDS" \
+    | tee "$RUN_ROOT/logs/generate_src_ref_images.json"
+}
+
 run_mask() {
   require_file "$VIDEO_MASK_PLAN" "video mask plan"
   require_file "$VIDEO_MASK_MANIFEST" "video mask manifest"
@@ -186,11 +307,16 @@ run_vace() {
   require_file "$VIDEO_EDIT_PLAN" "video edit plan"
   require_file "$GENERATED_MASK_MANIFEST" "generated mask manifest"
   echo "[masked-vace-queue] stage=vace gpu_ids=$VACE_GPU_IDS top_k=$VACE_TOP_K"
+  local src_ref_args=()
+  if [[ -s "$SRC_REF_IMAGE_SELECTION" ]]; then
+    src_ref_args=(--src-ref-selection "$SRC_REF_IMAGE_SELECTION")
+  fi
   scripts/run_vace_masked_visual_batch_from_plan.sh \
     --data-root "$DATA_ROOT" \
     --run-root "$VACE_RUN_ROOT" \
     --video-edit-plan "$VIDEO_EDIT_PLAN" \
     --mask-manifest "$GENERATED_MASK_MANIFEST" \
+    "${src_ref_args[@]}" \
     --top-k "$VACE_TOP_K" \
     --gpu-ids "$VACE_GPU_IDS" \
     --max-gpus "$VACE_MAX_GPUS" \
@@ -271,7 +397,13 @@ echo "[masked-vace-queue] clip_annotations=$CLIP_ANNOTATIONS"
 echo "[masked-vace-queue] note: this script never starts or stops Omni"
 
 case "$STAGE" in
+  select-clips) run_select_clips ;;
+  extract-clips) run_extract_clips ;;
+  understand) run_understand ;;
   plan) run_plan ;;
+  refplan) run_refplan ;;
+  refgen) run_refgen ;;
+  refselect) run_refselect ;;
   mask) run_mask ;;
   vace) run_vace ;;
   annotate) run_annotate ;;
@@ -279,11 +411,27 @@ case "$STAGE" in
   bundle) run_bundle ;;
   all)
     run_plan
+    run_refplan
+    if [[ -s "$SRC_REF_IMAGE_PLAN" ]]; then
+      run_refgen
+    fi
+    if [[ -s "$SRC_REF_IMAGE_SELECTION" ]]; then
+      echo "[masked-vace-queue] using existing src_ref selection: $SRC_REF_IMAGE_SELECTION"
+    else
+      run_refselect
+    fi
     run_mask
     run_vace
     run_annotate
     run_validate
     run_bundle
+    ;;
+  overnight)
+    run_select_clips
+    run_extract_clips
+    run_understand
+    run_plan
+    run_refplan
     ;;
   *) echo "[masked-vace-queue] unknown stage: $STAGE" >&2; usage >&2; exit 2 ;;
 esac

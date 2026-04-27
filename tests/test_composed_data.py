@@ -49,6 +49,10 @@ from app.composed_data import (
     main as composed_data_main,
     plan_audio_edits,
     plan_detective_event_clips,
+    plan_stable_omni_clips,
+    cache_reference_understandings,
+    plan_src_ref_images,
+    select_src_ref_images,
     plan_video_masks,
     plan_video_edits,
     propose_group_pairs,
@@ -202,6 +206,85 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(3, len(plan_records))
             self.assertEqual("same_source_video", group_records[0]["group_reason"])
             self.assertEqual([record["clip_id"] for record in plan_records], group_records[0]["candidate_clip_ids"])
+
+    def test_plan_stable_omni_clips_uses_cache_and_enforces_window_length(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "raw_datasets" / "daily_omni"
+            source.mkdir(parents=True)
+            video = source / "source.mp4"
+            video.write_bytes(b"x")
+            index_raw_sources(root=root, sources=[("daily_omni", source)])
+            cache_path = root / "caches" / "stable_cache.jsonl"
+
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={
+                    "duration_seconds": 20.0,
+                    "has_audio": True,
+                    "has_video": True,
+                    "width": 640,
+                    "height": 360,
+                    "fps": 25.0,
+                },
+            ):
+                first = plan_stable_omni_clips(
+                    root=root,
+                    cache_path=cache_path,
+                    max_source_videos=1,
+                    min_clip_seconds=5.0,
+                    max_clip_seconds=8.0,
+                )
+                second = plan_stable_omni_clips(
+                    root=root,
+                    cache_path=cache_path,
+                    max_source_videos=1,
+                    min_clip_seconds=5.0,
+                    max_clip_seconds=8.0,
+                )
+
+            records = [
+                json.loads(line)
+                for line in Path(second["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, first["clip_plan_count"])
+            self.assertEqual(1, second["cache_hits"])
+            self.assertGreaterEqual(records[0]["duration_seconds"], 5.0)
+            self.assertLessEqual(records[0]["duration_seconds"], 8.0)
+            self.assertIn("stable_clip_selection", records[0])
+
+    def test_cache_reference_understandings_writes_stable_edit_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "robot_ref",
+                        "output_path": "clips/robot_ref.mp4",
+                        "summary": "a black and gold robotic action figure rotates on a platform",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
+                    }
+                ],
+            )
+
+            summary = cache_reference_understandings(root=root, clip_annotations_path=annotations_path)
+            records = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["understanding_count"])
+            self.assertEqual("robot_ref", records[0]["clip_id"])
+            self.assertTrue(records[0]["stable_edit_targets"])
+            self.assertEqual("robot body", records[0]["stable_edit_targets"][0]["target"])
 
     def test_annotate_clips_writes_complete_annotations_with_mock_client(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4357,6 +4440,88 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("SAM2.1_video_predictor", mask_plans[0]["toolchain"]["segmenter"])
             self.assertEqual("robot_color", mask_manifest[0]["plan_id"])
             self.assertTrue(mask_manifest[0]["mask_video"].endswith("robot_color_mask.mp4"))
+
+    def test_plan_src_ref_images_requires_references_for_object_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "phone_to_tablet",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "replace the phone with a tablet",
+                        "difference": {"type": "object_presence", "from": "phone", "to": "tablet"},
+                        "model_route": "vace_controlled",
+                        "edit_token": "tablet",
+                        "edit_region": "hand-held object",
+                        "exploration_family": "object_replacement",
+                    },
+                    {
+                        "plan_id": "robot_color",
+                        "reference_video": "clips/robot.mp4",
+                        "edit_text": "change robot body color from black and gold to bright yellow",
+                        "difference": {"type": "attribute", "from": "black and gold", "to": "bright yellow"},
+                        "model_route": "vace_controlled",
+                        "edit_token": "bright yellow robot body",
+                        "edit_region": "robot body",
+                        "exploration_family": "attribute_color",
+                    },
+                ],
+            )
+
+            summary = plan_src_ref_images(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                image_root=root / "src_ref_images",
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("phone_to_tablet", plans[0]["plan_id"])
+            self.assertTrue(plans[0]["required"])
+            self.assertEqual("replacement_object", plans[0]["src_ref_role"])
+            self.assertIn("tablet", plans[0]["image_prompts"][0])
+            self.assertEqual(1, summary["skipped_reasons"]["src_ref_not_needed"])
+
+    def test_select_src_ref_images_picks_existing_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            candidate_dir = root / "src_ref_images" / "phone_to_tablet"
+            candidate_dir.mkdir(parents=True)
+            (candidate_dir / "candidate_001.png").write_bytes(b"one")
+            (candidate_dir / "candidate_002.png").write_bytes(b"two")
+            plan_path = root / "pairs" / "src_ref_image_plan.jsonl"
+            self._write_jsonl(
+                plan_path,
+                [
+                    {
+                        "plan_id": "phone_to_tablet",
+                        "candidate_dir": str(candidate_dir),
+                        "required": True,
+                        "src_ref_role": "replacement_object",
+                    }
+                ],
+            )
+
+            summary = select_src_ref_images(root=root, src_ref_image_plan_path=plan_path, max_selected=1)
+            records = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["selected_plan_count"])
+            self.assertEqual("selected", records[0]["status"])
+            self.assertEqual(1, len(records[0]["selected_src_ref_images"]))
+            self.assertEqual(1, len(records[0]["rejected"]))
 
     def test_plan_video_edits_rejects_tiny_additive_attribute_revision_for_vace(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

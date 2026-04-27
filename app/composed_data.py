@@ -31,6 +31,10 @@ DEFAULT_VIDEO_EDIT_PLAN_NAME = "video_edit_plan.jsonl"
 DEFAULT_VIDEO_EDIT_PLANNER_CACHE_NAME = "video_edit_planner_cache.jsonl"
 DEFAULT_VIDEO_MASK_PLAN_NAME = "video_mask_plan.jsonl"
 DEFAULT_VIDEO_MASK_MANIFEST_NAME = "video_mask_manifest.jsonl"
+DEFAULT_OMNI_STABLE_CLIP_SELECTION_CACHE_NAME = "omni_stable_clip_selection_cache.jsonl"
+DEFAULT_REFERENCE_UNDERSTANDING_CACHE_NAME = "reference_understanding_cache.jsonl"
+DEFAULT_SRC_REF_IMAGE_PLAN_NAME = "src_ref_image_plan.jsonl"
+DEFAULT_SRC_REF_IMAGE_SELECTION_NAME = "src_ref_image_selection.jsonl"
 DEFAULT_AUDIO_EDIT_PLAN_NAME = "audio_edit_plan.jsonl"
 DEFAULT_LICENSE_NOTE = "internal research pilot only"
 VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
@@ -1960,6 +1964,16 @@ def plan_video_edits(
         mask_plan_name = "grounded_sam2_video_mask" if route == "vace_controlled" else (
             "none" if route == "audio_deterministic" else "local_roi"
         )
+        src_ref_requirements = _src_ref_requirement_for_video_plan(
+            {
+                "difference": difference,
+                "edit_text": edit_text,
+                "edit_token": edit_token,
+                "edit_region": edit_region,
+                "model_route": route,
+                "exploration_family": str(candidate.get("exploration_family", "")).strip(),
+            }
+        )
         plan = {
             "plan_id": str(candidate.get("proposal_id", "")).strip()
             or f"video_edit_plan_{_stable_hash(reference_video + edit_text)}",
@@ -1985,6 +1999,7 @@ def plan_video_edits(
                 "src_mask": "to_be_generated" if route == "vace_controlled" else "",
                 "src_ref_images": [],
             },
+            "src_ref_requirements": src_ref_requirements,
             "difference": difference,
             "raw_planner_output": raw_planner_output,
             "reference_understanding": _video_edit_reference_understanding(reference_annotation),
@@ -2152,6 +2167,206 @@ def plan_audio_edits(
     }
 
 
+def plan_stable_omni_clips(
+    *,
+    root: str | Path,
+    raw_index_path: str | Path | None = None,
+    output_path: str | Path | None = None,
+    cache_path: str | Path | None = None,
+    max_source_videos: int = 50,
+    min_clip_seconds: float = 5.0,
+    max_clip_seconds: float = 8.0,
+    base_url: str | None = None,
+    api_key: str = "EMPTY",
+    model: str | None = None,
+    timeout_seconds: float = 180.0,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    raw_index_file = Path(raw_index_path) if raw_index_path else layout["metadata"] / DEFAULT_RAW_INDEX_NAME
+    raw_index = _load_raw_asset_index(raw_index_file)
+    if not raw_index:
+        raise ValueError("raw asset index is empty")
+    if min_clip_seconds <= 0:
+        raise ValueError("min_clip_seconds must be positive")
+    if max_clip_seconds < min_clip_seconds:
+        raise ValueError("max_clip_seconds must be >= min_clip_seconds")
+
+    output = Path(output_path) if output_path else layout["metadata"] / "omni_stable_clip_plan.jsonl"
+    cache_output = Path(cache_path) if cache_path else layout["caches"] / DEFAULT_OMNI_STABLE_CLIP_SELECTION_CACHE_NAME
+    cache = _load_records_by_key(cache_output, "cache_key")
+    client = (
+        OpenAIComposedDataClient(
+            base_url=base_url,
+            api_key=api_key,
+            model=model or "",
+            timeout_seconds=timeout_seconds,
+        )
+        if base_url and model
+        else None
+    )
+
+    plan_records: list[dict[str, Any]] = []
+    cache_records = dict(cache)
+    cache_hits = 0
+    cache_misses = 0
+    skipped_reasons: Counter[str] = Counter()
+    assets = sorted(raw_index.values(), key=lambda item: (str(item.get("dataset", "")), str(item.get("relative_path", ""))))
+    for asset in assets[: max(0, max_source_videos)]:
+        source_path = Path(str(asset.get("path", "")).strip())
+        if not source_path.exists():
+            skipped_reasons["missing_source_video"] += 1
+            continue
+        media = probe_media(source_path)
+        duration = float(media.get("duration_seconds") or 0.0)
+        if duration < min_clip_seconds:
+            skipped_reasons["too_short"] += 1
+            continue
+
+        cache_key = _stable_json_hash(
+            {
+                "asset_id": asset.get("asset_id"),
+                "path": str(source_path),
+                "mtime_ns": asset.get("mtime_ns"),
+                "min_clip_seconds": min_clip_seconds,
+                "max_clip_seconds": max_clip_seconds,
+                "model": model or "",
+            }
+        )
+        cached_record = cache.get(cache_key)
+        if cached_record is not None:
+            cache_hits += 1
+            selection = dict(cached_record.get("selection") or {})
+        else:
+            cache_misses += 1
+            selection = _heuristic_stable_clip_selection(
+                media=media,
+                min_clip_seconds=min_clip_seconds,
+                max_clip_seconds=max_clip_seconds,
+            )
+            if client is not None:
+                try:
+                    model_selection, raw_payload = client.select_stable_clip_window(
+                        source_video_path=str(source_path),
+                        media_info=media,
+                        min_clip_seconds=min_clip_seconds,
+                        max_clip_seconds=max_clip_seconds,
+                    )
+                    selection = _coerce_stable_clip_selection(
+                        model_selection,
+                        fallback=selection,
+                        media=media,
+                        min_clip_seconds=min_clip_seconds,
+                        max_clip_seconds=max_clip_seconds,
+                    )
+                    selection["planner"] = {
+                        "stage": "strongest_omni_stable_clip_selector",
+                        "fallback_used": False,
+                        "model": model,
+                        "raw_payload": raw_payload,
+                    }
+                except Exception as exc:
+                    selection["planner"] = {
+                        "stage": "heuristic_stable_clip_selector",
+                        "fallback_used": True,
+                        "model": model,
+                        "fallback_reason": f"{type(exc).__name__}: {exc}",
+                    }
+            else:
+                selection["planner"] = {
+                    "stage": "heuristic_stable_clip_selector",
+                    "fallback_used": True,
+                    "reason": "no Omni endpoint supplied",
+                }
+            cache_records[cache_key] = {
+                "cache_key": cache_key,
+                "asset_id": asset.get("asset_id"),
+                "source_video": str(source_path),
+                "selection": selection,
+            }
+
+        if not bool(selection.get("recommended_for_vace", True)):
+            skipped_reasons["not_recommended_for_vace"] += 1
+            continue
+        start_seconds = float(selection.get("start_sec", 0.0) or 0.0)
+        end_seconds = float(selection.get("end_sec", 0.0) or 0.0)
+        if end_seconds - start_seconds < min_clip_seconds or end_seconds - start_seconds > max_clip_seconds + 1e-6:
+            skipped_reasons["invalid_selected_window"] += 1
+            continue
+
+        dataset = str(asset.get("dataset", "raw")).strip() or "raw"
+        clip_id = f"{dataset}_{Path(str(asset.get('relative_path', source_path.name))).stem}__omni_{_stable_hash(cache_key)[:8]}"
+        clip_record = {
+            "clip_id": clip_id,
+            "source_asset_id": str(asset.get("asset_id", "")).strip(),
+            "source_path": str(source_path),
+            "output_path": f"clips/omni_stable/{clip_id}.mp4",
+            "start_seconds": round(start_seconds, 3),
+            "end_seconds": round(end_seconds, 3),
+            "duration_seconds": round(end_seconds - start_seconds, 3),
+            "role": "reference",
+            "notes": "Omni-selected stable short clip for VACE planning",
+            "stable_clip_selection": selection,
+        }
+        plan_records.append(clip_record)
+
+    _write_jsonl(output, plan_records)
+    _write_jsonl(cache_output, list(cache_records.values()))
+    return {
+        "raw_index_path": str(raw_index_file),
+        "clip_plan_count": len(plan_records),
+        "output_path": str(output),
+        "cache_path": str(cache_output),
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "skipped_reasons": dict(skipped_reasons),
+    }
+
+
+def cache_reference_understandings(
+    *,
+    root: str | Path,
+    clip_annotations_path: str | Path,
+    output_path: str | Path | None = None,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    annotations = list(_load_jsonl(Path(clip_annotations_path)))
+    if not annotations:
+        raise ValueError("clip annotations are empty")
+    output = Path(output_path) if output_path else layout["caches"] / DEFAULT_REFERENCE_UNDERSTANDING_CACHE_NAME
+    records: list[dict[str, Any]] = []
+    for annotation in annotations:
+        reference_video = str(annotation.get("output_path") or annotation.get("source_path") or "").strip()
+        clip_id = str(annotation.get("clip_id", "")).strip() or _stable_hash(reference_video)
+        visual_understanding = _video_edit_reference_understanding(annotation)
+        audio_understanding = _audio_edit_reference_understanding(annotation)
+        stable_targets = _stable_edit_targets_from_understanding(visual_understanding, annotation)
+        records.append(
+            {
+                "clip_id": clip_id,
+                "reference_video": reference_video,
+                "summary": str(annotation.get("summary", "")).strip(),
+                "subjects": _dedupe_strings(_normalize_list(annotation.get("subjects", []))),
+                "actions": _dedupe_strings(_normalize_list(annotation.get("actions", []))),
+                "scene": str(annotation.get("scene", "")).strip(),
+                "camera_motion": str(annotation.get("camera_motion", "")).strip() or "unknown",
+                "visible_text": _dedupe_strings(
+                    _normalize_list(annotation.get("visible_text", []))
+                    + _normalize_list(annotation.get("on_screen_text", []))
+                ),
+                "stable_edit_targets": stable_targets,
+                "bad_edits": visual_understanding.get("bad_edits", []),
+                "reference_understanding": visual_understanding,
+                "audio_reference_understanding": audio_understanding,
+            }
+        )
+    _write_jsonl(output, records)
+    return {
+        "clip_annotations_path": str(clip_annotations_path),
+        "understanding_count": len(records),
+        "output_path": str(output),
+    }
+
+
 def plan_video_masks(
     *,
     root: str | Path,
@@ -2245,6 +2460,122 @@ def plan_video_masks(
     }
 
 
+def plan_src_ref_images(
+    *,
+    root: str | Path,
+    video_edit_plan_path: str | Path,
+    output_path: str | Path | None = None,
+    image_root: str | Path | None = None,
+    num_candidates: int = 4,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    edit_plans = list(_load_jsonl(Path(video_edit_plan_path)))
+    if not edit_plans:
+        raise ValueError("video edit plan file is empty")
+    output = Path(output_path) if output_path else layout["pairs"] / DEFAULT_SRC_REF_IMAGE_PLAN_NAME
+    image_base = Path(image_root) if image_root else output.parent / "src_ref_images"
+    plans: list[dict[str, Any]] = []
+    skipped_reasons: Counter[str] = Counter()
+    for edit_plan in edit_plans:
+        requirement = _src_ref_requirement_for_video_plan(edit_plan)
+        if not requirement.get("required") and not requirement.get("recommended"):
+            skipped_reasons["src_ref_not_needed"] += 1
+            continue
+        plan_id = str(edit_plan.get("plan_id", "")).strip()
+        if not plan_id:
+            skipped_reasons["missing_plan_id"] += 1
+            continue
+        target = str(requirement.get("target", "")).strip()
+        if not target:
+            skipped_reasons["missing_src_ref_target"] += 1
+            continue
+        safe_id = _safe_id(plan_id)
+        candidate_dir = image_base / safe_id
+        plans.append(
+            {
+                "plan_id": plan_id,
+                "reference_video": str(edit_plan.get("reference_video", "")).strip(),
+                "edit_text": str(edit_plan.get("edit_text", "")).strip(),
+                "difference": edit_plan.get("difference", {}),
+                "target_object": target,
+                "src_ref_role": str(requirement.get("role", "")).strip(),
+                "required": bool(requirement.get("required")),
+                "recommended": bool(requirement.get("recommended")),
+                "image_prompts": _src_ref_image_prompts(requirement=requirement, edit_plan=edit_plan),
+                "negative_prompt": _src_ref_image_negative_prompt(requirement),
+                "num_candidates": max(1, int(num_candidates)),
+                "candidate_dir": str(candidate_dir),
+                "planner": {
+                    "stage": "src_ref_image_requirement_planner",
+                    "input": "video_edit_plan_and_omni_reference_understanding",
+                    "output": "image_generation_prompts_for_vace_src_ref_images",
+                },
+            }
+        )
+    _write_jsonl(output, plans)
+    return {
+        "video_edit_plan_path": str(video_edit_plan_path),
+        "plan_count": len(plans),
+        "output_path": str(output),
+        "image_root": str(image_base),
+        "skipped_reasons": dict(skipped_reasons),
+    }
+
+
+def select_src_ref_images(
+    *,
+    root: str | Path,
+    src_ref_image_plan_path: str | Path,
+    output_path: str | Path | None = None,
+    max_selected: int = 2,
+) -> dict[str, Any]:
+    ensure_layout(root)
+    image_plans = list(_load_jsonl(Path(src_ref_image_plan_path)))
+    if not image_plans:
+        raise ValueError("src_ref image plan file is empty")
+    output = Path(output_path) if output_path else Path(src_ref_image_plan_path).with_name(DEFAULT_SRC_REF_IMAGE_SELECTION_NAME)
+    records: list[dict[str, Any]] = []
+    selected_count = 0
+    missing_count = 0
+    for plan in image_plans:
+        candidate_dir = Path(str(plan.get("candidate_dir", "")).strip())
+        candidates = _find_src_ref_image_candidates(candidate_dir)
+        selected = [str(path) for path in candidates[: max(1, int(max_selected))]]
+        rejected = [
+            {"path": str(path), "reason": "not selected by deterministic prefilter"}
+            for path in candidates[max(1, int(max_selected)) :]
+        ]
+        if selected:
+            status = "selected"
+            selection_reason = "selected available image candidate(s); Omni audit can replace this deterministic preselection later"
+            selected_count += 1
+        else:
+            status = "missing_candidates"
+            selection_reason = "no generated candidate images found"
+            missing_count += 1
+        records.append(
+            {
+                "plan_id": str(plan.get("plan_id", "")).strip(),
+                "selected_src_ref_images": selected,
+                "rejected": rejected,
+                "status": status,
+                "required": bool(plan.get("required")),
+                "src_ref_role": str(plan.get("src_ref_role", "")).strip(),
+                "selection_reason": selection_reason,
+                "selection_method": "filesystem_prefilter_pending_omni_audit",
+                "candidate_dir": str(candidate_dir),
+            }
+        )
+    _write_jsonl(output, records)
+    return {
+        "src_ref_image_plan_path": str(src_ref_image_plan_path),
+        "selection_count": len(records),
+        "selected_plan_count": selected_count,
+        "missing_candidate_count": missing_count,
+        "output_path": str(output),
+    }
+
+
 def build_manual_review_bundle(
     *,
     root: str | Path,
@@ -2309,6 +2640,30 @@ def build_manual_review_bundle(
                 shutil.copy2(target_path, target_copy)
             else:
                 missing_videos.append(str(target_path or target_video_raw))
+        generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
+        src_ref_images = _normalize_list(generation.get("src_ref_images", []))
+        copied_src_ref_images: list[str] = []
+        if copy_videos and src_ref_images:
+            src_ref_dir = item_dir / "src_ref_images"
+            src_ref_dir.mkdir(parents=True, exist_ok=True)
+            for image_index, image_raw in enumerate(src_ref_images, start=1):
+                image_path = _resolve_under_root(root_path, image_raw)
+                if image_path.exists():
+                    image_copy = src_ref_dir / f"{image_index:03d}_{_safe_id(image_path.name)}"
+                    shutil.copy2(image_path, image_copy)
+                    copied_src_ref_images.append(str(image_copy))
+                else:
+                    missing_videos.append(str(image_path or image_raw))
+        src_mask = str(generation.get("src_mask", "")).strip()
+        mask_copy_path = ""
+        if copy_videos and src_mask:
+            mask_path = _resolve_under_root(root_path, src_mask)
+            if mask_path.exists():
+                mask_copy = item_dir / "mask.mp4"
+                shutil.copy2(mask_path, mask_copy)
+                mask_copy_path = str(mask_copy)
+            else:
+                missing_videos.append(str(mask_path or src_mask))
 
         metadata = {
             "index": index,
@@ -2325,7 +2680,11 @@ def build_manual_review_bundle(
             "verification": record.get("verification", {}),
             "observable_difference": record.get("observable_difference", {}),
             "competing_difference": record.get("competing_difference", {}),
-            "generation": record.get("generation", {}),
+            "generation": generation,
+            "src_ref_images": src_ref_images,
+            "copied_src_ref_images": copied_src_ref_images,
+            "src_mask": src_mask,
+            "copied_src_mask": mask_copy_path,
         }
         (item_dir / "metadata.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2),
@@ -7049,6 +7408,8 @@ def _manual_review_item_markdown(
         f"- verification.passed: `{verification.get('passed')}`",
         f"- observable_difference.passed: `{observable.get('passed')}`",
         f"- competing_difference.passed: `{competing.get('passed')}`",
+        f"- src_ref_images: `{json.dumps(metadata.get('src_ref_images', []), ensure_ascii=False)}`",
+        f"- src_mask: `{metadata.get('src_mask', '')}`",
         "",
         "## 视频文件",
         "",
@@ -7059,6 +7420,13 @@ def _manual_review_item_markdown(
     if target_filename:
         lines.append(f"- 目标视频本地副本: `{target_filename}`")
     lines.append(f"- 目标视频原路径: `{metadata.get('target_video_absolute', '')}`")
+    copied_refs = _normalize_list(metadata.get("copied_src_ref_images", []))
+    if copied_refs:
+        lines.extend(["", "## src_ref_images", ""])
+        for copied in copied_refs:
+            lines.append(f"- `{copied}`")
+    if metadata.get("copied_src_mask"):
+        lines.extend(["", "## mask", "", f"- `{metadata.get('copied_src_mask')}`"])
     lines.extend(
         [
             "",
@@ -7666,6 +8034,198 @@ def _video_mask_gate_defaults() -> dict[str, Any]:
         "mask_not_empty_all_frames": True,
         "mask_target_matches_query": True,
     }
+
+
+def _heuristic_stable_clip_selection(
+    *,
+    media: dict[str, Any],
+    min_clip_seconds: float,
+    max_clip_seconds: float,
+) -> dict[str, Any]:
+    duration = float(media.get("duration_seconds") or 0.0)
+    clip_seconds = min(max_clip_seconds, duration)
+    if clip_seconds < min_clip_seconds:
+        clip_seconds = duration
+    start = 0.0
+    end = min(duration, start + clip_seconds)
+    return {
+        "start_sec": round(start, 3),
+        "end_sec": round(end, 3),
+        "stability_score": 0.5,
+        "camera_motion": "unknown",
+        "main_subjects": [],
+        "visible_text_risk": False,
+        "recommended_for_vace": True,
+        "reason": "heuristic first stable-length window; Omni selection was not available",
+    }
+
+
+def _coerce_stable_clip_selection(
+    selection: dict[str, Any],
+    *,
+    fallback: dict[str, Any],
+    media: dict[str, Any],
+    min_clip_seconds: float,
+    max_clip_seconds: float,
+) -> dict[str, Any]:
+    duration = float(media.get("duration_seconds") or 0.0)
+    try:
+        start = max(0.0, float(selection.get("start_sec", fallback.get("start_sec", 0.0))))
+        end = max(start, float(selection.get("end_sec", fallback.get("end_sec", start))))
+    except (TypeError, ValueError):
+        start = float(fallback.get("start_sec", 0.0) or 0.0)
+        end = float(fallback.get("end_sec", min(duration, start + max_clip_seconds)) or 0.0)
+    if end > duration:
+        end = duration
+    window = end - start
+    if window < min_clip_seconds or window > max_clip_seconds:
+        fallback_start = float(fallback.get("start_sec", 0.0) or 0.0)
+        fallback_end = float(fallback.get("end_sec", min(duration, fallback_start + max_clip_seconds)) or 0.0)
+        start, end = fallback_start, fallback_end
+    coerced = {
+        "start_sec": round(start, 3),
+        "end_sec": round(end, 3),
+        "stability_score": _score_float(selection.get("stability_score", fallback.get("stability_score", 0.5))),
+        "camera_motion": str(selection.get("camera_motion", fallback.get("camera_motion", "unknown"))).strip() or "unknown",
+        "main_subjects": _dedupe_strings(_normalize_list(selection.get("main_subjects", fallback.get("main_subjects", []))))[:6],
+        "visible_text_risk": _boolish(selection.get("visible_text_risk", fallback.get("visible_text_risk", False))),
+        "recommended_for_vace": _boolish(selection.get("recommended_for_vace", fallback.get("recommended_for_vace", True))),
+        "reason": str(selection.get("reason", fallback.get("reason", ""))).strip(),
+    }
+    return coerced
+
+
+def _stable_edit_targets_from_understanding(
+    visual_understanding: dict[str, Any],
+    annotation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    for attribute in visual_understanding.get("editable_attributes", []):
+        if not isinstance(attribute, dict):
+            continue
+        target = str(attribute.get("target", "")).strip()
+        current = str(attribute.get("current", "")).strip()
+        safe_targets = _normalize_list(attribute.get("safe_targets", []))
+        if target and safe_targets:
+            targets.append(
+                {
+                    "target": target,
+                    "edit_family": "attribute_color",
+                    "suggested_edit": f"change {target} from {current or 'its current appearance'} to {safe_targets[0]}",
+                    "mask_query": target,
+                    "needs_src_ref_images": False,
+                    "src_ref_request": "",
+                    "safe_targets": safe_targets,
+                }
+            )
+    object_names = list(_normalize_object_counts(annotation.get("object_counts", {})).keys())
+    for source_name, replacement in VACE_EXPLORATION_OBJECT_REPLACEMENTS.items():
+        if any(_text_mentions_phrase(name, source_name) for name in object_names):
+            targets.append(
+                {
+                    "target": source_name,
+                    "edit_family": "object_replacement",
+                    "suggested_edit": f"replace the {source_name} with a {replacement}",
+                    "mask_query": source_name,
+                    "needs_src_ref_images": True,
+                    "src_ref_request": f"a realistic {replacement}, isolated, plain background, no hands, no text",
+                }
+            )
+            break
+    return targets[:8]
+
+
+def _src_ref_requirement_for_video_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    difference = plan.get("difference") if isinstance(plan.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
+    edit_text = _normalized_phrase(str(plan.get("edit_text", "")))
+    edit_token = str(plan.get("edit_token", "")).strip()
+    family = str(plan.get("exploration_family", "")).strip()
+    target = str(difference.get("to", "")).strip() or edit_token
+    from_value = str(difference.get("from", "")).strip()
+
+    if family == "object_replacement" or ("replace" in edit_text and difference_type in {"object_presence", "object_count"}):
+        return {
+            "required": True,
+            "recommended": True,
+            "role": "replacement_object",
+            "target": target,
+            "source_object": from_value,
+            "reason": "object replacement needs a visual reference image for the replacement object",
+        }
+    if family == "background_change" or difference_type == "scene" or "background" in edit_text:
+        return {
+            "required": True,
+            "recommended": True,
+            "role": "background_reference",
+            "target": target or "target background",
+            "source_object": from_value,
+            "reason": "background replacement benefits from a clean background reference image",
+        }
+    if family == "clothing_type" or any(token in edit_text for token in ("shirt", "jacket", "dress", "outfit", "clothing")) and "replace" in edit_text:
+        return {
+            "required": True,
+            "recommended": True,
+            "role": "clothing_reference",
+            "target": target or edit_token or "target clothing",
+            "source_object": from_value,
+            "reason": "clothing type replacement needs a reference image for the target clothing",
+        }
+    if family == "object_removal" or edit_text.startswith("remove "):
+        return {
+            "required": False,
+            "recommended": False,
+            "role": "none",
+            "target": "",
+            "source_object": from_value or edit_token,
+            "reason": "object removal uses mask inpainting and does not need src_ref_images",
+        }
+    return {
+        "required": False,
+        "recommended": False,
+        "role": "none",
+        "target": "",
+        "source_object": from_value,
+        "reason": "attribute/color/material edits can run with video + mask + prompt",
+    }
+
+
+def _src_ref_image_prompts(*, requirement: dict[str, Any], edit_plan: dict[str, Any]) -> list[str]:
+    target = str(requirement.get("target", "")).strip() or "target object"
+    role = str(requirement.get("role", "")).strip()
+    if role == "background_reference":
+        return [
+            f"a clean wide reference image of {target}, no people, no text, no watermark, natural perspective",
+            f"{target}, empty background plate, cinematic lighting, no foreground subject, no readable text",
+        ]
+    if role == "clothing_reference":
+        return [
+            f"a clean reference photo of {target}, front view, plain background, no person face, no text, no logo",
+            f"{target}, clothing reference, clear fabric shape and color, neutral background, no watermark",
+        ]
+    return [
+        f"a realistic {target}, isolated product reference, plain white background, no hands, no people, no text, no logo",
+        f"{target}, clean object reference image, centered, neutral lighting, transparent or plain background, no watermark",
+    ]
+
+
+def _src_ref_image_negative_prompt(requirement: dict[str, Any]) -> str:
+    role = str(requirement.get("role", "")).strip()
+    base = "text, watermark, logo, blur, clutter, extra objects, distorted shape"
+    if role == "replacement_object":
+        return f"hands, people, scene background, {base}"
+    if role == "background_reference":
+        return f"people, foreground subject, readable signs, {base}"
+    if role == "clothing_reference":
+        return f"face, full person identity, body pose, readable brand logo, {base}"
+    return base
+
+
+def _find_src_ref_image_candidates(candidate_dir: Path) -> list[Path]:
+    if not candidate_dir.exists() or not candidate_dir.is_dir():
+        return []
+    suffixes = {".png", ".jpg", ".jpeg", ".webp"}
+    return sorted(path for path in candidate_dir.iterdir() if path.is_file() and path.suffix.lower() in suffixes)
 
 
 def _video_edit_reference_understanding(annotation: dict[str, Any]) -> dict[str, Any]:
@@ -8609,6 +9169,24 @@ def build_parser() -> argparse.ArgumentParser:
     plan_detective_parser.add_argument("--min-clip-seconds", type=float, default=3.0)
     plan_detective_parser.add_argument("--max-clip-seconds", type=float, default=15.0)
 
+    stable_clips_parser = subparsers.add_parser("plan-stable-omni-clips")
+    stable_clips_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    stable_clips_parser.add_argument("--raw-index-path")
+    stable_clips_parser.add_argument("--output-path")
+    stable_clips_parser.add_argument("--cache-path")
+    stable_clips_parser.add_argument("--max-source-videos", type=int, default=50)
+    stable_clips_parser.add_argument("--min-clip-seconds", type=float, default=5.0)
+    stable_clips_parser.add_argument("--max-clip-seconds", type=float, default=8.0)
+    stable_clips_parser.add_argument("--base-url")
+    stable_clips_parser.add_argument("--api-key", default="EMPTY")
+    stable_clips_parser.add_argument("--model")
+    stable_clips_parser.add_argument("--timeout-seconds", type=float, default=180.0)
+
+    reference_understanding_parser = subparsers.add_parser("cache-reference-understandings")
+    reference_understanding_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    reference_understanding_parser.add_argument("--clip-annotations-path", required=True)
+    reference_understanding_parser.add_argument("--output-path")
+
     annotate_clips_parser = subparsers.add_parser("annotate-clips")
     annotate_clips_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
     annotate_clips_parser.add_argument("--clips-manifest-path", required=True)
@@ -8680,6 +9258,19 @@ def build_parser() -> argparse.ArgumentParser:
     plan_video_masks_parser.add_argument("--output-path")
     plan_video_masks_parser.add_argument("--mask-manifest-path")
     plan_video_masks_parser.add_argument("--max-masks", type=int)
+
+    src_ref_plan_parser = subparsers.add_parser("plan-src-ref-images")
+    src_ref_plan_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    src_ref_plan_parser.add_argument("--video-edit-plan-path", required=True)
+    src_ref_plan_parser.add_argument("--output-path")
+    src_ref_plan_parser.add_argument("--image-root")
+    src_ref_plan_parser.add_argument("--num-candidates", type=int, default=4)
+
+    src_ref_select_parser = subparsers.add_parser("select-src-ref-images")
+    src_ref_select_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    src_ref_select_parser.add_argument("--src-ref-image-plan-path", required=True)
+    src_ref_select_parser.add_argument("--output-path")
+    src_ref_select_parser.add_argument("--max-selected", type=int, default=2)
 
     validate_known_pairs_parser = subparsers.add_parser("validate-known-pairs")
     validate_known_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -8767,6 +9358,32 @@ def main() -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
+    if args.command == "plan-stable-omni-clips":
+        result = plan_stable_omni_clips(
+            root=args.root,
+            raw_index_path=args.raw_index_path,
+            output_path=args.output_path,
+            cache_path=args.cache_path,
+            max_source_videos=args.max_source_videos,
+            min_clip_seconds=args.min_clip_seconds,
+            max_clip_seconds=args.max_clip_seconds,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "cache-reference-understandings":
+        result = cache_reference_understandings(
+            root=args.root,
+            clip_annotations_path=args.clip_annotations_path,
+            output_path=args.output_path,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
     if args.command == "detective-annotate-clips":
         result = detective_annotate_clips(
             root=args.root,
@@ -8849,6 +9466,27 @@ def main() -> None:
             output_path=args.output_path,
             mask_manifest_path=args.mask_manifest_path,
             max_masks=args.max_masks,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "plan-src-ref-images":
+        result = plan_src_ref_images(
+            root=args.root,
+            video_edit_plan_path=args.video_edit_plan_path,
+            output_path=args.output_path,
+            image_root=args.image_root,
+            num_candidates=args.num_candidates,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "select-src-ref-images":
+        result = select_src_ref_images(
+            root=args.root,
+            src_ref_image_plan_path=args.src_ref_image_plan_path,
+            output_path=args.output_path,
+            max_selected=args.max_selected,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
