@@ -185,6 +185,10 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("generate_grounded_sam2_video_masks.py", script)
         self.assertIn("build_sam2_video_predictor", helper)
         self.assertIn("GroundingDINO found no box", helper)
+        self.assertIn("Florence-2 found no box", helper)
+        self.assertIn("--grounder", script)
+        self.assertIn("--florence-model", script)
+        self.assertIn("florence2", helper)
         self.assertIn("mask_temporal_stability", helper)
         self.assertIn("edit_background_inverse_subject", helper)
 

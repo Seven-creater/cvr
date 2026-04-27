@@ -16,6 +16,8 @@ REPORT_PATH=${REPORT_PATH:-$RUN_ROOT/grounded_sam2_mask_report.md}
 GROUNDED_SAM2_CODE=${GROUNDED_SAM2_CODE:-$MASK_ROOT/Grounded-SAM-2/code}
 GROUNDING_DINO_CONFIG=${GROUNDING_DINO_CONFIG:-$MASK_ROOT/Grounded-SAM-2/code/grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py}
 GROUNDING_DINO_CHECKPOINT=${GROUNDING_DINO_CHECKPOINT:-$MASK_ROOT/GroundingDINO/checkpoints}
+GROUNDER=${GROUNDER:-auto}
+FLORENCE_MODEL=${FLORENCE_MODEL:-$MASK_ROOT/Florence-2/Florence-2-large}
 SAM2_CONFIG=${SAM2_CONFIG:-configs/sam2.1/sam2.1_hiera_l.yaml}
 SAM2_CHECKPOINT=${SAM2_CHECKPOINT:-$MASK_ROOT/SAM2.1/checkpoints/sam2.1-hiera-large}
 CONDA_ENV=${CONDA_ENV:-grounded_sam2}
@@ -40,6 +42,8 @@ Options:
   --grounded-sam2-code PATH
   --grounding-dino-config PATH
   --grounding-dino-checkpoint PATH
+  --grounder auto|groundingdino|florence2
+  --florence-model PATH
   --sam2-config VALUE
   --sam2-checkpoint PATH
   --conda-env NAME
@@ -68,6 +72,8 @@ while [[ $# -gt 0 ]]; do
     --grounded-sam2-code) GROUNDED_SAM2_CODE="$2"; shift 2 ;;
     --grounding-dino-config) GROUNDING_DINO_CONFIG="$2"; shift 2 ;;
     --grounding-dino-checkpoint) GROUNDING_DINO_CHECKPOINT="$2"; shift 2 ;;
+    --grounder) GROUNDER="$2"; shift 2 ;;
+    --florence-model) FLORENCE_MODEL="$2"; shift 2 ;;
     --sam2-config) SAM2_CONFIG="$2"; shift 2 ;;
     --sam2-checkpoint) SAM2_CHECKPOINT="$2"; shift 2 ;;
     --conda-env) CONDA_ENV="$2"; shift 2 ;;
@@ -108,6 +114,8 @@ ARGS=(
   --output-manifest-path "$OUTPUT_MANIFEST"
   --report-path "$REPORT_PATH"
   --grounded-sam2-code "$GROUNDED_SAM2_CODE"
+  --grounder "$GROUNDER"
+  --florence-model "$FLORENCE_MODEL"
   --grounding-dino-config "$GROUNDING_DINO_CONFIG"
   --grounding-dino-checkpoint "$GROUNDING_DINO_CHECKPOINT"
   --sam2-config "$SAM2_CONFIG"
@@ -124,6 +132,7 @@ echo "[grounded-sam2-masks] mask_plan=$MASK_PLAN"
 echo "[grounded-sam2-masks] mask_manifest=$MASK_MANIFEST"
 echo "[grounded-sam2-masks] output_manifest=$OUTPUT_MANIFEST"
 echo "[grounded-sam2-masks] grounded_sam2_code=$GROUNDED_SAM2_CODE"
+echo "[grounded-sam2-masks] grounder=$GROUNDER florence_model=$FLORENCE_MODEL"
 echo "[grounded-sam2-masks] gpu_ids=$GPU_IDS conda_env=$CONDA_ENV"
 python scripts/generate_grounded_sam2_video_masks.py "${ARGS[@]}"
 echo "[grounded-sam2-masks] done $(date)"

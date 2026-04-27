@@ -36,6 +36,15 @@ def _find_file(path: Path, patterns: tuple[str, ...]) -> Path:
     raise FileNotFoundError(f"cannot find any of {patterns} under {path}")
 
 
+def _find_dir(path: Path, markers: tuple[str, ...]) -> Path:
+    if path.is_dir() and all((path / marker).exists() for marker in markers):
+        return path
+    for candidate in sorted(path.rglob("*")):
+        if candidate.is_dir() and all((candidate / marker).exists() for marker in markers):
+            return candidate
+    raise FileNotFoundError(f"cannot find model dir with markers {markers} under {path}")
+
+
 def _ffprobe_fps(video_path: Path) -> float:
     result = subprocess.run(
         [
@@ -224,6 +233,139 @@ def _run_grounded_sam2(
         }
 
 
+def _florence_boxes(
+    *,
+    image_path: Path,
+    mask_query: str,
+    florence_model_dir: Path,
+    device: str,
+) -> tuple[Any, list[str]]:
+    import numpy as np
+    import torch
+    from PIL import Image
+    from transformers import AutoModelForCausalLM, AutoProcessor
+
+    image = Image.open(image_path).convert("RGB")
+    processor = AutoProcessor.from_pretrained(str(florence_model_dir), trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        str(florence_model_dir),
+        trust_remote_code=True,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    ).eval().to(device)
+    task = "<OPEN_VOCABULARY_DETECTION>"
+    prompt = task + mask_query
+    inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
+    generated_ids = model.generate(
+        input_ids=inputs["input_ids"],
+        pixel_values=inputs["pixel_values"],
+        max_new_tokens=1024,
+        num_beams=3,
+        do_sample=False,
+    )
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    parsed = processor.post_process_generation(generated_text, task=task, image_size=(image.width, image.height))
+    result = parsed.get(task, {})
+    boxes = result.get("bboxes", []) or []
+    labels = result.get("bboxes_labels", result.get("labels", [])) or []
+    if not boxes:
+        raise RuntimeError(f"Florence-2 found no box for query: {mask_query}")
+    return np.array(boxes, dtype="float32"), [str(item) for item in labels]
+
+
+def _run_florence_sam2(
+    *,
+    reference_video: Path,
+    output_mask_video: Path,
+    mask_query: str,
+    mask_mode: str,
+    florence_model_dir: Path,
+    grounded_sam2_code: Path,
+    sam2_config: str,
+    sam2_checkpoint: Path,
+) -> dict[str, Any]:
+    import sys
+
+    sys.path.insert(0, str(grounded_sam2_code))
+
+    import cv2
+    import numpy as np
+    import torch
+    from sam2.build_sam import build_sam2_video_predictor
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    with tempfile.TemporaryDirectory(prefix="florence_sam2_mask_") as tmp:
+        tmp_dir = Path(tmp)
+        frame_dir = tmp_dir / "frames"
+        mask_dir = tmp_dir / "masks"
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        _extract_frames(reference_video, frame_dir)
+        frame_paths = sorted(frame_dir.glob("*.jpg"))
+        if not frame_paths:
+            raise RuntimeError(f"no frames extracted from {reference_video}")
+
+        boxes_xyxy, labels = _florence_boxes(
+            image_path=frame_paths[0],
+            mask_query=mask_query,
+            florence_model_dir=florence_model_dir,
+            device=device,
+        )
+        predictor = build_sam2_video_predictor(sam2_config, str(sam2_checkpoint), device=device)
+        inference_state = predictor.init_state(video_path=str(frame_dir))
+        predictor.reset_state(inference_state)
+        for object_id, box in enumerate(boxes_xyxy[:3], start=1):
+            predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=0,
+                obj_id=object_id,
+                box=box,
+            )
+
+        frame_masks: dict[int, np.ndarray] = {}
+        for frame_idx, _object_ids, mask_logits in predictor.propagate_in_video(inference_state):
+            masks = (mask_logits > 0.0).detach().cpu().numpy()
+            if masks.ndim == 4:
+                masks = masks[:, 0]
+            union = np.any(masks, axis=0).astype("uint8")
+            if mask_mode == "edit_background_inverse_subject":
+                union = 1 - union
+            frame_masks[int(frame_idx)] = union
+
+        coverages: list[float] = []
+        ious: list[float] = []
+        last_mask: np.ndarray | None = None
+        for idx, frame_path in enumerate(frame_paths):
+            frame = cv2.imread(str(frame_path))
+            if frame is None:
+                raise RuntimeError(f"cannot read extracted frame: {frame_path}")
+            mask = frame_masks.get(idx)
+            if mask is None:
+                mask = np.zeros(frame.shape[:2], dtype="uint8")
+            if mask.shape[:2] != frame.shape[:2]:
+                mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+            coverages.append(float(mask.mean()))
+            if last_mask is not None:
+                intersection = float(np.logical_and(last_mask, mask).sum())
+                union = float(np.logical_or(last_mask, mask).sum())
+                ious.append(intersection / union if union > 0 else 0.0)
+            last_mask = mask.copy()
+            cv2.imwrite(str(mask_dir / f"{idx:05d}.png"), (mask * 255).astype("uint8"))
+
+        fps = _ffprobe_fps(reference_video)
+        _encode_mask_video(mask_dir, output_mask_video, fps)
+        return {
+            "frame_count": len(frame_paths),
+            "fps": fps,
+            "mask_coverage_ratio_min": min(coverages) if coverages else 0.0,
+            "mask_coverage_ratio_avg": sum(coverages) / len(coverages) if coverages else 0.0,
+            "mask_coverage_ratio_max": max(coverages) if coverages else 0.0,
+            "mask_temporal_stability": sum(ious) / len(ious) if ious else 1.0,
+            "detected_phrases": labels,
+            "box_count": int(len(boxes_xyxy)),
+            "device": device,
+            "grounder": "florence2",
+        }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default="/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval")
@@ -232,6 +374,8 @@ def main() -> None:
     parser.add_argument("--output-manifest-path", required=True)
     parser.add_argument("--report-path")
     parser.add_argument("--grounded-sam2-code", required=True)
+    parser.add_argument("--grounder", choices=("auto", "groundingdino", "florence2"), default="auto")
+    parser.add_argument("--florence-model", default="")
     parser.add_argument("--grounding-dino-config", required=True)
     parser.add_argument("--grounding-dino-checkpoint", required=True)
     parser.add_argument("--sam2-config", default="configs/sam2.1/sam2.1_hiera_l.yaml")
@@ -247,7 +391,12 @@ def main() -> None:
     manifest_by_plan = {str(row.get("plan_id", "")): dict(row) for row in original_manifest}
     grounded_sam2_code = Path(args.grounded_sam2_code)
     grounding_config = Path(args.grounding_dino_config)
-    grounding_checkpoint = _find_file(Path(args.grounding_dino_checkpoint), ("*.pth", "*.pt"))
+    grounding_checkpoint = None
+    if args.grounder in {"auto", "groundingdino"}:
+        grounding_checkpoint = _find_file(Path(args.grounding_dino_checkpoint), ("*.pth", "*.pt", "*.safetensors"))
+    florence_model_dir = None
+    if args.grounder in {"auto", "florence2"} and args.florence_model:
+        florence_model_dir = _find_dir(Path(args.florence_model), ("config.json",))
     sam2_checkpoint = _find_file(Path(args.sam2_checkpoint), ("*.pt", "*.pth"))
 
     output_records: list[dict[str, Any]] = []
@@ -260,19 +409,35 @@ def main() -> None:
             mask_video = Path(str(plan.get("mask_video") or row.get("mask_video", "")))
             if not mask_video.is_absolute():
                 mask_video = Path(args.mask_manifest_path).resolve().parent / mask_video
-            metrics = _run_grounded_sam2(
-                reference_video=reference_video,
-                output_mask_video=mask_video,
-                mask_query=str(plan.get("mask_query", "")).strip(),
-                mask_mode=str(plan.get("mask_mode", "")).strip(),
-                grounded_sam2_code=grounded_sam2_code,
-                grounding_dino_config=grounding_config,
-                grounding_dino_checkpoint=grounding_checkpoint,
-                sam2_config=str(args.sam2_config),
-                sam2_checkpoint=sam2_checkpoint,
-                box_threshold=args.box_threshold,
-                text_threshold=args.text_threshold,
-            )
+            if args.grounder == "florence2":
+                if florence_model_dir is None:
+                    raise RuntimeError("--florence-model is required when --grounder florence2")
+                metrics = _run_florence_sam2(
+                    reference_video=reference_video,
+                    output_mask_video=mask_video,
+                    mask_query=str(plan.get("mask_query", "")).strip(),
+                    mask_mode=str(plan.get("mask_mode", "")).strip(),
+                    florence_model_dir=florence_model_dir,
+                    grounded_sam2_code=grounded_sam2_code,
+                    sam2_config=str(args.sam2_config),
+                    sam2_checkpoint=sam2_checkpoint,
+                )
+            else:
+                if grounding_checkpoint is None:
+                    raise RuntimeError("GroundingDINO checkpoint is required")
+                metrics = _run_grounded_sam2(
+                    reference_video=reference_video,
+                    output_mask_video=mask_video,
+                    mask_query=str(plan.get("mask_query", "")).strip(),
+                    mask_mode=str(plan.get("mask_mode", "")).strip(),
+                    grounded_sam2_code=grounded_sam2_code,
+                    grounding_dino_config=grounding_config,
+                    grounding_dino_checkpoint=grounding_checkpoint,
+                    sam2_config=str(args.sam2_config),
+                    sam2_checkpoint=sam2_checkpoint,
+                    box_threshold=args.box_threshold,
+                    text_threshold=args.text_threshold,
+                )
             row.update(
                 {
                     "mask_video": str(mask_video),
