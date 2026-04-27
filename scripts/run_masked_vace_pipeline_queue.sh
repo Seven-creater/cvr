@@ -12,6 +12,7 @@ RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/masked_vace_pipeline_queue_$(date +%Y%m%d)}
 PAIR_CANDIDATES=${PAIR_CANDIDATES:-$SOURCE_RUN_ROOT/judged_pair_proposals.jsonl}
 CLIP_ANNOTATIONS=${CLIP_ANNOTATIONS:-$SOURCE_RUN_ROOT/detective_annotations.jsonl}
 VIDEO_EDIT_PLAN=${VIDEO_EDIT_PLAN:-$RUN_ROOT/video_edit_plan.jsonl}
+VIDEO_EDIT_PLANNER_CACHE=${VIDEO_EDIT_PLANNER_CACHE:-$RUN_ROOT/video_edit_planner_cache.jsonl}
 VIDEO_MASK_PLAN=${VIDEO_MASK_PLAN:-$RUN_ROOT/video_mask_plan.jsonl}
 VIDEO_MASK_MANIFEST=${VIDEO_MASK_MANIFEST:-$RUN_ROOT/video_mask_manifest.jsonl}
 GENERATED_MASK_MANIFEST=${GENERATED_MASK_MANIFEST:-$RUN_ROOT/video_mask_manifest.generated.jsonl}
@@ -29,6 +30,7 @@ MAX_PLANS=${MAX_PLANS:-30}
 MAX_MASKS=${MAX_MASKS:-}
 VACE_TOP_K=${VACE_TOP_K:-5}
 MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-20}
+PLANNING_MODE=${PLANNING_MODE:-production}
 
 MASK_GPU_IDS=${MASK_GPU_IDS:-6}
 VACE_GPU_IDS=${VACE_GPU_IDS:-2,3,4,5}
@@ -68,6 +70,7 @@ Options:
   --max-plans N
   --max-masks N
   --vace-top-k N
+  --planning-mode production|exploration
   --mask-gpu-ids IDS
   --vace-gpu-ids IDS
   --timeout-seconds N
@@ -95,6 +98,7 @@ while [[ $# -gt 0 ]]; do
     --max-plans) MAX_PLANS="$2"; shift 2 ;;
     --max-masks) MAX_MASKS="$2"; shift 2 ;;
     --vace-top-k) VACE_TOP_K="$2"; shift 2 ;;
+    --planning-mode) PLANNING_MODE="$2"; shift 2 ;;
     --mask-gpu-ids) MASK_GPU_IDS="$2"; shift 2 ;;
     --vace-gpu-ids) VACE_GPU_IDS="$2"; shift 2 ;;
     --timeout-seconds) TIMEOUT_SECONDS="$2"; shift 2 ;;
@@ -105,6 +109,7 @@ done
 
 # Recompute derived paths after CLI parsing so --run-root is authoritative.
 VIDEO_EDIT_PLAN="$RUN_ROOT/video_edit_plan.jsonl"
+VIDEO_EDIT_PLANNER_CACHE="$RUN_ROOT/video_edit_planner_cache.jsonl"
 VIDEO_MASK_PLAN="$RUN_ROOT/video_mask_plan.jsonl"
 VIDEO_MASK_MANIFEST="$RUN_ROOT/video_mask_manifest.jsonl"
 GENERATED_MASK_MANIFEST="$RUN_ROOT/video_mask_manifest.generated.jsonl"
@@ -139,6 +144,8 @@ run_plan() {
     --api-key "$API_KEY" \
     --model "$MODEL" \
     --timeout-seconds "$TIMEOUT_SECONDS" \
+    --planning-mode "$PLANNING_MODE" \
+    --planner-cache-path "$VIDEO_EDIT_PLANNER_CACHE" \
     | tee "$RUN_ROOT/logs/plan_video_edits.json"
 
   local mask_limit_args=()

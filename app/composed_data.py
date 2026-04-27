@@ -28,6 +28,7 @@ DEFAULT_SYNTHETIC_JUDGED_PAIRS_NAME = "judged_synthetic_pair_proposals.jsonl"
 DEFAULT_SYNTHETIC_ACCEPTED_PAIRS_NAME = "accepted_synthetic_pairs.jsonl"
 DEFAULT_SYNTHETIC_PILOT_REVIEW_NAME = "synthetic_pilot_review.md"
 DEFAULT_VIDEO_EDIT_PLAN_NAME = "video_edit_plan.jsonl"
+DEFAULT_VIDEO_EDIT_PLANNER_CACHE_NAME = "video_edit_planner_cache.jsonl"
 DEFAULT_VIDEO_MASK_PLAN_NAME = "video_mask_plan.jsonl"
 DEFAULT_VIDEO_MASK_MANIFEST_NAME = "video_mask_manifest.jsonl"
 DEFAULT_AUDIO_EDIT_PLAN_NAME = "audio_edit_plan.jsonl"
@@ -179,6 +180,40 @@ VACE_BACKGROUND_STYLE_MARKERS = {
     "rain",
     "sunset",
     "studio",
+}
+VACE_EXPLORATION_OBJECT_REPLACEMENTS = {
+    "cup": "bottle",
+    "mug": "bottle",
+    "glass": "bottle",
+    "phone": "tablet",
+    "smartphone": "tablet",
+    "mobile phone": "tablet",
+    "laptop": "tablet",
+    "computer": "tablet",
+    "book": "notebook",
+    "bag": "backpack",
+    "tote bag": "backpack",
+    "box": "suitcase",
+    "chair": "stool",
+    "bottle": "thermos",
+    "toy": "wooden toy",
+}
+VACE_EXPLORATION_REMOVABLE_OBJECTS = {
+    "cup",
+    "mug",
+    "glass",
+    "phone",
+    "smartphone",
+    "mobile phone",
+    "bag",
+    "tote bag",
+    "backpack",
+    "glasses",
+    "sunglasses",
+    "hat",
+    "chair",
+    "box",
+    "bottle",
 }
 INTRACLIP_CHANGE_MARKERS = (
     "change from",
@@ -1612,9 +1647,15 @@ def plan_video_edits(
     api_key: str = "EMPTY",
     model: str | None = None,
     timeout_seconds: float = 180.0,
+    planning_mode: str = "production",
+    planner_cache_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    planning_mode = str(planning_mode).strip() or "production"
+    if planning_mode not in {"production", "exploration"}:
+        raise ValueError("planning_mode must be 'production' or 'exploration'")
     layout = ensure_layout(root)
     candidates = list(_load_jsonl(Path(pair_candidates_path)))
+    original_candidate_count = len(candidates)
     annotations = list(_load_jsonl(Path(clip_annotations_path)))
     if not candidates:
         raise ValueError("pair candidates file is empty")
@@ -1623,6 +1664,9 @@ def plan_video_edits(
 
     annotation_lookup = _annotation_lookup(root=layout["root"], annotations=annotations)
     output = Path(output_path) if output_path else layout["pairs"] / DEFAULT_VIDEO_EDIT_PLAN_NAME
+    cache_output = Path(planner_cache_path) if planner_cache_path else output.with_name(DEFAULT_VIDEO_EDIT_PLANNER_CACHE_NAME)
+    planner_cache = _load_video_edit_planner_cache(cache_output)
+    planner_cache_dirty = False
     planner_client = (
         OpenAIComposedDataClient(
             base_url=base_url,
@@ -1637,7 +1681,33 @@ def plan_video_edits(
     plans: list[dict[str, Any]] = []
     skipped_by_type: Counter[str] = Counter()
     skipped_reasons: Counter[str] = Counter()
+    cache_hits = 0
+    cache_misses = 0
+    if planning_mode == "exploration":
+        exploration_candidates: list[dict[str, Any]] = []
+        for candidate in candidates:
+            reference_video = str(candidate.get("reference_video", "")).strip()
+            if not reference_video:
+                skipped_by_type["unknown"] += 1
+                skipped_reasons["missing_reference_video"] += 1
+                continue
+            reference_annotation = _annotation_for_video_edit_plan(
+                root=layout["root"],
+                lookup=annotation_lookup,
+                record=candidate,
+                video_field="reference_video",
+                caption_field="reference_caption",
+            )
+            generated = _video_edit_exploration_candidates(candidate, reference_annotation)
+            if generated:
+                exploration_candidates.extend(generated)
+                skipped_reasons["exploration_ideation_from_reference"] += len(generated)
+            else:
+                skipped_reasons["exploration_no_suitable_reference_edit"] += 1
+        candidates = exploration_candidates
+
     seen_sources: set[str] = set()
+    seen_plan_keys: set[tuple[str, str, str, str, str]] = set()
     for candidate in candidates:
         if len(plans) >= max_plans:
             break
@@ -1651,7 +1721,7 @@ def plan_video_edits(
             skipped_by_type[difference_type or "unknown"] += 1
             skipped_reasons["missing_reference_video"] += 1
             continue
-        if reference_video in seen_sources:
+        if planning_mode != "exploration" and reference_video in seen_sources:
             skipped_reasons["duplicate_reference_video"] += 1
             continue
 
@@ -1692,6 +1762,8 @@ def plan_video_edits(
                 skipped_reasons["unsupported_difference_type"] += 1
                 continue
         risk = _video_edit_risk_assessment(reference_annotation, difference_type=difference_type)
+        if planning_mode == "exploration":
+            risk = _relax_visual_exploration_risk(risk, candidate)
         if safe_visual_ideation_used:
             risk = _relax_safe_visual_ideation_risk(risk, candidate)
         if not risk["allow_generation"]:
@@ -1701,8 +1773,8 @@ def plan_video_edits(
                 skipped_reasons[f"risk_{reason}"] += 1
             continue
         edit_text = str(candidate.get("edit_text", "")).strip() or _build_fallback_edit_text(difference)
-        edit_token = _video_edit_token(difference, edit_text)
-        edit_region = _video_edit_region(edit_text, difference, reference_annotation, route)
+        edit_token = str(candidate.get("suggested_edit_token", "")).strip() or _video_edit_token(difference, edit_text)
+        edit_region = str(candidate.get("suggested_edit_region", "")).strip() or _video_edit_region(edit_text, difference, reference_annotation, route)
         if difference_type in {"object_presence", "object_count"} and (not edit_token or not edit_region):
             skipped_by_type[difference_type or "unknown"] += 1
             skipped_reasons["missing_object_edit_token_or_region"] += 1
@@ -1723,22 +1795,57 @@ def plan_video_edits(
             "fallback_used": True,
         }
         raw_planner_output: dict[str, Any] = {}
-        planned_mask_query = ""
-        planned_preserve_regions: list[str] = []
-        if planner_client is not None:
+        planned_mask_query = str(candidate.get("suggested_mask_query", "")).strip()
+        planned_preserve_regions: list[str] = [
+            str(item).strip()
+            for item in candidate.get("suggested_preserve_regions", [])
+            if str(item).strip()
+        ] if isinstance(candidate.get("suggested_preserve_regions"), list) else []
+        planner_input = {
+            "edit_text": edit_text,
+            "difference": difference,
+            "reference_video": reference_video,
+            "reference_caption": str(candidate.get("reference_caption", "")).strip(),
+            "model_route_hint": route,
+            "planning_mode": planning_mode,
+            "exploration_family": str(candidate.get("exploration_family", "")).strip(),
+        }
+        planner_cache_key = _video_edit_planner_cache_key(
+            model=model,
+            planning_mode=planning_mode,
+            route=route,
+            reference_video=reference_video,
+            reference_annotation=reference_annotation,
+            candidate=planner_input,
+        )
+        cached_planner_record = planner_cache.get(planner_cache_key)
+        if cached_planner_record:
+            cache_hits += 1
+        elif planner_client is not None:
+            cache_misses += 1
+        if planner_client is not None or cached_planner_record is not None:
             try:
-                planned, raw_planner_output = planner_client.plan_video_edit(
-                    reference_clip_path=str(_resolve_under_root(layout["root"], reference_video)),
-                    reference_annotation=_annotation_prompt_view(reference_annotation),
-                    candidate={
-                        "edit_text": edit_text,
-                        "difference": difference,
+                if cached_planner_record is not None:
+                    planned = dict(cached_planner_record.get("planned", {}))
+                    raw_planner_output = dict(cached_planner_record.get("raw_planner_output", {}))
+                else:
+                    planned, raw_planner_output = planner_client.plan_video_edit(
+                        reference_clip_path=str(_resolve_under_root(layout["root"], reference_video)),
+                        reference_annotation=_annotation_prompt_view(reference_annotation),
+                        candidate=planner_input,
+                        route_hint=route,
+                    )
+                    planner_cache[planner_cache_key] = {
+                        "cache_key": planner_cache_key,
+                        "model": model,
+                        "planning_mode": planning_mode,
+                        "route": route,
                         "reference_video": reference_video,
-                        "reference_caption": str(candidate.get("reference_caption", "")).strip(),
-                        "model_route_hint": route,
-                    },
-                    route_hint=route,
-                )
+                        "candidate": planner_input,
+                        "planned": planned,
+                        "raw_planner_output": raw_planner_output,
+                    }
+                    planner_cache_dirty = True
                 if not bool(planned.get("should_generate")):
                     skipped_by_type[difference_type or "unknown"] += 1
                     skipped_reasons["model_planner_rejected"] += 1
@@ -1794,6 +1901,7 @@ def plan_video_edits(
                     "input": "short_clip_reference_video",
                     "output": "source_prompt_target_prompt_edit_token_preserve_constraints",
                     "fallback_used": False,
+                    "cache_hit": cached_planner_record is not None,
                     "model": model,
                     "reason": str(planned.get("reason", "")).strip(),
                     "repaired_fields": list(planned.get("repaired_fields", [])),
@@ -1820,6 +1928,16 @@ def plan_video_edits(
         if not suitability["allow_generation"]:
             skipped_by_type[difference_type or "unknown"] += 1
             skipped_reasons[str(suitability["reason"])] += 1
+            continue
+        plan_key = (
+            reference_video,
+            str(difference.get("type", "")).strip(),
+            _normalized_phrase(str(difference.get("from", "")).strip()),
+            _normalized_phrase(str(difference.get("to", "")).strip()),
+            _normalized_phrase(edit_text),
+        )
+        if plan_key in seen_plan_keys:
+            skipped_reasons["duplicate_exploration_plan"] += 1
             continue
         control_plan = _video_edit_control_plan(route)
         mask_query = _video_mask_query(
@@ -1872,6 +1990,9 @@ def plan_video_edits(
             "reference_understanding": _video_edit_reference_understanding(reference_annotation),
             "route_suitability": suitability,
             "visual_edit_risk": risk,
+            "planning_mode": planning_mode,
+            "exploration_family": str(candidate.get("exploration_family", "")).strip(),
+            "exploration_goal": str(candidate.get("exploration_goal", "")).strip(),
             "generation_defaults": _video_edit_generation_defaults(route),
             "validation_requirements": {
                 "visual_near_duplicate_min": MIN_SYNTHETIC_VISUAL_CONTEXT_SCORE,
@@ -1883,14 +2004,22 @@ def plan_video_edits(
             },
         }
         plans.append(plan)
-        if route != "audio_deterministic":
+        seen_plan_keys.add(plan_key)
+        if route != "audio_deterministic" and planning_mode != "exploration":
             seen_sources.add(reference_video)
 
+    if planner_cache_dirty:
+        _write_jsonl(cache_output, list(planner_cache.values()))
     _write_jsonl(output, plans)
     return {
-        "candidate_count": len(candidates),
+        "candidate_count": original_candidate_count,
+        "expanded_candidate_count": len(candidates),
         "plan_count": len(plans),
+        "planning_mode": planning_mode,
         "output_path": str(output),
+        "planner_cache_path": str(cache_output),
+        "planner_cache_hits": cache_hits,
+        "planner_cache_misses": cache_misses,
         "skipped_by_type": dict(skipped_by_type),
         "skipped_reasons": dict(skipped_reasons),
     }
@@ -3155,6 +3284,46 @@ def _build_asset_id(dataset_name: str, relative_path: str) -> str:
 
 def _stable_hash(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _stable_json_hash(value: Any) -> str:
+    return _stable_hash(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
+
+
+def _load_video_edit_planner_cache(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    cache: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        if not isinstance(payload, dict):
+            continue
+        key = str(payload.get("cache_key", "")).strip()
+        if key:
+            cache[key] = payload
+    return cache
+
+
+def _video_edit_planner_cache_key(
+    *,
+    model: str | None,
+    planning_mode: str,
+    route: str,
+    reference_video: str,
+    reference_annotation: dict[str, Any],
+    candidate: dict[str, Any],
+) -> str:
+    payload = {
+        "model": model or "",
+        "planning_mode": planning_mode,
+        "route": route,
+        "reference_video": reference_video,
+        "reference_annotation": _annotation_prompt_view(reference_annotation),
+        "candidate": candidate,
+    }
+    return _stable_json_hash(payload)
 
 
 def _safe_id(value: str) -> str:
@@ -6968,6 +7137,237 @@ def _safe_visual_ideation_candidate(candidate: dict[str, Any], annotation: dict[
     return revised
 
 
+def _video_edit_exploration_candidates(candidate: dict[str, Any], annotation: dict[str, Any]) -> list[dict[str, Any]]:
+    reference_video = str(candidate.get("reference_video", "")).strip()
+    if not reference_video:
+        return []
+
+    subjects = _dedupe_strings(_normalize_list(annotation.get("subjects", [])))
+    object_names = list(_normalize_object_counts(annotation.get("object_counts", {})).keys())
+    scene = str(annotation.get("scene", "")).strip()
+    summary = str(annotation.get("summary", "")).strip()
+    text = _normalized_phrase(" ".join([summary, scene, " ".join(subjects), " ".join(object_names)]))
+    source_edit_text = str(candidate.get("edit_text", "")).strip()
+    source_difference = candidate.get("difference", {})
+    base_proposal = str(candidate.get("proposal_id", "")).strip() or _stable_hash(reference_video)[:8]
+
+    def build(
+        *,
+        family: str,
+        edit_text: str,
+        difference: dict[str, Any],
+        edit_token: str,
+        edit_region: str,
+        mask_query: str,
+        goal: str,
+    ) -> dict[str, Any]:
+        seed = "|".join([base_proposal, reference_video, family, edit_text])
+        revised = dict(candidate)
+        revised["proposal_id"] = f"{base_proposal}__vace_explore_{_safe_id(family)}_{_stable_hash(seed)[:8]}"
+        revised["edit_text"] = edit_text
+        revised["difference"] = difference
+        revised["source_candidate_edit_text"] = source_edit_text
+        revised["source_candidate_difference"] = source_difference
+        revised["candidate_source"] = "vace_exploration_from_reference"
+        revised["exploration_family"] = family
+        revised["exploration_goal"] = goal
+        revised["suggested_edit_token"] = edit_token
+        revised["suggested_edit_region"] = edit_region
+        revised["suggested_mask_query"] = mask_query
+        revised["suggested_preserve_regions"] = _exploration_preserve_regions(annotation, edit_region)
+        return revised
+
+    candidates: list[dict[str, Any]] = []
+    if any(marker in text for marker in ("robot", "robotic", "action figure")):
+        candidates.append(
+            build(
+                family="attribute_color",
+                edit_text="change the robot body color from black and gold to bright yellow",
+                difference={
+                    "type": "attribute",
+                    "from": "black and gold robot body",
+                    "to": "bright yellow robot body",
+                    "description": "The existing robot body changes from black and gold to bright yellow.",
+                },
+                edit_token="bright yellow robot body",
+                edit_region="robot body",
+                mask_query="robot body",
+                goal="test existing-subject color editing",
+            )
+        )
+        candidates.append(
+            build(
+                family="attribute_material",
+                edit_text="change the robot body material from black and gold plastic to metallic silver",
+                difference={
+                    "type": "attribute",
+                    "from": "black and gold plastic robot body",
+                    "to": "metallic silver robot body",
+                    "description": "The existing robot body material changes to metallic silver.",
+                },
+                edit_token="metallic silver robot body",
+                edit_region="robot body",
+                mask_query="robot body",
+                goal="test material and surface editing",
+            )
+        )
+
+    if any(marker in text for marker in ("shirt", "jacket", "coat", "dress", "clothing", "outfit")):
+        candidates.append(
+            build(
+                family="clothing_color",
+                edit_text="change the clothing color to deep navy blue",
+                difference={
+                    "type": "attribute",
+                    "from": "original clothing color",
+                    "to": "deep navy blue clothing",
+                    "description": "The existing clothing changes to deep navy blue.",
+                },
+                edit_token="deep navy blue clothing",
+                edit_region="clothing",
+                mask_query="clothing",
+                goal="test clothing recoloring",
+            )
+        )
+        candidates.append(
+            build(
+                family="clothing_type",
+                edit_text="change the outfit into a black jacket",
+                difference={
+                    "type": "attribute",
+                    "from": "original outfit",
+                    "to": "black jacket",
+                    "description": "The existing outfit changes into a black jacket.",
+                },
+                edit_token="black jacket",
+                edit_region="clothing",
+                mask_query="clothing",
+                goal="test masked clothing type change",
+            )
+        )
+
+    if any(marker in text for marker in ("car", "vehicle", "truck", "bus")):
+        candidates.append(
+            build(
+                family="vehicle_color",
+                edit_text="change the vehicle body color to bright orange",
+                difference={
+                    "type": "attribute",
+                    "from": "original vehicle body color",
+                    "to": "bright orange vehicle body",
+                    "description": "The existing vehicle body changes to bright orange.",
+                },
+                edit_token="bright orange vehicle body",
+                edit_region="vehicle body",
+                mask_query="vehicle body",
+                goal="test large vehicle color editing",
+            )
+        )
+
+    if any(marker in text for marker in ("room", "office", "kitchen", "street", "studio", "wall", "background")):
+        candidates.append(
+            build(
+                family="background_change",
+                edit_text="change the background to a futuristic laboratory",
+                difference={
+                    "type": "scene",
+                    "from": "original background",
+                    "to": "futuristic laboratory background",
+                    "description": "The background changes to a futuristic laboratory while the main subject remains.",
+                },
+                edit_token="futuristic laboratory background",
+                edit_region="background",
+                mask_query="background",
+                goal="test masked background replacement",
+            )
+        )
+        candidates.append(
+            build(
+                family="style_lighting",
+                edit_text="change the scene style to cinematic neon lighting",
+                difference={
+                    "type": "scene",
+                    "from": "original scene style",
+                    "to": "cinematic neon lighting style",
+                    "description": "The scene style changes to cinematic neon lighting.",
+                },
+                edit_token="cinematic neon lighting style",
+                edit_region="background",
+                mask_query="background",
+                goal="test style and lighting editing",
+            )
+        )
+
+    replacement_count = 0
+    removal_count = 0
+    for object_name in object_names + subjects:
+        normalized_object = _normalized_phrase(object_name)
+        if not normalized_object or normalized_object in {"person", "man", "woman", "people", "hand", "hands"}:
+            continue
+        replacement = VACE_EXPLORATION_OBJECT_REPLACEMENTS.get(normalized_object)
+        if replacement and replacement_count < 2:
+            replacement_count += 1
+            candidates.append(
+                build(
+                    family="object_replacement",
+                    edit_text=f"replace the {object_name} with a {replacement}",
+                    difference={
+                        "type": "object_presence",
+                        "from": object_name,
+                        "to": replacement,
+                        "description": f"The existing {object_name} is replaced by a {replacement}.",
+                    },
+                    edit_token=replacement,
+                    edit_region=object_name,
+                    mask_query=object_name,
+                    goal="test masked object replacement",
+                )
+            )
+        if normalized_object in VACE_EXPLORATION_REMOVABLE_OBJECTS and removal_count < 2:
+            removal_count += 1
+            candidates.append(
+                build(
+                    family="object_removal",
+                    edit_text=f"remove the {object_name} from the scene",
+                    difference={
+                        "type": "object_presence",
+                        "from": object_name,
+                        "to": f"no {object_name}",
+                        "description": f"The existing {object_name} is removed from the scene.",
+                    },
+                    edit_token=object_name,
+                    edit_region=object_name,
+                    mask_query=object_name,
+                    goal="test masked object removal and inpainting",
+                )
+            )
+
+    return candidates
+
+
+def _exploration_preserve_regions(annotation: dict[str, Any], edit_region: str) -> list[str]:
+    values: list[str] = []
+    values.extend(_normalize_list(annotation.get("subjects", [])))
+    values.extend(list(_normalize_object_counts(annotation.get("object_counts", {})).keys()))
+    values.extend(_normalize_list(annotation.get("actions", [])))
+    scene = str(annotation.get("scene", "")).strip()
+    if scene:
+        values.append(scene)
+    values.extend(["camera motion", "lighting", "timing", "visible text"])
+    edit_key = _normalized_phrase(edit_region)
+    preserved: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = _normalized_phrase(value)
+        if not key or key == edit_key or key in seen:
+            continue
+        seen.add(key)
+        preserved.append(str(value).strip())
+        if len(preserved) >= 8:
+            break
+    return preserved
+
+
 def _safe_visual_edit_anchor(annotation: dict[str, Any]) -> tuple[str, dict[str, Any], str] | None:
     values: list[str] = [
         str(annotation.get("summary", "")),
@@ -7065,6 +7465,30 @@ def _relax_safe_visual_ideation_risk(risk: dict[str, Any], candidate: dict[str, 
         "preserve all text, hands, people, actions, motion order, and background content exactly",
     ]
     for lock in extra_locks:
+        if lock not in locks:
+            locks.append(lock)
+    relaxed["locks"] = locks
+    return relaxed
+
+
+def _relax_visual_exploration_risk(risk: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    if str(candidate.get("candidate_source", "")) != "vace_exploration_from_reference":
+        return risk
+    risk_reasons = [str(reason) for reason in risk.get("risk_reasons", [])]
+    relaxed = dict(risk)
+    relaxed["allow_generation"] = True
+    relaxed["risk_level"] = "exploration_high" if risk_reasons else "exploration_low"
+    relaxed["vace_exploration_relaxed"] = True
+    relaxed["relaxed_risk_reasons"] = risk_reasons
+    locks = [
+        str(item).strip()
+        for item in risk.get("locks", [])
+        if str(item).strip()
+    ]
+    for lock in (
+        "this is an exploration run; generate the requested single masked edit even if the reference is risky",
+        "preserve all non-masked regions, visible text, people, camera motion, action timing, and scene layout exactly",
+    ):
         if lock not in locks:
             locks.append(lock)
     relaxed["locks"] = locks
@@ -8240,6 +8664,8 @@ def build_parser() -> argparse.ArgumentParser:
     plan_video_edits_parser.add_argument("--api-key", default="EMPTY")
     plan_video_edits_parser.add_argument("--model")
     plan_video_edits_parser.add_argument("--timeout-seconds", type=float, default=180.0)
+    plan_video_edits_parser.add_argument("--planning-mode", choices=("production", "exploration"), default="production")
+    plan_video_edits_parser.add_argument("--planner-cache-path")
 
     plan_audio_edits_parser = subparsers.add_parser("plan-audio-edits")
     plan_audio_edits_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -8399,6 +8825,8 @@ def main() -> None:
             api_key=args.api_key,
             model=args.model,
             timeout_seconds=args.timeout_seconds,
+            planning_mode=args.planning_mode,
+            planner_cache_path=args.planner_cache_path,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

@@ -4154,6 +4154,161 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("to_be_generated", plans[0]["vace_inputs"]["src_mask"])
             self.assertTrue(plans[0]["validation_requirements"]["requires_mask"])
 
+    def test_plan_video_edits_exploration_mode_generates_diverse_vace_families_from_one_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "robot_ref.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "robot_ref",
+                        "output_path": "clips/robot_ref.mp4",
+                        "summary": "a black and gold robotic action figure rotates in a dark studio with a cup beside it",
+                        "subjects": ["robotic action figure", "cup", "platform"],
+                        "object_counts": {"robotic action figure": 1, "cup": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio background",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "robot_candidate",
+                        "reference_video": "clips/robot_ref.mp4",
+                        "reference_caption": "a robot rotates in a studio",
+                        "edit_text": "change the action from rotating to hovering",
+                        "difference": {"type": "action", "from": "rotating", "to": "hovering"},
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=10,
+                planning_mode="exploration",
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            families = {plan["exploration_family"] for plan in plans}
+            self.assertEqual("exploration", summary["planning_mode"])
+            self.assertGreaterEqual(summary["plan_count"], 5)
+            self.assertIn("attribute_color", families)
+            self.assertIn("attribute_material", families)
+            self.assertIn("background_change", families)
+            self.assertIn("style_lighting", families)
+            self.assertIn("object_replacement", families)
+            self.assertTrue(all(plan["model_route"] == "vace_controlled" for plan in plans))
+            self.assertEqual({"clips/robot_ref.mp4"}, {plan["reference_video"] for plan in plans})
+
+    def test_plan_video_edits_reuses_cached_omni_prompt_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "robot_ref.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "robot_ref",
+                        "output_path": "clips/robot_ref.mp4",
+                        "summary": "a black and gold robotic action figure rotates on a reflective platform",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "robot_color",
+                        "reference_video": "clips/robot_ref.mp4",
+                        "reference_caption": "a robot rotates on a platform",
+                        "edit_text": "change the robot body color from black and gold to bright yellow",
+                        "difference": {
+                            "type": "attribute",
+                            "from": "black and gold robot body",
+                            "to": "bright yellow robot body",
+                        },
+                    }
+                ],
+            )
+            cache_path = root / "pairs" / "planner_cache.jsonl"
+            planned_payload = {
+                "should_generate": True,
+                "edit_text": "change the robot body color from black and gold to bright yellow",
+                "difference": {
+                    "type": "attribute",
+                    "from": "black and gold robot body",
+                    "to": "bright yellow robot body",
+                },
+                "source_prompt": "A black and gold robotic action figure rotates on a platform.",
+                "target_prompt": "The same robot rotates on the same platform, but the body is bright yellow.",
+                "edit_token": "bright yellow robot body",
+                "preserve_tokens": ["platform", "dark studio", "camera motion", "lighting"],
+                "negative_prompt": "Do not change the platform, background, camera, lighting, timing, or visible text.",
+                "edit_region": "robot body",
+                "mask_query": "robot body",
+                "model_route": "vace_controlled",
+                "reason": "large existing attribute edit",
+                "repaired_fields": [],
+            }
+
+            first_client = mock.Mock()
+            first_client.plan_video_edit.return_value = (planned_payload, {"raw": "planner"})
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=first_client):
+                first_summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    planner_cache_path=cache_path,
+                )
+
+            second_client = mock.Mock()
+            second_client.plan_video_edit.side_effect = AssertionError("cache should avoid Omni call")
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=second_client):
+                second_summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    planner_cache_path=cache_path,
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(second_summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, first_summary["planner_cache_misses"])
+            self.assertEqual(1, second_summary["planner_cache_hits"])
+            second_client.plan_video_edit.assert_not_called()
+            self.assertFalse(plans[0]["planner"]["fallback_used"])
+            self.assertTrue(plans[0]["planner"]["cache_hit"])
+
     def test_plan_video_masks_builds_grounded_sam_manifest_for_vace_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
