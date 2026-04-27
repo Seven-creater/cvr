@@ -127,7 +127,8 @@ echo "[vace-batch] start $(date)"
 echo "[vace-batch] selected ids:"
 cat "$SELECTED_IDS"
 
-while IFS= read -r PLAN_ID; do
+mapfile -t SELECTED_PLAN_IDS < "$SELECTED_IDS"
+for PLAN_ID in "${SELECTED_PLAN_IDS[@]}"; do
   [[ -z "$PLAN_ID" ]] && continue
   SAFE_PLAN_ID=$(python3 - "$PLAN_ID" <<'PY'
 import re, sys
@@ -154,7 +155,8 @@ PY
       --max-gpus "$MAX_GPUS" \
       --use-torchrun "$USE_TORCHRUN" \
       --ulysses-size "$ULYSSES_SIZE" \
-      --ring-size "$RING_SIZE"; then
+      --ring-size "$RING_SIZE" \
+      < /dev/null; then
     cat "$ITEM_ROOT/pairs/synthetic_visual_candidate_pairs.jsonl" >> "$BATCH_PAIRS"
     cat "$ITEM_ROOT/metadata/synthetic_visual_target_manifest.jsonl" >> "$BATCH_MANIFEST"
     echo "- PASS \`$PLAN_ID\`: \`$ITEM_ROOT\`" >> "$BATCH_REPORT"
@@ -164,7 +166,7 @@ PY
       exit 1
     fi
   fi
-done < "$SELECTED_IDS"
+done
 
 {
   echo

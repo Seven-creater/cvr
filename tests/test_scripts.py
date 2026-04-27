@@ -160,6 +160,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("PLAN_IDS", script)
         self.assertIn("TOP_K", script)
         self.assertIn("run_vace_visual_synthetic_smoke.sh", script)
+        self.assertIn("mapfile -t SELECTED_PLAN_IDS", script)
+        self.assertIn("< /dev/null", script)
         self.assertIn("MASK_MANIFEST", script)
         self.assertIn("--mask-manifest", script)
         self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
