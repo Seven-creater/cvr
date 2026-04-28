@@ -9,6 +9,7 @@ from unittest import mock
 from app.composed_data import (
     _accepted_sample_from_record,
     _action_evidence_score,
+    _annotation_prompt_view,
     _compose_reject_reason,
     _detect_primary_difference,
     _evidence_from_annotations,
@@ -431,6 +432,36 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("daily_omni", records_by_id["clip_a"]["dataset"])
             self.assertEqual(["row_a"], records_by_id["clip_a"]["source_row_ids"])
             self.assertEqual({"question": "What is the cat doing?"}, records_by_id["clip_a"]["text_fields"])
+
+    def test_annotation_prompt_view_truncates_long_fields(self) -> None:
+        annotation = {
+            "clip_id": "clip_long",
+            "output_path": "clips/clip_long.mp4",
+            "summary": "s" * 1200,
+            "subjects": [f"subject {idx}" for idx in range(20)],
+            "object_counts": {"subject": 1},
+            "actions": ["walking"],
+            "scene": "room",
+            "attributes": [],
+            "on_screen_text": [],
+            "speech": ["speech " + "x" * 500],
+            "audio_events": [],
+            "modalities": ["visual"],
+            "storyline": ["story " + "y" * 500 for _ in range(10)],
+            "events": [{"description": "event " + "z" * 500, "irrelevant": "drop me"}],
+            "visible_text": [],
+            "speakers_and_transcript": ["speaker " + "t" * 500],
+            "uncertainties": [],
+        }
+
+        prompt = _annotation_prompt_view(annotation)
+
+        self.assertLessEqual(len(prompt["summary"]), 700)
+        self.assertEqual(8, len(prompt["subjects"]))
+        self.assertLessEqual(len(prompt["speech"][0]), 180)
+        self.assertEqual(6, len(prompt["storyline"]))
+        self.assertLessEqual(len(prompt["storyline"][0]), 220)
+        self.assertEqual(["description"], list(prompt["events"][0].keys()))
 
     def test_annotate_clips_marks_fallback_without_batch_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

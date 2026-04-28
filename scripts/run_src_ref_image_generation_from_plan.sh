@@ -12,6 +12,8 @@ GPU_IDS=${GPU_IDS:-6}
 MAX_PLANS=${MAX_PLANS:-0}
 STEPS=${STEPS:-30}
 GUIDANCE_SCALE=${GUIDANCE_SCALE:-4.0}
+DEVICE_MAP=${DEVICE_MAP:-}
+LOW_CPU_MEM_USAGE=${LOW_CPU_MEM_USAGE:-0}
 
 usage() {
   cat <<'EOF'
@@ -26,6 +28,8 @@ Options:
   --max-plans N
   --steps N
   --guidance-scale N
+  --device-map balanced|auto
+  --low-cpu-mem-usage 0|1
 
 Generates VACE src_ref_images from src_ref_image_plan.jsonl using a local
 Diffusers-compatible image generation model, such as Qwen-Image.
@@ -42,6 +46,8 @@ while [[ $# -gt 0 ]]; do
     --max-plans) MAX_PLANS="$2"; shift 2 ;;
     --steps) STEPS="$2"; shift 2 ;;
     --guidance-scale) GUIDANCE_SCALE="$2"; shift 2 ;;
+    --device-map) DEVICE_MAP="$2"; shift 2 ;;
+    --low-cpu-mem-usage) LOW_CPU_MEM_USAGE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[src-ref-gen] unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -61,6 +67,7 @@ export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 
 echo "[src-ref-gen] conda_env=$CONDA_ENV"
 echo "[src-ref-gen] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "[src-ref-gen] device_map=${DEVICE_MAP:-none}"
 python - <<'PY'
 import os
 try:
@@ -77,10 +84,19 @@ else:
     print(f"[src-ref-gen] env_CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
 PY
 
+extra_args=()
+if [[ -n "$DEVICE_MAP" ]]; then
+  extra_args+=(--device-map "$DEVICE_MAP")
+fi
+if [[ "$LOW_CPU_MEM_USAGE" == "1" ]]; then
+  extra_args+=(--low-cpu-mem-usage)
+fi
+
 python scripts/generate_src_ref_images_from_plan.py \
   --src-ref-image-plan "$SRC_REF_IMAGE_PLAN" \
   --model-dir "$MODEL_DIR" \
   --output-manifest "$OUTPUT_MANIFEST" \
   --max-plans "$MAX_PLANS" \
   --steps "$STEPS" \
-  --guidance-scale "$GUIDANCE_SCALE"
+  --guidance-scale "$GUIDANCE_SCALE" \
+  "${extra_args[@]}"

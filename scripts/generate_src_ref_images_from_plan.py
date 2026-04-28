@@ -57,6 +57,8 @@ def main() -> None:
     parser.add_argument("--guidance-scale", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=20260427)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--device-map", default="")
+    parser.add_argument("--low-cpu-mem-usage", action="store_true")
     args = parser.parse_args()
 
     import torch
@@ -73,12 +75,17 @@ def main() -> None:
         raise ValueError("src_ref image plan is empty")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    pipe = DiffusionPipeline.from_pretrained(
-        str(model_dir),
-        torch_dtype=_torch_dtype(torch, args.dtype),
-        trust_remote_code=True,
-    )
-    pipe = pipe.to(device)
+    load_kwargs: dict[str, Any] = {
+        "torch_dtype": _torch_dtype(torch, args.dtype),
+        "trust_remote_code": True,
+    }
+    if args.device_map:
+        load_kwargs["device_map"] = args.device_map
+    if args.low_cpu_mem_usage:
+        load_kwargs["low_cpu_mem_usage"] = True
+    pipe = DiffusionPipeline.from_pretrained(str(model_dir), **load_kwargs)
+    if not args.device_map:
+        pipe = pipe.to(device)
 
     manifest: list[dict[str, Any]] = []
     for plan_index, plan in enumerate(plans, start=1):
@@ -95,7 +102,8 @@ def main() -> None:
         generated: list[str] = []
         for candidate_index in range(1, num_candidates + 1):
             prompt = prompts[(candidate_index - 1) % len(prompts)]
-            generator = torch.Generator(device=device).manual_seed(args.seed + plan_index * 1000 + candidate_index)
+            generator_device = "cpu" if args.device_map else device
+            generator = torch.Generator(device=generator_device).manual_seed(args.seed + plan_index * 1000 + candidate_index)
             image = _call_pipeline(
                 pipe,
                 prompt=prompt,

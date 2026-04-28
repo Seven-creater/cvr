@@ -6227,22 +6227,51 @@ def _annotation_prompt_view(annotation: dict[str, Any]) -> dict[str, Any]:
     return {
         "clip_id": annotation["clip_id"],
         "output_path": annotation["output_path"],
-        "summary": annotation.get("summary", ""),
-        "subjects": list(annotation.get("subjects", [])),
+        "summary": _truncate_text(annotation.get("summary", ""), 700),
+        "subjects": _prompt_list(annotation.get("subjects", []), limit=8, text_limit=80),
         "object_counts": dict(annotation.get("object_counts", {})),
-        "actions": list(annotation.get("actions", [])),
-        "scene": annotation.get("scene", ""),
-        "attributes": list(annotation.get("attributes", [])),
-        "on_screen_text": list(annotation.get("on_screen_text", [])),
-        "speech": list(annotation.get("speech", [])),
-        "audio_events": list(annotation.get("audio_events", [])),
-        "modalities": list(annotation.get("modalities", [])),
-        "storyline": list(annotation.get("storyline", [])),
-        "events": list(annotation.get("events", [])),
-        "visible_text": list(annotation.get("visible_text", [])),
-        "speakers_and_transcript": list(annotation.get("speakers_and_transcript", [])),
-        "uncertainties": list(annotation.get("uncertainties", [])),
+        "actions": _prompt_list(annotation.get("actions", []), limit=8, text_limit=80),
+        "scene": _truncate_text(annotation.get("scene", ""), 300),
+        "attributes": _prompt_list(annotation.get("attributes", []), limit=8, text_limit=120),
+        "on_screen_text": _prompt_list(annotation.get("on_screen_text", []), limit=8, text_limit=120),
+        "speech": _prompt_list(annotation.get("speech", []), limit=6, text_limit=180),
+        "audio_events": _prompt_list(annotation.get("audio_events", []), limit=8, text_limit=120),
+        "modalities": _prompt_list(annotation.get("modalities", []), limit=4, text_limit=40),
+        "storyline": _prompt_list(annotation.get("storyline", []), limit=6, text_limit=220),
+        "events": _prompt_list(annotation.get("events", []), limit=8, text_limit=220),
+        "visible_text": _prompt_list(annotation.get("visible_text", []), limit=8, text_limit=120),
+        "speakers_and_transcript": _prompt_list(annotation.get("speakers_and_transcript", []), limit=6, text_limit=220),
+        "uncertainties": _prompt_list(annotation.get("uncertainties", []), limit=6, text_limit=160),
     }
+
+
+def _truncate_text(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _prompt_list(value: Any, *, limit: int, text_limit: int) -> list[Any]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    compact: list[Any] = []
+    for item in value[:limit]:
+        if isinstance(item, dict):
+            compact.append(
+                {
+                    str(key): _truncate_text(raw_value, text_limit)
+                    for key, raw_value in item.items()
+                    if key in {"time", "timestamp", "description", "visual", "audio", "text", "action", "event", "objects"}
+                }
+            )
+        else:
+            text = _truncate_text(item, text_limit)
+            if text:
+                compact.append(text)
+    return compact
 
 
 def _fallback_clip_annotation() -> dict[str, Any]:
