@@ -1498,7 +1498,12 @@ def propose_group_pairs(
                     judge_fallback_used = True
 
                 try:
-                    verification, verification_raw_output = client.verify_pair_difference(
+                    (
+                        verification,
+                        verification_raw_output,
+                        verification_context_retry_used,
+                    ) = _verify_pair_difference_with_context_retry(
+                        client,
                         proposal=proposal_view,
                         reference_annotation=_annotation_prompt_view(reference_annotation),
                         target_annotation=_annotation_prompt_view(target_annotation),
@@ -1509,6 +1514,7 @@ def propose_group_pairs(
                 except Exception as exc:
                     verification = _fallback_pair_verification(reason=f"{type(exc).__name__}: {exc}")
                     verification_raw_output = {"error": f"{type(exc).__name__}: {exc}"}
+                    verification_context_retry_used = False
                     verification_fallback_used = True
 
                 judge = _finalize_pair_judge(judge)
@@ -1562,6 +1568,7 @@ def propose_group_pairs(
                     "raw_model_output": raw_model_output,
                     "raw_judge_output": judge_raw_output,
                     "raw_verification_output": verification_raw_output,
+                    "verification_annotation_only_retry_used": verification_context_retry_used,
                 }
                 proposed_count += 1
 
@@ -2916,7 +2923,12 @@ def validate_known_pairs(
                 judge_fallback_used = True
 
             try:
-                verification, raw_verification_output = client.verify_pair_difference(
+                (
+                    verification,
+                    raw_verification_output,
+                    verification_context_retry_used,
+                ) = _verify_pair_difference_with_context_retry(
+                    client,
                     proposal=proposal_view,
                     reference_annotation=_annotation_prompt_view(reference_annotation),
                     target_annotation=_annotation_prompt_view(target_annotation),
@@ -2927,6 +2939,7 @@ def validate_known_pairs(
             except Exception as exc:
                 verification = _fallback_pair_verification(reason=f"{type(exc).__name__}: {exc}")
                 raw_verification_output = {"error": f"{type(exc).__name__}: {exc}"}
+                verification_context_retry_used = False
                 verification_fallback_used = True
 
             judge = _finalize_pair_judge(judge)
@@ -2981,6 +2994,7 @@ def validate_known_pairs(
                 "raw_model_output": {"known_pair": True},
                 "raw_judge_output": raw_judge_output,
                 "raw_verification_output": raw_verification_output,
+                "verification_annotation_only_retry_used": verification_context_retry_used,
             }
             proposed_count += 1
 
@@ -6403,6 +6417,68 @@ def _fallback_pair_judge(quality: dict[str, Any], *, reason: str) -> dict[str, A
         "accept": False,
         "reject_reason": f"pair judge fallback: {reason}",
     }
+
+
+def _is_verification_context_limit_error(exc: Exception) -> bool:
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        marker in message
+        for marker in (
+            "context length",
+            "context window",
+            "input length",
+            "max_model_len",
+            "maximum context",
+            "too many tokens",
+            "token limit",
+        )
+    )
+
+
+def _verify_pair_difference_with_context_retry(
+    client: OpenAIComposedDataClient,
+    *,
+    proposal: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    reference_clip_path: str,
+    target_clip_path: str,
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    try:
+        verification, raw_output = client.verify_pair_difference(
+            proposal=proposal,
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            reference_clip_path=reference_clip_path,
+            target_clip_path=target_clip_path,
+        )
+        return verification, raw_output, False
+    except Exception as exc:
+        if not _is_verification_context_limit_error(exc):
+            raise
+        first_error = f"{type(exc).__name__}: {exc}"
+        try:
+            verification, retry_raw_output = client.verify_pair_difference(
+                proposal=proposal,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                reference_clip_path=None,
+                target_clip_path=None,
+            )
+        except Exception as retry_exc:
+            raise RuntimeError(
+                "annotation-only verification retry failed after video verification "
+                f"context error: {first_error}; retry error: {type(retry_exc).__name__}: {retry_exc}"
+            ) from retry_exc
+        return (
+            verification,
+            {
+                "video_verification_error": first_error,
+                "annotation_only_retry_used": True,
+                "annotation_only_retry": retry_raw_output,
+            },
+            True,
+        )
 
 
 def _fallback_pair_verification(*, reason: str) -> dict[str, Any]:

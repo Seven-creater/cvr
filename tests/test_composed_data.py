@@ -3805,6 +3805,167 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("synthetic_edit", accepted_records[0]["source_type"])
             self.assertEqual("Wan2.1-VACE-1.3B", accepted_records[0]["generation"]["model"])
 
+    def test_validate_known_pairs_retries_verification_without_video_on_context_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            annotations_path = root / "captions" / "known_annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref",
+                        "output_path": "clips/ref.mp4",
+                        "summary": "a chair without a backpack",
+                        "subjects": ["chair"],
+                        "object_counts": {"chair": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                    {
+                        "clip_id": "target",
+                        "output_path": "clips/target.mp4",
+                        "summary": "a chair with a red backpack",
+                        "subjects": ["chair", "red backpack"],
+                        "object_counts": {"chair": 1, "red backpack": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": ["red"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                    {
+                        "clip_id": "neg1",
+                        "output_path": "clips/neg1.mp4",
+                        "summary": "a chair with a blue backpack",
+                        "subjects": ["chair", "blue backpack"],
+                        "object_counts": {"chair": 1, "blue backpack": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": ["blue"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                    {
+                        "clip_id": "neg2",
+                        "output_path": "clips/neg2.mp4",
+                        "summary": "a chair with a laptop",
+                        "subjects": ["chair", "laptop"],
+                        "object_counts": {"chair": 1, "laptop": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                ],
+            )
+            known_pairs_path = root / "pairs" / "synthetic_candidate_pairs.jsonl"
+            self._write_jsonl(
+                known_pairs_path,
+                [
+                    {
+                        "source_type": "synthetic_edit",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": "clips/target.mp4",
+                        "edit_text": "add a red backpack on the chair",
+                        "modalities": ["visual"],
+                        "difference": {
+                            "type": "object_presence",
+                            "from": "no red backpack",
+                            "to": "red backpack",
+                            "description": "a red backpack is added to the chair",
+                        },
+                        "quality": {"visual_near_duplicate_score": 0.9},
+                        "hard_negatives": ["clips/neg1.mp4", "clips/neg2.mp4"],
+                        "generation": {
+                            "model": "Wan2.1-VACE-1.3B",
+                            "model_route": "vace_controlled",
+                            "source_video": "clips/ref.mp4",
+                            "prompt": "Only add a red backpack on the chair.",
+                            "target_prompt": "a chair with a red backpack",
+                            "source_prompt": "a chair without a backpack",
+                            "preserve_tokens": ["chair", "room", "camera motion"],
+                            "postprocess": {"audio_copied_from_reference": True},
+                            "seed": 1234,
+                        },
+                    }
+                ],
+            )
+            verification = {
+                "caption_delta": {
+                    "caption_equivalent": False,
+                    "has_concrete_difference": True,
+                    "difference_matches_edit": True,
+                },
+                "edit_projection": {"target_matches_projection": True, "score": 0.95},
+                "edit_necessity": {
+                    "edit_needed": True,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.92,
+                },
+            }
+            judge = {
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "single_main_difference": True,
+                "same_context_score": 0.95,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "audio_required": False,
+                "hard_negative_quality": "good",
+                "accept": True,
+                "reject_reason": "",
+            }
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client = client_cls.return_value
+                client.judge_pair.return_value = (judge, {"provider": "mock"})
+                client.verify_pair_difference.side_effect = [
+                    RuntimeError("input length 21257 exceeds max_model_len 16384"),
+                    (verification, {"provider": "mock-retry"}),
+                ]
+                summary = validate_known_pairs(
+                    root=root,
+                    known_pairs_path=known_pairs_path,
+                    clip_annotations_path=annotations_path,
+                    output_path=root / "pairs" / "judged_synthetic_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_synthetic_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="instruct-model",
+                    overwrite=True,
+                )
+
+            self.assertEqual(2, client.verify_pair_difference.call_count)
+            first_call = client.verify_pair_difference.call_args_list[0].kwargs
+            retry_call = client.verify_pair_difference.call_args_list[1].kwargs
+            self.assertEqual(Path(first_call["reference_clip_path"]).name, "ref.mp4")
+            self.assertIsNone(retry_call["reference_clip_path"])
+            self.assertIsNone(retry_call["target_clip_path"])
+            judged = [
+                json.loads(line)
+                for line in (root / "pairs" / "judged_synthetic_pair_proposals.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertTrue(judged[0]["verification_annotation_only_retry_used"])
+            self.assertIn("video_verification_error", judged[0]["raw_verification_output"])
+            self.assertEqual({"provider": "mock-retry"}, judged[0]["raw_verification_output"]["annotation_only_retry"])
+
     def test_synthetic_sample_ids_are_stable_per_proposal_not_batch_index(self) -> None:
         first = _accepted_sample_from_record(
             {

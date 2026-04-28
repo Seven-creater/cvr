@@ -144,6 +144,21 @@ env_path = Path(sys.argv[8])
 out_root = Path(sys.argv[9])
 wan_ckpt = Path(sys.argv[10])
 
+def resolve_existing_path(raw_path, base_dirs):
+    raw = str(raw_path).strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    candidates = [path]
+    for base_dir in base_dirs:
+        candidates.append(Path(base_dir) / path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
 rows = [json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 if not rows:
     raise SystemExit(f"empty video edit plan: {plan_path}")
@@ -196,20 +211,16 @@ if src_ref_selection_path:
     selection_matches = [row for row in selection_rows if str(row.get("plan_id", "")) == plan_id]
     if selection_matches:
         for raw_image in selection_matches[0].get("selected_src_ref_images", []):
-            image_path = Path(str(raw_image))
-            if not image_path.is_absolute():
-                image_path = src_ref_selection_path.parent / image_path
-            if not image_path.exists():
+            image_path = resolve_existing_path(raw_image, [src_ref_selection_path.parent, data_root])
+            if image_path is None or not image_path.exists():
                 raise SystemExit(f"selected src_ref_image does not exist for plan_id {plan_id}: {image_path}")
             src_ref_images.append(str(image_path))
     elif (plan.get("src_ref_requirements") or {}).get("required"):
         raise SystemExit(f"src_ref selection has no row for required plan_id: {plan_id}")
 else:
     for raw_image in ((plan.get("vace_inputs") or {}).get("src_ref_images") or []):
-        image_path = Path(str(raw_image))
-        if not image_path.is_absolute():
-            image_path = data_root / image_path
-        if image_path.exists():
+        image_path = resolve_existing_path(raw_image, [data_root, plan_path.parent])
+        if image_path is not None and image_path.exists():
             src_ref_images.append(str(image_path))
 if (plan.get("src_ref_requirements") or {}).get("required") and not src_ref_images:
     raise SystemExit(f"plan_id {plan_id} requires src_ref_images but none were selected")

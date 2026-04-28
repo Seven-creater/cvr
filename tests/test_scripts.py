@@ -153,6 +153,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--src_ref_images", script)
         self.assertIn("SRC_REF_IMAGES", script)
         self.assertIn("--src-ref-selection", script)
+        self.assertIn("resolve_existing_path", script)
+        self.assertIn("candidates = [path]", script)
         self.assertIn("src_mask", script)
         self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
         self.assertIn("synthetic_visual_target_manifest.jsonl", script)
