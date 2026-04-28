@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -2208,6 +2209,7 @@ def plan_stable_omni_clips(
     output = Path(output_path) if output_path else layout["metadata"] / "omni_stable_clip_plan.jsonl"
     cache_output = Path(cache_path) if cache_path else layout["caches"] / DEFAULT_OMNI_STABLE_CLIP_SELECTION_CACHE_NAME
     cache = _load_records_by_key(cache_output, "cache_key")
+    _write_jsonl(output, [])
     client = (
         OpenAIComposedDataClient(
             base_url=base_url,
@@ -2291,12 +2293,14 @@ def plan_stable_omni_clips(
                     "fallback_used": True,
                     "reason": "no Omni endpoint supplied",
                 }
-            cache_records[cache_key] = {
+            cache_record = {
                 "cache_key": cache_key,
                 "asset_id": asset.get("asset_id"),
                 "source_video": str(source_path),
                 "selection": selection,
             }
+            cache_records[cache_key] = cache_record
+            _append_jsonl_record(cache_output, cache_record)
 
         if not bool(selection.get("recommended_for_vace", True)):
             skipped_reasons["not_recommended_for_vace"] += 1
@@ -2322,6 +2326,7 @@ def plan_stable_omni_clips(
             "stable_clip_selection": selection,
         }
         plan_records.append(clip_record)
+        _append_jsonl_record(output, clip_record)
 
     _write_jsonl(output, plan_records)
     _write_jsonl(cache_output, list(cache_records.values()))
@@ -9169,6 +9174,14 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _append_jsonl_record(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _resolve_under_root(root: Path, raw_path: str | Path) -> Path:

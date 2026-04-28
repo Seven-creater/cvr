@@ -255,6 +255,89 @@ class ComposedDataTests(unittest.TestCase):
             self.assertLessEqual(records[0]["duration_seconds"], 8.0)
             self.assertIn("stable_clip_selection", records[0])
 
+    def test_plan_stable_omni_clips_persists_each_cache_record_before_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "raw_datasets" / "daily_omni"
+            source.mkdir(parents=True)
+            (source / "a.mp4").write_bytes(b"a")
+            (source / "b.mp4").write_bytes(b"b")
+            index_raw_sources(root=root, sources=[("daily_omni", source)])
+            output_path = root / "metadata" / "stable_plan.jsonl"
+            cache_path = root / "caches" / "stable_cache.jsonl"
+
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={
+                    "duration_seconds": 20.0,
+                    "has_audio": True,
+                    "has_video": True,
+                    "width": 640,
+                    "height": 360,
+                    "fps": 25.0,
+                },
+            ), mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client = client_cls.return_value
+                client.select_stable_clip_window.side_effect = [
+                    (
+                        {
+                            "start_sec": 2.0,
+                            "end_sec": 8.0,
+                            "stability_score": 0.95,
+                            "camera_motion": "static",
+                            "main_subjects": ["robot"],
+                            "visible_text_risk": False,
+                            "recommended_for_vace": True,
+                            "reason": "stable single subject",
+                        },
+                        {"provider": "mock"},
+                    ),
+                    KeyboardInterrupt(),
+                ]
+
+                with self.assertRaises(KeyboardInterrupt):
+                    plan_stable_omni_clips(
+                        root=root,
+                        output_path=output_path,
+                        cache_path=cache_path,
+                        max_source_videos=2,
+                        min_clip_seconds=5.0,
+                        max_clip_seconds=8.0,
+                        base_url="http://127.0.0.1:8093/v1",
+                        api_key="EMPTY",
+                        model="omni",
+                    )
+
+            cache_records = [json.loads(line) for line in cache_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            plan_records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, len(cache_records))
+            self.assertEqual(1, len(plan_records))
+            self.assertEqual("stable single subject", cache_records[0]["selection"]["reason"])
+
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={
+                    "duration_seconds": 20.0,
+                    "has_audio": True,
+                    "has_video": True,
+                    "width": 640,
+                    "height": 360,
+                    "fps": 25.0,
+                },
+            ):
+                resumed = plan_stable_omni_clips(
+                    root=root,
+                    output_path=output_path,
+                    cache_path=cache_path,
+                    max_source_videos=1,
+                    min_clip_seconds=5.0,
+                    max_clip_seconds=8.0,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="omni",
+                )
+            self.assertEqual(1, resumed["cache_hits"])
+
     def test_cache_reference_understandings_writes_stable_edit_targets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
