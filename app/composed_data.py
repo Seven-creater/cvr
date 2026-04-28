@@ -1702,6 +1702,9 @@ def plan_video_edits(
                 video_field="reference_video",
                 caption_field="reference_caption",
             )
+            if not _annotation_is_usable_for_reference_understanding(reference_annotation):
+                skipped_reasons["reference_annotation_unusable"] += 1
+                continue
             generated = _video_edit_exploration_candidates(candidate, reference_annotation)
             if generated:
                 exploration_candidates.extend(generated)
@@ -1736,6 +1739,10 @@ def plan_video_edits(
             video_field="reference_video",
             caption_field="reference_caption",
         )
+        if not _annotation_is_usable_for_reference_understanding(reference_annotation):
+            skipped_by_type[difference_type or "unknown"] += 1
+            skipped_reasons["reference_annotation_unusable"] += 1
+            continue
         if route not in {None, "vace_controlled"} and planner_client is not None:
             ideation_candidate = _safe_visual_ideation_candidate(candidate, reference_annotation)
             if ideation_candidate is not None:
@@ -2334,7 +2341,11 @@ def cache_reference_understandings(
         raise ValueError("clip annotations are empty")
     output = Path(output_path) if output_path else layout["caches"] / DEFAULT_REFERENCE_UNDERSTANDING_CACHE_NAME
     records: list[dict[str, Any]] = []
+    skipped_unusable_count = 0
     for annotation in annotations:
+        if not _annotation_is_usable_for_reference_understanding(annotation):
+            skipped_unusable_count += 1
+            continue
         reference_video = str(annotation.get("output_path") or annotation.get("source_path") or "").strip()
         clip_id = str(annotation.get("clip_id", "")).strip() or _stable_hash(reference_video)
         visual_understanding = _video_edit_reference_understanding(annotation)
@@ -2363,6 +2374,7 @@ def cache_reference_understandings(
     return {
         "clip_annotations_path": str(clip_annotations_path),
         "understanding_count": len(records),
+        "skipped_unusable_annotation_count": skipped_unusable_count,
         "output_path": str(output),
     }
 
@@ -8133,6 +8145,33 @@ def _stable_edit_targets_from_understanding(
             )
             break
     return targets[:8]
+
+
+def _annotation_is_usable_for_reference_understanding(annotation: dict[str, Any]) -> bool:
+    if bool(annotation.get("fallback_used")):
+        return False
+    if str(annotation.get("detective_fallback_reason", "")).strip() == "detective_and_single_pass_failed":
+        return False
+    if str(annotation.get("fallback_reason", "")).strip() == "annotation_fallback":
+        return False
+    text_fields = [
+        str(annotation.get("summary", "")).strip(),
+        str(annotation.get("scene", "")).strip(),
+    ]
+    list_fields = (
+        _normalize_list(annotation.get("subjects", []))
+        + _normalize_list(annotation.get("actions", []))
+        + _normalize_list(annotation.get("visible_text", []))
+        + _normalize_list(annotation.get("on_screen_text", []))
+        + _normalize_list(annotation.get("audio_events", []))
+        + _normalize_list(annotation.get("speech", []))
+        + _normalize_list(annotation.get("storyline", []))
+        + _normalize_list(annotation.get("events", []))
+    )
+    if any(text_fields) or any(str(item).strip() for item in list_fields):
+        return True
+    object_counts = annotation.get("object_counts")
+    return isinstance(object_counts, dict) and bool(object_counts)
 
 
 def _src_ref_requirement_for_video_plan(plan: dict[str, Any]) -> dict[str, Any]:

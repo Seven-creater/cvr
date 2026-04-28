@@ -286,6 +286,47 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(records[0]["stable_edit_targets"])
             self.assertEqual("robot body", records[0]["stable_edit_targets"][0]["target"])
 
+    def test_cache_reference_understandings_skips_failed_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "empty_fallback",
+                        "output_path": "clips/empty_fallback.mp4",
+                        "summary": "",
+                        "subjects": [],
+                        "actions": [],
+                        "scene": "",
+                        "fallback_used": True,
+                        "detective_fallback_reason": "detective_and_single_pass_failed",
+                    },
+                    {
+                        "clip_id": "usable",
+                        "output_path": "clips/usable.mp4",
+                        "summary": "a red tote bag on a table",
+                        "subjects": ["tote bag"],
+                        "object_counts": {"tote bag": 1},
+                        "actions": ["resting"],
+                        "scene": "tabletop",
+                    },
+                ],
+            )
+
+            summary = cache_reference_understandings(root=root, clip_annotations_path=annotations_path)
+            records = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["understanding_count"])
+            self.assertEqual(1, summary["skipped_unusable_annotation_count"])
+            self.assertEqual(["usable"], [record["clip_id"] for record in records])
+
     def test_annotate_clips_writes_complete_annotations_with_mock_client(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3944,6 +3985,55 @@ class ComposedDataTests(unittest.TestCase):
             self.assertIn("mobile phone", plans[0]["source_prompt"])
             self.assertIn("tablet", plans[0]["target_prompt"])
             self.assertEqual(1, summary["skipped_by_type"]["audio_event"])
+
+    def test_plan_video_edits_skips_unusable_reference_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "fallback_ref",
+                        "output_path": "clips/fallback_ref.mp4",
+                        "summary": "",
+                        "subjects": [],
+                        "actions": [],
+                        "scene": "",
+                        "fallback_used": True,
+                        "detective_fallback_reason": "detective_and_single_pass_failed",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "proposal__fallback",
+                        "reference_video": "clips/fallback_ref.mp4",
+                        "edit_text": "change the robot body color from black and gold to bright yellow",
+                        "difference": {"type": "attribute", "from": "black and gold", "to": "bright yellow"},
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual([], plans)
+            self.assertEqual(1, summary["skipped_reasons"]["reference_annotation_unusable"])
 
     def test_plan_video_edits_uses_model_prompt_planner_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
