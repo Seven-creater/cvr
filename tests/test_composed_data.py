@@ -616,6 +616,102 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(["visual"], records_by_id["clip_a"]["modalities"])
             self.assertFalse(records_by_id["clip_b"]["fallback_used"])
 
+    def test_detective_annotate_clips_persists_each_record_and_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "clip_a.mp4").write_bytes(b"a")
+            (root / "clips" / "clip_b.mp4").write_bytes(b"b")
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [
+                    {"clip_id": "clip_a", "source_asset_id": "asset_a", "output_path": "clips/clip_a.mp4"},
+                    {"clip_id": "clip_b", "source_asset_id": "asset_b", "output_path": "clips/clip_b.mp4"},
+                ],
+            )
+            output_path = root / "captions" / "clip_annotations_detective.jsonl"
+            detective_output = (
+                {
+                    "summary": "a robot rotates in a studio",
+                    "subjects": ["robot"],
+                    "object_counts": {"robot": 1},
+                    "actions": ["rotating"],
+                    "scene": "studio",
+                    "attributes": ["black and gold"],
+                    "on_screen_text": [],
+                    "speech": [],
+                    "audio_events": [],
+                    "modalities": ["visual"],
+                    "storyline": ["robot rotates"],
+                    "visible_text": [],
+                    "speakers_and_transcript": [],
+                    "detective_notes": [],
+                    "detective_trajectory": [{"stage": "observer"}],
+                    "uncertainties": [],
+                },
+                {"provider": "mock", "mode": "detective"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client = client_cls.return_value
+                client.annotate_clip_detective.side_effect = [detective_output, KeyboardInterrupt()]
+                with self.assertRaises(KeyboardInterrupt):
+                    detective_annotate_clips(
+                        root=root,
+                        clips_manifest_path=manifest_path,
+                        output_path=output_path,
+                        base_url="http://127.0.0.1:8093/v1",
+                        api_key="EMPTY",
+                        model="qwen3-omni",
+                        overwrite=True,
+                    )
+                self.assertEqual(2, client.annotate_clip_detective.call_count)
+
+            partial_records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(["clip_a"], [record["clip_id"] for record in partial_records])
+
+            second_output = (
+                {
+                    "summary": "a tote bag rests on a table",
+                    "subjects": ["tote bag"],
+                    "object_counts": {"tote bag": 1},
+                    "actions": [],
+                    "scene": "room",
+                    "attributes": ["red"],
+                    "on_screen_text": [],
+                    "speech": [],
+                    "audio_events": [],
+                    "modalities": ["visual"],
+                    "storyline": ["bag on table"],
+                    "visible_text": [],
+                    "speakers_and_transcript": [],
+                    "detective_notes": [],
+                    "detective_trajectory": [{"stage": "observer"}],
+                    "uncertainties": [],
+                },
+                {"provider": "mock", "mode": "detective"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client = client_cls.return_value
+                client.annotate_clip_detective.return_value = second_output
+                summary = detective_annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=output_path,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    overwrite=True,
+                )
+                self.assertEqual(1, client.annotate_clip_detective.call_count)
+
+            final_records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(2, summary["clip_count"])
+            self.assertEqual(1, summary["reused_count"])
+            self.assertEqual(1, summary["annotated_count"])
+            self.assertEqual({"clip_a", "clip_b"}, {record["clip_id"] for record in final_records})
+
     def test_detective_annotate_clips_writes_trajectory_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

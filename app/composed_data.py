@@ -1010,7 +1010,12 @@ def _annotate_clips_impl(
         raise ValueError("clip manifest is empty")
 
     output = Path(output_path) if output_path else layout["captions"] / DEFAULT_CLIP_ANNOTATIONS_NAME
-    existing_records = {} if overwrite else _load_records_by_key(output, "clip_id")
+    # Long Omni annotation runs must be restartable.  Even when callers pass
+    # overwrite=True for a fresh run, keep already written records as a resume
+    # cache; delete the output file explicitly to force a full re-annotation.
+    existing_records = _load_records_by_key(output, "clip_id")
+    if not output.exists():
+        _write_jsonl(output, [])
     client = OpenAIComposedDataClient(
         base_url=base_url,
         api_key=api_key,
@@ -1123,6 +1128,7 @@ def _annotate_clips_impl(
             if fallback_reason:
                 record["fallback_reason"] = fallback_reason
             annotated_count += 1
+            _append_jsonl_record(output, record)
 
         if bool(record.get("fallback_used")):
             fallback_count += 1
