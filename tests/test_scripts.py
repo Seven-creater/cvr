@@ -250,6 +250,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("cache-reference-understandings", script)
         self.assertIn("plan-src-ref-images", script)
         self.assertIn("run_src_ref_image_generation_from_plan.sh", script)
+        self.assertIn("--image-gpu-ids", script)
+        self.assertIn("IMAGE_GEN_GPU_IDS", script)
         self.assertIn("select-src-ref-images", script)
         self.assertIn("PLANNING_MODE=${PLANNING_MODE:-production}", script)
         self.assertIn("plan-video-edits", script)
@@ -280,6 +282,7 @@ class ScriptTests(unittest.TestCase):
 
         self.assertIn("Qwen-Image-2512", script)
         self.assertIn("CUDA_VISIBLE_DEVICES", script)
+        self.assertIn("[src-ref-gen] CUDA_VISIBLE_DEVICES", script)
         self.assertIn("generate_src_ref_images_from_plan.py", script)
         self.assertIn("DiffusionPipeline.from_pretrained", helper)
         self.assertIn('f"candidate_{candidate_index:03d}.png"', helper)

@@ -59,6 +59,24 @@ source /data02/usr/wangqihao/miniconda3/etc/profile.d/conda.sh
 conda activate "$CONDA_ENV"
 export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 
+echo "[src-ref-gen] conda_env=$CONDA_ENV"
+echo "[src-ref-gen] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+python - <<'PY'
+import os
+try:
+    import torch
+except Exception as exc:
+    print(f"[src-ref-gen] torch import failed: {exc}")
+else:
+    print(f"[src-ref-gen] torch_cuda_available={torch.cuda.is_available()}")
+    print(f"[src-ref-gen] torch_visible_device_count={torch.cuda.device_count()}")
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        print(f"[src-ref-gen] torch_logical_device_0={torch.cuda.get_device_name(0)}")
+        free, total = torch.cuda.mem_get_info(0)
+        print(f"[src-ref-gen] torch_logical_device_0_free_mib={free // (1024 * 1024)} total_mib={total // (1024 * 1024)}")
+    print(f"[src-ref-gen] env_CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
+PY
+
 python scripts/generate_src_ref_images_from_plan.py \
   --src-ref-image-plan "$SRC_REF_IMAGE_PLAN" \
   --model-dir "$MODEL_DIR" \

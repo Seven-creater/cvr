@@ -27,6 +27,7 @@ SRC_REF_IMAGE_GENERATION_MANIFEST=${SRC_REF_IMAGE_GENERATION_MANIFEST:-$RUN_ROOT
 SRC_REF_IMAGE_ROOT=${SRC_REF_IMAGE_ROOT:-$RUN_ROOT/src_ref_images}
 SRC_REF_IMAGE_MODEL_DIR=${SRC_REF_IMAGE_MODEL_DIR:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/ImageGen/Qwen-Image-2512}
 IMAGE_GEN_CONDA_ENV=${IMAGE_GEN_CONDA_ENV:-omni_src}
+IMAGE_GEN_GPU_IDS=${IMAGE_GEN_GPU_IDS:-6}
 VACE_RUN_ROOT=${VACE_RUN_ROOT:-$RUN_ROOT/vace_batch}
 TARGET_ANNOTATIONS=${TARGET_ANNOTATIONS:-$RUN_ROOT/synthetic_target_annotations.jsonl}
 ALL_ANNOTATIONS=${ALL_ANNOTATIONS:-$RUN_ROOT/synthetic_all_annotations.jsonl}
@@ -94,6 +95,7 @@ Options:
   --max-masks N
   --vace-top-k N
   --planning-mode production|exploration
+  --image-gpu-ids IDS
   --mask-gpu-ids IDS
   --vace-gpu-ids IDS
   --timeout-seconds N
@@ -123,6 +125,7 @@ while [[ $# -gt 0 ]]; do
     --max-masks) MAX_MASKS="$2"; shift 2 ;;
     --vace-top-k) VACE_TOP_K="$2"; shift 2 ;;
     --planning-mode) PLANNING_MODE="$2"; shift 2 ;;
+    --image-gpu-ids) IMAGE_GEN_GPU_IDS="$2"; shift 2 ;;
     --mask-gpu-ids) MASK_GPU_IDS="$2"; shift 2 ;;
     --vace-gpu-ids) VACE_GPU_IDS="$2"; shift 2 ;;
     --timeout-seconds) TIMEOUT_SECONDS="$2"; shift 2 ;;
@@ -272,13 +275,13 @@ run_refgen() {
     echo "[masked-vace-queue] stage=refgen no src_ref image plan; skip"
     return
   fi
-  echo "[masked-vace-queue] stage=refgen model_dir=$SRC_REF_IMAGE_MODEL_DIR"
+  echo "[masked-vace-queue] stage=refgen model_dir=$SRC_REF_IMAGE_MODEL_DIR gpu_ids=$IMAGE_GEN_GPU_IDS"
   scripts/run_src_ref_image_generation_from_plan.sh \
     --src-ref-image-plan "$SRC_REF_IMAGE_PLAN" \
     --model-dir "$SRC_REF_IMAGE_MODEL_DIR" \
     --output-manifest "$SRC_REF_IMAGE_GENERATION_MANIFEST" \
     --conda-env "$IMAGE_GEN_CONDA_ENV" \
-    --gpu-ids "$MASK_GPU_IDS" \
+    --gpu-ids "$IMAGE_GEN_GPU_IDS" \
     | tee "$RUN_ROOT/logs/generate_src_ref_images.json"
 }
 
