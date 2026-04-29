@@ -247,6 +247,9 @@ class ScriptTests(unittest.TestCase):
 
         self.assertIn("never starts or stops Omni", script)
         self.assertIn("MASK_GPU_IDS=${MASK_GPU_IDS:-6}", script)
+        self.assertIn("ANNOTATE_CONCURRENCY=${ANNOTATE_CONCURRENCY:-1}", script)
+        self.assertIn("--annotate-concurrency", script)
+        self.assertIn("--concurrency \"$ANNOTATE_CONCURRENCY\"", script)
         self.assertIn("VACE_GPU_IDS=${VACE_GPU_IDS:-2,3,4,5}", script)
         self.assertIn("plan-stable-omni-clips", script)
         self.assertIn("cache-reference-understandings", script)

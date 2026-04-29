@@ -40,6 +40,7 @@ BASE_URL=${BASE_URL:-http://127.0.0.1:8093/v1}
 API_KEY=${API_KEY:-EMPTY}
 MODEL=${MODEL:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-instruct}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-180}
+ANNOTATE_CONCURRENCY=${ANNOTATE_CONCURRENCY:-1}
 MAX_PLANS=${MAX_PLANS:-30}
 MAX_MASKS=${MAX_MASKS:-}
 VACE_TOP_K=${VACE_TOP_K:-5}
@@ -102,6 +103,7 @@ Options:
   --mask-gpu-ids IDS
   --vace-gpu-ids IDS
   --timeout-seconds N
+  --annotate-concurrency N
   -h, --help
 
 This is a queue orchestrator. It never starts or stops Omni.
@@ -133,6 +135,7 @@ while [[ $# -gt 0 ]]; do
     --mask-gpu-ids) MASK_GPU_IDS="$2"; shift 2 ;;
     --vace-gpu-ids) VACE_GPU_IDS="$2"; shift 2 ;;
     --timeout-seconds) TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --annotate-concurrency) ANNOTATE_CONCURRENCY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[masked-vace-queue] unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -208,6 +211,7 @@ run_understand() {
     --api-key "$API_KEY" \
     --model "$MODEL" \
     --timeout-seconds "$TIMEOUT_SECONDS" \
+    --concurrency "$ANNOTATE_CONCURRENCY" \
     --overwrite \
     | tee "$RUN_ROOT/logs/annotate_stable_clips.json"
   python -m app.composed_data cache-reference-understandings \
@@ -352,6 +356,7 @@ run_annotate() {
     --api-key "$API_KEY" \
     --model "$MODEL" \
     --timeout-seconds "$TIMEOUT_SECONDS" \
+    --concurrency "$ANNOTATE_CONCURRENCY" \
     --overwrite \
     | tee "$RUN_ROOT/logs/annotate_targets.json"
 

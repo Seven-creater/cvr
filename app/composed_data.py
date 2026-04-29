@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -953,6 +954,7 @@ def annotate_clips(
     output_path: str | Path | None = None,
     overwrite: bool = False,
     timeout_seconds: float = 180.0,
+    concurrency: int = 1,
 ) -> dict[str, Any]:
     return _annotate_clips_impl(
         root=root,
@@ -964,6 +966,7 @@ def annotate_clips(
         timeout_seconds=timeout_seconds,
         overwrite=overwrite,
         detective=False,
+        concurrency=concurrency,
     )
 
 
@@ -977,6 +980,7 @@ def detective_annotate_clips(
     output_path: str | Path | None = None,
     overwrite: bool = False,
     timeout_seconds: float = 180.0,
+    concurrency: int = 1,
 ) -> dict[str, Any]:
     return _annotate_clips_impl(
         root=root,
@@ -988,6 +992,7 @@ def detective_annotate_clips(
         timeout_seconds=timeout_seconds,
         overwrite=overwrite,
         detective=True,
+        concurrency=concurrency,
     )
 
 
@@ -1002,6 +1007,7 @@ def _annotate_clips_impl(
     overwrite: bool,
     timeout_seconds: float,
     detective: bool,
+    concurrency: int,
 ) -> dict[str, Any]:
     layout = ensure_layout(root)
     manifest_path = Path(clips_manifest_path)
@@ -1016,17 +1022,113 @@ def _annotate_clips_impl(
     existing_records = _load_records_by_key(output, "clip_id")
     if not output.exists():
         _write_jsonl(output, [])
-    client = OpenAIComposedDataClient(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        timeout_seconds=timeout_seconds,
-    )
+    concurrency = max(1, int(concurrency or 1))
 
-    output_records: list[dict[str, Any]] = []
+    def annotate_one(item: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        local_client = OpenAIComposedDataClient(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+        )
+        clip_id = str(item.get("clip_id", "")).strip()
+        clip_path = _resolve_under_root(layout["root"], str(item.get("output_path", "")).strip())
+        if not clip_path.exists():
+            raise FileNotFoundError(f"clip output does not exist: {clip_path}")
+
+        fallback_reason = ""
+        detective_fallback_reason = ""
+        detective_fallback_used = False
+        detective_to_single_pass = False
+        raw_model_output: dict[str, Any] = {}
+        if detective:
+            tool_observations = _build_toolbox_observations(clip_path)
+            try:
+                normalized, raw_model_output = local_client.annotate_clip_detective(
+                    clip_path=str(clip_path),
+                    tool_observations=tool_observations,
+                )
+                fallback_used = False
+            except Exception as detective_exc:
+                detective_fallback_used = True
+                detective_fallback_reason = "detective_to_single_pass"
+                try:
+                    normalized, single_pass_output = local_client.annotate_clip(clip_path=str(clip_path))
+                    raw_model_output = {
+                        "detective_error": f"{type(detective_exc).__name__}: {detective_exc}",
+                        "single_pass_fallback": single_pass_output,
+                    }
+                    normalized["storyline"] = []
+                    normalized["visible_text"] = []
+                    normalized["speakers_and_transcript"] = []
+                    normalized["detective_notes"] = ["detective annotation failed; used single-pass annotation"]
+                    normalized["detective_trajectory"] = [
+                        *tool_observations,
+                        {"stage": "detective_error", "error": raw_model_output["detective_error"]},
+                        {"stage": "single_pass_fallback", "payload": single_pass_output},
+                    ]
+                    normalized["uncertainties"] = ["detective annotation failed; used single-pass annotation"]
+                    fallback_used = False
+                    detective_to_single_pass = True
+                except Exception as single_pass_exc:
+                    normalized = _fallback_clip_annotation()
+                    raw_model_output = {
+                        "detective_error": f"{type(detective_exc).__name__}: {detective_exc}",
+                        "single_pass_error": f"{type(single_pass_exc).__name__}: {single_pass_exc}",
+                    }
+                    fallback_used = True
+                    fallback_reason = "annotation_fallback"
+                    detective_fallback_reason = "detective_and_single_pass_failed"
+        else:
+            try:
+                normalized, raw_model_output = local_client.annotate_clip(clip_path=str(clip_path))
+                fallback_used = False
+            except Exception as exc:
+                normalized = _fallback_clip_annotation()
+                raw_model_output = {"error": f"{type(exc).__name__}: {exc}"}
+                fallback_used = True
+                fallback_reason = "annotation_fallback"
+
+        record = {
+            "clip_id": clip_id,
+            "output_path": _display_path(layout["root"], clip_path),
+            "summary": normalized["summary"],
+            "subjects": list(normalized["subjects"]),
+            "object_counts": dict(normalized["object_counts"]),
+            "actions": list(normalized["actions"]),
+            "scene": normalized["scene"],
+            "attributes": list(normalized["attributes"]),
+            "on_screen_text": list(normalized["on_screen_text"]),
+            "speech": list(normalized["speech"]),
+            "audio_events": list(normalized["audio_events"]),
+            "modalities": list(normalized["modalities"]),
+            "source_asset_id": str(item.get("source_asset_id", "")).strip() or None,
+            "fallback_used": fallback_used,
+            "raw_model_output": raw_model_output,
+        }
+        if detective:
+            record.update(
+                {
+                    "storyline": list(normalized.get("storyline", [])),
+                    "visible_text": list(normalized.get("visible_text", [])),
+                    "speakers_and_transcript": list(normalized.get("speakers_and_transcript", [])),
+                    "detective_notes": list(normalized.get("detective_notes", [])),
+                    "detective_trajectory": list(normalized.get("detective_trajectory", [])),
+                    "uncertainties": list(normalized.get("uncertainties", [])),
+                    "detective_fallback_used": detective_fallback_used,
+                }
+            )
+            if detective_fallback_reason:
+                record["detective_fallback_reason"] = detective_fallback_reason
+        record.update(_clip_manifest_metadata(item=item, root=layout["root"]))
+        if fallback_reason:
+            record["fallback_reason"] = fallback_reason
+        return record, detective_to_single_pass
+
+    records_by_clip_id: dict[str, dict[str, Any]] = {}
+    pending_items: list[dict[str, Any]] = []
     annotated_count = 0
     reused_count = 0
-    fallback_count = 0
     detective_to_single_pass_count = 0
     for item in clips:
         clip_id = str(item.get("clip_id", "")).strip()
@@ -1034,105 +1136,40 @@ def _annotate_clips_impl(
             raise ValueError("clip manifest contains an entry without clip_id")
 
         if clip_id in existing_records:
-            record = existing_records[clip_id]
+            records_by_clip_id[clip_id] = existing_records[clip_id]
             reused_count += 1
         else:
-            clip_path = _resolve_under_root(layout["root"], str(item.get("output_path", "")).strip())
-            if not clip_path.exists():
-                raise FileNotFoundError(f"clip output does not exist: {clip_path}")
+            pending_items.append(item)
 
-            fallback_reason = ""
-            detective_fallback_reason = ""
-            detective_fallback_used = False
-            raw_model_output: dict[str, Any] = {}
-            if detective:
-                tool_observations = _build_toolbox_observations(clip_path)
-                try:
-                    normalized, raw_model_output = client.annotate_clip_detective(
-                        clip_path=str(clip_path),
-                        tool_observations=tool_observations,
-                    )
-                    fallback_used = False
-                except Exception as detective_exc:
-                    detective_fallback_used = True
-                    detective_fallback_reason = "detective_to_single_pass"
-                    try:
-                        normalized, single_pass_output = client.annotate_clip(clip_path=str(clip_path))
-                        raw_model_output = {
-                            "detective_error": f"{type(detective_exc).__name__}: {detective_exc}",
-                            "single_pass_fallback": single_pass_output,
-                        }
-                        normalized["storyline"] = []
-                        normalized["visible_text"] = []
-                        normalized["speakers_and_transcript"] = []
-                        normalized["detective_notes"] = ["detective annotation failed; used single-pass annotation"]
-                        normalized["detective_trajectory"] = [
-                            *tool_observations,
-                            {"stage": "detective_error", "error": raw_model_output["detective_error"]},
-                            {"stage": "single_pass_fallback", "payload": single_pass_output},
-                        ]
-                        normalized["uncertainties"] = ["detective annotation failed; used single-pass annotation"]
-                        fallback_used = False
-                        detective_to_single_pass_count += 1
-                    except Exception as single_pass_exc:
-                        normalized = _fallback_clip_annotation()
-                        raw_model_output = {
-                            "detective_error": f"{type(detective_exc).__name__}: {detective_exc}",
-                            "single_pass_error": f"{type(single_pass_exc).__name__}: {single_pass_exc}",
-                        }
-                        fallback_used = True
-                        fallback_reason = "annotation_fallback"
-                        detective_fallback_reason = "detective_and_single_pass_failed"
-            else:
-                try:
-                    normalized, raw_model_output = client.annotate_clip(clip_path=str(clip_path))
-                    fallback_used = False
-                except Exception as exc:
-                    normalized = _fallback_clip_annotation()
-                    raw_model_output = {"error": f"{type(exc).__name__}: {exc}"}
-                    fallback_used = True
-                    fallback_reason = "annotation_fallback"
-
-            record = {
-                "clip_id": clip_id,
-                "output_path": _display_path(layout["root"], clip_path),
-                "summary": normalized["summary"],
-                "subjects": list(normalized["subjects"]),
-                "object_counts": dict(normalized["object_counts"]),
-                "actions": list(normalized["actions"]),
-                "scene": normalized["scene"],
-                "attributes": list(normalized["attributes"]),
-                "on_screen_text": list(normalized["on_screen_text"]),
-                "speech": list(normalized["speech"]),
-                "audio_events": list(normalized["audio_events"]),
-                "modalities": list(normalized["modalities"]),
-                "source_asset_id": str(item.get("source_asset_id", "")).strip() or None,
-                "fallback_used": fallback_used,
-                "raw_model_output": raw_model_output,
-            }
-            if detective:
-                record.update(
-                    {
-                        "storyline": list(normalized.get("storyline", [])),
-                        "visible_text": list(normalized.get("visible_text", [])),
-                        "speakers_and_transcript": list(normalized.get("speakers_and_transcript", [])),
-                        "detective_notes": list(normalized.get("detective_notes", [])),
-                        "detective_trajectory": list(normalized.get("detective_trajectory", [])),
-                        "uncertainties": list(normalized.get("uncertainties", [])),
-                        "detective_fallback_used": detective_fallback_used,
-                    }
-                )
-                if detective_fallback_reason:
-                    record["detective_fallback_reason"] = detective_fallback_reason
-            record.update(_clip_manifest_metadata(item=item, root=layout["root"]))
-            if fallback_reason:
-                record["fallback_reason"] = fallback_reason
+    if concurrency <= 1:
+        for item in pending_items:
+            record, detective_to_single_pass = annotate_one(item)
+            records_by_clip_id[str(record["clip_id"])] = record
             annotated_count += 1
+            if detective_to_single_pass:
+                detective_to_single_pass_count += 1
             _append_jsonl_record(output, record)
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(annotate_one, item) for item in pending_items]
+            for future in as_completed(futures):
+                record, detective_to_single_pass = future.result()
+                records_by_clip_id[str(record["clip_id"])] = record
+                annotated_count += 1
+                if detective_to_single_pass:
+                    detective_to_single_pass_count += 1
+                _append_jsonl_record(output, record)
 
+    output_records: list[dict[str, Any]] = []
+    for item in clips:
+        clip_id = str(item.get("clip_id", "")).strip()
+        record = records_by_clip_id[clip_id]
+        output_records.append(record)
+
+    fallback_count = 0
+    for record in output_records:
         if bool(record.get("fallback_used")):
             fallback_count += 1
-        output_records.append(record)
 
     _write_jsonl(output, output_records)
     return {
@@ -1144,6 +1181,7 @@ def _annotate_clips_impl(
         "fallback_count": fallback_count,
         "annotation_mode": "detective" if detective else "single_pass",
         "detective_to_single_pass_count": detective_to_single_pass_count if detective else 0,
+        "concurrency": concurrency,
     }
 
 
@@ -9358,6 +9396,7 @@ def build_parser() -> argparse.ArgumentParser:
     annotate_clips_parser.add_argument("--api-key", required=True)
     annotate_clips_parser.add_argument("--model", required=True)
     annotate_clips_parser.add_argument("--timeout-seconds", type=float, default=180.0)
+    annotate_clips_parser.add_argument("--concurrency", type=int, default=1)
     annotate_clips_parser.add_argument("--overwrite", action="store_true")
 
     detective_annotate_parser = subparsers.add_parser("detective-annotate-clips")
@@ -9368,6 +9407,7 @@ def build_parser() -> argparse.ArgumentParser:
     detective_annotate_parser.add_argument("--api-key", required=True)
     detective_annotate_parser.add_argument("--model", required=True)
     detective_annotate_parser.add_argument("--timeout-seconds", type=float, default=180.0)
+    detective_annotate_parser.add_argument("--concurrency", type=int, default=1)
     detective_annotate_parser.add_argument("--overwrite", action="store_true")
 
     propose_pairs_parser = subparsers.add_parser("propose-pairs")
@@ -9502,6 +9542,7 @@ def main() -> None:
             api_key=args.api_key,
             model=args.model,
             timeout_seconds=args.timeout_seconds,
+            concurrency=args.concurrency,
             overwrite=args.overwrite,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -9556,6 +9597,7 @@ def main() -> None:
             api_key=args.api_key,
             model=args.model,
             timeout_seconds=args.timeout_seconds,
+            concurrency=args.concurrency,
             overwrite=args.overwrite,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))

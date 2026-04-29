@@ -616,6 +616,68 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(["visual"], records_by_id["clip_a"]["modalities"])
             self.assertFalse(records_by_id["clip_b"]["fallback_used"])
 
+    def test_annotate_clips_supports_concurrent_requests_and_preserves_manifest_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("clip_a.mp4", "clip_b.mp4", "clip_c.mp4"):
+                (root / "clips" / name).write_bytes(name.encode("utf-8"))
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [
+                    {"clip_id": "clip_a", "source_asset_id": "asset_a", "output_path": "clips/clip_a.mp4"},
+                    {"clip_id": "clip_b", "source_asset_id": "asset_b", "output_path": "clips/clip_b.mp4"},
+                    {"clip_id": "clip_c", "source_asset_id": "asset_c", "output_path": "clips/clip_c.mp4"},
+                ],
+            )
+
+            class FakeClient:
+                calls: list[str] = []
+
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def annotate_clip(self, *, clip_path: str) -> tuple[dict[str, object], dict[str, object]]:
+                    clip_id = Path(clip_path).stem
+                    FakeClient.calls.append(clip_id)
+                    return (
+                        {
+                            "summary": f"{clip_id} summary",
+                            "subjects": [clip_id],
+                            "object_counts": {clip_id: 1},
+                            "actions": [],
+                            "scene": "test scene",
+                            "attributes": [],
+                            "on_screen_text": [],
+                            "speech": [],
+                            "audio_events": [],
+                            "modalities": ["visual"],
+                        },
+                        {"provider": "fake", "clip_id": clip_id},
+                    )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", FakeClient):
+                summary = annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=root / "captions" / "clip_annotations.jsonl",
+                    base_url="http://127.0.0.1:8092/v1",
+                    api_key="EMPTY",
+                    model="captioner-model",
+                    concurrency=2,
+                )
+
+            records = [
+                json.loads(line)
+                for line in (root / "captions" / "clip_annotations.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(3, summary["annotated_count"])
+            self.assertEqual(2, summary["concurrency"])
+            self.assertEqual(["clip_a", "clip_b", "clip_c"], [record["clip_id"] for record in records])
+            self.assertEqual({"clip_a", "clip_b", "clip_c"}, set(FakeClient.calls))
+
     def test_detective_annotate_clips_persists_each_record_and_resumes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
