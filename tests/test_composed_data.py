@@ -9,6 +9,7 @@ from unittest import mock
 from app.composed_data import (
     _accepted_sample_from_record,
     _action_evidence_score,
+    _annotation_prompt_view,
     _compose_reject_reason,
     _detect_primary_difference,
     _evidence_from_annotations,
@@ -21,6 +22,7 @@ from app.composed_data import (
     _finalize_pair_verification,
     _has_intraclip_difference_conflict,
     _judge_accepts,
+    _audio_event_independent_evidence_gate,
     _non_speech_audio_event_score,
     _observable_difference_gate,
     _pair_record_acceptance_issues,
@@ -36,7 +38,9 @@ from app.composed_data import (
     _speech_specificity_score,
     _source_context,
     _target_uniqueness_score,
+    _video_edit_risk_assessment,
     annotate_clips,
+    build_manual_review_bundle,
     build_ffmpeg_extract_command,
     detective_annotate_clips,
     discover_raw_sources,
@@ -44,7 +48,14 @@ from app.composed_data import (
     extract_clips,
     index_raw_sources,
     main as composed_data_main,
+    plan_audio_edits,
     plan_detective_event_clips,
+    plan_stable_omni_clips,
+    cache_reference_understandings,
+    plan_src_ref_images,
+    select_src_ref_images,
+    plan_video_masks,
+    plan_video_edits,
     propose_group_pairs,
     propose_pairs,
     validate_known_pairs,
@@ -197,6 +208,209 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("same_source_video", group_records[0]["group_reason"])
             self.assertEqual([record["clip_id"] for record in plan_records], group_records[0]["candidate_clip_ids"])
 
+    def test_plan_stable_omni_clips_uses_cache_and_enforces_window_length(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "raw_datasets" / "daily_omni"
+            source.mkdir(parents=True)
+            video = source / "source.mp4"
+            video.write_bytes(b"x")
+            index_raw_sources(root=root, sources=[("daily_omni", source)])
+            cache_path = root / "caches" / "stable_cache.jsonl"
+
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={
+                    "duration_seconds": 20.0,
+                    "has_audio": True,
+                    "has_video": True,
+                    "width": 640,
+                    "height": 360,
+                    "fps": 25.0,
+                },
+            ):
+                first = plan_stable_omni_clips(
+                    root=root,
+                    cache_path=cache_path,
+                    max_source_videos=1,
+                    min_clip_seconds=5.0,
+                    max_clip_seconds=8.0,
+                )
+                second = plan_stable_omni_clips(
+                    root=root,
+                    cache_path=cache_path,
+                    max_source_videos=1,
+                    min_clip_seconds=5.0,
+                    max_clip_seconds=8.0,
+                )
+
+            records = [
+                json.loads(line)
+                for line in Path(second["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, first["clip_plan_count"])
+            self.assertEqual(1, second["cache_hits"])
+            self.assertGreaterEqual(records[0]["duration_seconds"], 5.0)
+            self.assertLessEqual(records[0]["duration_seconds"], 8.0)
+            self.assertIn("stable_clip_selection", records[0])
+
+    def test_plan_stable_omni_clips_persists_each_cache_record_before_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "raw_datasets" / "daily_omni"
+            source.mkdir(parents=True)
+            (source / "a.mp4").write_bytes(b"a")
+            (source / "b.mp4").write_bytes(b"b")
+            index_raw_sources(root=root, sources=[("daily_omni", source)])
+            output_path = root / "metadata" / "stable_plan.jsonl"
+            cache_path = root / "caches" / "stable_cache.jsonl"
+
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={
+                    "duration_seconds": 20.0,
+                    "has_audio": True,
+                    "has_video": True,
+                    "width": 640,
+                    "height": 360,
+                    "fps": 25.0,
+                },
+            ), mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client = client_cls.return_value
+                client.select_stable_clip_window.side_effect = [
+                    (
+                        {
+                            "start_sec": 2.0,
+                            "end_sec": 8.0,
+                            "stability_score": 0.95,
+                            "camera_motion": "static",
+                            "main_subjects": ["robot"],
+                            "visible_text_risk": False,
+                            "recommended_for_vace": True,
+                            "reason": "stable single subject",
+                        },
+                        {"provider": "mock"},
+                    ),
+                    KeyboardInterrupt(),
+                ]
+
+                with self.assertRaises(KeyboardInterrupt):
+                    plan_stable_omni_clips(
+                        root=root,
+                        output_path=output_path,
+                        cache_path=cache_path,
+                        max_source_videos=2,
+                        min_clip_seconds=5.0,
+                        max_clip_seconds=8.0,
+                        base_url="http://127.0.0.1:8093/v1",
+                        api_key="EMPTY",
+                        model="omni",
+                    )
+
+            cache_records = [json.loads(line) for line in cache_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            plan_records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, len(cache_records))
+            self.assertEqual(1, len(plan_records))
+            self.assertEqual("stable single subject", cache_records[0]["selection"]["reason"])
+
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={
+                    "duration_seconds": 20.0,
+                    "has_audio": True,
+                    "has_video": True,
+                    "width": 640,
+                    "height": 360,
+                    "fps": 25.0,
+                },
+            ):
+                resumed = plan_stable_omni_clips(
+                    root=root,
+                    output_path=output_path,
+                    cache_path=cache_path,
+                    max_source_videos=1,
+                    min_clip_seconds=5.0,
+                    max_clip_seconds=8.0,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="omni",
+                )
+            self.assertEqual(1, resumed["cache_hits"])
+
+    def test_cache_reference_understandings_writes_stable_edit_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "robot_ref",
+                        "output_path": "clips/robot_ref.mp4",
+                        "summary": "a black and gold robotic action figure rotates on a platform",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
+                    }
+                ],
+            )
+
+            summary = cache_reference_understandings(root=root, clip_annotations_path=annotations_path)
+            records = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["understanding_count"])
+            self.assertEqual("robot_ref", records[0]["clip_id"])
+            self.assertTrue(records[0]["stable_edit_targets"])
+            self.assertEqual("robot body", records[0]["stable_edit_targets"][0]["target"])
+
+    def test_cache_reference_understandings_skips_failed_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "empty_fallback",
+                        "output_path": "clips/empty_fallback.mp4",
+                        "summary": "",
+                        "subjects": [],
+                        "actions": [],
+                        "scene": "",
+                        "fallback_used": True,
+                        "detective_fallback_reason": "detective_and_single_pass_failed",
+                    },
+                    {
+                        "clip_id": "usable",
+                        "output_path": "clips/usable.mp4",
+                        "summary": "a red tote bag on a table",
+                        "subjects": ["tote bag"],
+                        "object_counts": {"tote bag": 1},
+                        "actions": ["resting"],
+                        "scene": "tabletop",
+                    },
+                ],
+            )
+
+            summary = cache_reference_understandings(root=root, clip_annotations_path=annotations_path)
+            records = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["understanding_count"])
+            self.assertEqual(1, summary["skipped_unusable_annotation_count"])
+            self.assertEqual(["usable"], [record["clip_id"] for record in records])
+
     def test_annotate_clips_writes_complete_annotations_with_mock_client(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -302,6 +516,36 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(["row_a"], records_by_id["clip_a"]["source_row_ids"])
             self.assertEqual({"question": "What is the cat doing?"}, records_by_id["clip_a"]["text_fields"])
 
+    def test_annotation_prompt_view_truncates_long_fields(self) -> None:
+        annotation = {
+            "clip_id": "clip_long",
+            "output_path": "clips/clip_long.mp4",
+            "summary": "s" * 1200,
+            "subjects": [f"subject {idx}" for idx in range(20)],
+            "object_counts": {"subject": 1},
+            "actions": ["walking"],
+            "scene": "room",
+            "attributes": [],
+            "on_screen_text": [],
+            "speech": ["speech " + "x" * 500],
+            "audio_events": [],
+            "modalities": ["visual"],
+            "storyline": ["story " + "y" * 500 for _ in range(10)],
+            "events": [{"description": "event " + "z" * 500, "irrelevant": "drop me"}],
+            "visible_text": [],
+            "speakers_and_transcript": ["speaker " + "t" * 500],
+            "uncertainties": [],
+        }
+
+        prompt = _annotation_prompt_view(annotation)
+
+        self.assertLessEqual(len(prompt["summary"]), 700)
+        self.assertEqual(8, len(prompt["subjects"]))
+        self.assertLessEqual(len(prompt["speech"][0]), 180)
+        self.assertEqual(6, len(prompt["storyline"]))
+        self.assertLessEqual(len(prompt["storyline"][0]), 220)
+        self.assertEqual(["description"], list(prompt["events"][0].keys()))
+
     def test_annotate_clips_marks_fallback_without_batch_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -371,6 +615,164 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("annotation_fallback", records_by_id["clip_a"]["fallback_reason"])
             self.assertEqual(["visual"], records_by_id["clip_a"]["modalities"])
             self.assertFalse(records_by_id["clip_b"]["fallback_used"])
+
+    def test_annotate_clips_supports_concurrent_requests_and_preserves_manifest_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("clip_a.mp4", "clip_b.mp4", "clip_c.mp4"):
+                (root / "clips" / name).write_bytes(name.encode("utf-8"))
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [
+                    {"clip_id": "clip_a", "source_asset_id": "asset_a", "output_path": "clips/clip_a.mp4"},
+                    {"clip_id": "clip_b", "source_asset_id": "asset_b", "output_path": "clips/clip_b.mp4"},
+                    {"clip_id": "clip_c", "source_asset_id": "asset_c", "output_path": "clips/clip_c.mp4"},
+                ],
+            )
+
+            class FakeClient:
+                calls: list[str] = []
+
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def annotate_clip(self, *, clip_path: str) -> tuple[dict[str, object], dict[str, object]]:
+                    clip_id = Path(clip_path).stem
+                    FakeClient.calls.append(clip_id)
+                    return (
+                        {
+                            "summary": f"{clip_id} summary",
+                            "subjects": [clip_id],
+                            "object_counts": {clip_id: 1},
+                            "actions": [],
+                            "scene": "test scene",
+                            "attributes": [],
+                            "on_screen_text": [],
+                            "speech": [],
+                            "audio_events": [],
+                            "modalities": ["visual"],
+                        },
+                        {"provider": "fake", "clip_id": clip_id},
+                    )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", FakeClient):
+                summary = annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=root / "captions" / "clip_annotations.jsonl",
+                    base_url="http://127.0.0.1:8092/v1",
+                    api_key="EMPTY",
+                    model="captioner-model",
+                    concurrency=2,
+                )
+
+            records = [
+                json.loads(line)
+                for line in (root / "captions" / "clip_annotations.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(3, summary["annotated_count"])
+            self.assertEqual(2, summary["concurrency"])
+            self.assertEqual(["clip_a", "clip_b", "clip_c"], [record["clip_id"] for record in records])
+            self.assertEqual({"clip_a", "clip_b", "clip_c"}, set(FakeClient.calls))
+
+    def test_detective_annotate_clips_persists_each_record_and_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "clip_a.mp4").write_bytes(b"a")
+            (root / "clips" / "clip_b.mp4").write_bytes(b"b")
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [
+                    {"clip_id": "clip_a", "source_asset_id": "asset_a", "output_path": "clips/clip_a.mp4"},
+                    {"clip_id": "clip_b", "source_asset_id": "asset_b", "output_path": "clips/clip_b.mp4"},
+                ],
+            )
+            output_path = root / "captions" / "clip_annotations_detective.jsonl"
+            detective_output = (
+                {
+                    "summary": "a robot rotates in a studio",
+                    "subjects": ["robot"],
+                    "object_counts": {"robot": 1},
+                    "actions": ["rotating"],
+                    "scene": "studio",
+                    "attributes": ["black and gold"],
+                    "on_screen_text": [],
+                    "speech": [],
+                    "audio_events": [],
+                    "modalities": ["visual"],
+                    "storyline": ["robot rotates"],
+                    "visible_text": [],
+                    "speakers_and_transcript": [],
+                    "detective_notes": [],
+                    "detective_trajectory": [{"stage": "observer"}],
+                    "uncertainties": [],
+                },
+                {"provider": "mock", "mode": "detective"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client = client_cls.return_value
+                client.annotate_clip_detective.side_effect = [detective_output, KeyboardInterrupt()]
+                with self.assertRaises(KeyboardInterrupt):
+                    detective_annotate_clips(
+                        root=root,
+                        clips_manifest_path=manifest_path,
+                        output_path=output_path,
+                        base_url="http://127.0.0.1:8093/v1",
+                        api_key="EMPTY",
+                        model="qwen3-omni",
+                        overwrite=True,
+                    )
+                self.assertEqual(2, client.annotate_clip_detective.call_count)
+
+            partial_records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(["clip_a"], [record["clip_id"] for record in partial_records])
+
+            second_output = (
+                {
+                    "summary": "a tote bag rests on a table",
+                    "subjects": ["tote bag"],
+                    "object_counts": {"tote bag": 1},
+                    "actions": [],
+                    "scene": "room",
+                    "attributes": ["red"],
+                    "on_screen_text": [],
+                    "speech": [],
+                    "audio_events": [],
+                    "modalities": ["visual"],
+                    "storyline": ["bag on table"],
+                    "visible_text": [],
+                    "speakers_and_transcript": [],
+                    "detective_notes": [],
+                    "detective_trajectory": [{"stage": "observer"}],
+                    "uncertainties": [],
+                },
+                {"provider": "mock", "mode": "detective"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client = client_cls.return_value
+                client.annotate_clip_detective.return_value = second_output
+                summary = detective_annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=output_path,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    overwrite=True,
+                )
+                self.assertEqual(1, client.annotate_clip_detective.call_count)
+
+            final_records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(2, summary["clip_count"])
+            self.assertEqual(1, summary["reused_count"])
+            self.assertEqual(1, summary["annotated_count"])
+            self.assertEqual({"clip_a", "clip_b"}, {record["clip_id"] for record in final_records})
 
     def test_detective_annotate_clips_writes_trajectory_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1605,6 +2007,81 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertGreaterEqual(_non_speech_audio_event_score(reference, target), 0.70)
 
+    def test_audio_event_independent_evidence_accepts_specific_absence_phrase(self) -> None:
+        evidence = _audio_event_independent_evidence_gate(
+            reference_annotation={"audio_events": []},
+            target_annotation={"audio_events": ["whoosh"]},
+            difference={"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+        )
+
+        self.assertTrue(evidence["passed"])
+        self.assertEqual(["whoosh"], evidence["target_evidence"])
+
+    def test_synthetic_audio_evidence_corrects_contradictory_verification(self) -> None:
+        record = {
+            "source_type": "synthetic_edit",
+            "reference_video": "clips/ref.mp4",
+            "target_video": "clips/target.mp4",
+            "edit_text": "add whoosh to the audio",
+            "modalities": ["audio"],
+            "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+            "quality": {
+                "same_context_score": 0.98,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "difference_strength_score": 0.8,
+                "visual_near_duplicate_score": 0.99,
+                "difference_type": "audio_event",
+                "non_speech_audio_event_score": 0.7,
+            },
+            "generation": {
+                "model": "ffmpeg-deterministic-audio",
+                "model_route": "deterministic_overlay",
+                "source_video": "clips/ref.mp4",
+                "audio_edit_plan": {
+                    "route": "deterministic_overlay",
+                    "expected_event": "whoosh",
+                    "audio_prompt": "whoosh",
+                    "preserve_video": True,
+                },
+            },
+            "judge": {
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "single_main_difference": True,
+                "same_context_score": 0.98,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "hard_negative_quality": "good",
+                "accept": True,
+            },
+            "verification": {
+                "caption_delta": {
+                    "caption_equivalent": True,
+                    "has_concrete_difference": False,
+                    "difference_matches_edit": False,
+                    "concrete_differences": ["target contains whoosh, reference does not"],
+                },
+                "edit_projection": {"target_matches_projection": False, "score": 0.0},
+                "edit_necessity": {
+                    "edit_needed": False,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.0,
+                },
+            },
+        }
+
+        prepared = _prepare_record_for_acceptance(
+            record,
+            reference_annotation={"audio_events": []},
+            target_annotation={"audio_events": ["whoosh"]},
+        )
+
+        self.assertEqual(1.0, prepared["quality"]["audio_event_independent_evidence_passed"])
+        self.assertTrue(prepared["verification"]["passed"])
+        self.assertTrue(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
+
     def test_audio_event_gate_accepts_timeline_audio_delta_without_top_level_audio_events(self) -> None:
         reference = {"events": [{"audio": "quiet forest ambience"}]}
         target = {"events": [{"audio": "chainsaw noise and machine buzzing"}]}
@@ -2777,6 +3254,58 @@ class ComposedDataTests(unittest.TestCase):
         self.assertEqual(1, len(accepted))
         self.assertEqual("clips/shared_target.mp4", accepted[0]["target_video"])
 
+    def test_select_final_accepted_records_keeps_distinct_synthetic_edits_with_same_delta(self) -> None:
+        base_record = {
+            "accepted": True,
+            "source_type": "synthetic_edit",
+            "group_id": "synthetic_robot_color",
+            "source_context": {"relation": "synthetic_edit"},
+            "modalities": ["visual"],
+            "reference_caption": "a black and gold robot rotates on a platform",
+            "target_caption": "a bright yellow robot rotates on the same platform",
+            "hard_negatives": ["clips/neg.mp4"],
+            "source": {"platform": "synthetic", "url": "file:///tmp/target.mp4", "license_note": "internal"},
+            "evidence": {},
+            "judge": {},
+            "verification": {"passed": True},
+            "speech_quality": {},
+            "audio_event_quality": {},
+            "transcript_backed": None,
+            "group_reason": "synthetic_edit",
+            "edit_text": "change robot body color from black and gold to bright yellow",
+            "difference": {"type": "attribute", "from": "black and gold robot body", "to": "bright yellow robot body"},
+            "quality": {
+                "difference_type": "attribute",
+                "difference_strength_score": 0.8,
+                "same_context_score": 0.95,
+                "target_uniqueness_score": 0.98,
+                "edit_match_score": 0.9,
+            },
+        }
+        records = [
+            {
+                **base_record,
+                "proposal_id": "synthetic_visual_pair_plan_a",
+                "reference_video": "clips/robot_seg_003.mp4",
+                "target_video": "clips/synth_robot_seg_003_yellow.mp4",
+            },
+            {
+                **base_record,
+                "proposal_id": "synthetic_visual_pair_plan_b",
+                "reference_video": "clips/robot_seg_004.mp4",
+                "target_video": "clips/synth_robot_seg_004_yellow.mp4",
+            },
+        ]
+
+        accepted = _select_final_accepted_records(records, max_accepted_pairs=5)
+
+        self.assertEqual(2, len(accepted))
+        self.assertEqual(
+            {"clips/synth_robot_seg_003_yellow.mp4", "clips/synth_robot_seg_004_yellow.mp4"},
+            {record["target_video"] for record in accepted},
+        )
+        self.assertEqual(2, len({record["sample_id"] for record in accepted}))
+
     def test_difference_strength_scores_concrete_object_changes(self) -> None:
         reference = {
             "object_counts": {"cat": 1},
@@ -3446,11 +3975,17 @@ class ComposedDataTests(unittest.TestCase):
                             "to": "red backpack",
                             "description": "a red backpack is added to the chair",
                         },
+                        "quality": {"visual_near_duplicate_score": 0.9},
                         "hard_negatives": ["clips/neg1.mp4", "clips/neg2.mp4"],
                         "generation": {
                             "model": "Wan2.1-VACE-1.3B",
+                            "model_route": "vace_controlled",
                             "source_video": "clips/ref.mp4",
                             "prompt": "Only add a red backpack on the chair.",
+                            "source_prompt": "a chair without a backpack",
+                            "target_prompt": "a chair with a red backpack",
+                            "preserve_tokens": ["chair", "room", "camera motion"],
+                            "postprocess": {"audio_copied_from_reference": True},
                             "seed": 1234,
                         },
                     }
@@ -3507,9 +4042,214 @@ class ComposedDataTests(unittest.TestCase):
                 for line in (root / "pairs" / "accepted_synthetic_pairs.jsonl").read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            self.assertEqual("covr_omni_synth_0001", accepted_records[0]["sample_id"])
+            self.assertRegex(accepted_records[0]["sample_id"], r"^covr_omni_synth_[0-9a-f]{8}$")
             self.assertEqual("synthetic_edit", accepted_records[0]["source_type"])
             self.assertEqual("Wan2.1-VACE-1.3B", accepted_records[0]["generation"]["model"])
+
+    def test_validate_known_pairs_retries_verification_without_video_on_context_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            annotations_path = root / "captions" / "known_annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref",
+                        "output_path": "clips/ref.mp4",
+                        "summary": "a chair without a backpack",
+                        "subjects": ["chair"],
+                        "object_counts": {"chair": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                    {
+                        "clip_id": "target",
+                        "output_path": "clips/target.mp4",
+                        "summary": "a chair with a red backpack",
+                        "subjects": ["chair", "red backpack"],
+                        "object_counts": {"chair": 1, "red backpack": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": ["red"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                    {
+                        "clip_id": "neg1",
+                        "output_path": "clips/neg1.mp4",
+                        "summary": "a chair with a blue backpack",
+                        "subjects": ["chair", "blue backpack"],
+                        "object_counts": {"chair": 1, "blue backpack": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": ["blue"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                    {
+                        "clip_id": "neg2",
+                        "output_path": "clips/neg2.mp4",
+                        "summary": "a chair with a laptop",
+                        "subjects": ["chair", "laptop"],
+                        "object_counts": {"chair": 1, "laptop": 1},
+                        "actions": [],
+                        "scene": "room",
+                        "attributes": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                ],
+            )
+            known_pairs_path = root / "pairs" / "synthetic_candidate_pairs.jsonl"
+            self._write_jsonl(
+                known_pairs_path,
+                [
+                    {
+                        "source_type": "synthetic_edit",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": "clips/target.mp4",
+                        "edit_text": "add a red backpack on the chair",
+                        "modalities": ["visual"],
+                        "difference": {
+                            "type": "object_presence",
+                            "from": "no red backpack",
+                            "to": "red backpack",
+                            "description": "a red backpack is added to the chair",
+                        },
+                        "quality": {"visual_near_duplicate_score": 0.9},
+                        "hard_negatives": ["clips/neg1.mp4", "clips/neg2.mp4"],
+                        "generation": {
+                            "model": "Wan2.1-VACE-1.3B",
+                            "model_route": "vace_controlled",
+                            "source_video": "clips/ref.mp4",
+                            "prompt": "Only add a red backpack on the chair.",
+                            "target_prompt": "a chair with a red backpack",
+                            "source_prompt": "a chair without a backpack",
+                            "preserve_tokens": ["chair", "room", "camera motion"],
+                            "postprocess": {"audio_copied_from_reference": True},
+                            "seed": 1234,
+                        },
+                    }
+                ],
+            )
+            verification = {
+                "caption_delta": {
+                    "caption_equivalent": False,
+                    "has_concrete_difference": True,
+                    "difference_matches_edit": True,
+                },
+                "edit_projection": {"target_matches_projection": True, "score": 0.95},
+                "edit_necessity": {
+                    "edit_needed": True,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "score": 0.92,
+                },
+            }
+            judge = {
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "single_main_difference": True,
+                "same_context_score": 0.95,
+                "edit_match_score": 0.9,
+                "target_uniqueness_score": 0.9,
+                "audio_required": False,
+                "hard_negative_quality": "good",
+                "accept": True,
+                "reject_reason": "",
+            }
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client = client_cls.return_value
+                client.judge_pair.return_value = (judge, {"provider": "mock"})
+                client.verify_pair_difference.side_effect = [
+                    RuntimeError("input length 21257 exceeds max_model_len 16384"),
+                    (verification, {"provider": "mock-retry"}),
+                ]
+                summary = validate_known_pairs(
+                    root=root,
+                    known_pairs_path=known_pairs_path,
+                    clip_annotations_path=annotations_path,
+                    output_path=root / "pairs" / "judged_synthetic_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_synthetic_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="instruct-model",
+                    overwrite=True,
+                )
+
+            self.assertEqual(2, client.verify_pair_difference.call_count)
+            first_call = client.verify_pair_difference.call_args_list[0].kwargs
+            retry_call = client.verify_pair_difference.call_args_list[1].kwargs
+            self.assertEqual(Path(first_call["reference_clip_path"]).name, "ref.mp4")
+            self.assertIsNone(retry_call["reference_clip_path"])
+            self.assertIsNone(retry_call["target_clip_path"])
+            judged = [
+                json.loads(line)
+                for line in (root / "pairs" / "judged_synthetic_pair_proposals.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertTrue(judged[0]["verification_annotation_only_retry_used"])
+            self.assertIn("video_verification_error", judged[0]["raw_verification_output"])
+            self.assertEqual({"provider": "mock-retry"}, judged[0]["raw_verification_output"]["annotation_only_retry"])
+
+    def test_synthetic_sample_ids_are_stable_per_proposal_not_batch_index(self) -> None:
+        first = _accepted_sample_from_record(
+            {
+                "source_type": "synthetic_edit",
+                "proposal_id": "synthetic_visual_pair_plan_a",
+                "reference_video": "clips/ref_a.mp4",
+                "target_video": "clips/target_a.mp4",
+                "edit_text": "change robot body color to yellow",
+                "modalities": ["visual"],
+                "difference": {"type": "attribute"},
+                "reference_caption": "",
+                "target_caption": "",
+                "hard_negatives": [],
+                "quality": {},
+                "source": {},
+                "judge": {},
+                "verification": {},
+            },
+            1,
+        )
+        second = _accepted_sample_from_record(
+            {
+                "source_type": "synthetic_edit",
+                "proposal_id": "synthetic_visual_pair_plan_b",
+                "reference_video": "clips/ref_b.mp4",
+                "target_video": "clips/target_b.mp4",
+                "edit_text": "change robot body color to yellow",
+                "modalities": ["visual"],
+                "difference": {"type": "attribute"},
+                "reference_caption": "",
+                "target_caption": "",
+                "hard_negatives": [],
+                "quality": {},
+                "source": {},
+                "judge": {},
+                "verification": {},
+            },
+            1,
+        )
+
+        self.assertRegex(first["sample_id"], r"^covr_omni_synth_[0-9a-f]{8}$")
+        self.assertRegex(second["sample_id"], r"^covr_omni_synth_[0-9a-f]{8}$")
+        self.assertNotEqual(first["sample_id"], second["sample_id"])
 
     def test_validate_known_pairs_rejects_missing_generation_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3611,6 +4351,1270 @@ class ComposedDataTests(unittest.TestCase):
                 if line.strip()
             ]
             self.assertIn("generation", judged[0]["judge"]["reject_reason"])
+
+    def test_plan_video_edits_uses_omni_prompt_planner_and_excludes_audio_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a person holds a mobile phone at a desk",
+                        "subjects": ["person", "mobile phone", "desk"],
+                        "object_counts": {"person": 1, "mobile phone": 1, "desk": 1},
+                        "actions": ["holding"],
+                        "scene": "desk",
+                    },
+                    {
+                        "clip_id": "ref_audio",
+                        "output_path": "clips/ref_audio.mp4",
+                        "summary": "a person jumps",
+                        "subjects": ["person"],
+                        "actions": ["jumping"],
+                        "audio_events": [],
+                    },
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "visual_1",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "reference_caption": "a person holds a mobile phone at a desk",
+                        "edit_text": "replace the mobile phone with a tablet",
+                        "difference": {"type": "object_presence", "from": "mobile phone", "to": "tablet"},
+                    },
+                    {
+                        "proposal_id": "audio_1",
+                        "reference_video": "clips/ref_audio.mp4",
+                        "edit_text": "add whoosh to the audio",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                    },
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("visual_1", plans[0]["plan_id"])
+            self.assertEqual("heuristic_prompt_planner", plans[0]["planner"]["stage"])
+            self.assertTrue(plans[0]["planner"]["fallback_used"])
+            self.assertIn("mobile phone", plans[0]["source_prompt"])
+            self.assertIn("tablet", plans[0]["target_prompt"])
+            self.assertEqual(1, summary["skipped_by_type"]["audio_event"])
+
+    def test_plan_video_edits_skips_unusable_reference_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "fallback_ref",
+                        "output_path": "clips/fallback_ref.mp4",
+                        "summary": "",
+                        "subjects": [],
+                        "actions": [],
+                        "scene": "",
+                        "fallback_used": True,
+                        "detective_fallback_reason": "detective_and_single_pass_failed",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "proposal__fallback",
+                        "reference_video": "clips/fallback_ref.mp4",
+                        "edit_text": "change the robot body color from black and gold to bright yellow",
+                        "difference": {"type": "attribute", "from": "black and gold", "to": "bright yellow"},
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual([], plans)
+            self.assertEqual(1, summary["skipped_reasons"]["reference_annotation_unusable"])
+
+    def test_plan_video_edits_uses_model_prompt_planner_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "ref_visual.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a person holds a mobile phone at a desk",
+                        "subjects": ["person", "mobile phone", "desk"],
+                        "object_counts": {"person": 1, "mobile phone": 1, "desk": 1},
+                        "actions": ["holding"],
+                        "scene": "desk",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "visual_1",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "reference_caption": "a person holds a mobile phone at a desk",
+                        "edit_text": "replace the mobile phone with a tablet",
+                        "difference": {"type": "object_presence", "from": "mobile phone", "to": "tablet"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "source_prompt": "Omni source prompt: a person holds a phone at a desk.",
+                    "target_prompt": "Omni target prompt: same shot, replace only the phone with a tablet.",
+                    "edit_token": "tablet",
+                    "preserve_tokens": ["person", "desk", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the person, desk, camera motion, lighting, timing, or visible text.",
+                    "edit_region": "hand-held object",
+                    "model_route": "vace_controlled",
+                    "reason": "The object is visible and localized.",
+                    "repaired_fields": ["target_prompt"],
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client) as client_cls:
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["plan_count"])
+            client_cls.assert_called_once()
+            fake_client.plan_video_edit.assert_called_once()
+            self.assertEqual("strongest_omni_prompt_planner", plans[0]["planner"]["stage"])
+            self.assertFalse(plans[0]["planner"]["fallback_used"])
+            self.assertEqual("qwen3-omni", plans[0]["planner"]["model"])
+            self.assertEqual(["target_prompt"], plans[0]["planner"]["repaired_fields"])
+            self.assertEqual("tablet", plans[0]["edit_token"])
+            self.assertEqual("hand-held object", plans[0]["edit_region"])
+            self.assertIn("replace only the phone", plans[0]["target_prompt"])
+            self.assertEqual({"raw": "planner"}, plans[0]["raw_planner_output"])
+
+    def test_plan_video_edits_rejects_clean_naked_object_insertion_for_vace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "robot_ref",
+                        "output_path": "clips/robot_ref.mp4",
+                        "summary": "a black and gold robotic action figure rotates on a reflective platform",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "plant_insert",
+                        "reference_video": "clips/robot_ref.mp4",
+                        "reference_caption": "a robot rotates on a platform",
+                        "edit_text": "add a medium green potted plant in the background",
+                        "difference": {
+                            "type": "object_presence",
+                            "from": "no medium green potted plant",
+                            "to": "medium green potted plant",
+                        },
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual([], plans)
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["vace_rejects_tiny_or_naked_object_edit"])
+
+    def test_plan_video_edits_uses_model_revised_safe_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "ref_visual.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a hand writes on a white paper on a desk",
+                        "subjects": ["hand", "paper", "desk"],
+                        "object_counts": {"hand": 1, "paper": 1, "desk": 1},
+                        "actions": ["writing"],
+                        "scene": "desk",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "visual_1",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "reference_caption": "a hand writes on paper",
+                        "edit_text": "add a robot action figure",
+                        "difference": {"type": "object_presence", "from": "no robot action figure", "to": "robot action figure"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "edit_text": "change the paper color from white to pale blue",
+                    "difference": {"type": "attribute", "from": "white paper", "to": "pale blue paper"},
+                    "source_prompt": "A close-up video of a hand writing on white paper on a desk.",
+                    "target_prompt": "The same close-up video of the same hand writing on the same desk, but the paper surface is pale blue while everything else stays unchanged.",
+                    "edit_token": "pale blue paper",
+                    "preserve_tokens": ["hand", "paper", "desk", "writing", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the hand, paper, writing, desk, camera motion, lighting, timing, or visible text.",
+                    "edit_region": "paper surface",
+                    "model_route": "vace_controlled",
+                    "reason": "The candidate object insertion is unsuitable, so the planner chose a safer large visible color edit.",
+                    "repaired_fields": [],
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client):
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("change the paper color from white to pale blue", plans[0]["edit_text"])
+            self.assertEqual({"type": "attribute", "from": "white paper", "to": "pale blue paper"}, plans[0]["difference"])
+            self.assertEqual("pale blue paper", plans[0]["edit_token"])
+            self.assertEqual("paper surface", plans[0]["edit_region"])
+            self.assertEqual("vace_controlled", plans[0]["model_route"])
+
+    def test_plan_video_edits_prefers_reference_attribute_ideation_over_action_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "robot_ref.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "robot_ref",
+                        "output_path": "clips/robot_ref.mp4",
+                        "summary": "a black and gold robotic action figure rotates on a reflective platform in a dark studio",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "robot_action",
+                        "reference_video": "clips/robot_ref.mp4",
+                        "reference_caption": "a robot rotates on a platform",
+                        "edit_text": "change the action from rotating to hovering",
+                        "difference": {"type": "action", "from": "rotating", "to": "hovering"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "edit_text": "change the robot body color from black and gold to bright yellow",
+                    "difference": {
+                        "type": "attribute",
+                        "from": "black and gold robot body",
+                        "to": "bright yellow robot body",
+                    },
+                    "source_prompt": "A black and gold robotic action figure rotates on a reflective platform in a dark studio.",
+                    "target_prompt": "The same robotic action figure rotates on the same platform in the same dark studio, but the robot body is bright yellow.",
+                    "edit_token": "bright yellow robot body",
+                    "preserve_tokens": ["yellow visor", "platform", "dark studio", "rotation", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the platform, camera motion, lighting, timing, background, or visible text.",
+                    "edit_region": "robot body",
+                    "model_route": "vace_controlled",
+                    "reason": "The robot body color is a safer VACE edit than changing the action.",
+                    "repaired_fields": [],
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client):
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["safe_visual_ideation_from_non_vace_candidate"])
+            self.assertEqual("change the action from rotating to hovering", plans[0]["source_candidate_edit_text"])
+            self.assertEqual("attribute", plans[0]["difference"]["type"])
+            self.assertEqual("vace_controlled", plans[0]["model_route"])
+            self.assertEqual("strongest_omni_prompt_planner", plans[0]["planner"]["stage"])
+            self.assertFalse(plans[0]["planner"]["fallback_used"])
+            self.assertEqual("existing_subject_attribute_edit", plans[0]["route_suitability"]["reason"])
+            self.assertEqual("robot body", plans[0]["mask_query"])
+            self.assertEqual("grounded_sam2_video_mask", plans[0]["mask_plan"])
+            self.assertEqual("vace14b_masked_v2v", plans[0]["route"])
+            self.assertEqual("to_be_generated", plans[0]["vace_inputs"]["src_mask"])
+            self.assertTrue(plans[0]["validation_requirements"]["requires_mask"])
+
+    def test_plan_video_edits_exploration_mode_generates_diverse_vace_families_from_one_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "robot_ref.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "robot_ref",
+                        "output_path": "clips/robot_ref.mp4",
+                        "summary": "a black and gold robotic action figure rotates in a dark studio with a cup beside it",
+                        "subjects": ["robotic action figure", "cup", "platform"],
+                        "object_counts": {"robotic action figure": 1, "cup": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio background",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "robot_candidate",
+                        "reference_video": "clips/robot_ref.mp4",
+                        "reference_caption": "a robot rotates in a studio",
+                        "edit_text": "change the action from rotating to hovering",
+                        "difference": {"type": "action", "from": "rotating", "to": "hovering"},
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=10,
+                planning_mode="exploration",
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            families = {plan["exploration_family"] for plan in plans}
+            self.assertEqual("exploration", summary["planning_mode"])
+            self.assertGreaterEqual(summary["plan_count"], 5)
+            self.assertIn("attribute_color", families)
+            self.assertIn("attribute_material", families)
+            self.assertIn("background_change", families)
+            self.assertIn("style_lighting", families)
+            self.assertIn("object_replacement", families)
+            self.assertTrue(all(plan["model_route"] == "vace_controlled" for plan in plans))
+            self.assertEqual({"clips/robot_ref.mp4"}, {plan["reference_video"] for plan in plans})
+
+    def test_plan_video_edits_reuses_cached_omni_prompt_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "robot_ref.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "robot_ref",
+                        "output_path": "clips/robot_ref.mp4",
+                        "summary": "a black and gold robotic action figure rotates on a reflective platform",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "robot_color",
+                        "reference_video": "clips/robot_ref.mp4",
+                        "reference_caption": "a robot rotates on a platform",
+                        "edit_text": "change the robot body color from black and gold to bright yellow",
+                        "difference": {
+                            "type": "attribute",
+                            "from": "black and gold robot body",
+                            "to": "bright yellow robot body",
+                        },
+                    }
+                ],
+            )
+            cache_path = root / "pairs" / "planner_cache.jsonl"
+            planned_payload = {
+                "should_generate": True,
+                "edit_text": "change the robot body color from black and gold to bright yellow",
+                "difference": {
+                    "type": "attribute",
+                    "from": "black and gold robot body",
+                    "to": "bright yellow robot body",
+                },
+                "source_prompt": "A black and gold robotic action figure rotates on a platform.",
+                "target_prompt": "The same robot rotates on the same platform, but the body is bright yellow.",
+                "edit_token": "bright yellow robot body",
+                "preserve_tokens": ["platform", "dark studio", "camera motion", "lighting"],
+                "negative_prompt": "Do not change the platform, background, camera, lighting, timing, or visible text.",
+                "edit_region": "robot body",
+                "mask_query": "robot body",
+                "model_route": "vace_controlled",
+                "reason": "large existing attribute edit",
+                "repaired_fields": [],
+            }
+
+            first_client = mock.Mock()
+            first_client.plan_video_edit.return_value = (planned_payload, {"raw": "planner"})
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=first_client):
+                first_summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    planner_cache_path=cache_path,
+                )
+
+            second_client = mock.Mock()
+            second_client.plan_video_edit.side_effect = AssertionError("cache should avoid Omni call")
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=second_client):
+                second_summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    planner_cache_path=cache_path,
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(second_summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, first_summary["planner_cache_misses"])
+            self.assertEqual(1, second_summary["planner_cache_hits"])
+            second_client.plan_video_edit.assert_not_called()
+            self.assertFalse(plans[0]["planner"]["fallback_used"])
+            self.assertTrue(plans[0]["planner"]["cache_hit"])
+
+    def test_plan_video_masks_builds_grounded_sam_manifest_for_vace_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "robot_ref.mp4").write_bytes(b"video")
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "robot_color",
+                        "reference_video": "clips/robot_ref.mp4",
+                        "edit_text": "change the robot body color from black and gold to bright yellow",
+                        "difference": {"type": "attribute", "from": "black and gold robot body", "to": "bright yellow robot body"},
+                        "model_route": "vace_controlled",
+                        "edit_token": "bright yellow robot body",
+                        "edit_region": "robot body",
+                        "mask_query": "robot body",
+                        "preserve_tokens": ["platform", "dark studio", "camera motion"],
+                    }
+                ],
+            )
+
+            summary = plan_video_masks(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                output_path=root / "pairs" / "video_mask_plan.jsonl",
+                mask_manifest_path=root / "pairs" / "video_mask_manifest.jsonl",
+            )
+            mask_plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            mask_manifest = [
+                json.loads(line)
+                for line in Path(summary["mask_manifest_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["mask_plan_count"])
+            self.assertEqual("robot body", mask_plans[0]["mask_query"])
+            self.assertEqual("edit_masked_region", mask_plans[0]["mask_mode"])
+            self.assertEqual(0.02, mask_plans[0]["mask_gate"]["min_coverage_ratio"])
+            self.assertEqual(0.65, mask_plans[0]["mask_gate"]["max_coverage_ratio"])
+            self.assertEqual("SAM2.1_video_predictor", mask_plans[0]["toolchain"]["segmenter"])
+            self.assertEqual("robot_color", mask_manifest[0]["plan_id"])
+            self.assertTrue(mask_manifest[0]["mask_video"].endswith("robot_color_mask.mp4"))
+
+    def test_plan_src_ref_images_requires_references_for_object_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "phone_to_tablet",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "replace the phone with a tablet",
+                        "difference": {"type": "object_presence", "from": "phone", "to": "tablet"},
+                        "model_route": "vace_controlled",
+                        "edit_token": "tablet",
+                        "edit_region": "hand-held object",
+                        "exploration_family": "object_replacement",
+                    },
+                    {
+                        "plan_id": "robot_color",
+                        "reference_video": "clips/robot.mp4",
+                        "edit_text": "change robot body color from black and gold to bright yellow",
+                        "difference": {"type": "attribute", "from": "black and gold", "to": "bright yellow"},
+                        "model_route": "vace_controlled",
+                        "edit_token": "bright yellow robot body",
+                        "edit_region": "robot body",
+                        "exploration_family": "attribute_color",
+                    },
+                ],
+            )
+
+            summary = plan_src_ref_images(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                image_root=root / "src_ref_images",
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("phone_to_tablet", plans[0]["plan_id"])
+            self.assertTrue(plans[0]["required"])
+            self.assertEqual("replacement_object", plans[0]["src_ref_role"])
+            self.assertIn("tablet", plans[0]["image_prompts"][0])
+            self.assertEqual(1, summary["skipped_reasons"]["src_ref_not_needed"])
+
+    def test_select_src_ref_images_picks_existing_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            candidate_dir = root / "src_ref_images" / "phone_to_tablet"
+            candidate_dir.mkdir(parents=True)
+            (candidate_dir / "candidate_001.png").write_bytes(b"one")
+            (candidate_dir / "candidate_002.png").write_bytes(b"two")
+            plan_path = root / "pairs" / "src_ref_image_plan.jsonl"
+            self._write_jsonl(
+                plan_path,
+                [
+                    {
+                        "plan_id": "phone_to_tablet",
+                        "candidate_dir": str(candidate_dir),
+                        "required": True,
+                        "src_ref_role": "replacement_object",
+                    }
+                ],
+            )
+
+            summary = select_src_ref_images(root=root, src_ref_image_plan_path=plan_path, max_selected=1)
+            records = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["selected_plan_count"])
+            self.assertEqual("selected", records[0]["status"])
+            self.assertEqual(1, len(records[0]["selected_src_ref_images"]))
+            self.assertEqual(1, len(records[0]["rejected"]))
+
+    def test_plan_video_edits_rejects_tiny_additive_attribute_revision_for_vace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "ref_visual.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a woman speaks to camera in a room",
+                        "subjects": ["woman", "room"],
+                        "object_counts": {"woman": 1},
+                        "actions": ["speaking"],
+                        "scene": "room",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "visual_1",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "reference_caption": "a woman speaks to camera",
+                        "edit_text": "change the attribute from no nose ring to nose ring",
+                        "difference": {"type": "attribute", "from": "no nose ring", "to": "nose ring"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "edit_text": "add a nose ring to the woman",
+                    "difference": {"type": "attribute", "from": "no nose ring", "to": "nose ring"},
+                    "source_prompt": "A woman speaks to camera in the same room.",
+                    "target_prompt": "The same woman speaks to camera in the same room with a small nose ring added.",
+                    "edit_token": "nose ring",
+                    "preserve_tokens": ["woman", "room", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the woman, room, camera motion, lighting, timing, or visible text.",
+                    "edit_region": "face, nose area",
+                    "model_route": "tokenflow_style",
+                    "reason": "A nose ring is a localized accessory addition.",
+                    "repaired_fields": [],
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client):
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual([], plans)
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["vace_rejects_tiny_or_naked_object_edit"])
+
+    def test_plan_video_edits_ideates_safe_visual_edit_from_audio_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "ref_audio.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_audio",
+                        "output_path": "clips/ref_audio.mp4",
+                        "summary": "a black and gold robotic action figure rotates on a reflective platform in a dark studio",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating", "turning"],
+                        "scene": "dark studio",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "audio_1",
+                        "reference_video": "clips/ref_audio.mp4",
+                        "reference_caption": "a hand writes on paper",
+                        "edit_text": "add whoosh to the audio",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "edit_text": "change the robot body color from black and gold to bright yellow",
+                    "difference": {
+                        "type": "attribute",
+                        "from": "black and gold robot body",
+                        "to": "bright yellow robot body",
+                    },
+                    "source_prompt": "A black and gold robotic action figure rotates on a reflective platform in a dark studio.",
+                    "target_prompt": "The same robotic action figure rotates on the same platform in the same dark studio, but the robot body is bright yellow.",
+                    "edit_token": "bright yellow robot body",
+                    "preserve_tokens": ["yellow visor", "platform", "dark studio", "rotation", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the platform, camera motion, lighting, timing, background, or visible text.",
+                    "edit_region": "robot body",
+                    "model_route": "vace_controlled",
+                    "reason": "The robot body color is a large existing attribute suitable for VACE.",
+                    "repaired_fields": [],
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client):
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("add whoosh to the audio", plans[0]["source_candidate_edit_text"])
+            self.assertEqual("change the robot body color from black and gold to bright yellow", plans[0]["edit_text"])
+            self.assertEqual("attribute", plans[0]["difference"]["type"])
+            self.assertEqual("vace_controlled", plans[0]["model_route"])
+            self.assertTrue(plans[0]["visual_edit_risk"]["safe_visual_ideation_relaxed"])
+            self.assertIn("multiple_actions", plans[0]["visual_edit_risk"]["relaxed_risk_reasons"])
+            self.assertEqual(1, summary["skipped_reasons"]["safe_visual_ideation_from_unsupported_type"])
+            call_kwargs = fake_client.plan_video_edit.call_args.kwargs
+            self.assertEqual("change the robot body color from black and gold to bright yellow", call_kwargs["candidate"]["edit_text"])
+
+    def test_plan_video_edits_keeps_visible_text_hard_risk_for_safe_ideation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "ref_audio.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_audio",
+                        "output_path": "clips/ref_audio.mp4",
+                        "summary": "a black and gold robotic action figure rotates on a platform with visible chemical text",
+                        "subjects": ["robotic action figure", "platform"],
+                        "object_counts": {"robotic action figure": 1, "platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
+                        "visible_text": ["chemical formula"],
+                        "on_screen_text": ["chemical formula"],
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "audio_1",
+                        "reference_video": "clips/ref_audio.mp4",
+                        "reference_caption": "a hand writes on paper",
+                        "edit_text": "add whoosh to the audio",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client):
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["safe_visual_ideation_from_unsupported_type"])
+            self.assertEqual(1, summary["skipped_reasons"]["risk_visible_text_present"])
+            fake_client.plan_video_edit.assert_not_called()
+
+    def test_plan_video_edits_skips_high_risk_visible_text_and_motion_references(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "text_ref",
+                        "output_path": "clips/text_ref.mp4",
+                        "summary": "a person speaks while a lower-third caption is visible",
+                        "subjects": ["person", "caption"],
+                        "object_counts": {"person": 1},
+                        "actions": ["speaking", "gesturing"],
+                        "scene": "indoor room",
+                        "visible_text": ["MAKE WRONG"],
+                        "on_screen_text": ["MAKE WRONG"],
+                    },
+                    {
+                        "clip_id": "motion_ref",
+                        "output_path": "clips/motion_ref.mp4",
+                        "summary": "a person runs, jumps, and then waves",
+                        "subjects": ["person"],
+                        "object_counts": {"person": 1},
+                        "actions": ["running", "jumping", "waving"],
+                        "scene": "outdoor track",
+                    },
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "text_risky",
+                        "reference_video": "clips/text_ref.mp4",
+                        "edit_text": "add a pen-like device",
+                        "difference": {"type": "object_presence", "from": "no pen-like device", "to": "pen-like device"},
+                    },
+                    {
+                        "proposal_id": "motion_risky",
+                        "reference_video": "clips/motion_ref.mp4",
+                        "edit_text": "add a small backpack",
+                        "difference": {"type": "object_presence", "from": "no backpack", "to": "backpack"},
+                    },
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["risk_visible_text_present"])
+            self.assertGreaterEqual(summary["skipped_reasons"]["risk_multiple_actions"], 1)
+
+    def test_video_edit_risk_adds_text_and_motion_locks(self) -> None:
+        risk = _video_edit_risk_assessment(
+            {
+                "summary": "a person speaks to camera",
+                "subjects": ["person"],
+                "actions": ["speaking", "gesturing"],
+                "visible_text": ["hello"],
+            },
+            difference_type="object_presence",
+        )
+
+        self.assertFalse(risk["allow_generation"])
+        self.assertIn("visible_text_present", risk["risk_reasons"])
+        self.assertTrue(any("visible text" in lock for lock in risk["locks"]))
+        self.assertTrue(any("motion timing" in lock for lock in risk["locks"]))
+
+    def test_plan_audio_edits_only_allows_non_speech_audio_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref",
+                        "output_path": "clips/ref.mp4",
+                        "summary": "a person jumps across a small platform",
+                        "actions": ["jumping"],
+                        "audio_events": [],
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "audio_ok",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "add whoosh to the audio",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                    },
+                    {
+                        "proposal_id": "speech_bad",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "change the speech topic to marketing",
+                        "difference": {"type": "speech", "from": "sports", "to": "marketing"},
+                    },
+                    {
+                        "proposal_id": "audio_speech_bad",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "change the audio to only speech",
+                        "difference": {"type": "audio_event", "from": "no distinctive audio event", "to": "only speech"},
+                    },
+                ],
+            )
+
+            summary = plan_audio_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("audio_ok", plans[0]["plan_id"])
+            self.assertEqual("strongest_omni_audio_prompt_planner", plans[0]["planner"]["stage"])
+            self.assertEqual("short_clip_reference_video_and_audio_understanding", plans[0]["planner"]["input"])
+            self.assertEqual("whoosh", plans[0]["audio_edit_plan"]["expected_event"])
+            self.assertEqual("visual_sync", plans[0]["audio_edit_plan"]["timing_strategy"])
+            self.assertEqual("contextual_non_speech_audio_edit", plans[0]["route_suitability"]["reason"])
+            self.assertEqual("S", plans[0]["route_suitability"]["priority"])
+            self.assertEqual("whoosh", plans[0]["audio_reference_understanding"]["suggested_non_speech_audio_events"][0]["expected_event"])
+            self.assertEqual(1, summary["skipped_by_type"]["speech"])
+            self.assertEqual(2, summary["skipped_reasons"]["speech_content_or_speech_only_audio"])
+
+    def test_plan_audio_edits_ideates_contextual_sound_from_action_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref",
+                        "output_path": "clips/ref.mp4",
+                        "summary": "a character is launched from a cliff and glides through the air",
+                        "subjects": ["character", "cliff"],
+                        "actions": ["launched", "gliding"],
+                        "audio_events": [],
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "action_hint",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "change the action from running to launched",
+                        "difference": {"type": "action", "from": "running", "to": "launched"},
+                    }
+                ],
+            )
+
+            summary = plan_audio_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["safe_audio_ideation_from_non_audio_candidate"])
+            self.assertEqual("change the action from running to launched", plans[0]["source_candidate_edit_text"])
+            self.assertEqual("audio_event", plans[0]["difference"]["type"])
+            self.assertEqual("whoosh", plans[0]["audio_edit_plan"]["expected_event"])
+            self.assertEqual("foleycrafter_temporal", plans[0]["audio_edit_plan"]["route"])
+            self.assertEqual("visual_sync", plans[0]["route_suitability"]["timing_strategy"])
+            self.assertEqual("S", plans[0]["route_suitability"]["priority"])
+
+    def test_plan_audio_edits_rejects_event_already_present_in_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref",
+                        "output_path": "clips/ref.mp4",
+                        "summary": "a person jumps with a whoosh sound",
+                        "actions": ["jumping"],
+                        "audio_events": ["whoosh"],
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "audio_dup",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "add whoosh to the audio",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                    }
+                ],
+            )
+
+            summary = plan_audio_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual([], plans)
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["reference_already_has_expected_audio_event"])
+
+    def test_build_manual_review_bundle_copies_videos_and_writes_descriptions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "clips").mkdir(parents=True)
+            (root / "synthetic").mkdir(parents=True)
+            (root / "clips" / "ref.mp4").write_bytes(b"reference-video")
+            (root / "synthetic" / "target.mp4").write_bytes(b"target-video")
+            pairs_path = root / "accepted.jsonl"
+            self._write_jsonl(
+                pairs_path,
+                [
+                    {
+                        "sample_id": "sample_1",
+                        "proposal_id": "proposal__abc",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": "synthetic/target.mp4",
+                        "edit_text": "change the robot body color from black and gold to bright yellow",
+                        "difference": {"type": "attribute", "from": "black and gold", "to": "bright yellow"},
+                        "reference_caption": "A black and gold robot rotates on a platform.",
+                        "target_caption": "A bright yellow robot rotates on the same platform.",
+                        "verification": {"passed": True},
+                        "observable_difference": {"passed": True},
+                        "competing_difference": {"passed": True},
+                    }
+                ],
+            )
+            output_dir = root / "manual_review"
+
+            summary = build_manual_review_bundle(
+                root=root,
+                pairs_path=pairs_path,
+                output_dir=output_dir,
+            )
+
+            self.assertEqual(1, summary["bundle_count"])
+            item_dir = output_dir / "0001_sample_1"
+            self.assertTrue((item_dir / "reference.mp4").exists())
+            self.assertTrue((item_dir / "target.mp4").exists())
+            review_text = (item_dir / "review.md").read_text(encoding="utf-8")
+            self.assertIn("change the robot body color", review_text)
+            self.assertIn("A black and gold robot", review_text)
+            self.assertIn("A bright yellow robot", review_text)
+            self.assertTrue((item_dir / "metadata.json").exists())
+            self.assertIn("sample_1", (output_dir / "index.md").read_text(encoding="utf-8"))
+
+    def test_pair_record_acceptance_issues_rejects_speech_difference_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            issues = _pair_record_acceptance_issues(
+                root=root,
+                record={
+                    "reference_video": "ref.mp4",
+                    "target_video": "target.mp4",
+                    "edit_text": "change the speech topic to marketing",
+                    "difference": {"type": "speech", "from": "sales", "to": "marketing"},
+                },
+                reference_annotation={"speech": ["sales"]},
+                target_annotation={"speech": ["marketing"]},
+            )
+
+            self.assertTrue(any("speech difference type is disabled" in issue for issue in issues))
+
+    def test_synthetic_audio_rejects_visual_drift_and_missing_target_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={"duration_seconds": 8.0, "has_audio": True, "has_video": True},
+            ):
+                issues = _pair_record_acceptance_issues(
+                    root=root,
+                    record={
+                        "source_type": "synthetic_edit",
+                        "reference_video": "ref.mp4",
+                        "target_video": "target.mp4",
+                        "edit_text": "add whoosh to the audio",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                        "quality": {"visual_near_duplicate_score": 0.80},
+                        "source_context": {"relation": "synthetic_from_reference"},
+                        "generation": {
+                            "model_route": "deterministic_overlay",
+                            "audio_edit_plan": {"route": "deterministic_overlay", "expected_event": "whoosh"},
+                        },
+                    },
+                    reference_annotation={"audio_events": []},
+                    target_annotation={"audio_events": ["quiet room"]},
+                )
+
+            self.assertTrue(any("audio synthetic target changed visual stream" in issue for issue in issues))
+            self.assertTrue(any("target sound was not detected" in issue for issue in issues))
+
+    def test_synthetic_visual_requires_reference_audio_remux_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={"duration_seconds": 8.0, "has_audio": True, "has_video": True},
+            ):
+                issues = _pair_record_acceptance_issues(
+                    root=root,
+                    record={
+                        "source_type": "synthetic_edit",
+                        "reference_video": "ref.mp4",
+                        "target_video": "target.mp4",
+                        "edit_text": "add a red backpack",
+                        "difference": {"type": "object_presence", "from": "no red backpack", "to": "red backpack"},
+                        "quality": {"visual_near_duplicate_score": 0.90},
+                        "source_context": {"relation": "synthetic_from_reference"},
+                        "generation": {"model_route": "vace_controlled", "postprocess": {}},
+                    },
+                    reference_annotation={"object_counts": {"chair": 1}},
+                    target_annotation={"object_counts": {"chair": 1, "red backpack": 1}},
+                )
+
+            self.assertTrue(any("audio_copied_from_reference=true" in issue for issue in issues))
 
     def test_validate_pilot_dataset_builds_gallery_from_targets_and_negatives(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3764,6 +5768,67 @@ class ComposedDataTests(unittest.TestCase):
                 {"clips/target.mp4", "clips/neg1.mp4", "clips/neg2.mp4"},
                 {record["video_path"] for record in gallery_records},
             )
+
+    def test_validate_pilot_dataset_allows_synthetic_plan_proposal_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("ref.mp4", "target.mp4", "neg.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+
+            pilot_path = root / "pilot.jsonl"
+            self._write_jsonl(
+                pilot_path,
+                [
+                    {
+                        "sample_id": "covr_omni_synth_0001",
+                        "proposal_id": "synthetic_audio_pair_0001",
+                        "source_type": "synthetic_edit",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": "clips/target.mp4",
+                        "edit_text": "add whoosh to the audio",
+                        "modalities": ["audio"],
+                        "reference_caption": "same visual clip without whoosh",
+                        "target_caption": "same visual clip with whoosh",
+                        "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                        "hard_negatives": ["clips/neg.mp4"],
+                        "quality": {
+                            "same_context_score": 0.98,
+                            "edit_match_score": 0.9,
+                            "target_uniqueness_score": 0.9,
+                            "difference_strength_score": 0.8,
+                            "non_speech_audio_event_score": 0.9,
+                        },
+                        "source_context": {"relation": "synthetic_from_reference"},
+                        "source": {
+                            "platform": "synthetic",
+                            "url": "file:///tmp/target.mp4",
+                            "license_note": "internal research pilot only",
+                        },
+                        "generation": {
+                            "model": "ffmpeg-deterministic-audio",
+                            "model_route": "deterministic_overlay",
+                            "source_video": "clips/ref.mp4",
+                            "audio_edit_plan": {
+                                "route": "deterministic_overlay",
+                                "audio_prompt": "whoosh",
+                                "expected_event": "whoosh",
+                                "preserve_video": True,
+                            },
+                        },
+                    }
+                ],
+            )
+
+            summary = validate_pilot_dataset(
+                root=root,
+                pilot_jsonl_path=pilot_path,
+                gallery_output_path=root / "gallery.jsonl",
+                report_output_path=root / "review.md",
+            )
+
+            self.assertEqual(1, summary["sample_count"])
+            self.assertEqual({"synthetic_edit": 1}, summary["source_type_counts"])
 
     def test_validate_pilot_dataset_rejects_duplicate_proposals(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

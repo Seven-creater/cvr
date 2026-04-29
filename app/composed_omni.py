@@ -86,6 +86,18 @@ REQUIRED_PAIR_VERIFICATION_FIELDS = (
     "edit_necessity",
 )
 
+REQUIRED_VIDEO_EDIT_PLAN_FIELDS = (
+    "should_generate",
+    "source_prompt",
+    "target_prompt",
+    "edit_token",
+    "preserve_tokens",
+    "negative_prompt",
+    "edit_region",
+    "model_route",
+    "reason",
+)
+
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 NON_SPEECH_AUDIO_TOKENS = {
     "ambient",
@@ -434,6 +446,68 @@ def _pair_verification_system_prompt() -> str:
     )
 
 
+def _video_edit_planner_system_prompt() -> str:
+    return (
+        "You are the strongest Omni video-edit prompt planner for synthetic composed video retrieval. "
+        "Watch the short reference clip and use the candidate edit as a hint, not as something to blindly copy. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"should_generate": boolean, "edit_text": string, "difference": object, '
+        '"source_prompt": string, "target_prompt": string, '
+        '"edit_token": string, "preserve_tokens": [string], "negative_prompt": string, '
+        '"edit_region": string, "mask_query": string, "preserve_regions": [string], '
+        '"model_route": string, "reason": string}. '
+        "First understand the reference video: main subjects, stable scene, visible text, actions, editable attributes, and bad edits. "
+        "If the candidate edit is unsuitable but the reference clip has a safer single visual edit, revise edit_text and difference to that safer edit instead of rejecting. "
+        "Prefer VACE-friendly edits on existing content in this order: clothing/outfit changes, background replacement, video style changes, object replacement inside an existing maskable region, object removal/inpainting, large subject color/material changes, lighting/weather/time-of-day changes. "
+        "Do not revise to naked small-object insertion, tiny accessories, exact count edits, or precise text edits. "
+        "Only revise to attribute/color/material edits, existing-object replacements, or simple action edits that are visibly supported by the reference. "
+        "The source_prompt must faithfully describe the reference video. "
+        "The target_prompt must preserve the same subject, scene, camera, lighting, timing, and layout, while applying exactly one visual edit. "
+        "The edit_token is the one object, attribute, or action concept the editor should change. "
+        "mask_query is the visual target that Grounded-SAM-2 should segment, for example robot body, shirt, cup, glasses, or background. "
+        "preserve_tokens are concepts that must stay unchanged. "
+        "preserve_regions are visual regions that must stay unchanged outside the mask. "
+        "negative_prompt must explicitly forbid changing people, scene, camera, visible text, timing, and unrelated objects. "
+        "edit_region should be localized when possible, such as top-right paper surface, wall area, desk surface, hand-held object, or background. "
+        "For VACE, route clothing/background/style/object-replacement/removal/color/material edits to vace_controlled. "
+        "Do not route no-object -> object insertion such as stickers, plants, badges, nose rings, posters, text, or labels to VACE unless a deterministic mask/overlay editor is explicitly available. "
+        "Reject by setting should_generate=false when the edit is audio-only, speech/topic, visible text/OCR, broad scene replacement, impossible for this reference, or likely to change the whole clip. "
+        "Do not write a caption as target_prompt; write an instruction-ready prompt for VACE/LTX style video editing."
+    )
+
+
+def _stable_clip_selector_system_prompt() -> str:
+    return (
+        "You select short stable clips for synthetic video editing. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"start_sec": number, "end_sec": number, "stability_score": number, '
+        '"camera_motion": "static"|"slow_pan"|"unstable"|"unknown", "main_subjects": [string], '
+        '"visible_text_risk": boolean, "recommended_for_vace": boolean, "reason": string}. '
+        "Choose a 5-8 second window with one clear subject, stable camera, minimal scene cuts, minimal visible text, "
+        "and an edit-friendly visual structure. Prefer windows suitable for masked VACE editing."
+    )
+
+
+def _build_stable_clip_selector_user_content(
+    *,
+    source_video_path: str,
+    media_info: dict[str, Any],
+    min_clip_seconds: float,
+    max_clip_seconds: float,
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: choose one stable short window from this source video for later VACE editing.\n"
+        f"Media info JSON:\n{json.dumps(media_info, ensure_ascii=False)}\n"
+        f"Window length must be between {min_clip_seconds:.1f} and {max_clip_seconds:.1f} seconds.\n"
+        "Prefer a window with a single main subject, no/low visible text risk, no rapid cuts, and a maskable object or subject.\n"
+        "If no good window exists, set recommended_for_vace=false and still return the least bad 5-8 second window."
+    )
+    return [
+        {"type": "video_url", "video_url": {"url": source_video_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
 def _build_clip_annotation_user_content(clip_path: str) -> list[dict[str, Any]]:
     prompt = (
         "Task: describe this clip for composed retrieval dataset construction.\n"
@@ -626,6 +700,38 @@ def _build_pair_verification_user_content(
     return content
 
 
+def _build_video_edit_planner_user_content(
+    *,
+    reference_clip_path: str,
+    reference_annotation: dict[str, Any],
+    candidate: dict[str, Any],
+    route_hint: str,
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: build a controlled video-edit prompt plan for this reference clip.\n"
+        "The goal is to create a synthetic target video for composed video retrieval: reference video + edit_text -> target video.\n"
+        "The video editor must be used with purpose. First understand what is actually in the reference video, then decide whether the candidate edit is suitable.\n"
+        f"Route hint: {route_hint}\n"
+        f"Reference annotation JSON:\n{json.dumps(reference_annotation, ensure_ascii=False)}\n"
+        f"Candidate edit JSON:\n{json.dumps(candidate, ensure_ascii=False)}\n"
+        "Rules:\n"
+        "- Keep the clip short-context identity: same scene, subject identity, camera motion, timing, lighting, and layout.\n"
+        "- Prefer VACE edits in this order: change clothing/outfit, replace background, style transfer, replace an existing object, remove/inpaint an object, change large color/material, change lighting/weather/time.\n"
+        "- Do not propose naked small-object insertion such as a sticker, plant, badge, nose ring, poster, label, logo, or text unless a deterministic mask/overlay editor is explicitly available.\n"
+        "- If the candidate edit is not suitable but another local visual edit is suitable for this exact reference, output the safer revised edit_text and difference.\n"
+        "- The safest VACE edit is usually a large, visible attribute change on the main subject, not adding a new object to the background.\n"
+        "- Do not plan visible-text edits unless OCR-backed text editing is explicitly available.\n"
+        "- Do not plan audio_event or speech edits for a video editor.\n"
+        "- Do not use a universal edit. The edit must fit objects/actions visible in this reference video.\n"
+        "- Set should_generate=false only when no safe single local visual edit is available for this video.\n"
+        "Return JSON only."
+    )
+    return [
+        {"type": "video_url", "video_url": {"url": reference_clip_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
 class OpenAIComposedDataClient:
     def __init__(
         self,
@@ -751,6 +857,57 @@ class OpenAIComposedDataClient:
             max_tokens=1300,
         )
         return _normalize_pair_verification_payload(raw_payload), raw_payload
+
+    def plan_video_edit(
+        self,
+        *,
+        reference_clip_path: str,
+        reference_annotation: dict[str, Any],
+        candidate: dict[str, Any],
+        route_hint: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_video_edit_planner_user_content(
+                reference_clip_path=reference_clip_path,
+                reference_annotation=reference_annotation,
+                candidate=candidate,
+                route_hint=route_hint,
+            ),
+            system_prompt=_video_edit_planner_system_prompt(),
+            max_tokens=1300,
+        )
+        repaired_payload = _repair_video_edit_plan_payload(
+            raw_payload,
+            candidate=candidate,
+            reference_annotation=reference_annotation,
+            route_hint=route_hint,
+        )
+        return _normalize_video_edit_plan_payload(repaired_payload), raw_payload
+
+    def select_stable_clip_window(
+        self,
+        *,
+        source_video_path: str,
+        media_info: dict[str, Any],
+        min_clip_seconds: float,
+        max_clip_seconds: float,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_stable_clip_selector_user_content(
+                source_video_path=source_video_path,
+                media_info=media_info,
+                min_clip_seconds=min_clip_seconds,
+                max_clip_seconds=max_clip_seconds,
+            ),
+            system_prompt=_stable_clip_selector_system_prompt(),
+            max_tokens=700,
+        )
+        return _normalize_stable_clip_selection_payload(
+            raw_payload,
+            min_clip_seconds=min_clip_seconds,
+            max_clip_seconds=max_clip_seconds,
+            duration_seconds=float(media_info.get("duration_seconds") or 0.0),
+        ), raw_payload
 
     def _request_json(
         self,
@@ -951,6 +1108,232 @@ def _normalize_pair_verification_payload(payload: dict[str, Any]) -> dict[str, A
             "score": _score_value(edit_text_quality_check.get("score", 1.0)),
             "failure_reason": str(edit_text_quality_check.get("failure_reason", "")).strip(),
         },
+    }
+
+
+def _repair_video_edit_plan_payload(
+    payload: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    reference_annotation: dict[str, Any] | None = None,
+    route_hint: str,
+) -> dict[str, Any]:
+    repaired = dict(payload)
+    repaired_fields: list[str] = _string_list(repaired.get("repaired_fields"))
+    source_prompt = str(repaired.get("source_prompt", "")).strip()
+    edit_text = str(candidate.get("edit_text", "")).strip()
+    difference = candidate.get("difference") if isinstance(candidate.get("difference"), dict) else {}
+    edit_token = str(repaired.get("edit_token", "")).strip()
+    if not edit_token:
+        for field_name in ("to", "description", "from"):
+            value = str(difference.get(field_name, "")).strip()
+            if value and value.lower() not in {"none", "missing", "absent"} and not value.lower().startswith("no "):
+                edit_token = value
+                repaired["edit_token"] = edit_token
+                repaired_fields.append("edit_token")
+                break
+    preserve_tokens = _string_list(repaired.get("preserve_tokens"))
+    if not preserve_tokens:
+        preserve_tokens = _infer_video_edit_preserve_tokens(
+            reference_annotation=reference_annotation or {},
+            payload=repaired,
+            difference=difference,
+            edit_token=edit_token,
+        )
+        if preserve_tokens:
+            repaired["preserve_tokens"] = preserve_tokens
+            repaired_fields.append("preserve_tokens")
+    if source_prompt and not str(repaired.get("target_prompt", "")).strip():
+        edit_instruction = edit_text or (f"add or change {edit_token}" if edit_token else "apply the requested edit")
+        repaired["target_prompt"] = (
+            f"{source_prompt.rstrip('.')} Apply exactly one localized edit: {edit_instruction}. "
+            "Preserve all other visible content, camera motion, lighting, timing, and layout."
+        )
+        repaired_fields.append("target_prompt")
+    if not str(repaired.get("negative_prompt", "")).strip() and preserve_tokens:
+        protected = ", ".join(preserve_tokens[:6])
+        repaired["negative_prompt"] = (
+            f"Do not change {protected}. Do not change people, scene, camera, lighting, visible text, "
+            "timing, or unrelated objects."
+        )
+        repaired_fields.append("negative_prompt")
+    if route_hint and not str(repaired.get("model_route", "")).strip():
+        repaired["model_route"] = route_hint
+        repaired_fields.append("model_route")
+    if not str(repaired.get("edit_region", "")).strip():
+        edit_region = _infer_video_edit_region(
+            payload=repaired,
+            candidate=candidate,
+            difference=difference,
+            edit_token=edit_token,
+        )
+        if edit_region:
+            repaired["edit_region"] = edit_region
+            repaired_fields.append("edit_region")
+    if not str(repaired.get("reason", "")).strip():
+        repaired["reason"] = "Planner response was repaired conservatively from the candidate edit."
+        repaired_fields.append("reason")
+    if repaired_fields:
+        repaired["repaired_fields"] = sorted(set(repaired_fields))
+    return repaired
+
+
+def _infer_video_edit_preserve_tokens(
+    *,
+    reference_annotation: dict[str, Any],
+    payload: dict[str, Any],
+    difference: dict[str, Any],
+    edit_token: str,
+) -> list[str]:
+    values: list[str] = []
+    if isinstance(reference_annotation, dict):
+        values.extend(_string_list(reference_annotation.get("subjects")))
+        values.extend(_normalize_object_counts(reference_annotation.get("object_counts")).keys())
+        values.extend(_string_list(reference_annotation.get("actions")))
+        scene = str(reference_annotation.get("scene", "")).strip()
+        if scene:
+            values.append(scene)
+        values.extend(_string_list(reference_annotation.get("on_screen_text")))
+
+    source_prompt = str(payload.get("source_prompt", "")).strip()
+    if source_prompt:
+        for phrase in (
+            "camera motion",
+            "camera angle",
+            "lighting",
+            "timing",
+            "layout",
+            "background",
+            "foreground",
+        ):
+            if phrase in source_prompt.lower():
+                values.append(phrase)
+
+    for field_name in ("from", "description"):
+        value = str(difference.get(field_name, "")).strip()
+        if value and value.lower() not in {"none", "missing", "absent"} and not value.lower().startswith("no "):
+            values.append(value)
+
+    values.extend(["camera motion", "lighting", "timing", "layout"])
+    edit_key = _phrase_key(edit_token)
+    preserve_tokens: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value).strip()
+        key = _phrase_key(item)
+        if not item or not key or key == edit_key or key in seen:
+            continue
+        seen.add(key)
+        preserve_tokens.append(item)
+        if len(preserve_tokens) >= 8:
+            break
+    if not preserve_tokens:
+        preserve_tokens = ["original subject", "scene", "camera motion", "lighting", "timing", "layout"]
+    return preserve_tokens
+
+
+def _phrase_key(value: str) -> str:
+    return " ".join(TOKEN_PATTERN.findall(str(value).lower()))
+
+
+def _infer_video_edit_region(
+    *,
+    payload: dict[str, Any],
+    candidate: dict[str, Any],
+    difference: dict[str, Any],
+    edit_token: str,
+) -> str:
+    text_parts = [
+        candidate.get("edit_text", ""),
+        payload.get("target_prompt", ""),
+        payload.get("source_prompt", ""),
+        difference.get("description", ""),
+        difference.get("to", ""),
+        difference.get("from", ""),
+    ]
+    text = " ".join(str(part) for part in text_parts if part).lower()
+    region_patterns = (
+        (r"\btop[- ]right\b|\bupper[- ]right\b", "top-right region"),
+        (r"\btop[- ]left\b|\bupper[- ]left\b", "top-left region"),
+        (r"\bbottom[- ]right\b|\blower[- ]right\b", "bottom-right region"),
+        (r"\bbottom[- ]left\b|\blower[- ]left\b", "bottom-left region"),
+        (r"\bbackground\b|\bbackdrop\b|\bin the back\b", "background"),
+        (r"\bforeground\b|\bfront\b", "foreground"),
+        (r"\bwall\b|\bposter\b|\bpainting\b|\bframed picture\b|\bwall art\b", "wall area"),
+        (r"\bpaper\b|\bpage\b|\bnotebook\b|\bworksheet\b", "paper surface"),
+        (r"\bdesk\b|\btable\b|\bcounter\b|\bsurface\b", "desk/table surface"),
+        (r"\bfloor\b|\bground\b", "floor area"),
+        (r"\bhand[- ]held\b|\bin (?:the )?hand\b|\bholding\b|\bheld\b", "hand-held object"),
+        (r"\bcenter\b|\bmiddle\b", "center region"),
+        (r"\bleft side\b|\bon the left\b", "left side"),
+        (r"\bright side\b|\bon the right\b", "right side"),
+    )
+    for pattern, region in region_patterns:
+        if re.search(pattern, text):
+            return region
+    if edit_token:
+        return f"localized region around {edit_token}"
+    return ""
+
+
+def _normalize_video_edit_plan_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_VIDEO_EDIT_PLAN_FIELDS)
+    if missing_fields:
+        raise ValueError(f"video edit plan missing fields: {missing_fields}")
+
+    preserve_tokens = _string_list(payload.get("preserve_tokens"))
+    preserve_regions = _string_list(payload.get("preserve_regions"))
+    normalized = {
+        "should_generate": _bool_value(payload.get("should_generate")),
+        "edit_text": str(payload.get("edit_text", "")).strip(),
+        "difference": payload.get("difference") if isinstance(payload.get("difference"), dict) else {},
+        "source_prompt": str(payload.get("source_prompt", "")).strip(),
+        "target_prompt": str(payload.get("target_prompt", "")).strip(),
+        "edit_token": str(payload.get("edit_token", "")).strip(),
+        "preserve_tokens": preserve_tokens,
+        "negative_prompt": str(payload.get("negative_prompt", "")).strip(),
+        "edit_region": str(payload.get("edit_region", "")).strip(),
+        "mask_query": str(payload.get("mask_query", "")).strip(),
+        "preserve_regions": preserve_regions,
+        "model_route": str(payload.get("model_route", "")).strip(),
+        "reason": str(payload.get("reason", "")).strip(),
+        "repaired_fields": _string_list(payload.get("repaired_fields")),
+    }
+    for field_name in ("source_prompt", "target_prompt", "edit_token", "negative_prompt", "edit_region", "reason"):
+        if not normalized[field_name]:
+            raise ValueError(f"video edit plan {field_name} is required")
+    if not normalized["preserve_tokens"]:
+        raise ValueError("video edit plan preserve_tokens is required")
+    return normalized
+
+
+def _normalize_stable_clip_selection_payload(
+    payload: dict[str, Any],
+    *,
+    min_clip_seconds: float,
+    max_clip_seconds: float,
+    duration_seconds: float,
+) -> dict[str, Any]:
+    start = _score_or_zero(payload.get("start_sec"))
+    try:
+        end = float(payload.get("end_sec"))
+    except (TypeError, ValueError):
+        end = start + min_clip_seconds
+    start = max(0.0, min(start, max(0.0, duration_seconds)))
+    end = max(start, min(end, duration_seconds if duration_seconds > 0 else end))
+    if end - start < min_clip_seconds:
+        end = min(duration_seconds if duration_seconds > 0 else start + min_clip_seconds, start + min_clip_seconds)
+    if end - start > max_clip_seconds:
+        end = start + max_clip_seconds
+    return {
+        "start_sec": round(start, 3),
+        "end_sec": round(end, 3),
+        "stability_score": _score_value(payload.get("stability_score")),
+        "camera_motion": str(payload.get("camera_motion", "unknown")).strip() or "unknown",
+        "main_subjects": _string_list(payload.get("main_subjects")),
+        "visible_text_risk": _bool_value(payload.get("visible_text_risk")),
+        "recommended_for_vace": _bool_value(payload.get("recommended_for_vace", True)),
+        "reason": str(payload.get("reason", "")).strip(),
     }
 
 

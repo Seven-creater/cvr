@@ -169,6 +169,253 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertEqual("instruct-model", request_body["model"])
         self.assertEqual(22.0, request_holder["timeout"])
 
+    def test_plan_video_edit_materializes_reference_video_and_normalizes_plan(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_generate": True,
+                                "source_prompt": "A close-up video of a person holding a mobile phone at a desk.",
+                                "target_prompt": "A close-up video of the same person at the same desk holding a tablet instead of the mobile phone.",
+                                "edit_token": "tablet",
+                                "preserve_tokens": ["person", "desk", "camera motion", "lighting", "timing"],
+                                "negative_prompt": "Do not change the person, desk, camera, lighting, timing, or visible text.",
+                                "edit_region": "hand-held object",
+                                "model_route": "vace_controlled",
+                                "reason": "The phone is visible and can be locally replaced.",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            request_holder["timeout"] = timeout
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-video-edit-plan-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            clip_path = tmp_dir / "clip.mp4"
+            clip_path.write_bytes(b"fake-mp4-bytes")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+                timeout_seconds=44.0,
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.plan_video_edit(
+                    reference_clip_path=str(clip_path),
+                    reference_annotation={"summary": "a person holds a mobile phone at a desk"},
+                    candidate={
+                        "edit_text": "replace the mobile phone with a tablet",
+                        "difference": {"type": "object_presence", "from": "mobile phone", "to": "tablet"},
+                    },
+                    route_hint="vace_controlled",
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertTrue(normalized["should_generate"])
+        self.assertEqual("tablet", normalized["edit_token"])
+        self.assertEqual("vace_controlled", normalized["model_route"])
+        self.assertIn("camera motion", normalized["preserve_tokens"])
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        self.assertEqual({"type": "json_object"}, request_body["response_format"])
+        user_content = request_body["messages"][1]["content"]
+        self.assertEqual("video_url", user_content[0]["type"])
+        self.assertTrue(user_content[0]["video_url"]["url"].startswith("data:video/mp4;base64,"))
+        self.assertIn("Candidate edit JSON", user_content[1]["text"])
+        self.assertEqual(44.0, request_holder["timeout"])
+
+    def test_plan_video_edit_repairs_empty_target_prompt_without_discarding_plan(self) -> None:
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_generate": True,
+                                "source_prompt": "A close-up video of a hand writing on white paper.",
+                                "target_prompt": "",
+                                "edit_token": "blue star sticker",
+                                "preserve_tokens": ["hand", "paper", "camera motion", "lighting"],
+                                "negative_prompt": "Do not change the hand, paper, writing, camera, timing, or lighting.",
+                                "edit_region": "top-right paper surface",
+                                "model_route": "vace_controlled",
+                                "reason": "The paper surface is visible and localized.",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-video-edit-plan-repair-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            clip_path = tmp_dir / "clip.mp4"
+            clip_path.write_bytes(b"fake-mp4-bytes")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.plan_video_edit(
+                    reference_clip_path=str(clip_path),
+                    reference_annotation={"summary": "a hand writes on white paper"},
+                    candidate={
+                        "edit_text": "add a blue star sticker to the top-right corner of the paper",
+                        "difference": {"type": "object_presence", "from": "no blue star sticker", "to": "blue star sticker"},
+                    },
+                    route_hint="vace_controlled",
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertIn("add a blue star sticker", normalized["target_prompt"])
+        self.assertIn("Preserve all other visible content", normalized["target_prompt"])
+        self.assertEqual(["target_prompt"], normalized["repaired_fields"])
+        self.assertEqual("blue star sticker", normalized["edit_token"])
+
+    def test_plan_video_edit_repairs_missing_edit_region_without_discarding_plan(self) -> None:
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_generate": True,
+                                "source_prompt": "A product showcase of a rotating robot platform.",
+                                "target_prompt": "A product showcase of a rotating robot platform with a robot action figure added in the background.",
+                                "edit_token": "robot action figure",
+                                "preserve_tokens": ["platform", "camera motion", "lighting", "timing"],
+                                "negative_prompt": "Do not change the platform, camera, lighting, timing, or scene.",
+                                "edit_region": "",
+                                "model_route": "vace_controlled",
+                                "reason": "The edit is localized behind the platform.",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-video-edit-plan-region-repair-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            clip_path = tmp_dir / "clip.mp4"
+            clip_path.write_bytes(b"fake-mp4-bytes")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.plan_video_edit(
+                    reference_clip_path=str(clip_path),
+                    reference_annotation={"summary": "a robot platform rotates in a dark studio"},
+                    candidate={
+                        "edit_text": "add a robot action figure to the background",
+                        "difference": {
+                            "type": "object_presence",
+                            "from": "no robot action figure",
+                            "to": "robot action figure",
+                        },
+                    },
+                    route_hint="vace_controlled",
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual("background", normalized["edit_region"])
+        self.assertEqual(["edit_region"], normalized["repaired_fields"])
+        self.assertEqual("robot action figure", normalized["edit_token"])
+
+    def test_plan_video_edit_repairs_missing_preserve_tokens_without_discarding_plan(self) -> None:
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_generate": True,
+                                "source_prompt": "A product showcase of a rotating platform in a dark studio.",
+                                "target_prompt": "A product showcase of a rotating platform in a dark studio with a robot action figure in the background.",
+                                "edit_token": "robot action figure",
+                                "edit_region": "background",
+                                "model_route": "vace_controlled",
+                                "reason": "The background can be edited locally while preserving the platform.",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-video-edit-plan-preserve-repair-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            clip_path = tmp_dir / "clip.mp4"
+            clip_path.write_bytes(b"fake-mp4-bytes")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.plan_video_edit(
+                    reference_clip_path=str(clip_path),
+                    reference_annotation={
+                        "summary": "a rotating platform in a dark studio",
+                        "subjects": ["rotating platform"],
+                        "object_counts": {"platform": 1},
+                        "actions": ["rotating"],
+                        "scene": "dark studio",
+                    },
+                    candidate={
+                        "edit_text": "add a robot action figure to the background",
+                        "difference": {
+                            "type": "object_presence",
+                            "from": "no robot action figure",
+                            "to": "robot action figure",
+                        },
+                    },
+                    route_hint="vace_controlled",
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertIn("rotating platform", normalized["preserve_tokens"])
+        self.assertIn("camera motion", normalized["preserve_tokens"])
+        self.assertNotIn("robot action figure", normalized["preserve_tokens"])
+        self.assertIn("Do not change rotating platform", normalized["negative_prompt"])
+        self.assertEqual(["negative_prompt", "preserve_tokens"], normalized["repaired_fields"])
+
     def test_detective_annotation_runs_observer_then_final_pass(self) -> None:
         requests = []
         observer_payload = {
