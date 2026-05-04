@@ -59,7 +59,7 @@ if [[ -n "$SRC_REF_SELECTION" ]]; then
   SRC_REF_ARGS=(--src-ref-selection "$SRC_REF_SELECTION")
 fi
 
-scripts/run_vace_visual_batch_from_plan.sh \
+bash scripts/run_vace_visual_batch_from_plan.sh \
   --data-root "$DATA_ROOT" \
   --run-root "$RUN_ROOT" \
   --video-edit-plan "$VIDEO_EDIT_PLAN" \

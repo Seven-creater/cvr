@@ -169,6 +169,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("PLAN_IDS", script)
         self.assertIn("TOP_K", script)
         self.assertIn("run_vace_visual_synthetic_smoke.sh", script)
+        self.assertIn("bash scripts/run_vace_visual_synthetic_smoke.sh", script)
         self.assertIn("mapfile -t SELECTED_PLAN_IDS", script)
         self.assertIn("< /dev/null", script)
         self.assertIn("MASK_MANIFEST", script)
@@ -178,6 +179,12 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
         self.assertIn("synthetic_visual_target_manifest.jsonl", script)
         self.assertIn("batch_generation_report.md", script)
+
+    def test_vace_masked_batch_script_invokes_nested_script_with_bash(self) -> None:
+        script = Path("scripts/run_vace_masked_visual_batch_from_plan.sh").read_text(encoding="utf-8")
+
+        self.assertIn("bash scripts/run_vace_visual_batch_from_plan.sh", script)
+        self.assertNotIn("\nscripts/run_vace_visual_batch_from_plan.sh", script)
         self.assertIn("This script does not start Omni", script)
 
     def test_vace_masked_visual_batch_script_requires_mask_manifest(self) -> None:
@@ -263,6 +270,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("cache-reference-understandings", script)
         self.assertIn("plan-src-ref-images", script)
         self.assertIn("run_src_ref_image_generation_from_plan.sh", script)
+        self.assertIn("bash scripts/run_src_ref_image_generation_from_plan.sh", script)
         self.assertIn("--image-gpu-ids", script)
         self.assertIn("IMAGE_GEN_GPU_IDS", script)
         self.assertIn("--image-device-map", script)
@@ -274,10 +282,14 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--planner-cache-path \"$VIDEO_EDIT_PLANNER_CACHE\"", script)
         self.assertIn("plan-video-masks", script)
         self.assertIn("run_grounded_sam2_video_masks.sh", script)
+        self.assertIn("bash scripts/run_grounded_sam2_video_masks.sh", script)
         self.assertIn("run_vace_masked_visual_batch_from_plan.sh", script)
+        self.assertIn("bash scripts/run_vace_masked_visual_batch_from_plan.sh", script)
         self.assertIn("detective-annotate-clips", script)
         self.assertIn("validate-known-pairs", script)
         self.assertIn("build_synthetic_manual_review_bundle.sh", script)
+        self.assertIn("bash scripts/build_synthetic_manual_review_bundle.sh", script)
+        self.assertNotRegex(script, r"(?m)^\s{2}scripts/[^ ]+\.sh")
         self.assertIn("florence2", script)
         self.assertIn("vace-14B", script)
 

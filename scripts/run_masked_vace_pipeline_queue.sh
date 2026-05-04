@@ -299,7 +299,7 @@ run_refgen() {
   if [[ -n "$IMAGE_GEN_DEVICE_MAP" ]]; then
     image_device_map_args=(--device-map "$IMAGE_GEN_DEVICE_MAP" --low-cpu-mem-usage "$IMAGE_GEN_LOW_CPU_MEM_USAGE")
   fi
-  scripts/run_src_ref_image_generation_from_plan.sh \
+  bash scripts/run_src_ref_image_generation_from_plan.sh \
     --src-ref-image-plan "$SRC_REF_IMAGE_PLAN" \
     --model-dir "$SRC_REF_IMAGE_MODEL_DIR" \
     --output-manifest "$SRC_REF_IMAGE_GENERATION_MANIFEST" \
@@ -317,7 +317,7 @@ run_mask() {
   if [[ -n "$MAX_MASKS" ]]; then
     mask_limit_args=(--max-masks "$MAX_MASKS")
   fi
-  scripts/run_grounded_sam2_video_masks.sh \
+  bash scripts/run_grounded_sam2_video_masks.sh \
     --data-root "$DATA_ROOT" \
     --run-root "$RUN_ROOT" \
     --mask-plan "$VIDEO_MASK_PLAN" \
@@ -338,7 +338,7 @@ run_vace() {
   if [[ -s "$SRC_REF_IMAGE_SELECTION" ]]; then
     src_ref_args=(--src-ref-selection "$SRC_REF_IMAGE_SELECTION")
   fi
-  scripts/run_vace_masked_visual_batch_from_plan.sh \
+  bash scripts/run_vace_masked_visual_batch_from_plan.sh \
     --data-root "$DATA_ROOT" \
     --run-root "$VACE_RUN_ROOT" \
     --video-edit-plan "$VIDEO_EDIT_PLAN" \
@@ -409,7 +409,7 @@ run_validate() {
 run_bundle() {
   require_file "$VALIDATION_RUN_ROOT/accepted_synthetic_pairs.jsonl" "accepted synthetic pairs"
   echo "[masked-vace-queue] stage=bundle output=$REVIEW_BUNDLE"
-  scripts/build_synthetic_manual_review_bundle.sh \
+  bash scripts/build_synthetic_manual_review_bundle.sh \
     --root "$DATA_ROOT" \
     --pairs-path "$VALIDATION_RUN_ROOT/accepted_synthetic_pairs.jsonl" \
     --clip-annotations "$ALL_ANNOTATIONS" \

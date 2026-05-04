@@ -148,7 +148,7 @@ PY
   if [[ -n "$SRC_REF_SELECTION" ]]; then
     SRC_REF_ARGS=(--src-ref-selection "$SRC_REF_SELECTION")
   fi
-  if scripts/run_vace_visual_synthetic_smoke.sh \
+  if bash scripts/run_vace_visual_synthetic_smoke.sh \
       --data-root "$DATA_ROOT" \
       --run-root "$RUN_ROOT" \
       --video-edit-plan "$VIDEO_EDIT_PLAN" \
