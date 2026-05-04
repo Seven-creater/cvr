@@ -141,6 +141,9 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("refusing CPU offload", script)
         self.assertIn("refusing CPU text encoder", script)
         self.assertIn("--src_video", script)
+        self.assertIn("SRC_VIDEO_FOR_VACE", script)
+        self.assertIn("maskedmerge", script)
+        self.assertIn("review_inputs", script)
         self.assertIn("--prompt", script)
         self.assertIn("--task \"$VACE_TASK\"", script)
         self.assertIn("--offload_model \"$OFFLOAD_MODEL\"", script)
@@ -156,6 +159,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("resolve_existing_path", script)
         self.assertIn("candidates = [path]", script)
         self.assertIn("src_mask", script)
+        self.assertNotIn("Negative constraints:", script)
         self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
         self.assertIn("synthetic_visual_target_manifest.jsonl", script)
 
@@ -233,6 +237,10 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("export FLORENCE_MODEL", script)
         self.assertIn("AutoProcessor.from_pretrained", script)
         self.assertIn("AutoModelForCausalLM.from_pretrained", script)
+        helper = Path("scripts/generate_grounded_sam2_video_masks.py").read_text(encoding="utf-8")
+        self.assertIn("_sample_keyframe_indices", helper)
+        self.assertIn("mask gate failed", helper)
+        self.assertIn("mask_nonempty_frame_ratio", helper)
 
     def test_manual_review_bundle_script_calls_review_bundle_command(self) -> None:
         script = Path("scripts/build_synthetic_manual_review_bundle.sh").read_text(encoding="utf-8")

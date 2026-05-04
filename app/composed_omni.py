@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import re
+from pathlib import Path
 import urllib.error
 import urllib.request
 from typing import Any
@@ -224,6 +227,20 @@ def _is_speech_like_audio_value(value: str) -> bool:
 def _is_non_speech_audio_value(value: str) -> bool:
     tokens = _tokenize_text(value)
     return bool(tokens & NON_SPEECH_AUDIO_TOKENS) and not _is_speech_like_audio_value(value)
+
+
+def _materialize_image_url(raw_url: str) -> str:
+    if raw_url.startswith(("http://", "https://", "data:")):
+        return raw_url
+    image_path = Path(raw_url)
+    if raw_url.startswith("file://"):
+        image_path = Path(urllib.request.url2pathname(raw_url.removeprefix("file://")))
+    if not image_path.exists():
+        raise FileNotFoundError(f"image file not found: {image_path}")
+    mime_type, _ = mimetypes.guess_type(str(image_path))
+    mime_type = mime_type or "image/png"
+    content = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+    return f"data:{mime_type};base64,{content}"
 
 
 def _collect_non_speech_audio_terms(payload: dict[str, Any]) -> list[str]:
@@ -462,17 +479,21 @@ def _video_edit_planner_system_prompt() -> str:
         "Do not revise to naked small-object insertion, tiny accessories, exact count edits, or precise text edits. "
         "Only revise to attribute/color/material edits, existing-object replacements, or simple action edits that are visibly supported by the reference. "
         "The source_prompt must faithfully describe the reference video. "
-        "The target_prompt must preserve the same subject, scene, camera, lighting, timing, and layout, while applying exactly one visual edit. "
+        "The target_prompt must be a positive description of the desired edited video, not a bare command. "
+        "For object replacement, describe the target object in the original source-object location and explicitly state that the source object is no longer visible. "
+        "For object removal, describe the source-object area as clean/naturally filled and explicitly state that the object is no longer visible. "
+        "The target_prompt must preserve the same subject, camera, lighting, timing, and layout, while applying exactly one visual edit. "
         "The edit_token is the one object, attribute, or action concept the editor should change. "
-        "mask_query is the visual target that Grounded-SAM-2 should segment, for example robot body, shirt, cup, glasses, or background. "
-        "preserve_tokens are concepts that must stay unchanged. "
+        "mask_query is the visual target that Grounded-SAM-2 should segment, for example robot body, shirt, cup, glasses, or the foreground subject for background edits. "
+        "For background edits, do not use mask_query=background; use the foreground subject so the mask can be inverted to edit the background. "
+        "preserve_tokens are concepts that must stay unchanged, but must not include the object being replaced or removed. "
         "preserve_regions are visual regions that must stay unchanged outside the mask. "
-        "negative_prompt must explicitly forbid changing people, scene, camera, visible text, timing, and unrelated objects. "
+        "negative_prompt must explicitly forbid changing people, scene, camera, visible text, timing, and unrelated objects, but must not forbid changing the source object being replaced or removed. "
         "edit_region should be localized when possible, such as top-right paper surface, wall area, desk surface, hand-held object, or background. "
         "For VACE, route clothing/background/style/object-replacement/removal/color/material edits to vace_controlled. "
         "Do not route no-object -> object insertion such as stickers, plants, badges, nose rings, posters, text, or labels to VACE unless a deterministic mask/overlay editor is explicitly available. "
         "Reject by setting should_generate=false when the edit is audio-only, speech/topic, visible text/OCR, broad scene replacement, impossible for this reference, or likely to change the whole clip. "
-        "Do not write a caption as target_prompt; write an instruction-ready prompt for VACE/LTX style video editing."
+        "Do not write malformed phrases like 'Add only no chair' or 'Add only tablet' for replacements; write the clean target-video description."
     )
 
 
@@ -732,6 +753,110 @@ def _build_video_edit_planner_user_content(
     ]
 
 
+def _src_ref_image_audit_system_prompt() -> str:
+    return (
+        "You audit generated source reference images for VACE video editing. "
+        "Select only candidates that should be passed as src_ref_images to VACE. "
+        "The selected images must match the edit role, target object or scene, camera perspective, scale, and material; "
+        "they must avoid visible text, watermarks, logos, extra people, wrong objects, or product-flatlay views that will confuse the video editor. "
+        "For replacement objects, select at most 1-2 strong object references. "
+        "For clothing, prefer wearable upper-body references suitable for a person, not flat product catalog images. "
+        "For backgrounds, prefer 16:9 empty scene plates with no people or text. "
+        "Return JSON only with fields: selected_indices, audit, rejected, reason. "
+        "selected_indices are 1-based indices from the candidate list."
+    )
+
+
+def _build_src_ref_image_audit_user_content(
+    *,
+    src_ref_plan: dict[str, Any],
+    candidate_image_paths: list[str],
+    max_selected: int,
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Audit these generated candidate images for a VACE src_ref_images input.\n"
+        f"Max selected images: {max_selected}\n"
+        f"Source reference plan JSON:\n{json.dumps(src_ref_plan, ensure_ascii=False)}\n"
+        "For each candidate, decide whether it is useful as a source reference image. "
+        "Reject images with wrong target, visible text/watermark/logo, poor composition, mismatched perspective, or confusing extra objects.\n"
+        "Return JSON schema:\n"
+        "{"
+        "\"selected_indices\":[1],"
+        "\"audit\":[{\"index\":1,\"score\":0.0,\"verdict\":\"select|reject\",\"reason\":\"...\"}],"
+        "\"rejected\":[{\"index\":2,\"reason\":\"...\"}],"
+        "\"reason\":\"short final selection reason\""
+        "}"
+    )
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for index, image_path in enumerate(candidate_image_paths, start=1):
+        content.append({"type": "text", "text": f"Candidate {index}: {image_path}"})
+        content.append({"type": "image_url", "image_url": {"url": image_path}})
+    return content
+
+
+def _normalize_src_ref_image_audit_payload(
+    payload: dict[str, Any],
+    *,
+    candidate_count: int,
+    max_selected: int,
+) -> dict[str, Any]:
+    selected_indices: list[int] = []
+    raw_indices = payload.get("selected_indices")
+    if isinstance(raw_indices, list):
+        for raw_index in raw_indices:
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= index <= candidate_count and index not in selected_indices:
+                selected_indices.append(index)
+            if len(selected_indices) >= max(1, max_selected):
+                break
+
+    audit_rows = payload.get("audit")
+    if not isinstance(audit_rows, list):
+        audit_rows = []
+    normalized_audit = []
+    for row in audit_rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            index = int(row.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= index <= candidate_count:
+            continue
+        normalized_audit.append(
+            {
+                "index": index,
+                "score": row.get("score"),
+                "verdict": str(row.get("verdict", "")).strip(),
+                "reason": str(row.get("reason", "")).strip(),
+            }
+        )
+
+    rejected_rows = payload.get("rejected")
+    if not isinstance(rejected_rows, list):
+        rejected_rows = []
+    rejected = []
+    for row in rejected_rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            index = int(row.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= index <= candidate_count:
+            rejected.append({"index": index, "reason": str(row.get("reason", "")).strip()})
+
+    return {
+        "selected_indices": selected_indices,
+        "audit": normalized_audit,
+        "rejected": rejected,
+        "reason": str(payload.get("reason", "")).strip(),
+    }
+
+
 class OpenAIComposedDataClient:
     def __init__(
         self,
@@ -884,6 +1009,28 @@ class OpenAIComposedDataClient:
         )
         return _normalize_video_edit_plan_payload(repaired_payload), raw_payload
 
+    def audit_src_ref_images(
+        self,
+        *,
+        src_ref_plan: dict[str, Any],
+        candidate_image_paths: list[str],
+        max_selected: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_src_ref_image_audit_user_content(
+                src_ref_plan=src_ref_plan,
+                candidate_image_paths=candidate_image_paths,
+                max_selected=max_selected,
+            ),
+            system_prompt=_src_ref_image_audit_system_prompt(),
+            max_tokens=1000,
+        )
+        return _normalize_src_ref_image_audit_payload(
+            raw_payload,
+            candidate_count=len(candidate_image_paths),
+            max_selected=max_selected,
+        ), raw_payload
+
     def select_stable_clip_window(
         self,
         *,
@@ -922,6 +1069,11 @@ class OpenAIComposedDataClient:
                 video_url = dict(item["video_url"])
                 video_url["url"] = _materialize_video_url(str(video_url["url"]))
                 request_content.append({"type": "video_url", "video_url": video_url})
+                continue
+            if item.get("type") == "image_url":
+                image_url = dict(item["image_url"])
+                image_url["url"] = _materialize_image_url(str(image_url["url"]))
+                request_content.append({"type": "image_url", "image_url": image_url})
                 continue
             request_content.append(item)
 
@@ -1209,19 +1361,16 @@ def _infer_video_edit_preserve_tokens(
             if phrase in source_prompt.lower():
                 values.append(phrase)
 
-    for field_name in ("from", "description"):
-        value = str(difference.get(field_name, "")).strip()
-        if value and value.lower() not in {"none", "missing", "absent"} and not value.lower().startswith("no "):
-            values.append(value)
-
     values.extend(["camera motion", "lighting", "timing", "layout"])
     edit_key = _phrase_key(edit_token)
+    source_key = _phrase_key(str(difference.get("from", "")).strip())
+    target_key = _phrase_key(str(difference.get("to", "")).strip())
     preserve_tokens: list[str] = []
     seen: set[str] = set()
     for value in values:
         item = str(value).strip()
         key = _phrase_key(item)
-        if not item or not key or key == edit_key or key in seen:
+        if not item or not key or key == edit_key or key == source_key or key == target_key or key in seen:
             continue
         seen.add(key)
         preserve_tokens.append(item)

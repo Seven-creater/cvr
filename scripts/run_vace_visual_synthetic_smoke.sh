@@ -189,6 +189,7 @@ plan_id = str(plan.get("plan_id", "")).strip() or "visual_plan"
 safe_plan_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", plan_id)[:80]
 raw_video = out_root / "videos" / f"{safe_plan_id}_raw.mp4"
 target_video = out_root / "videos" / f"{safe_plan_id}_with_ref_audio.mp4"
+src_video_for_vace = out_root / "videos" / f"{safe_plan_id}_src_video_for_vace.mp4"
 src_mask = ""
 if mask_manifest_path:
     mask_rows = [json.loads(line) for line in mask_manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -232,12 +233,6 @@ preserve_tokens = [str(item).strip() for item in plan.get("preserve_tokens", [])
 if not target_prompt:
     raise SystemExit("selected plan has empty target_prompt")
 prompt = target_prompt
-if edit_region:
-    prompt += f" Edit only the {edit_region}."
-if preserve_tokens:
-    prompt += " Preserve: " + ", ".join(preserve_tokens[:8]) + "."
-if negative_prompt:
-    prompt += " Negative constraints: " + negative_prompt
 
 selected_plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -256,6 +251,7 @@ known_pair = {
         "model": wan_ckpt.name or str(wan_ckpt),
         "model_route": route,
         "source_video": str(reference_path),
+        "src_video_for_vace": str(src_video_for_vace if src_mask else reference_path),
         "prompt": prompt,
         "source_prompt": str(plan.get("source_prompt", "")).strip(),
         "target_prompt": target_prompt,
@@ -299,6 +295,7 @@ manifest = {
 env_values = {
     "PLAN_ID": plan_id,
     "REFERENCE_VIDEO": str(reference_path),
+    "SRC_VIDEO_FOR_VACE": str(src_video_for_vace if src_mask else reference_path),
     "RAW_VIDEO": str(raw_video),
     "TARGET_VIDEO": str(target_video),
     "SRC_MASK": src_mask,
@@ -316,6 +313,7 @@ source "$ENV_FILE"
 echo "[vace-smoke] start $(date)"
 echo "[vace-smoke] plan_id=$PLAN_ID"
 echo "[vace-smoke] reference=$REFERENCE_VIDEO"
+echo "[vace-smoke] src_video_for_vace=$SRC_VIDEO_FOR_VACE"
 echo "[vace-smoke] raw_video=$RAW_VIDEO"
 echo "[vace-smoke] target_video=$TARGET_VIDEO"
 echo "[vace-smoke] src_mask=${SRC_MASK:-none}"
@@ -327,6 +325,43 @@ echo "[vace-smoke] conda_env=$CONDA_ENV"
 echo "[vace-smoke] gpu_ids=$GPU_IDS offload_model=$OFFLOAD_MODEL t5_cpu=$T5_CPU allow_cpu_offload=$ALLOW_CPU_OFFLOAD"
 echo "[vace-smoke] ulysses_size=$ULYSSES_SIZE ring_size=$RING_SIZE"
 echo "[vace-smoke] prompt=$PROMPT"
+
+mkdir -p "$OUT_ROOT/review_inputs/src_ref_images"
+{
+  echo "plan_id=$PLAN_ID"
+  echo "reference=$REFERENCE_VIDEO"
+  echo "src_video_for_vace=$SRC_VIDEO_FOR_VACE"
+  echo "src_mask=${SRC_MASK:-none}"
+  echo "src_ref_images=${SRC_REF_IMAGES:-none}"
+  echo
+  echo "$PROMPT"
+} > "$OUT_ROOT/review_inputs/vace_prompt.txt"
+ffmpeg -y -i "$REFERENCE_VIDEO" -vf "fps=1,scale=240:-1,tile=5x1" -frames:v 1 \
+  "$OUT_ROOT/review_inputs/reference_contact.jpg" > "$OUT_ROOT/logs/contact_reference.log" 2>&1 || true
+if [[ -n "${SRC_MASK:-}" ]]; then
+  ffmpeg -y -i "$SRC_MASK" -vf "fps=1,scale=240:-1,tile=5x1" -frames:v 1 \
+    "$OUT_ROOT/review_inputs/mask_contact.jpg" > "$OUT_ROOT/logs/contact_mask.log" 2>&1 || true
+  WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
+  HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
+  FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
+  DURATION=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
+  ffmpeg -y -i "$REFERENCE_VIDEO" -i "$SRC_MASK" \
+    -filter_complex "[1:v]scale=${WIDTH}:${HEIGHT},format=gray[m];color=c=gray:s=${WIDTH}x${HEIGHT}:r=${FPS}:d=${DURATION},format=yuv420p[gray];[0:v]format=yuv420p[base];[base][gray][m]maskedmerge[out]" \
+    -map "[out]" -map 0:a? -c:v libx264 -crf 18 -preset veryfast -c:a copy -shortest "$SRC_VIDEO_FOR_VACE" \
+    > "$OUT_ROOT/logs/src_video_for_vace.log" 2>&1 || {
+      echo "[vace-smoke] failed to create src_video_for_vace=$SRC_VIDEO_FOR_VACE" >&2
+      tail -80 "$OUT_ROOT/logs/src_video_for_vace.log" >&2 || true
+      exit 1
+    }
+fi
+if [[ -n "${SRC_REF_IMAGES:-}" ]]; then
+  IFS=',' read -r -a SRC_REF_IMAGE_ARRAY <<< "$SRC_REF_IMAGES"
+  idx=0
+  for image_path in "${SRC_REF_IMAGE_ARRAY[@]}"; do
+    idx=$((idx + 1))
+    cp "$image_path" "$OUT_ROOT/review_inputs/src_ref_images/$(printf '%03d' "$idx")_$(basename "$image_path")" || true
+  done
+fi
 
 if [[ ! -d "$WAN_CODE" ]]; then
   echo "[vace-smoke] missing WAN_CODE=$WAN_CODE" >&2
@@ -361,7 +396,7 @@ GEN_ARGS=(
   --task "$VACE_TASK"
   --size "$SIZE"
   --ckpt_dir "$WAN_CKPT"
-  --src_video "$REFERENCE_VIDEO"
+  --src_video "$SRC_VIDEO_FOR_VACE"
   --prompt "$PROMPT"
   --frame_num "$FRAME_NUM"
   --sample_steps "$SAMPLE_STEPS"

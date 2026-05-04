@@ -114,6 +114,35 @@ def _encode_mask_video(mask_dir: Path, output_path: Path, fps: float) -> None:
     )
 
 
+def _sample_keyframe_indices(frame_count: int) -> list[int]:
+    if frame_count <= 0:
+        return []
+    raw = [0, frame_count // 4, frame_count // 2, (frame_count * 3) // 4, frame_count - 1]
+    return sorted({max(0, min(frame_count - 1, idx)) for idx in raw})
+
+
+def _mask_gate_errors(mask_gate: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    avg_coverage = float(metrics.get("mask_coverage_ratio_avg", 0.0) or 0.0)
+    min_coverage = float(mask_gate.get("min_coverage_ratio", 0.0) or 0.0)
+    max_coverage = float(mask_gate.get("max_coverage_ratio", 1.0) or 1.0)
+    if avg_coverage < min_coverage:
+        errors.append(f"avg_coverage {avg_coverage:.4f} < min {min_coverage:.4f}")
+    if avg_coverage > max_coverage:
+        errors.append(f"avg_coverage {avg_coverage:.4f} > max {max_coverage:.4f}")
+    min_stability = float(mask_gate.get("min_temporal_stability", 0.0) or 0.0)
+    stability = float(metrics.get("mask_temporal_stability", 0.0) or 0.0)
+    if stability < min_stability:
+        errors.append(f"temporal_stability {stability:.4f} < min {min_stability:.4f}")
+    min_nonempty = float(mask_gate.get("min_nonempty_frame_ratio", 0.0) or 0.0)
+    nonempty = float(metrics.get("mask_nonempty_frame_ratio", 0.0) or 0.0)
+    if nonempty < min_nonempty:
+        errors.append(f"nonempty_frame_ratio {nonempty:.4f} < min {min_nonempty:.4f}")
+    if bool(mask_gate.get("mask_not_empty_all_frames")) and nonempty < 1.0:
+        errors.append("mask is empty on at least one frame")
+    return errors
+
+
 def _run_grounded_sam2(
     *,
     reference_video: Path,
@@ -154,27 +183,47 @@ def _run_grounded_sam2(
             str(grounding_dino_checkpoint),
             device=device,
         )
-        first_frame_path = frame_paths[0]
-        image_source, image = load_image(str(first_frame_path))
-        boxes, logits, phrases = predict(
-            model=grounding_model,
-            image=image,
-            caption=mask_query,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-            device=device,
-        )
-        if boxes is None or len(boxes) == 0:
-            raise RuntimeError(f"GroundingDINO found no box for query: {mask_query}")
-
-        h, w = image_source.shape[:2]
-        boxes_np = boxes.detach().cpu().numpy()
-        # GroundingDINO boxes are normalized cxcywh.
-        boxes_xyxy = np.zeros_like(boxes_np)
-        boxes_xyxy[:, 0] = (boxes_np[:, 0] - boxes_np[:, 2] / 2) * w
-        boxes_xyxy[:, 1] = (boxes_np[:, 1] - boxes_np[:, 3] / 2) * h
-        boxes_xyxy[:, 2] = (boxes_np[:, 0] + boxes_np[:, 2] / 2) * w
-        boxes_xyxy[:, 3] = (boxes_np[:, 1] + boxes_np[:, 3] / 2) * h
+        best_detection: dict[str, Any] | None = None
+        for frame_idx in _sample_keyframe_indices(len(frame_paths)):
+            frame_path = frame_paths[frame_idx]
+            image_source, image = load_image(str(frame_path))
+            boxes, logits, phrases = predict(
+                model=grounding_model,
+                image=image,
+                caption=mask_query,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+                device=device,
+            )
+            if boxes is None or len(boxes) == 0:
+                continue
+            h, w = image_source.shape[:2]
+            boxes_np = boxes.detach().cpu().numpy()
+            boxes_xyxy = np.zeros_like(boxes_np)
+            boxes_xyxy[:, 0] = (boxes_np[:, 0] - boxes_np[:, 2] / 2) * w
+            boxes_xyxy[:, 1] = (boxes_np[:, 1] - boxes_np[:, 3] / 2) * h
+            boxes_xyxy[:, 2] = (boxes_np[:, 0] + boxes_np[:, 2] / 2) * w
+            boxes_xyxy[:, 3] = (boxes_np[:, 1] + boxes_np[:, 3] / 2) * h
+            clipped = boxes_xyxy.copy()
+            clipped[:, 0::2] = np.clip(clipped[:, 0::2], 0, w)
+            clipped[:, 1::2] = np.clip(clipped[:, 1::2], 0, h)
+            box_areas = np.maximum(0, clipped[:, 2] - clipped[:, 0]) * np.maximum(0, clipped[:, 3] - clipped[:, 1])
+            coverage = float(box_areas[:3].sum() / max(float(w * h), 1.0))
+            logits_np = logits.detach().cpu().numpy() if hasattr(logits, "detach") else np.array(logits)
+            confidence = float(logits_np.max()) if logits_np.size else 0.0
+            score = confidence - abs(min(coverage, 1.0) - 0.12)
+            if best_detection is None or score > float(best_detection["score"]):
+                best_detection = {
+                    "frame_idx": frame_idx,
+                    "boxes_xyxy": boxes_xyxy,
+                    "phrases": [str(item) for item in phrases],
+                    "score": score,
+                    "box_coverage": coverage,
+                }
+        if best_detection is None:
+            raise RuntimeError(f"GroundingDINO found no box for query in sampled frames: {mask_query}")
+        boxes_xyxy = best_detection["boxes_xyxy"]
+        keyframe_idx = int(best_detection["frame_idx"])
 
         predictor = build_sam2_video_predictor(sam2_config, str(sam2_checkpoint), device=device)
         inference_state = predictor.init_state(video_path=str(frame_dir))
@@ -182,7 +231,7 @@ def _run_grounded_sam2(
         for object_id, box in enumerate(boxes_xyxy[:3], start=1):
             predictor.add_new_points_or_box(
                 inference_state=inference_state,
-                frame_idx=0,
+                frame_idx=keyframe_idx,
                 obj_id=object_id,
                 box=box,
             )
@@ -199,6 +248,7 @@ def _run_grounded_sam2(
 
         coverages: list[float] = []
         ious: list[float] = []
+        nonempty_count = 0
         last_mask: np.ndarray | None = None
         for idx, frame_path in enumerate(frame_paths):
             frame = cv2.imread(str(frame_path))
@@ -210,6 +260,8 @@ def _run_grounded_sam2(
             if mask.shape[:2] != frame.shape[:2]:
                 mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
             coverages.append(float(mask.mean()))
+            if float(mask.mean()) > 0.0:
+                nonempty_count += 1
             if last_mask is not None:
                 intersection = float(np.logical_and(last_mask, mask).sum())
                 union = float(np.logical_or(last_mask, mask).sum())
@@ -227,7 +279,10 @@ def _run_grounded_sam2(
             "mask_coverage_ratio_avg": sum(coverages) / len(coverages) if coverages else 0.0,
             "mask_coverage_ratio_max": max(coverages) if coverages else 0.0,
             "mask_temporal_stability": sum(ious) / len(ious) if ious else 1.0,
-            "detected_phrases": [str(item) for item in phrases],
+            "mask_nonempty_frame_ratio": nonempty_count / len(coverages) if coverages else 0.0,
+            "detected_phrases": best_detection["phrases"],
+            "detected_keyframe_index": keyframe_idx,
+            "detected_keyframe_box_coverage": best_detection["box_coverage"],
             "box_count": int(len(boxes_xyxy)),
             "device": device,
         }
@@ -301,19 +356,47 @@ def _run_florence_sam2(
         if not frame_paths:
             raise RuntimeError(f"no frames extracted from {reference_video}")
 
-        boxes_xyxy, labels = _florence_boxes(
-            image_path=frame_paths[0],
-            mask_query=mask_query,
-            florence_model_dir=florence_model_dir,
-            device=device,
-        )
+        best_detection: dict[str, Any] | None = None
+        for frame_idx in _sample_keyframe_indices(len(frame_paths)):
+            try:
+                boxes_xyxy, labels = _florence_boxes(
+                    image_path=frame_paths[frame_idx],
+                    mask_query=mask_query,
+                    florence_model_dir=florence_model_dir,
+                    device=device,
+                )
+            except RuntimeError:
+                continue
+            frame = cv2.imread(str(frame_paths[frame_idx]))
+            if frame is None:
+                continue
+            h, w = frame.shape[:2]
+            clipped = boxes_xyxy.copy()
+            clipped[:, 0::2] = np.clip(clipped[:, 0::2], 0, w)
+            clipped[:, 1::2] = np.clip(clipped[:, 1::2], 0, h)
+            box_areas = np.maximum(0, clipped[:, 2] - clipped[:, 0]) * np.maximum(0, clipped[:, 3] - clipped[:, 1])
+            coverage = float(box_areas[:3].sum() / max(float(w * h), 1.0))
+            score = -abs(min(coverage, 1.0) - 0.12) + min(len(boxes_xyxy), 3) * 0.05
+            if best_detection is None or score > float(best_detection["score"]):
+                best_detection = {
+                    "frame_idx": frame_idx,
+                    "boxes_xyxy": boxes_xyxy,
+                    "labels": labels,
+                    "score": score,
+                    "box_coverage": coverage,
+                }
+        if best_detection is None:
+            raise RuntimeError(f"Florence-2 found no box for query in sampled frames: {mask_query}")
+        boxes_xyxy = best_detection["boxes_xyxy"]
+        labels = best_detection["labels"]
+        keyframe_idx = int(best_detection["frame_idx"])
         predictor = build_sam2_video_predictor(sam2_config, str(sam2_checkpoint), device=device)
         inference_state = predictor.init_state(video_path=str(frame_dir))
         predictor.reset_state(inference_state)
         for object_id, box in enumerate(boxes_xyxy[:3], start=1):
             predictor.add_new_points_or_box(
                 inference_state=inference_state,
-                frame_idx=0,
+                frame_idx=keyframe_idx,
                 obj_id=object_id,
                 box=box,
             )
@@ -330,6 +413,7 @@ def _run_florence_sam2(
 
         coverages: list[float] = []
         ious: list[float] = []
+        nonempty_count = 0
         last_mask: np.ndarray | None = None
         for idx, frame_path in enumerate(frame_paths):
             frame = cv2.imread(str(frame_path))
@@ -341,6 +425,8 @@ def _run_florence_sam2(
             if mask.shape[:2] != frame.shape[:2]:
                 mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
             coverages.append(float(mask.mean()))
+            if float(mask.mean()) > 0.0:
+                nonempty_count += 1
             if last_mask is not None:
                 intersection = float(np.logical_and(last_mask, mask).sum())
                 union = float(np.logical_or(last_mask, mask).sum())
@@ -357,7 +443,10 @@ def _run_florence_sam2(
             "mask_coverage_ratio_avg": sum(coverages) / len(coverages) if coverages else 0.0,
             "mask_coverage_ratio_max": max(coverages) if coverages else 0.0,
             "mask_temporal_stability": sum(ious) / len(ious) if ious else 1.0,
+            "mask_nonempty_frame_ratio": nonempty_count / len(coverages) if coverages else 0.0,
             "detected_phrases": labels,
+            "detected_keyframe_index": keyframe_idx,
+            "detected_keyframe_box_coverage": best_detection["box_coverage"],
             "box_count": int(len(boxes_xyxy)),
             "device": device,
             "grounder": "florence2",
@@ -436,11 +525,16 @@ def main() -> None:
                     box_threshold=args.box_threshold,
                     text_threshold=args.text_threshold,
                 )
+            mask_gate = plan.get("mask_gate") if isinstance(plan.get("mask_gate"), dict) else {}
+            gate_errors = _mask_gate_errors(mask_gate, metrics)
+            if gate_errors:
+                raise RuntimeError("mask gate failed: " + "; ".join(gate_errors))
             row.update(
                 {
                     "mask_video": str(mask_video),
                     "status": "generated",
                     "mask_metrics": metrics,
+                    "mask_gate_result": {"passed": True, "errors": []},
                 }
             )
         except Exception as exc:  # pragma: no cover - integration path

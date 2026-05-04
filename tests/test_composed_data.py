@@ -4468,6 +4468,192 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual([], plans)
             self.assertEqual(1, summary["skipped_reasons"]["reference_annotation_unusable"])
 
+    def test_plan_video_edits_rewrites_replacement_without_preserving_source_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a man sits beside a cup on a small table",
+                        "subjects": ["man", "cup", "table"],
+                        "object_counts": {"man": 1, "cup": 1, "table": 1},
+                        "actions": ["sitting"],
+                        "scene": "office",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "cup_to_bottle",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "edit_text": "replace the cup with a bottle",
+                        "difference": {"type": "object_presence", "from": "cup", "to": "bottle"},
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertNotIn("Add only", plans[0]["target_prompt"])
+            self.assertIn("Replace only the cup with bottle", plans[0]["target_prompt"])
+            self.assertIn("no cup is visible", plans[0]["target_prompt"].lower())
+            self.assertNotIn("cup", [item.lower() for item in plans[0]["preserve_tokens"]])
+            self.assertNotIn("cup", plans[0]["negative_prompt"].lower())
+            self.assertTrue(plans[0]["plan_lint"]["passed"])
+
+    def test_plan_video_edits_rewrites_removal_without_add_only_no(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a table has a cup beside a notebook",
+                        "subjects": ["table", "cup", "notebook"],
+                        "object_counts": {"table": 1, "cup": 1, "notebook": 1},
+                        "actions": ["static"],
+                        "scene": "desk",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "remove_cup",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "edit_text": "remove the cup from the scene",
+                        "difference": {"type": "object_presence", "from": "cup", "to": "no cup"},
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertNotIn("Add only no", plans[0]["target_prompt"])
+            self.assertIn("Remove only the cup", plans[0]["target_prompt"])
+            self.assertNotIn("cup", plans[0]["negative_prompt"].lower())
+            self.assertTrue(plans[0]["plan_lint"]["passed"])
+
+    def test_plan_video_edits_rejects_screen_text_object_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a person wipes a laptop displaying a webpage",
+                        "subjects": ["person", "laptop"],
+                        "object_counts": {"person": 1, "laptop": 1},
+                        "actions": ["wiping"],
+                        "scene": "wooden table",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "laptop_to_tablet",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "edit_text": "replace the laptop with a tablet",
+                        "difference": {"type": "object_presence", "from": "laptop", "to": "tablet"},
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["plan_lint_object_replacement_screen_or_visible_text_risk"])
+
+    def test_plan_video_edits_rejects_removing_seated_support_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a young girl sits in a chair holding a toy",
+                        "subjects": ["young girl", "chair"],
+                        "object_counts": {"young girl": 1, "chair": 1},
+                        "actions": ["sitting"],
+                        "scene": "indoor room",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "remove_chair",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "edit_text": "remove the chair from the scene",
+                        "difference": {"type": "object_presence", "from": "chair", "to": "no chair"},
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["plan_lint_object_removal_breaks_seated_support"])
+
     def test_plan_video_edits_uses_model_prompt_planner_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -4507,7 +4693,7 @@ class ComposedDataTests(unittest.TestCase):
                 {
                     "should_generate": True,
                     "source_prompt": "Omni source prompt: a person holds a phone at a desk.",
-                    "target_prompt": "Omni target prompt: same shot, replace only the phone with a tablet.",
+                    "target_prompt": "Omni target prompt: same shot, replace only the phone with a tablet. No mobile phone is visible.",
                     "edit_token": "tablet",
                     "preserve_tokens": ["person", "desk", "camera motion", "lighting"],
                     "negative_prompt": "Do not change the person, desk, camera motion, lighting, timing, or visible text.",
@@ -4964,6 +5150,51 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("robot_color", mask_manifest[0]["plan_id"])
             self.assertTrue(mask_manifest[0]["mask_video"].endswith("robot_color_mask.mp4"))
 
+    def test_background_plan_masks_foreground_subject_for_inverse_background_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "man_ref.mp4").write_bytes(b"video")
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "lab_background",
+                        "reference_video": "clips/man_ref.mp4",
+                        "edit_text": "change the background to a futuristic laboratory",
+                        "difference": {
+                            "type": "scene",
+                            "from": "original background",
+                            "to": "futuristic laboratory background",
+                        },
+                        "model_route": "vace_controlled",
+                        "edit_token": "futuristic laboratory background",
+                        "edit_region": "background",
+                        "mask_query": "background",
+                        "reference_understanding": {"main_subjects": ["man with white beard"]},
+                        "preserve_tokens": ["man with white beard", "camera motion"],
+                    }
+                ],
+            )
+
+            summary = plan_video_masks(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                output_path=root / "pairs" / "video_mask_plan.jsonl",
+                mask_manifest_path=root / "pairs" / "video_mask_manifest.jsonl",
+            )
+            mask_plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual("man with white beard", mask_plans[0]["mask_query"])
+            self.assertEqual("edit_background_inverse_subject", mask_plans[0]["mask_mode"])
+            self.assertEqual(0.20, mask_plans[0]["mask_gate"]["min_coverage_ratio"])
+            self.assertEqual(0.90, mask_plans[0]["mask_gate"]["max_coverage_ratio"])
+
     def test_plan_src_ref_images_requires_references_for_object_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -5045,6 +5276,71 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("selected", records[0]["status"])
             self.assertEqual(1, len(records[0]["selected_src_ref_images"]))
             self.assertEqual(1, len(records[0]["rejected"]))
+
+    def test_select_src_ref_images_uses_omni_audit_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            candidate_dir = root / "src_ref_images" / "phone_to_tablet"
+            candidate_dir.mkdir(parents=True)
+            (candidate_dir / "candidate_001.png").write_bytes(b"one")
+            (candidate_dir / "candidate_002.png").write_bytes(b"two")
+            plan_path = root / "pairs" / "src_ref_image_plan.jsonl"
+            self._write_jsonl(
+                plan_path,
+                [
+                    {
+                        "plan_id": "phone_to_tablet",
+                        "candidate_dir": str(candidate_dir),
+                        "required": True,
+                        "src_ref_role": "replacement_object",
+                    }
+                ],
+            )
+
+            class FakeClient:
+                def __init__(self, **kwargs: object) -> None:
+                    self.kwargs = kwargs
+
+                def audit_src_ref_images(
+                    self,
+                    *,
+                    src_ref_plan: dict,
+                    candidate_image_paths: list[str],
+                    max_selected: int,
+                ) -> tuple[dict, dict]:
+                    self.src_ref_plan = src_ref_plan
+                    self.candidate_image_paths = candidate_image_paths
+                    self.max_selected = max_selected
+                    return (
+                        {
+                            "selected_indices": [2],
+                            "audit": [{"index": 2, "verdict": "select", "reason": "better angle"}],
+                            "rejected": [{"index": 1, "reason": "flat view"}],
+                            "reason": "candidate 2 best matches the replacement object",
+                        },
+                        {"raw": True},
+                    )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", FakeClient):
+                summary = select_src_ref_images(
+                    root=root,
+                    src_ref_image_plan_path=plan_path,
+                    max_selected=1,
+                    base_url="http://127.0.0.1:8093/v1",
+                    model="qwen3-omni",
+                )
+            records = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["selected_plan_count"])
+            self.assertEqual("omni_src_ref_image_audit", records[0]["selection_method"])
+            self.assertTrue(records[0]["selected_src_ref_images"][0].endswith("candidate_002.png"))
+            self.assertEqual("candidate 2 best matches the replacement object", records[0]["selection_reason"])
+            self.assertIn("omni_audit", records[0])
 
     def test_plan_video_edits_rejects_tiny_additive_attribute_revision_for_vace(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

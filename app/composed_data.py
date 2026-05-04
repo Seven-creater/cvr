@@ -92,6 +92,7 @@ MIN_SYNTHETIC_AUDIO_VISUAL_CONTEXT_SCORE = 0.95
 MIN_VIDEO_MASK_COVERAGE_RATIO = 0.02
 MAX_VIDEO_MASK_COVERAGE_RATIO = 0.65
 MIN_VIDEO_MASK_TEMPORAL_STABILITY = 0.75
+MIN_VIDEO_MASK_NONEMPTY_FRAME_RATIO = 0.90
 MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE = 0.995
 VISUAL_DIFFERENCE_TYPES = {"object_count", "object_presence", "attribute", "action", "scene", "visible_text"}
 SYNTHETIC_VISUAL_ROUTES = {"vace_controlled", "ltx2_retake", "tokenflow_style"}
@@ -221,6 +222,17 @@ VACE_EXPLORATION_REMOVABLE_OBJECTS = {
     "box",
     "bottle",
 }
+VACE_SCREEN_TEXT_OBJECTS = {
+    "computer",
+    "desktop",
+    "laptop",
+    "monitor",
+    "screen",
+    "tablet",
+    "television",
+    "tv",
+}
+VACE_SEATED_SUPPORT_OBJECTS = {"bench", "chair", "seat", "sofa", "stool"}
 INTRACLIP_CHANGE_MARKERS = (
     "change from",
     "changes from",
@@ -1992,6 +2004,52 @@ def plan_video_edits(
             skipped_by_type[difference_type or "unknown"] += 1
             skipped_reasons[str(suitability["reason"])] += 1
             continue
+        default_mask_query = _video_mask_query(
+            difference=difference,
+            edit_text=edit_text,
+            edit_token=edit_token,
+            edit_region=edit_region,
+            route=route,
+            suitability=suitability,
+            reference_annotation=reference_annotation,
+        )
+        mask_query = default_mask_query
+        if planned_mask_query:
+            if not (
+                str(difference.get("type", "")).strip() == "scene"
+                and _normalized_phrase(planned_mask_query) == "background"
+            ):
+                mask_query = planned_mask_query
+        target_prompt, preserve_tokens, negative_prompt, prompt_repairs = _repair_video_edit_prompt_contract(
+            source_prompt=source_prompt,
+            target_prompt=target_prompt,
+            edit_text=edit_text,
+            difference=difference,
+            edit_token=edit_token,
+            preserve_tokens=preserve_tokens,
+            negative_prompt=negative_prompt,
+            mask_query=mask_query,
+            risk=risk,
+        )
+        if prompt_repairs:
+            planner_metadata = dict(planner_metadata)
+            repaired_fields = list(planner_metadata.get("repaired_fields", []))
+            repaired_fields.extend(prompt_repairs)
+            planner_metadata["repaired_fields"] = sorted(set(repaired_fields))
+            planner_metadata["post_lint_repaired"] = True
+        plan_lint = _video_edit_plan_lint(
+            target_prompt=target_prompt,
+            edit_text=edit_text,
+            difference=difference,
+            preserve_tokens=preserve_tokens,
+            negative_prompt=negative_prompt,
+            reference_annotation=reference_annotation,
+        )
+        if not plan_lint["passed"]:
+            skipped_by_type[difference_type or "unknown"] += 1
+            for reason in plan_lint["errors"]:
+                skipped_reasons[f"plan_lint_{reason}"] += 1
+            continue
         plan_key = (
             reference_video,
             str(difference.get("type", "")).strip(),
@@ -2003,16 +2061,6 @@ def plan_video_edits(
             skipped_reasons["duplicate_exploration_plan"] += 1
             continue
         control_plan = _video_edit_control_plan(route)
-        mask_query = _video_mask_query(
-            difference=difference,
-            edit_text=edit_text,
-            edit_token=edit_token,
-            edit_region=edit_region,
-            route=route,
-            suitability=suitability,
-        )
-        if planned_mask_query:
-            mask_query = planned_mask_query
         preserve_regions = _video_preserve_regions(
             preserve_tokens=preserve_tokens,
             edit_region=edit_region,
@@ -2063,6 +2111,7 @@ def plan_video_edits(
             "raw_planner_output": raw_planner_output,
             "reference_understanding": _video_edit_reference_understanding(reference_annotation),
             "route_suitability": suitability,
+            "plan_lint": plan_lint,
             "visual_edit_risk": risk,
             "planning_mode": planning_mode,
             "exploration_family": str(candidate.get("exploration_family", "")).strip(),
@@ -2473,7 +2522,17 @@ def plan_video_masks(
             edit_region=str(edit_plan.get("edit_region", "")).strip(),
             route=str(edit_plan.get("model_route", "")).strip(),
             suitability=edit_plan.get("route_suitability") if isinstance(edit_plan.get("route_suitability"), dict) else {},
+            reference_annotation=edit_plan.get("reference_understanding")
+            if isinstance(edit_plan.get("reference_understanding"), dict)
+            else {},
         )
+        if (
+            str((edit_plan.get("difference") or {}).get("type", "")).strip() == "scene"
+            and _normalized_phrase(mask_query) == "background"
+        ):
+            mask_query = _foreground_mask_query_from_annotation(
+                edit_plan.get("reference_understanding") if isinstance(edit_plan.get("reference_understanding"), dict) else edit_plan
+            )
         if not mask_query:
             skipped_reasons["missing_mask_query"] += 1
             continue
@@ -2502,7 +2561,7 @@ def plan_video_masks(
                 "segmenter": "SAM2.1_video_predictor",
                 "wrapper": "Grounded-SAM-2",
             },
-            "mask_gate": _video_mask_gate_defaults(),
+            "mask_gate": _video_mask_gate_defaults(mask_mode=_video_mask_mode(edit_plan), mask_query=mask_query),
             "status": "planned",
         }
         mask_plans.append(mask_record)
@@ -2596,50 +2655,126 @@ def select_src_ref_images(
     src_ref_image_plan_path: str | Path,
     output_path: str | Path | None = None,
     max_selected: int = 2,
+    base_url: str | None = None,
+    api_key: str = "EMPTY",
+    model: str | None = None,
+    timeout_seconds: float = 180.0,
 ) -> dict[str, Any]:
     ensure_layout(root)
     image_plans = list(_load_jsonl(Path(src_ref_image_plan_path)))
     if not image_plans:
         raise ValueError("src_ref image plan file is empty")
     output = Path(output_path) if output_path else Path(src_ref_image_plan_path).with_name(DEFAULT_SRC_REF_IMAGE_SELECTION_NAME)
+    audit_client = (
+        OpenAIComposedDataClient(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+        )
+        if base_url and model
+        else None
+    )
     records: list[dict[str, Any]] = []
     selected_count = 0
     missing_count = 0
+    audit_rejected_count = 0
+    audit_failed_count = 0
     for plan in image_plans:
         candidate_dir = Path(str(plan.get("candidate_dir", "")).strip())
         candidates = _find_src_ref_image_candidates(candidate_dir)
-        selected = [str(path) for path in candidates[: max(1, int(max_selected))]]
+        audited = sorted(
+            (_audit_src_ref_image_candidate(path, plan) for path in candidates),
+            key=lambda item: (-float(item.get("score", 0.0)), str(item.get("path", ""))),
+        )
+        role = str(plan.get("src_ref_role", "")).strip()
+        selection_limit = max(1, int(max_selected))
+        if role == "replacement_object":
+            selection_limit = min(selection_limit, 2)
+        selected_audits = audited[:selection_limit]
+        selection_method = "deterministic_src_ref_quality_audit"
+        selection_reason = "selected highest-scoring candidate image(s) by deterministic VACE src_ref quality audit"
+        omni_audit: dict[str, Any] | None = None
+        raw_omni_audit: dict[str, Any] | None = None
+        if audit_client and audited:
+            try:
+                candidate_image_paths = [str(item["path"]) for item in audited]
+                omni_audit, raw_omni_audit = audit_client.audit_src_ref_images(
+                    src_ref_plan=plan,
+                    candidate_image_paths=candidate_image_paths,
+                    max_selected=selection_limit,
+                )
+                selected_indices = [
+                    int(index)
+                    for index in omni_audit.get("selected_indices", [])
+                    if isinstance(index, int) or str(index).isdigit()
+                ]
+                selected_audits = [
+                    audited[index - 1]
+                    for index in selected_indices
+                    if 1 <= index <= len(audited)
+                ]
+                selection_method = "omni_src_ref_image_audit"
+                selection_reason = str(omni_audit.get("reason", "")).strip() or (
+                    "selected candidate image(s) by Omni src_ref visual audit"
+                    if selected_audits
+                    else "Omni audit rejected all generated candidate images"
+                )
+            except Exception as exc:
+                selected_audits = []
+                selection_method = "omni_src_ref_image_audit_failed"
+                selection_reason = f"Omni src_ref audit failed: {exc}"
+                audit_failed_count += 1
+        selected = [str(item["path"]) for item in selected_audits]
+        selected_set = set(selected)
         rejected = [
-            {"path": str(path), "reason": "not selected by deterministic prefilter"}
-            for path in candidates[max(1, int(max_selected)) :]
+            {
+                "path": str(item.get("path", "")),
+                "reason": (
+                    "not selected by Omni src_ref audit"
+                    if audit_client and audited
+                    else "lower deterministic src_ref audit score"
+                ),
+                "audit": item,
+            }
+            for item in audited
+            if str(item.get("path", "")) not in selected_set
         ]
         if selected:
             status = "selected"
-            selection_reason = "selected available image candidate(s); Omni audit can replace this deterministic preselection later"
             selected_count += 1
+        elif audited and audit_client:
+            status = "rejected_by_omni_audit" if selection_method == "omni_src_ref_image_audit" else "omni_audit_failed"
+            audit_rejected_count += int(selection_method == "omni_src_ref_image_audit")
         else:
             status = "missing_candidates"
             selection_reason = "no generated candidate images found"
             missing_count += 1
-        records.append(
-            {
-                "plan_id": str(plan.get("plan_id", "")).strip(),
-                "selected_src_ref_images": selected,
-                "rejected": rejected,
-                "status": status,
-                "required": bool(plan.get("required")),
-                "src_ref_role": str(plan.get("src_ref_role", "")).strip(),
-                "selection_reason": selection_reason,
-                "selection_method": "filesystem_prefilter_pending_omni_audit",
-                "candidate_dir": str(candidate_dir),
-            }
-        )
+        record = {
+            "plan_id": str(plan.get("plan_id", "")).strip(),
+            "selected_src_ref_images": selected,
+            "rejected": rejected,
+            "status": status,
+            "required": bool(plan.get("required")),
+            "src_ref_role": str(plan.get("src_ref_role", "")).strip(),
+            "selection_reason": selection_reason,
+            "selection_method": selection_method,
+            "candidate_dir": str(candidate_dir),
+            "candidate_audit": audited,
+        }
+        if omni_audit is not None:
+            record["omni_audit"] = omni_audit
+        if raw_omni_audit is not None:
+            record["raw_omni_audit"] = raw_omni_audit
+        records.append(record)
     _write_jsonl(output, records)
     return {
         "src_ref_image_plan_path": str(src_ref_image_plan_path),
         "selection_count": len(records),
         "selected_plan_count": selected_count,
         "missing_candidate_count": missing_count,
+        "audit_rejected_count": audit_rejected_count,
+        "audit_failed_count": audit_failed_count,
         "output_path": str(output),
     }
 
@@ -7811,7 +7946,7 @@ def _video_edit_exploration_candidates(candidate: dict[str, Any], annotation: di
                 },
                 edit_token="futuristic laboratory background",
                 edit_region="background",
-                mask_query="background",
+                mask_query=_foreground_mask_query_from_annotation(annotation),
                 goal="test masked background replacement",
             )
         )
@@ -7827,7 +7962,7 @@ def _video_edit_exploration_candidates(candidate: dict[str, Any], annotation: di
                 },
                 edit_token="cinematic neon lighting style",
                 edit_region="background",
-                mask_query="background",
+                mask_query=_foreground_mask_query_from_annotation(annotation),
                 goal="test style and lighting editing",
             )
         )
@@ -8125,6 +8260,7 @@ def _video_mask_query(
     edit_region: str,
     route: str,
     suitability: dict[str, Any],
+    reference_annotation: dict[str, Any] | None = None,
 ) -> str:
     if route != "vace_controlled":
         return ""
@@ -8132,7 +8268,7 @@ def _video_mask_query(
     reason = str(suitability.get("reason", "")).strip()
     combined = _normalized_phrase(" ".join([edit_text, edit_token, edit_region, str(difference.get("description", ""))]))
     if difference_type == "scene" or "background" in reason or "background" in combined:
-        return "background"
+        return _foreground_mask_query_from_annotation(reference_annotation or {})
     if any(marker in combined for marker in ("shirt", "jacket", "coat", "dress", "clothing", "outfit")):
         return "clothing"
     if any(marker in combined for marker in ("robot body", "robotic body", "robot shell")):
@@ -8150,6 +8286,30 @@ def _video_mask_query(
     if edit_region and not edit_region.startswith("localized region around"):
         return edit_region[:120]
     return (edit_token or str(difference.get("target", "")).strip() or edit_region)[:120]
+
+
+def _foreground_mask_query_from_annotation(annotation: dict[str, Any]) -> str:
+    candidates: list[str] = []
+    candidates.extend(_normalize_list(annotation.get("main_subjects", [])))
+    candidates.extend(_normalize_list(annotation.get("subjects", [])))
+    reference_understanding = annotation.get("reference_understanding")
+    if isinstance(reference_understanding, dict):
+        candidates.extend(_normalize_list(reference_understanding.get("main_subjects", [])))
+    candidates.extend(_normalize_object_counts(annotation.get("object_counts", {})).keys())
+    generic = {"background", "scene", "room", "wall", "floor", "table", "desk", "lighting", "camera motion"}
+    for candidate in candidates:
+        item = str(candidate).strip()
+        key = _normalized_phrase(item)
+        if not item or key in generic:
+            continue
+        if any(token in key.split() for token in ("man", "woman", "person", "girl", "boy", "robot", "vehicle", "car", "dog", "cat")):
+            return item[:120]
+    for candidate in candidates:
+        item = str(candidate).strip()
+        key = _normalized_phrase(item)
+        if item and key not in generic:
+            return item[:120]
+    return "main subject"
 
 
 def _video_preserve_regions(
@@ -8192,11 +8352,25 @@ def _video_mask_mode(plan: dict[str, Any]) -> str:
     return "edit_masked_region"
 
 
-def _video_mask_gate_defaults() -> dict[str, Any]:
+def _video_mask_gate_defaults(*, mask_mode: str = "", mask_query: str = "") -> dict[str, Any]:
+    normalized_query = _normalized_phrase(mask_query)
+    if mask_mode in {"replace_masked_object", "remove_or_inpaint_masked_object"}:
+        min_coverage = 0.005
+        max_coverage = 0.20
+    elif mask_mode == "edit_background_inverse_subject":
+        min_coverage = 0.20
+        max_coverage = 0.90
+    elif any(marker in normalized_query for marker in ("clothing", "shirt", "jacket", "outfit")):
+        min_coverage = 0.03
+        max_coverage = 0.30
+    else:
+        min_coverage = MIN_VIDEO_MASK_COVERAGE_RATIO
+        max_coverage = MAX_VIDEO_MASK_COVERAGE_RATIO
     return {
-        "min_coverage_ratio": MIN_VIDEO_MASK_COVERAGE_RATIO,
-        "max_coverage_ratio": MAX_VIDEO_MASK_COVERAGE_RATIO,
+        "min_coverage_ratio": min_coverage,
+        "max_coverage_ratio": max_coverage,
         "min_temporal_stability": MIN_VIDEO_MASK_TEMPORAL_STABILITY,
+        "min_nonempty_frame_ratio": MIN_VIDEO_MASK_NONEMPTY_FRAME_RATIO,
         "mask_not_empty_all_frames": True,
         "mask_target_matches_query": True,
     }
@@ -8388,17 +8562,17 @@ def _src_ref_image_prompts(*, requirement: dict[str, Any], edit_plan: dict[str, 
     role = str(requirement.get("role", "")).strip()
     if role == "background_reference":
         return [
-            f"a clean wide reference image of {target}, no people, no text, no watermark, natural perspective",
-            f"{target}, empty background plate, cinematic lighting, no foreground subject, no readable text",
+            f"a clean 16:9 wide reference image of {target}, empty scene plate, natural camera perspective, no people, no text, no watermark",
+            f"{target}, wide empty background plate matching a talking-head video perspective, cinematic but realistic lighting, no foreground subject, no readable text",
         ]
     if role == "clothing_reference":
         return [
-            f"a clean reference photo of {target}, front view, plain background, no person face, no text, no logo",
-            f"{target}, clothing reference, clear fabric shape and color, neutral background, no watermark",
+            f"a clean upper-body clothing reference photo of {target} on a neutral mannequin torso, front three-quarter view, no face, no text, no logo",
+            f"{target}, wearable jacket or shirt reference for a standing performer, clear sleeves and torso shape, neutral background, no watermark",
         ]
     return [
-        f"a realistic {target}, isolated product reference, plain white background, no hands, no people, no text, no logo",
-        f"{target}, clean object reference image, centered, neutral lighting, transparent or plain background, no watermark",
+        f"a realistic {target}, isolated product reference, three-quarter view, plain white background, no hands, no people, no text, no logo",
+        f"{target}, clean object reference image with visible side and top shape, centered, neutral lighting, transparent or plain background, no watermark",
     ]
 
 
@@ -8419,6 +8593,56 @@ def _find_src_ref_image_candidates(candidate_dir: Path) -> list[Path]:
         return []
     suffixes = {".png", ".jpg", ".jpeg", ".webp"}
     return sorted(path for path in candidate_dir.iterdir() if path.is_file() and path.suffix.lower() in suffixes)
+
+
+def _audit_src_ref_image_candidate(path: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    role = str(plan.get("src_ref_role", "")).strip()
+    score = 0.50
+    reasons: list[str] = ["candidate file exists"]
+    warnings: list[str] = []
+    width = 0
+    height = 0
+    try:
+        from PIL import Image  # type: ignore
+
+        with Image.open(path) as image:
+            width, height = image.size
+        score += 0.15
+        reasons.append(f"readable image {width}x{height}")
+    except Exception:
+        warnings.append("image dimensions unavailable for deterministic audit")
+
+    if width > 0 and height > 0:
+        aspect = width / max(height, 1)
+        if role == "background_reference":
+            if 1.45 <= aspect <= 1.95:
+                score += 0.20
+                reasons.append("background candidate is close to 16:9")
+            else:
+                warnings.append("background candidate is not close to 16:9")
+        elif role == "clothing_reference":
+            if 0.55 <= aspect <= 1.35:
+                score += 0.15
+                reasons.append("clothing candidate has plausible torso/reference aspect")
+            else:
+                warnings.append("clothing candidate aspect may be hard to fit to a person")
+        elif role == "replacement_object":
+            if 0.45 <= aspect <= 2.20:
+                score += 0.10
+                reasons.append("replacement object candidate has usable aspect")
+
+    name_key = _normalized_phrase(path.name)
+    if any(token in name_key for token in ("text", "logo", "watermark", "person", "hand", "face")):
+        score -= 0.25
+        warnings.append("filename suggests a forbidden visual artifact")
+    return {
+        "path": str(path),
+        "score": round(max(0.0, min(1.0, score)), 3),
+        "width": width,
+        "height": height,
+        "reasons": reasons,
+        "warnings": warnings,
+    }
 
 
 def _video_edit_reference_understanding(annotation: dict[str, Any]) -> dict[str, Any]:
@@ -8571,17 +8795,122 @@ def _video_edit_source_prompt(annotation: dict[str, Any], record: dict[str, Any]
     return ". ".join(clauses).strip().rstrip(".") + "."
 
 
+def _is_existing_object_replacement(difference: dict[str, Any], edit_text: str = "") -> bool:
+    difference_type = str(difference.get("type", "")).strip()
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    if difference_type != "object_presence":
+        return False
+    if _absence_like_phrase(from_value) or _absence_like_phrase(to_value):
+        return False
+    return "replace" in _normalized_phrase(edit_text) or bool(from_value and to_value)
+
+
+def _is_object_removal(difference: dict[str, Any], edit_text: str = "") -> bool:
+    difference_type = str(difference.get("type", "")).strip()
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    return bool(
+        difference_type == "object_presence"
+        and not _absence_like_phrase(from_value)
+        and (_absence_like_phrase(to_value) or _normalized_phrase(edit_text).startswith("remove "))
+    )
+
+
+def _video_edit_source_object(difference: dict[str, Any], edit_text: str = "") -> str:
+    from_value = str(difference.get("from", "")).strip()
+    if from_value and not _absence_like_phrase(from_value):
+        return from_value
+    match = re.search(r"\breplace\s+(?:the\s+)?(.+?)\s+with\b", str(edit_text), flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"\bremove\s+(?:the\s+)?(.+?)(?:\s+from|\s+in|\s*$)", str(edit_text), flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def _video_edit_target_object(difference: dict[str, Any], edit_text: str = "", edit_token: str = "") -> str:
+    to_value = str(difference.get("to", "")).strip()
+    if to_value and not _absence_like_phrase(to_value):
+        return to_value
+    match = re.search(r"\bwith\s+(?:a\s+|an\s+|the\s+)?(.+?)(?:\.|$)", str(edit_text), flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return str(edit_token).strip()
+
+
+def _video_edit_exclusion_keys(difference: dict[str, Any], *, edit_token: str = "", mask_query: str = "") -> set[str]:
+    exclusions: set[str] = set()
+    for value in (
+        _video_edit_source_object(difference),
+        _video_edit_target_object(difference, edit_token=edit_token),
+        edit_token,
+    ):
+        key = _normalized_phrase(value)
+        if key:
+            exclusions.add(key)
+    difference_type = str(difference.get("type", "")).strip()
+    if difference_type != "scene":
+        mask_key = _normalized_phrase(mask_query)
+        if mask_key:
+            exclusions.add(mask_key)
+    if _is_existing_object_replacement(difference) or _is_object_removal(difference):
+        from_value = _video_edit_source_object(difference)
+        for token in TOKEN_PATTERN.findall(from_value.lower()):
+            if token:
+                exclusions.add(token)
+    return exclusions
+
+
+def _filter_video_edit_preserve_tokens(
+    preserve_tokens: list[str],
+    *,
+    difference: dict[str, Any],
+    edit_token: str,
+    mask_query: str = "",
+) -> list[str]:
+    exclusions = _video_edit_exclusion_keys(difference, edit_token=edit_token, mask_query=mask_query)
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for raw_item in preserve_tokens:
+        item = str(raw_item).strip()
+        key = _normalized_phrase(item)
+        if not item or not key or key in seen:
+            continue
+        if key in exclusions or any(excluded and excluded in key.split() for excluded in exclusions):
+            continue
+        filtered.append(item)
+        seen.add(key)
+    return filtered
+
+
 def _video_edit_target_prompt(*, source_prompt: str, edit_text: str, difference: dict[str, Any]) -> str:
     difference_type = str(difference.get("type", "")).strip()
     to_value = str(difference.get("to", "")).strip()
-    if difference_type == "object_presence" and to_value:
+    from_value = _video_edit_source_object(difference, edit_text)
+    if _is_existing_object_replacement(difference, edit_text):
+        target = _video_edit_target_object(difference, edit_text)
+        edit_clause = (
+            f"Replace only the {from_value} with {target}. "
+            f"The same shot shows {target} in the original {from_value} location; no {from_value} is visible."
+        )
+    elif _is_object_removal(difference, edit_text):
+        edit_clause = (
+            f"Remove only the {from_value}. "
+            f"The {from_value} area is clean and naturally filled; no {from_value} is visible."
+        )
+    elif difference_type == "object_presence" and to_value:
         edit_clause = f"Add only {to_value}."
     elif difference_type == "object_count" and to_value:
         edit_clause = f"Change only the count to {to_value}."
     elif difference_type == "attribute":
         edit_clause = f"Change only the specified attribute: {edit_text}."
     elif difference_type == "scene":
-        edit_clause = f"Change only the background or visual style: {edit_text}."
+        target = to_value or str(difference.get("description", "")).strip() or edit_text
+        edit_clause = (
+            f"The same subject, camera, action timing, and layout are preserved while the background becomes {target}."
+        )
     elif difference_type == "action":
         edit_clause = f"Change only the action: {edit_text}."
     elif difference_type == "audio_event":
@@ -8604,12 +8933,11 @@ def _video_edit_preserve_tokens(
     if scene:
         values.append(scene)
     values.extend(["camera motion", "lighting", "timing"])
-    normalized_edit = _normalized_phrase(edit_token)
-    preserved = [
-        item
-        for item in _dedupe_strings([str(value).strip() for value in values if str(value).strip()])
-        if not normalized_edit or _normalized_phrase(item) != normalized_edit
-    ]
+    preserved = _filter_video_edit_preserve_tokens(
+        _dedupe_strings([str(value).strip() for value in values if str(value).strip()]),
+        difference=difference,
+        edit_token=edit_token,
+    )
     return preserved[:8]
 
 
@@ -8695,6 +9023,153 @@ def _video_edit_negative_prompt(preserve_tokens: list[str], *, risk: dict[str, A
         "reorder shots, or introduce additional edits."
     )
     return _merge_video_edit_locks(prompt, risk)
+
+
+def _target_prompt_contract_mentions_absence(prompt: str, source_object: str) -> bool:
+    source = _normalized_phrase(source_object)
+    text = _normalized_phrase(prompt)
+    return bool(source and (f"no {source}" in text or f"without {source}" in text))
+
+
+def _repair_video_edit_prompt_contract(
+    *,
+    source_prompt: str,
+    target_prompt: str,
+    edit_text: str,
+    difference: dict[str, Any],
+    edit_token: str,
+    preserve_tokens: list[str],
+    negative_prompt: str,
+    mask_query: str,
+    risk: dict[str, Any] | None,
+) -> tuple[str, list[str], str, list[str]]:
+    repairs: list[str] = []
+    source_object = _video_edit_source_object(difference, edit_text)
+    normalized_target = _normalized_phrase(target_prompt)
+    if _is_existing_object_replacement(difference, edit_text):
+        if "add only" in normalized_target or "replace" not in normalized_target:
+            target_prompt = _video_edit_target_prompt(source_prompt=source_prompt, edit_text=edit_text, difference=difference)
+            repairs.append("target_prompt_rewritten_for_object_replacement")
+        elif not _target_prompt_contract_mentions_absence(target_prompt, source_object):
+            target_prompt = f"{target_prompt.rstrip('.')} No {source_object} is visible."
+            repairs.append("target_prompt_added_source_absence")
+    elif _is_object_removal(difference, edit_text):
+        if "add only no" in normalized_target or (
+            "remove" not in normalized_target and not _target_prompt_contract_mentions_absence(target_prompt, source_object)
+        ):
+            target_prompt = _video_edit_target_prompt(source_prompt=source_prompt, edit_text=edit_text, difference=difference)
+            repairs.append("target_prompt_rewritten_for_object_removal")
+        elif not _target_prompt_contract_mentions_absence(target_prompt, source_object):
+            target_prompt = f"{target_prompt.rstrip('.')} No {source_object} is visible."
+            repairs.append("target_prompt_added_source_absence")
+
+    filtered_preserve = _filter_video_edit_preserve_tokens(
+        preserve_tokens,
+        difference=difference,
+        edit_token=edit_token,
+        mask_query=mask_query,
+    )
+    if filtered_preserve != preserve_tokens:
+        preserve_tokens = filtered_preserve
+        repairs.append("preserve_tokens_removed_edit_source")
+
+    source_key = _normalized_phrase(source_object)
+    negative_key = _normalized_phrase(negative_prompt)
+    if not negative_prompt or (source_key and source_key in negative_key):
+        negative_prompt = _video_edit_negative_prompt(preserve_tokens, risk=risk)
+        repairs.append("negative_prompt_regenerated_without_edit_source")
+    return target_prompt, preserve_tokens, negative_prompt, repairs
+
+
+def _annotation_mentions_object(annotation: dict[str, Any], object_name: str) -> bool:
+    object_key = _normalized_phrase(object_name)
+    if not object_key:
+        return False
+    counts = _normalize_object_counts(annotation.get("object_counts", {}))
+    if any(object_key == _normalized_phrase(name) for name in counts):
+        return True
+    text = _normalized_phrase(
+        " ".join(
+            [
+                str(annotation.get("summary", "")),
+                str(annotation.get("scene", "")),
+                " ".join(_normalize_list(annotation.get("subjects", []))),
+                " ".join(_normalize_list(annotation.get("actions", []))),
+            ]
+        )
+    )
+    return object_key in text
+
+
+def _reference_has_screen_text_risk(annotation: dict[str, Any], source_object: str) -> bool:
+    source_tokens = set(TOKEN_PATTERN.findall(_normalized_phrase(source_object)))
+    if not source_tokens & VACE_SCREEN_TEXT_OBJECTS:
+        return False
+    visible_text = _normalize_list(annotation.get("visible_text", [])) + _normalize_list(annotation.get("on_screen_text", []))
+    text = _normalized_phrase(
+        " ".join(
+            [str(annotation.get("summary", "")), str(annotation.get("scene", "")), " ".join(visible_text)]
+        )
+    )
+    risky_markers = {"webpage", "website", "screen", "browser", "ui", "interface", "text", "logo", "caption"}
+    return bool(visible_text or source_tokens & {"laptop", "computer", "screen", "monitor"} and any(marker in text for marker in risky_markers))
+
+
+def _reference_has_seated_support_conflict(annotation: dict[str, Any], source_object: str) -> bool:
+    source_tokens = set(TOKEN_PATTERN.findall(_normalized_phrase(source_object)))
+    if not source_tokens & VACE_SEATED_SUPPORT_OBJECTS:
+        return False
+    text = _normalized_phrase(
+        " ".join(
+            [
+                str(annotation.get("summary", "")),
+                " ".join(_normalize_list(annotation.get("actions", []))),
+                " ".join(_normalize_list(annotation.get("subjects", []))),
+            ]
+        )
+    )
+    return any(marker in text for marker in ("sit", "sits", "sitting", "seated", "seat", "sits in", "sits on"))
+
+
+def _video_edit_plan_lint(
+    *,
+    target_prompt: str,
+    edit_text: str,
+    difference: dict[str, Any],
+    preserve_tokens: list[str],
+    negative_prompt: str,
+    reference_annotation: dict[str, Any],
+) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    target_key = _normalized_phrase(target_prompt)
+    source_object = _video_edit_source_object(difference, edit_text)
+    source_key = _normalized_phrase(source_object)
+    preserve_keys = {_normalized_phrase(item) for item in preserve_tokens}
+    negative_key = _normalized_phrase(negative_prompt)
+
+    if "add only no" in target_key:
+        errors.append("target_prompt_contains_add_only_no")
+    if _is_existing_object_replacement(difference, edit_text) and "add only" in target_key:
+        errors.append("replacement_target_prompt_uses_add_instead_of_replace")
+    if source_key and (source_key in preserve_keys or any(source_key == key for key in preserve_keys)):
+        errors.append("preserve_tokens_lock_edit_source")
+    if source_key and source_key in negative_key:
+        errors.append("negative_prompt_locks_edit_source")
+
+    if (_is_existing_object_replacement(difference, edit_text) or _is_object_removal(difference, edit_text)) and source_object:
+        if not _annotation_mentions_object(reference_annotation, source_object):
+            warnings.append("edit_source_not_clearly_present_in_annotation")
+    if _is_existing_object_replacement(difference, edit_text) and _reference_has_screen_text_risk(reference_annotation, source_object):
+        errors.append("object_replacement_screen_or_visible_text_risk")
+    if _is_object_removal(difference, edit_text) and _reference_has_seated_support_conflict(reference_annotation, source_object):
+        errors.append("object_removal_breaks_seated_support")
+
+    return {
+        "passed": not errors,
+        "errors": errors,
+        "warnings": warnings,
+    }
 
 
 def _video_edit_control_plan(route: str) -> list[str]:
@@ -9474,6 +9949,10 @@ def build_parser() -> argparse.ArgumentParser:
     src_ref_select_parser.add_argument("--src-ref-image-plan-path", required=True)
     src_ref_select_parser.add_argument("--output-path")
     src_ref_select_parser.add_argument("--max-selected", type=int, default=2)
+    src_ref_select_parser.add_argument("--base-url")
+    src_ref_select_parser.add_argument("--api-key", default="EMPTY")
+    src_ref_select_parser.add_argument("--model")
+    src_ref_select_parser.add_argument("--timeout-seconds", type=float, default=180.0)
 
     validate_known_pairs_parser = subparsers.add_parser("validate-known-pairs")
     validate_known_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -9692,6 +10171,10 @@ def main() -> None:
             src_ref_image_plan_path=args.src_ref_image_plan_path,
             output_path=args.output_path,
             max_selected=args.max_selected,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            timeout_seconds=args.timeout_seconds,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

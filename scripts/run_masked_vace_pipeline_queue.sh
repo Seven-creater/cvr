@@ -271,10 +271,21 @@ run_refselect() {
     return
   fi
   echo "[masked-vace-queue] stage=refselect"
+  refselect_args=(
+    --root "$DATA_ROOT"
+    --src-ref-image-plan-path "$SRC_REF_IMAGE_PLAN"
+    --output-path "$SRC_REF_IMAGE_SELECTION"
+  )
+  if [[ -n "${BASE_URL:-}" && -n "${MODEL:-}" ]]; then
+    refselect_args+=(
+      --base-url "$BASE_URL"
+      --api-key "$API_KEY"
+      --model "$MODEL"
+      --timeout-seconds "$TIMEOUT_SECONDS"
+    )
+  fi
   python -m app.composed_data select-src-ref-images \
-    --root "$DATA_ROOT" \
-    --src-ref-image-plan-path "$SRC_REF_IMAGE_PLAN" \
-    --output-path "$SRC_REF_IMAGE_SELECTION" \
+    "${refselect_args[@]}" \
     | tee "$RUN_ROOT/logs/select_src_ref_images.json"
 }
 
