@@ -23,6 +23,7 @@ from app.composed_data import (
     _finalize_pair_verification,
     _has_intraclip_difference_conflict,
     _judge_accepts,
+    _known_pair_generation_issues,
     _audio_event_independent_evidence_gate,
     _non_speech_audio_event_score,
     _observable_difference_gate,
@@ -3896,8 +3897,9 @@ class ComposedDataTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             ensure_layout(root)
-            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4"):
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4", "src_video_for_vace.mp4", "mask.mp4", "raw.mp4"):
                 (root / "clips" / name).write_bytes(b"x")
+            (root / "review_inputs").mkdir()
 
             annotations_path = root / "captions" / "known_annotations.jsonl"
             self._write_jsonl(
@@ -3987,7 +3989,24 @@ class ComposedDataTests(unittest.TestCase):
                             "source_prompt": "a chair without a backpack",
                             "target_prompt": "a chair with a red backpack",
                             "preserve_tokens": ["chair", "room", "camera motion"],
-                            "postprocess": {"audio_copied_from_reference": True},
+                            "src_video_for_vace": "clips/src_video_for_vace.mp4",
+                            "src_mask": "clips/mask.mp4",
+                            "mask_metrics": {"mask_coverage_ratio_avg": 0.12},
+                            "review_inputs_dir": "review_inputs",
+                            "duration_metrics": {
+                                "raw_duration_drift_seconds": 0.0,
+                                "target_duration_drift_seconds": 0.0,
+                                "max_duration_drift_seconds": 0.5,
+                                "duration_gate": {"passed": True},
+                            },
+                            "post_vace_verdict": {
+                                "semantic_gate_required": False,
+                                "semantic_gate_passed": True,
+                            },
+                            "postprocess": {
+                                "audio_copied_from_reference": True,
+                                "raw_generated_video": "clips/raw.mp4",
+                            },
                             "seed": 1234,
                         },
                     }
@@ -4052,8 +4071,9 @@ class ComposedDataTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             ensure_layout(root)
-            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4"):
+            for name in ("ref.mp4", "target.mp4", "neg1.mp4", "neg2.mp4", "src_video_for_vace.mp4", "mask.mp4", "raw.mp4"):
                 (root / "clips" / name).write_bytes(b"x")
+            (root / "review_inputs").mkdir()
 
             annotations_path = root / "captions" / "known_annotations.jsonl"
             self._write_jsonl(
@@ -4143,7 +4163,24 @@ class ComposedDataTests(unittest.TestCase):
                             "target_prompt": "a chair with a red backpack",
                             "source_prompt": "a chair without a backpack",
                             "preserve_tokens": ["chair", "room", "camera motion"],
-                            "postprocess": {"audio_copied_from_reference": True},
+                            "src_video_for_vace": "clips/src_video_for_vace.mp4",
+                            "src_mask": "clips/mask.mp4",
+                            "mask_metrics": {"mask_coverage_ratio_avg": 0.12},
+                            "review_inputs_dir": "review_inputs",
+                            "duration_metrics": {
+                                "raw_duration_drift_seconds": 0.0,
+                                "target_duration_drift_seconds": 0.0,
+                                "max_duration_drift_seconds": 0.5,
+                                "duration_gate": {"passed": True},
+                            },
+                            "post_vace_verdict": {
+                                "semantic_gate_required": False,
+                                "semantic_gate_passed": True,
+                            },
+                            "postprocess": {
+                                "audio_copied_from_reference": True,
+                                "raw_generated_video": "clips/raw.mp4",
+                            },
                             "seed": 1234,
                         },
                     }
@@ -4572,7 +4609,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertNotIn("cup", plans[0]["negative_prompt"].lower())
             self.assertTrue(plans[0]["plan_lint"]["passed"])
 
-    def test_plan_video_edits_rewrites_clothing_prompt_without_source_clothing(self) -> None:
+    def test_plan_video_edits_rewrites_safe_clothing_prompt_without_source_clothing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             ensure_layout(root)
@@ -4596,13 +4633,13 @@ class ComposedDataTests(unittest.TestCase):
                 candidates_path,
                 [
                     {
-                        "proposal_id": "black_jacket",
+                        "proposal_id": "solid_black_shirt",
                         "reference_video": "clips/musician_ref.mp4",
-                        "edit_text": "change the outfit into a black jacket",
+                        "edit_text": "change the patterned shirt into a solid black shirt",
                         "difference": {
                             "type": "attribute",
-                            "from": "original outfit",
-                            "to": "black jacket",
+                            "from": "patterned shirt",
+                            "to": "solid black shirt",
                         },
                     }
                 ],
@@ -4621,14 +4658,14 @@ class ComposedDataTests(unittest.TestCase):
             ]
 
             self.assertEqual(1, summary["plan_count"])
-            self.assertIn("open black long-sleeved jacket", plans[0]["target_prompt"])
-            self.assertIn("same black T-shirt", plans[0]["target_prompt"])
+            self.assertIn("solid black shirt", plans[0]["target_prompt"])
             self.assertIn("blue fedora", plans[0]["target_prompt"])
             self.assertNotIn("patterned shirt", plans[0]["target_prompt"])
+            self.assertNotIn("jacket", plans[0]["target_prompt"].lower())
             self.assertNotIn("Change only", plans[0]["target_prompt"])
             self.assertTrue(plans[0]["plan_lint"]["passed"])
 
-    def test_plan_video_edits_keeps_exploration_risk_relaxation_after_model_revision(self) -> None:
+    def test_plan_video_edits_rejects_structural_clothing_after_model_revision(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             ensure_layout(root)
@@ -4704,14 +4741,9 @@ class ComposedDataTests(unittest.TestCase):
                 if line.strip()
             ]
 
-            self.assertEqual(1, summary["plan_count"])
-            self.assertEqual("black jacket", plans[0]["edit_token"])
-            self.assertIn("open black long-sleeved jacket", plans[0]["target_prompt"])
-            self.assertIn("target_prompt_rewritten_for_clothing_edit", plans[0]["planner"]["repaired_fields"])
-            self.assertEqual("exploration_high", plans[0]["visual_edit_risk"]["risk_level"])
-            self.assertTrue(plans[0]["visual_edit_risk"]["vace_exploration_relaxed"])
-            self.assertIn("visible_text_present", plans[0]["visual_edit_risk"]["relaxed_risk_reasons"])
-            self.assertTrue(plans[0]["plan_lint"]["passed"])
+            self.assertEqual([], plans)
+            self.assertEqual(0, summary["plan_count"])
+            self.assertGreaterEqual(summary["skipped_reasons"]["plan_lint_structural_clothing_tryon_required"], 1)
             self.assertNotIn("model_planner_revised_to_high_risk_high", summary["skipped_reasons"])
 
     def test_plan_video_edits_rejects_screen_text_object_replacement(self) -> None:
@@ -5431,7 +5463,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertIn("tablet", plans[0]["image_prompts"][0])
             self.assertEqual(1, summary["skipped_reasons"]["src_ref_not_needed"])
 
-    def test_plan_src_ref_images_uses_human_pose_prompt_for_black_jacket(self) -> None:
+    def test_plan_src_ref_images_skips_structural_black_jacket(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             ensure_layout(root)
@@ -5457,6 +5489,36 @@ class ComposedDataTests(unittest.TestCase):
                 video_edit_plan_path=edit_plan_path,
                 image_root=root / "src_ref_images",
             )
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["structural_clothing_tryon_required"])
+            self.assertEqual("", Path(summary["output_path"]).read_text(encoding="utf-8"))
+
+    def test_plan_src_ref_images_keeps_safe_clothing_reference_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "solid_black_shirt",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "change the patterned shirt into a solid black shirt",
+                        "difference": {"type": "attribute", "from": "patterned shirt", "to": "solid black shirt"},
+                        "model_route": "vace_controlled",
+                        "edit_token": "solid black shirt",
+                        "edit_region": "clothing",
+                        "exploration_family": "clothing_type",
+                    }
+                ],
+            )
+
+            summary = plan_src_ref_images(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                image_root=root / "src_ref_images",
+            )
             plans = [
                 json.loads(line)
                 for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
@@ -5465,10 +5527,11 @@ class ComposedDataTests(unittest.TestCase):
 
             self.assertEqual(1, summary["plan_count"])
             self.assertEqual("clothing_reference", plans[0]["src_ref_role"])
-            self.assertEqual("open black long-sleeved jacket over a black T-shirt", plans[0]["target_object"])
-            self.assertIn("standing musician", plans[0]["image_prompts"][0])
-            self.assertIn("open black long-sleeved jacket", plans[0]["image_prompts"][0])
-            self.assertIn("arms bent", plans[0]["image_prompts"][0])
+            self.assertEqual("solid black shirt", plans[0]["target_object"])
+            self.assertIn("cropped upper-body photo", plans[0]["image_prompts"][0])
+            self.assertIn("solid black shirt", plans[0]["image_prompts"][0])
+            self.assertNotIn("jacket", plans[0]["image_prompts"][0].lower())
+            self.assertIn("garment silhouette clearly visible", plans[0]["image_prompts"][0])
 
     def test_select_src_ref_images_picks_existing_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6126,6 +6189,9 @@ class ComposedDataTests(unittest.TestCase):
             (root / "synthetic" / "raw.mp4").write_bytes(b"raw-video")
             (root / "src_ref" / "jacket.png").write_bytes(b"src-ref")
             (root / "review_inputs_src" / "vace_prompt.txt").write_text("same shot target prompt", encoding="utf-8")
+            (root / "review_inputs_src" / "preflight_report.json").write_text("{}", encoding="utf-8")
+            (root / "review_inputs_src" / "duration_metrics.json").write_text("{}", encoding="utf-8")
+            (root / "review_inputs_src" / "vace_command.json").write_text("{}", encoding="utf-8")
             pairs_path = root / "accepted.jsonl"
             self._write_jsonl(
                 pairs_path,
@@ -6184,7 +6250,62 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue((item_dir / "src_ref_images" / "001_jacket_png").exists())
             self.assertTrue((item_dir / "review_inputs" / "vace_prompt.txt").exists())
             self.assertTrue((item_dir / "metadata.json").exists())
+            self.assertTrue((item_dir / "semantic_evaluation_result.json").exists())
+            metadata = json.loads((item_dir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertFalse(metadata["incomplete_review_bundle"])
+            self.assertEqual([], metadata["review_bundle_issues"])
             self.assertIn("sample_1", (output_dir / "index.md").read_text(encoding="utf-8"))
+            self.assertIn("complete", (output_dir / "index.md").read_text(encoding="utf-8"))
+
+    def test_build_manual_review_bundle_marks_incomplete_visual_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "clips").mkdir(parents=True)
+            (root / "synthetic").mkdir(parents=True)
+            (root / "src_ref").mkdir(parents=True)
+            (root / "clips" / "ref.mp4").write_bytes(b"reference-video")
+            (root / "synthetic" / "target.mp4").write_bytes(b"target-video")
+            (root / "synthetic" / "raw.mp4").write_bytes(b"raw-video")
+            (root / "src_ref" / "jacket.png").write_bytes(b"src-ref")
+            pairs_path = root / "accepted.jsonl"
+            self._write_jsonl(
+                pairs_path,
+                [
+                    {
+                        "sample_id": "sample_incomplete",
+                        "proposal_id": "proposal__missing_inputs",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": "synthetic/target.mp4",
+                        "edit_text": "replace the cup with a bottle",
+                        "difference": {"type": "object_presence", "from": "cup", "to": "bottle"},
+                        "generation": {
+                            "model_route": "vace_controlled",
+                            "src_ref_requirements": {"required": True},
+                            "src_ref_images": ["src_ref/jacket.png"],
+                            "duration_metrics": {"duration_gate": {"passed": True}},
+                            "post_vace_verdict": {"semantic_gate_required": True, "semantic_gate_passed": True},
+                            "postprocess": {
+                                "audio_copied_from_reference": True,
+                                "raw_generated_video": "synthetic/raw.mp4",
+                            },
+                        },
+                    }
+                ],
+            )
+
+            summary = build_manual_review_bundle(
+                root=root,
+                pairs_path=pairs_path,
+                output_dir=root / "manual_review",
+            )
+
+            self.assertEqual(1, summary["incomplete_review_bundle_count"])
+            item_dir = root / "manual_review" / "0001_sample_incomplete"
+            metadata = json.loads((item_dir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertTrue(metadata["incomplete_review_bundle"])
+            self.assertTrue(any("missing src_mask" in issue for issue in metadata["review_bundle_issues"]))
+            self.assertTrue(any("missing src_video_for_vace" in issue for issue in metadata["review_bundle_issues"]))
+            self.assertTrue(any("missing review_inputs_dir" in issue for issue in metadata["review_bundle_issues"]))
 
     def test_pair_record_acceptance_issues_rejects_speech_difference_type(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6336,6 +6457,71 @@ class ComposedDataTests(unittest.TestCase):
                 )
 
             self.assertTrue(any("post-VACE semantic gate" in issue for issue in issues))
+
+    def test_synthetic_visual_rejects_structural_clothing_vace_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={"duration_seconds": 5.0, "has_audio": True, "has_video": True},
+            ):
+                issues = _pair_record_acceptance_issues(
+                    root=root,
+                    record={
+                        "source_type": "synthetic_edit",
+                        "reference_video": "ref.mp4",
+                        "target_video": "target.mp4",
+                        "edit_text": "change the outfit into a black jacket",
+                        "difference": {"type": "attribute", "from": "patterned shirt", "to": "black jacket"},
+                        "quality": {"visual_near_duplicate_score": 0.90},
+                        "source_context": {"relation": "synthetic_from_reference"},
+                        "generation": {
+                            "model": "wan-vace",
+                            "model_route": "vace_controlled",
+                            "prompt": "same shot",
+                            "source_prompt": "A man in a patterned shirt plays ukulele.",
+                            "target_prompt": "A man in an open black long-sleeved jacket plays ukulele.",
+                            "preserve_tokens": ["man", "ukulele"],
+                            "src_video_for_vace": "ref.mp4",
+                            "src_mask": "target.mp4",
+                            "mask_metrics": {"mask_coverage_ratio_avg": 0.1},
+                            "review_inputs_dir": ".",
+                            "duration_metrics": {"duration_gate": {"passed": True}},
+                            "post_vace_verdict": {"semantic_gate_required": True, "semantic_gate_passed": True},
+                            "postprocess": {"audio_copied_from_reference": True, "raw_generated_video": "target.mp4"},
+                        },
+                    },
+                    reference_annotation={"object_counts": {"man": 1}},
+                    target_annotation={"object_counts": {"man": 1}},
+                )
+                issues.extend(
+                    _known_pair_generation_issues(
+                        {
+                            "source_type": "synthetic_edit",
+                            "edit_text": "change the outfit into a black jacket",
+                            "difference": {"type": "attribute", "from": "patterned shirt", "to": "black jacket"},
+                            "generation": {
+                                "model": "wan-vace",
+                                "model_route": "vace_controlled",
+                                "prompt": "same shot",
+                                "source_prompt": "A man in a patterned shirt plays ukulele.",
+                                "target_prompt": "A man in an open black long-sleeved jacket plays ukulele.",
+                                "preserve_tokens": ["man", "ukulele"],
+                                "src_video_for_vace": "ref.mp4",
+                                "src_mask": "target.mp4",
+                                "mask_metrics": {"mask_coverage_ratio_avg": 0.1},
+                                "review_inputs_dir": ".",
+                                "duration_metrics": {"duration_gate": {"passed": True}},
+                                "post_vace_verdict": {"semantic_gate_required": True, "semantic_gate_passed": True},
+                                "postprocess": {"audio_copied_from_reference": True, "raw_generated_video": "target.mp4"},
+                            },
+                        }
+                    )
+                )
+
+            self.assertTrue(any("try-on route" in issue for issue in issues))
 
     def test_post_vace_semantic_verdict_passes_strict_black_jacket_annotation(self) -> None:
         record = {

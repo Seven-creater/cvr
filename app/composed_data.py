@@ -269,6 +269,21 @@ VACE_CLOTHING_SRC_REF_ARTIFACT_MARKERS = {
     "product catalog",
     "catalog",
 }
+VACE_STRUCTURAL_CLOTHING_TARGET_MARKERS = {
+    "open jacket",
+    "open black jacket",
+    "open black long sleeved jacket",
+    "long sleeve jacket",
+    "long sleeved jacket",
+    "long sleeves",
+    "outerwear",
+    "layered jacket",
+    "jacket over",
+    "coat over",
+    "blazer",
+}
+VACE_OUTERWEAR_MARKERS = {"jacket", "coat", "blazer", "outerwear"}
+VACE_NON_OUTERWEAR_CLOTHING_MARKERS = {"shirt", "t shirt", "tee", "short sleeve", "short sleeved", "outfit", "clothing"}
 INTRACLIP_CHANGE_MARKERS = (
     "change from",
     "changes from",
@@ -2647,7 +2662,12 @@ def plan_src_ref_images(
     for edit_plan in edit_plans:
         requirement = _src_ref_requirement_for_video_plan(edit_plan)
         if not requirement.get("required") and not requirement.get("recommended"):
-            skipped_reasons["src_ref_not_needed"] += 1
+            skipped_reason = (
+                "structural_clothing_tryon_required"
+                if str(requirement.get("reason", "")).strip() == "structural_clothing_tryon_required"
+                else "src_ref_not_needed"
+            )
+            skipped_reasons[skipped_reason] += 1
             continue
         plan_id = str(edit_plan.get("plan_id", "")).strip()
         if not plan_id:
@@ -2827,6 +2847,40 @@ def select_src_ref_images(
     }
 
 
+def _manual_review_bundle_issues(metadata: dict[str, Any]) -> list[str]:
+    generation = metadata.get("generation", {}) if isinstance(metadata.get("generation"), dict) else {}
+    route = _synthetic_generation_route(generation)
+    if route not in SYNTHETIC_VISUAL_ROUTES:
+        return []
+    issues: list[str] = []
+    if not metadata.get("copied_src_video_for_vace"):
+        issues.append("incomplete_review_bundle: missing src_video_for_vace")
+    if route == "vace_controlled" and not metadata.get("copied_src_mask"):
+        issues.append("incomplete_review_bundle: missing src_mask")
+    if not metadata.get("copied_raw_generated_video"):
+        issues.append("incomplete_review_bundle: missing raw_generated_video")
+    src_ref_requirements = (
+        generation.get("src_ref_requirements", {}) if isinstance(generation.get("src_ref_requirements"), dict) else {}
+    )
+    if src_ref_requirements.get("required") and not metadata.get("copied_src_ref_images"):
+        issues.append("incomplete_review_bundle: missing required src_ref_images")
+    copied_review_inputs = str(metadata.get("copied_review_inputs", "")).strip()
+    if not copied_review_inputs:
+        issues.append("incomplete_review_bundle: missing review_inputs_dir")
+    else:
+        review_inputs_path = Path(copied_review_inputs)
+        for filename in ("vace_prompt.txt", "preflight_report.json", "duration_metrics.json", "vace_command.json"):
+            if not (review_inputs_path / filename).exists():
+                issues.append(f"incomplete_review_bundle: missing review_inputs/{filename}")
+    if not metadata.get("duration_metrics"):
+        issues.append("incomplete_review_bundle: missing duration_metrics")
+    if route == "vace_controlled" and not metadata.get("mask_metrics"):
+        issues.append("incomplete_review_bundle: missing mask_metrics")
+    if not metadata.get("post_vace_verdict"):
+        issues.append("incomplete_review_bundle: missing post_vace_verdict")
+    return issues
+
+
 def build_manual_review_bundle(
     *,
     root: str | Path,
@@ -2845,6 +2899,7 @@ def build_manual_review_bundle(
 
     items: list[dict[str, Any]] = []
     missing_videos: list[str] = []
+    incomplete_review_bundle_count = 0
     selected_pairs = pairs[: limit if limit and limit > 0 else None]
     for index, record in enumerate(selected_pairs, start=1):
         sample_id = str(record.get("sample_id") or record.get("proposal_id") or f"sample_{index:04d}").strip()
@@ -2979,8 +3034,25 @@ def build_manual_review_bundle(
             "vace_command": generation.get("vace_command", {}),
             "post_vace_verdict": generation.get("post_vace_verdict", {}),
         }
+        review_bundle_issues = _manual_review_bundle_issues(metadata)
+        metadata["review_bundle_issues"] = review_bundle_issues
+        metadata["incomplete_review_bundle"] = bool(review_bundle_issues)
+        if review_bundle_issues:
+            incomplete_review_bundle_count += 1
         (item_dir / "metadata.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (item_dir / "semantic_evaluation_result.json").write_text(
+            json.dumps(metadata.get("post_vace_verdict", {}), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (item_dir / "mask_metrics.json").write_text(
+            json.dumps(metadata.get("mask_metrics", {}), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (item_dir / "duration_metrics.json").write_text(
+            json.dumps(metadata.get("duration_metrics", {}), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         review_md = _manual_review_item_markdown(
@@ -2999,6 +3071,8 @@ def build_manual_review_bundle(
                 "review_md": str(item_dir / "review.md"),
                 "reference_video": str(reference_copy if copy_videos and reference_copy.exists() else reference_path),
                 "target_video": str(target_copy if copy_videos and target_copy.exists() else target_path),
+                "incomplete_review_bundle": bool(review_bundle_issues),
+                "review_bundle_issues": review_bundle_issues,
             }
         )
 
@@ -3008,6 +3082,7 @@ def build_manual_review_bundle(
     return {
         "pair_count": len(pairs),
         "bundle_count": len(items),
+        "incomplete_review_bundle_count": incomplete_review_bundle_count,
         "output_dir": str(output_root),
         "index_path": str(output_root / "index.md"),
         "items_path": str(output_root / "review_items.jsonl"),
@@ -7926,6 +8001,8 @@ def _manual_review_item_markdown(
         f"- raw_generated_video: `{metadata.get('raw_generated_video', '')}`",
         f"- duration_metrics: `{json.dumps(metadata.get('duration_metrics', {}), ensure_ascii=False)}`",
         f"- mask_metrics: `{json.dumps(metadata.get('mask_metrics', {}), ensure_ascii=False)}`",
+        f"- incomplete_review_bundle: `{metadata.get('incomplete_review_bundle')}`",
+        f"- review_bundle_issues: `{json.dumps(metadata.get('review_bundle_issues', []), ensure_ascii=False)}`",
         "",
         "## 视频文件",
         "",
@@ -7949,6 +8026,16 @@ def _manual_review_item_markdown(
         lines.extend(["", "## raw target", "", f"- `{metadata.get('copied_raw_generated_video')}`"])
     if metadata.get("copied_review_inputs"):
         lines.extend(["", "## review_inputs", "", f"- `{metadata.get('copied_review_inputs')}`"])
+    lines.extend(
+        [
+            "",
+            "## Diagnostics",
+            "",
+            "- `semantic_evaluation_result.json`",
+            "- `mask_metrics.json`",
+            "- `duration_metrics.json`",
+        ]
+    )
     lines.extend(
         [
             "",
@@ -7978,16 +8065,18 @@ def _manual_review_index_markdown(
         f"- Source pairs: `{source_pairs_path}`",
         f"- Sample count: `{len(items)}`",
         f"- Missing video count: `{len(missing_videos)}`",
+        f"- Incomplete review bundle count: `{sum(1 for item in items if item.get('incomplete_review_bundle'))}`",
         "",
         "## Samples",
         "",
-        "| # | sample_id | type | edit_text | folder |",
-        "|---|-----------|------|-----------|--------|",
+        "| # | sample_id | type | status | edit_text | folder |",
+        "|---|-----------|------|--------|-----------|--------|",
     ]
     for item in items:
+        status = "incomplete" if item.get("incomplete_review_bundle") else "complete"
         lines.append(
             f"| {item['index']} | `{item['sample_id']}` | `{item.get('difference_type', '')}` | "
-            f"{item.get('edit_text', '')} | `{Path(item['item_dir']).name}` |"
+            f"{status} | {item.get('edit_text', '')} | `{Path(item['item_dir']).name}` |"
         )
     if missing_videos:
         lines.extend(["", "## Missing Videos", ""])
@@ -8122,17 +8211,17 @@ def _video_edit_exploration_candidates(candidate: dict[str, Any], annotation: di
         candidates.append(
             build(
                 family="clothing_type",
-                edit_text="change the outfit into a black jacket",
+                edit_text="change the patterned shirt into a solid black shirt",
                 difference={
                     "type": "attribute",
-                    "from": "original outfit",
-                    "to": "black jacket",
-                    "description": "The existing outfit changes into a black jacket.",
+                    "from": "patterned shirt",
+                    "to": "solid black shirt",
+                    "description": "The existing patterned shirt changes into a solid black shirt.",
                 },
-                edit_token="black jacket",
+                edit_token="solid black shirt",
                 edit_region="clothing",
                 mask_query="clothing",
-                goal="test masked clothing type change",
+                goal="test safe masked clothing type change without structural outerwear",
             )
         )
 
@@ -8747,6 +8836,22 @@ def _src_ref_requirement_for_video_plan(plan: dict[str, Any]) -> dict[str, Any]:
     target = str(difference.get("to", "")).strip() or edit_token
     from_value = str(difference.get("from", "")).strip()
 
+    structural_clothing_reason = _structural_clothing_edit_reason(
+        difference,
+        str(plan.get("edit_text", "")),
+        edit_token,
+        str(plan.get("source_prompt", "")),
+    )
+    if structural_clothing_reason:
+        return {
+            "required": False,
+            "recommended": False,
+            "role": "none",
+            "target": "",
+            "source_object": from_value,
+            "reason": structural_clothing_reason,
+        }
+
     if family == "object_replacement" or ("replace" in edit_text and difference_type in {"object_presence", "object_count"}):
         return {
             "required": True,
@@ -8817,8 +8922,8 @@ def _src_ref_image_prompts(*, requirement: dict[str, Any], edit_plan: dict[str, 
                 f"a realistic human torso wearing {target_with_article}, open jacket front and sleeve structure visible, arms slightly bent, neutral background, no product catalog layout, no watermark",
             ]
         return [
-            f"a realistic cropped upper-body photo of a person wearing {target_with_article}, full sleeves visible, arms slightly bent as if holding a small instrument, front three-quarter view, no face, no text, no logo",
-            f"a standing musician torso wearing {target_with_article}, natural human shoulder and sleeve fit, arms visible, neutral background, no product catalog layout, no watermark",
+            f"a realistic cropped upper-body photo of a person wearing {target_with_article}, garment silhouette clearly visible, arms slightly bent as if holding a small instrument, front three-quarter view, no face, no text, no logo",
+            f"a standing musician torso wearing {target_with_article}, natural human shoulder fit, arms visible, neutral background, no product catalog layout, no watermark",
         ]
     return [
         f"a realistic {target}, isolated product reference, three-quarter view, plain white background, no hands, no people, no text, no logo",
@@ -9204,6 +9309,39 @@ def _is_black_jacket_target(difference: dict[str, Any], edit_text: str = "", edi
         )
     )
     return "black jacket" in text
+
+
+def _structural_clothing_edit_reason(
+    difference: dict[str, Any],
+    edit_text: str = "",
+    edit_token: str = "",
+    source_prompt: str = "",
+) -> str:
+    if not _is_clothing_edit(difference, edit_text, edit_token):
+        return ""
+    target_key = _normalized_phrase(_video_edit_target_object(difference, edit_text, edit_token))
+    source_key = _normalized_phrase(" ".join([str(difference.get("from", "")), source_prompt]))
+    combined = _normalized_phrase(
+        " ".join(
+            [
+                target_key,
+                str(edit_text),
+                str(edit_token),
+                str(difference.get("to", "")),
+                str(difference.get("description", "")),
+            ]
+        )
+    )
+    if _is_black_jacket_target(difference, edit_text, edit_token):
+        return "structural_clothing_tryon_required"
+    if any(marker in combined for marker in VACE_STRUCTURAL_CLOTHING_TARGET_MARKERS):
+        return "structural_clothing_tryon_required"
+    target_is_outerwear = any(marker in target_key for marker in VACE_OUTERWEAR_MARKERS)
+    source_is_outerwear = any(marker in source_key for marker in VACE_OUTERWEAR_MARKERS)
+    source_is_non_outerwear = any(marker in source_key for marker in VACE_NON_OUTERWEAR_CLOTHING_MARKERS)
+    if target_is_outerwear and source_is_non_outerwear and not source_is_outerwear:
+        return "structural_clothing_tryon_required"
+    return ""
 
 
 def _black_jacket_target_prompt(source_prompt: str) -> str:
@@ -9594,6 +9732,14 @@ def _video_edit_plan_lint(
     if source_key and source_key in negative_key:
         errors.append("negative_prompt_locks_edit_source")
     if _is_clothing_edit(difference, edit_text, edit_token):
+        structural_clothing_reason = _structural_clothing_edit_reason(
+            difference,
+            edit_text,
+            edit_token,
+            source_prompt,
+        )
+        if structural_clothing_reason:
+            errors.append(structural_clothing_reason)
         target_clothing = _video_edit_target_object(difference, edit_text, edit_token) or edit_token
         if "change only" in target_key:
             errors.append("clothing_target_prompt_uses_operation_instruction")
@@ -10121,12 +10267,40 @@ def _known_pair_generation_issues(record: dict[str, Any]) -> list[str]:
     for field_name in ("prompt", "source_prompt", "target_prompt"):
         if not str(generation.get(field_name, "")).strip():
             issues.append(f"generation.{field_name} is required for synthetic visual pairs")
+    review_inputs_dir = str(generation.get("review_inputs_dir", "")).strip()
+    if not review_inputs_dir:
+        issues.append("generation.review_inputs_dir is required for synthetic visual pairs")
     preserve_tokens = generation.get("preserve_tokens")
     if not isinstance(preserve_tokens, list) or not [item for item in preserve_tokens if str(item).strip()]:
         issues.append("generation.preserve_tokens is required for synthetic visual pairs")
     postprocess = generation.get("postprocess")
     if not isinstance(postprocess, dict) or "audio_copied_from_reference" not in postprocess:
         issues.append("generation.postprocess.audio_copied_from_reference is required for synthetic visual pairs")
+    elif not str(postprocess.get("raw_generated_video", "")).strip():
+        issues.append("generation.postprocess.raw_generated_video is required for synthetic visual pairs")
+    duration_metrics = generation.get("duration_metrics")
+    if not isinstance(duration_metrics, dict) or not duration_metrics:
+        issues.append("generation.duration_metrics is required for synthetic visual pairs")
+    post_vace_verdict = generation.get("post_vace_verdict")
+    if not isinstance(post_vace_verdict, dict) or not post_vace_verdict:
+        issues.append("generation.post_vace_verdict is required for synthetic visual pairs")
+    edit_token = str(generation.get("edit_token") or record.get("edit_token") or "").strip()
+    structural_clothing_reason = _structural_clothing_edit_reason(
+        record.get("difference", {}) if isinstance(record.get("difference"), dict) else {},
+        str(record.get("edit_text", "")).strip(),
+        edit_token,
+        str(generation.get("source_prompt", "")).strip(),
+    )
+    if structural_clothing_reason and route == "vace_controlled":
+        issues.append("structural clothing edit requires try-on route instead of vace_controlled")
+    if route == "vace_controlled":
+        if not str(generation.get("src_video_for_vace", "")).strip():
+            issues.append("generation.src_video_for_vace is required for vace_controlled pairs")
+        if not str(generation.get("src_mask", "")).strip():
+            issues.append("generation.src_mask is required for vace_controlled pairs")
+        mask_metrics = generation.get("mask_metrics")
+        if not isinstance(mask_metrics, dict) or not mask_metrics:
+            issues.append("generation.mask_metrics is required for vace_controlled pairs")
     return issues
 
 

@@ -224,7 +224,30 @@ def clothing_prompt_errors(plan):
     target_prompt = str(plan.get("target_prompt", "")).strip()
     target_key = normalize_phrase(target_object(plan))
     target_text = normalize_phrase(target_prompt)
+    source_key = normalize_phrase(
+        " ".join([source_prompt, str(difference.get("from", ""))])
+    )
     errors = []
+    structural_markers = (
+        "open jacket",
+        "open black jacket",
+        "open black long sleeved jacket",
+        "long sleeve jacket",
+        "long sleeved jacket",
+        "long sleeves",
+        "outerwear",
+        "layered jacket",
+        "jacket over",
+        "coat over",
+        "blazer",
+    )
+    target_outerwear = any(marker in target_key for marker in ("jacket", "coat", "blazer", "outerwear"))
+    source_non_outerwear = any(marker in source_key for marker in ("shirt", "t shirt", "tee", "short sleeve", "short sleeved", "outfit", "clothing"))
+    source_outerwear = any(marker in source_key for marker in ("jacket", "coat", "blazer", "outerwear"))
+    if "black jacket" in combined or any(marker in combined for marker in structural_markers) or (
+        target_outerwear and source_non_outerwear and not source_outerwear
+    ):
+        errors.append("structural_clothing_tryon_required")
     if "change only" in target_text:
         errors.append("target_prompt_uses_operation_instruction_for_clothing_edit")
     for source_clothing in clothing_phrases(source_prompt):
