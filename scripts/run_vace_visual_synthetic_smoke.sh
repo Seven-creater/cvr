@@ -262,6 +262,19 @@ def clothing_prompt_errors(plan):
                 errors.append(f"black_jacket_target_prompt_forbidden_marker:{marker}")
     return errors
 
+def visual_prompt_errors(plan):
+    difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
+    edit_text = normalize_phrase(plan.get("edit_text", ""))
+    target_text = normalize_phrase(plan.get("target_prompt", ""))
+    errors = []
+    if "add only no" in target_text:
+        errors.append("target_prompt_contains_add_only_no")
+    if "replace" in edit_text and "add only" in target_text:
+        errors.append("replacement_target_prompt_uses_add_instead_of_replace")
+    if str(difference.get("type", "")).strip() == "object_presence" and "replace" in edit_text and "replace" not in target_text:
+        errors.append("replacement_target_prompt_missing_replace")
+    return errors
+
 rows = [json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 if not rows:
     raise SystemExit(f"empty video edit plan: {plan_path}")
@@ -348,7 +361,7 @@ edit_region = str(plan.get("edit_region", "")).strip()
 preserve_tokens = [str(item).strip() for item in plan.get("preserve_tokens", []) if str(item).strip()]
 if not target_prompt:
     raise SystemExit("selected plan has empty target_prompt")
-prompt_errors = clothing_prompt_errors(plan)
+prompt_errors = visual_prompt_errors(plan) + clothing_prompt_errors(plan)
 if prompt_errors:
     raise SystemExit("selected plan failed target prompt lint: " + "; ".join(prompt_errors))
 prompt = target_prompt
@@ -821,6 +834,7 @@ ffmpeg -y -i "$RAW_VIDEO" -i "$REFERENCE_VIDEO" \
 
 python3 - "$OUT_ROOT" "$REFERENCE_VIDEO" "$RAW_VIDEO" "$TARGET_VIDEO" "$VACE_DURATION_DRIFT_MAX" "$KNOWN_PAIRS" "$FRAME_NUM" "$VACE_SOURCE_FPS" <<'PY'
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path

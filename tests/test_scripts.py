@@ -317,9 +317,13 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("target_prompt_uses_operation_instruction_for_clothing_edit", script)
         self.assertIn("target_prompt_preserves_source_clothing", script)
         self.assertIn("structural_clothing_tryon_required", script)
+        self.assertIn("target_prompt_contains_add_only_no", script)
+        self.assertIn("replacement_target_prompt_uses_add_instead_of_replace", script)
+        self.assertIn("replacement_target_prompt_missing_replace", script)
         self.assertIn("black_jacket_target_prompt_missing_open_black_long_sleeved_jacket", script)
         self.assertIn("black_jacket_target_prompt_forbidden_marker", script)
         self.assertIn("semantic_gate_required", script)
+        self.assertIn("import re", script)
 
     def test_prepare_grounded_sam2_env_script_installs_expected_packages(self) -> None:
         script = Path("scripts/prepare_grounded_sam2_env.sh").read_text(encoding="utf-8")
@@ -426,9 +430,14 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("[src-ref-gen] CUDA_VISIBLE_DEVICES", script)
         self.assertIn("--device-map", script)
         self.assertIn("--low-cpu-mem-usage", script)
+        self.assertIn("--background-width", script)
+        self.assertIn("--background-height", script)
         self.assertIn("generate_src_ref_images_from_plan.py", script)
         self.assertIn("DiffusionPipeline.from_pretrained", helper)
         self.assertIn('"device_map"', helper)
+        self.assertIn('"width"', helper)
+        self.assertIn('"height"', helper)
+        self.assertIn("true_cfg_scale", helper)
         self.assertIn('f"candidate_{candidate_index:03d}.png"', helper)
         self.assertIn("src_ref_image_generation_manifest", script)
 

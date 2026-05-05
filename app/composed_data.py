@@ -269,6 +269,8 @@ VACE_CLOTHING_SRC_REF_ARTIFACT_MARKERS = {
     "product catalog",
     "catalog",
 }
+VACE_BACKGROUND_SRC_REF_WIDTH = 1664
+VACE_BACKGROUND_SRC_REF_HEIGHT = 928
 VACE_STRUCTURAL_CLOTHING_TARGET_MARKERS = {
     "open jacket",
     "open black jacket",
@@ -2693,6 +2695,12 @@ def plan_src_ref_images(
                 "negative_prompt": _src_ref_image_negative_prompt(requirement),
                 "num_candidates": max(1, int(num_candidates)),
                 "candidate_dir": str(candidate_dir),
+                "image_width": VACE_BACKGROUND_SRC_REF_WIDTH
+                if str(requirement.get("role", "")).strip() == "background_reference"
+                else 0,
+                "image_height": VACE_BACKGROUND_SRC_REF_HEIGHT
+                if str(requirement.get("role", "")).strip() == "background_reference"
+                else 0,
                 "planner": {
                     "stage": "src_ref_image_requirement_planner",
                     "input": "video_edit_plan_and_omni_reference_understanding",

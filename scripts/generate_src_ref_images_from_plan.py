@@ -31,20 +31,36 @@ def _torch_dtype(torch_module: Any, dtype_name: str) -> Any:
     return torch_module.bfloat16
 
 
-def _call_pipeline(pipe: Any, *, prompt: str, negative_prompt: str, steps: int, guidance_scale: float, generator: Any) -> Any:
+def _call_pipeline(
+    pipe: Any,
+    *,
+    prompt: str,
+    negative_prompt: str,
+    steps: int,
+    guidance_scale: float,
+    generator: Any,
+    width: int = 0,
+    height: int = 0,
+) -> Any:
     kwargs = {
         "prompt": prompt,
         "num_inference_steps": steps,
-        "guidance_scale": guidance_scale,
         "generator": generator,
     }
+    if width > 0 and height > 0:
+        kwargs["width"] = width
+        kwargs["height"] = height
     if negative_prompt:
         kwargs["negative_prompt"] = negative_prompt
     try:
-        return pipe(**kwargs).images[0]
+        return pipe(**dict(kwargs, true_cfg_scale=guidance_scale)).images[0]
+    except TypeError:
+        pass
+    try:
+        return pipe(**dict(kwargs, guidance_scale=guidance_scale)).images[0]
     except TypeError:
         kwargs.pop("negative_prompt", None)
-        return pipe(**kwargs).images[0]
+        return pipe(**dict(kwargs, guidance_scale=guidance_scale)).images[0]
 
 
 def main() -> None:
@@ -59,6 +75,8 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--device-map", default="")
     parser.add_argument("--low-cpu-mem-usage", action="store_true")
+    parser.add_argument("--background-width", type=int, default=1664)
+    parser.add_argument("--background-height", type=int, default=928)
     args = parser.parse_args()
 
     import torch
@@ -98,6 +116,12 @@ def main() -> None:
         if not prompts:
             raise ValueError(f"plan {plan_id} is missing image_prompts")
         negative_prompt = str(plan.get("negative_prompt", "")).strip()
+        role = str(plan.get("src_ref_role", "")).strip()
+        width = int(plan.get("image_width") or 0)
+        height = int(plan.get("image_height") or 0)
+        if role == "background_reference" and (width <= 0 or height <= 0):
+            width = int(args.background_width)
+            height = int(args.background_height)
         num_candidates = max(1, int(plan.get("num_candidates", 1) or 1))
         generated: list[str] = []
         for candidate_index in range(1, num_candidates + 1):
@@ -111,6 +135,8 @@ def main() -> None:
                 steps=args.steps,
                 guidance_scale=args.guidance_scale,
                 generator=generator,
+                width=width,
+                height=height,
             )
             image_path = candidate_dir / f"candidate_{candidate_index:03d}.png"
             image.save(image_path)
@@ -120,6 +146,8 @@ def main() -> None:
                 "plan_id": plan_id,
                 "candidate_dir": str(candidate_dir),
                 "generated_images": generated,
+                "image_width": width,
+                "image_height": height,
                 "model_dir": str(model_dir),
                 "status": "generated",
             }

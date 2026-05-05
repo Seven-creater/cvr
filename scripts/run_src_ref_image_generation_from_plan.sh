@@ -14,6 +14,8 @@ STEPS=${STEPS:-30}
 GUIDANCE_SCALE=${GUIDANCE_SCALE:-4.0}
 DEVICE_MAP=${DEVICE_MAP:-}
 LOW_CPU_MEM_USAGE=${LOW_CPU_MEM_USAGE:-0}
+BACKGROUND_WIDTH=${BACKGROUND_WIDTH:-1664}
+BACKGROUND_HEIGHT=${BACKGROUND_HEIGHT:-928}
 
 usage() {
   cat <<'EOF'
@@ -30,6 +32,8 @@ Options:
   --guidance-scale N
   --device-map balanced|auto
   --low-cpu-mem-usage 0|1
+  --background-width N
+  --background-height N
 
 Generates VACE src_ref_images from src_ref_image_plan.jsonl using a local
 Diffusers-compatible image generation model, such as Qwen-Image.
@@ -48,6 +52,8 @@ while [[ $# -gt 0 ]]; do
     --guidance-scale) GUIDANCE_SCALE="$2"; shift 2 ;;
     --device-map) DEVICE_MAP="$2"; shift 2 ;;
     --low-cpu-mem-usage) LOW_CPU_MEM_USAGE="$2"; shift 2 ;;
+    --background-width) BACKGROUND_WIDTH="$2"; shift 2 ;;
+    --background-height) BACKGROUND_HEIGHT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[src-ref-gen] unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -99,4 +105,6 @@ python scripts/generate_src_ref_images_from_plan.py \
   --max-plans "$MAX_PLANS" \
   --steps "$STEPS" \
   --guidance-scale "$GUIDANCE_SCALE" \
+  --background-width "$BACKGROUND_WIDTH" \
+  --background-height "$BACKGROUND_HEIGHT" \
   "${extra_args[@]}"

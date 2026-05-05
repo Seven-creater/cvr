@@ -5463,6 +5463,43 @@ class ComposedDataTests(unittest.TestCase):
             self.assertIn("tablet", plans[0]["image_prompts"][0])
             self.assertEqual(1, summary["skipped_reasons"]["src_ref_not_needed"])
 
+    def test_plan_src_ref_images_sets_16x9_size_for_background_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "lab_background",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "change the background to a futuristic laboratory",
+                        "difference": {"type": "scene", "from": "brick wall", "to": "futuristic laboratory"},
+                        "model_route": "vace_controlled",
+                        "edit_token": "futuristic laboratory",
+                        "edit_region": "background",
+                        "exploration_family": "background_change",
+                    }
+                ],
+            )
+
+            summary = plan_src_ref_images(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                image_root=root / "src_ref_images",
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("background_reference", plans[0]["src_ref_role"])
+            self.assertEqual(1664, plans[0]["image_width"])
+            self.assertEqual(928, plans[0]["image_height"])
+
     def test_plan_src_ref_images_skips_structural_black_jacket(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
