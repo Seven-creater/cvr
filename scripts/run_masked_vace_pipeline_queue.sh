@@ -58,6 +58,7 @@ VACE_ULYSSES_SIZE=${VACE_ULYSSES_SIZE:-4}
 VACE_RING_SIZE=${VACE_RING_SIZE:-0}
 VACE_FRAME_NUM=${VACE_FRAME_NUM:-81}
 VACE_CLIP_SECONDS=${VACE_CLIP_SECONDS:-5}
+VACE_SOURCE_FPS=${VACE_SOURCE_FPS:-16}
 WAN_CKPT=${WAN_CKPT:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/Wan2.1/Wan2.1-VACE-14B}
 VACE_TASK=${VACE_TASK:-vace-14B}
 VACE_CONDA_ENV=${VACE_CONDA_ENV:-wan_vace}
@@ -106,6 +107,7 @@ Options:
   --vace-gpu-ids IDS
   --vace-frame-num N
   --vace-clip-seconds N
+  --vace-source-fps N
   --timeout-seconds N
   --annotate-concurrency N
   -h, --help
@@ -140,6 +142,7 @@ while [[ $# -gt 0 ]]; do
     --vace-gpu-ids) VACE_GPU_IDS="$2"; shift 2 ;;
     --vace-frame-num) VACE_FRAME_NUM="$2"; shift 2 ;;
     --vace-clip-seconds) VACE_CLIP_SECONDS="$2"; shift 2 ;;
+    --vace-source-fps) VACE_SOURCE_FPS="$2"; shift 2 ;;
     --timeout-seconds) TIMEOUT_SECONDS="$2"; shift 2 ;;
     --annotate-concurrency) ANNOTATE_CONCURRENCY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -339,7 +342,7 @@ run_mask() {
 run_vace() {
   require_file "$VIDEO_EDIT_PLAN" "video edit plan"
   require_file "$GENERATED_MASK_MANIFEST" "generated mask manifest"
-  echo "[masked-vace-queue] stage=vace gpu_ids=$VACE_GPU_IDS top_k=$VACE_TOP_K frame_num=$VACE_FRAME_NUM clip_seconds=$VACE_CLIP_SECONDS"
+  echo "[masked-vace-queue] stage=vace gpu_ids=$VACE_GPU_IDS top_k=$VACE_TOP_K frame_num=$VACE_FRAME_NUM clip_seconds=$VACE_CLIP_SECONDS source_fps=$VACE_SOURCE_FPS"
   local src_ref_args=()
   if [[ -s "$SRC_REF_IMAGE_SELECTION" ]]; then
     src_ref_args=(--src-ref-selection "$SRC_REF_IMAGE_SELECTION")
@@ -360,7 +363,8 @@ run_vace() {
     --ulysses-size "$VACE_ULYSSES_SIZE" \
     --ring-size "$VACE_RING_SIZE" \
     --frame-num "$VACE_FRAME_NUM" \
-    --vace-clip-seconds "$VACE_CLIP_SECONDS"
+    --vace-clip-seconds "$VACE_CLIP_SECONDS" \
+    --vace-source-fps "$VACE_SOURCE_FPS"
 }
 
 run_annotate() {

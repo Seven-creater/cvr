@@ -21,6 +21,7 @@ ULYSSES_SIZE=${ULYSSES_SIZE:-4}
 RING_SIZE=${RING_SIZE:-0}
 FRAME_NUM=${FRAME_NUM:-81}
 VACE_CLIP_SECONDS=${VACE_CLIP_SECONDS:-5}
+VACE_SOURCE_FPS=${VACE_SOURCE_FPS:-16}
 FAIL_FAST=${FAIL_FAST:-0}
 
 usage() {
@@ -45,6 +46,7 @@ Options:
   --ring-size N
   --frame-num N
   --vace-clip-seconds N
+  --vace-source-fps N
   --fail-fast 0|1
   -h, --help
 
@@ -73,6 +75,7 @@ while [[ $# -gt 0 ]]; do
     --ring-size) RING_SIZE="$2"; shift 2 ;;
     --frame-num) FRAME_NUM="$2"; shift 2 ;;
     --vace-clip-seconds) VACE_CLIP_SECONDS="$2"; shift 2 ;;
+    --vace-source-fps) VACE_SOURCE_FPS="$2"; shift 2 ;;
     --fail-fast) FAIL_FAST="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[vace-batch] unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -128,6 +131,7 @@ PY
   echo "- wan_ckpt: \`$WAN_CKPT\`"
   echo "- frame_num: \`$FRAME_NUM\`"
   echo "- vace_clip_seconds: \`$VACE_CLIP_SECONDS\`"
+  echo "- vace_source_fps: \`$VACE_SOURCE_FPS\`"
   echo "- started: \`$(date)\`"
   echo
   echo "## Items"
@@ -174,6 +178,7 @@ PY
       --ring-size "$RING_SIZE" \
       --frame-num "$FRAME_NUM" \
       --vace-clip-seconds "$VACE_CLIP_SECONDS" \
+      --vace-source-fps "$VACE_SOURCE_FPS" \
       < /dev/null; then
     cat "$ITEM_ROOT/pairs/synthetic_visual_candidate_pairs.jsonl" >> "$BATCH_PAIRS"
     cat "$ITEM_ROOT/metadata/synthetic_visual_target_manifest.jsonl" >> "$BATCH_MANIFEST"

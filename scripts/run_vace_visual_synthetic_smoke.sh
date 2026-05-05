@@ -25,6 +25,7 @@ RING_SIZE=${RING_SIZE:-0}
 SIZE=${SIZE:-832*480}
 FRAME_NUM=${FRAME_NUM:-81}
 VACE_CLIP_SECONDS=${VACE_CLIP_SECONDS:-5}
+VACE_SOURCE_FPS=${VACE_SOURCE_FPS:-16}
 VACE_INPUT_DURATION_DRIFT_MAX=${VACE_INPUT_DURATION_DRIFT_MAX:-0.15}
 VACE_DURATION_DRIFT_MAX=${VACE_DURATION_DRIFT_MAX:-0.5}
 SAMPLE_STEPS=${SAMPLE_STEPS:-25}
@@ -58,6 +59,7 @@ Options:
   --ring-size N
   --frame-num N
   --vace-clip-seconds N
+  --vace-source-fps N
   --out-root PATH
   --allow-cpu-offload 0|1
   -h, --help
@@ -90,6 +92,7 @@ while [[ $# -gt 0 ]]; do
     --ring-size) RING_SIZE="$2"; shift 2 ;;
     --frame-num) FRAME_NUM="$2"; shift 2 ;;
     --vace-clip-seconds) VACE_CLIP_SECONDS="$2"; shift 2 ;;
+    --vace-source-fps) VACE_SOURCE_FPS="$2"; shift 2 ;;
     --out-root) OUT_ROOT="$2"; shift 2 ;;
     --allow-cpu-offload) ALLOW_CPU_OFFLOAD="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -352,7 +355,7 @@ echo "[vace-smoke] vace_task=$VACE_TASK"
 echo "[vace-smoke] conda_env=$CONDA_ENV"
 echo "[vace-smoke] gpu_ids=$GPU_IDS offload_model=$OFFLOAD_MODEL t5_cpu=$T5_CPU allow_cpu_offload=$ALLOW_CPU_OFFLOAD"
 echo "[vace-smoke] ulysses_size=$ULYSSES_SIZE ring_size=$RING_SIZE"
-echo "[vace-smoke] frame_num=$FRAME_NUM vace_clip_seconds=$VACE_CLIP_SECONDS"
+echo "[vace-smoke] frame_num=$FRAME_NUM vace_clip_seconds=$VACE_CLIP_SECONDS vace_source_fps=$VACE_SOURCE_FPS"
 echo "[vace-smoke] prompt=$PROMPT"
 
 mkdir -p "$OUT_ROOT/review_inputs/src_ref_images"
@@ -366,16 +369,39 @@ PY
   exit 1
 fi
 
-ffmpeg -y -i "$REFERENCE_VIDEO_ORIGINAL" -t "$VACE_CLIP_SECONDS" \
-  -map 0:v:0 -map 0:a? -c:v libx264 -crf 18 -preset veryfast -c:a aac -movflags +faststart "$REFERENCE_VIDEO" \
+if ! python3 - "$VACE_SOURCE_FPS" <<'PY'; then
+import sys
+fps = float(sys.argv[1])
+if fps <= 0:
+    raise SystemExit(f"VACE_SOURCE_FPS must be positive, got {fps}")
+PY
+  exit 1
+fi
+
+VACE_SOURCE_DURATION=$(python3 - "$FRAME_NUM" "$VACE_SOURCE_FPS" <<'PY'
+import sys
+frame_num = int(sys.argv[1])
+fps = float(sys.argv[2])
+print(f"{frame_num / fps:.6f}")
+PY
+)
+echo "[vace-smoke] vace_source_duration=$VACE_SOURCE_DURATION exact_frames=${FRAME_NUM}@${VACE_SOURCE_FPS}fps"
+
+ffmpeg -y -i "$REFERENCE_VIDEO_ORIGINAL" \
+  -filter_complex "[0:v]fps=${VACE_SOURCE_FPS},tpad=stop_mode=clone:stop_duration=1,trim=start_frame=0:end_frame=${FRAME_NUM},setpts=N/${VACE_SOURCE_FPS}/TB[v]" \
+  -map "[v]" -map 0:a? -t "$VACE_SOURCE_DURATION" \
+  -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -movflags +faststart "$REFERENCE_VIDEO" \
   > "$OUT_ROOT/logs/reference_for_vace.log" 2>&1 || {
     echo "[vace-smoke] failed to create clipped reference=$REFERENCE_VIDEO" >&2
     tail -80 "$OUT_ROOT/logs/reference_for_vace.log" >&2 || true
     exit 1
   }
 if [[ -n "${SRC_MASK_ORIGINAL:-}" ]]; then
-  ffmpeg -y -i "$SRC_MASK_ORIGINAL" -t "$VACE_CLIP_SECONDS" \
-    -map 0:v:0 -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p "$SRC_MASK" \
+  WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
+  HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
+  ffmpeg -y -i "$SRC_MASK_ORIGINAL" \
+    -filter_complex "[0:v]fps=${VACE_SOURCE_FPS},scale=${WIDTH}:${HEIGHT},format=gray,tpad=stop_mode=clone:stop_duration=1,trim=start_frame=0:end_frame=${FRAME_NUM},setpts=N/${VACE_SOURCE_FPS}/TB[v]" \
+    -map "[v]" -an -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p "$SRC_MASK" \
     > "$OUT_ROOT/logs/src_mask_for_vace.log" 2>&1 || {
       echo "[vace-smoke] failed to create clipped src_mask=$SRC_MASK" >&2
       tail -80 "$OUT_ROOT/logs/src_mask_for_vace.log" >&2 || true
@@ -400,11 +426,9 @@ if [[ -n "${SRC_MASK:-}" ]]; then
     "$OUT_ROOT/review_inputs/mask_contact.jpg" > "$OUT_ROOT/logs/contact_mask.log" 2>&1 || true
   WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
   HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
-  FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
-  DURATION=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
   ffmpeg -y -i "$REFERENCE_VIDEO" -i "$SRC_MASK" \
-    -filter_complex "[1:v]scale=${WIDTH}:${HEIGHT},format=gray[m];color=c=gray:s=${WIDTH}x${HEIGHT}:r=${FPS}:d=${DURATION},format=yuv420p[gray];[0:v]format=yuv420p[base];[base][gray][m]maskedmerge[out]" \
-    -map "[out]" -map 0:a? -c:v libx264 -crf 18 -preset veryfast -c:a copy -shortest "$SRC_VIDEO_FOR_VACE" \
+    -filter_complex "[1:v]scale=${WIDTH}:${HEIGHT},format=gray[m];color=c=gray:s=${WIDTH}x${HEIGHT}:r=${VACE_SOURCE_FPS}:d=${VACE_SOURCE_DURATION},format=yuv420p[gray];[0:v]format=yuv420p[base];[base][gray][m]maskedmerge[out]" \
+    -map "[out]" -frames:v "$FRAME_NUM" -an -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p "$SRC_VIDEO_FOR_VACE" \
     > "$OUT_ROOT/logs/src_video_for_vace.log" 2>&1 || {
       echo "[vace-smoke] failed to create src_video_for_vace=$SRC_VIDEO_FOR_VACE" >&2
       tail -80 "$OUT_ROOT/logs/src_video_for_vace.log" >&2 || true
@@ -420,7 +444,7 @@ if [[ -n "${SRC_REF_IMAGES:-}" ]]; then
   done
 fi
 
-python3 - "$OUT_ROOT" "$REFERENCE_VIDEO" "$SRC_VIDEO_FOR_VACE" "${SRC_MASK:-}" "$SRC_REF_IMAGES" "$SRC_REF_REQUIRED" "$VACE_INPUT_DURATION_DRIFT_MAX" <<'PY'
+python3 - "$OUT_ROOT" "$REFERENCE_VIDEO" "$SRC_VIDEO_FOR_VACE" "${SRC_MASK:-}" "$SRC_REF_IMAGES" "$SRC_REF_REQUIRED" "$VACE_INPUT_DURATION_DRIFT_MAX" "$FRAME_NUM" "$VACE_SOURCE_FPS" <<'PY'
 import json
 import os
 import subprocess
@@ -434,6 +458,21 @@ src_mask = Path(sys.argv[4]) if sys.argv[4].strip() else None
 src_ref_images = [Path(item) for item in sys.argv[5].split(",") if item.strip()]
 src_ref_required = sys.argv[6] == "1"
 max_drift = float(sys.argv[7])
+expected_frame_num = int(sys.argv[8])
+expected_fps = float(sys.argv[9])
+
+def parse_fraction(value: str) -> float:
+    if "/" in value:
+        numerator, denominator = value.split("/", 1)
+        try:
+            denominator_float = float(denominator)
+            return float(numerator) / denominator_float if denominator_float else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 def probe(path: Path) -> dict:
     if not path.exists() or path.stat().st_size <= 0:
@@ -443,6 +482,7 @@ def probe(path: Path) -> dict:
             "ffprobe",
             "-v",
             "error",
+            "-count_frames",
             "-print_format",
             "json",
             "-show_format",
@@ -455,11 +495,18 @@ def probe(path: Path) -> dict:
     )
     payload = json.loads(completed.stdout or "{}")
     video_stream = next((row for row in payload.get("streams", []) if row.get("codec_type") == "video"), {})
+    raw_frame_count = video_stream.get("nb_read_frames") or video_stream.get("nb_frames") or 0
+    try:
+        frame_count = int(raw_frame_count)
+    except (TypeError, ValueError):
+        frame_count = 0
     return {
         "path": str(path),
         "duration_seconds": float((payload.get("format") or {}).get("duration") or video_stream.get("duration") or 0.0),
         "width": int(video_stream.get("width") or 0),
         "height": int(video_stream.get("height") or 0),
+        "fps": parse_fraction(str(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "")),
+        "frame_count": frame_count,
         "has_video": bool(video_stream),
     }
 
@@ -471,6 +518,11 @@ if (reference["width"], reference["height"]) != (src["width"], src["height"]):
     raise SystemExit(f"preflight failed: reference/src_video size mismatch {reference} vs {src}")
 if abs(reference["duration_seconds"] - src["duration_seconds"]) > max_drift:
     raise SystemExit(f"preflight failed: reference/src_video duration mismatch {reference} vs {src}")
+for label, media in (("reference", reference), ("src_video", src)):
+    if media["frame_count"] != expected_frame_num:
+        raise SystemExit(f"preflight failed: {label} frame_count {media['frame_count']} != expected {expected_frame_num}: {media}")
+    if abs(media["fps"] - expected_fps) > 0.01:
+        raise SystemExit(f"preflight failed: {label} fps {media['fps']:.4f} != expected {expected_fps:.4f}: {media}")
 mask = None
 if src_mask is not None:
     mask = probe(src_mask)
@@ -478,6 +530,10 @@ if src_mask is not None:
         raise SystemExit(f"preflight failed: reference/src_mask size mismatch {reference} vs {mask}")
     if abs(reference["duration_seconds"] - mask["duration_seconds"]) > max_drift:
         raise SystemExit(f"preflight failed: reference/src_mask duration mismatch {reference} vs {mask}")
+    if mask["frame_count"] != expected_frame_num:
+        raise SystemExit(f"preflight failed: src_mask frame_count {mask['frame_count']} != expected {expected_frame_num}: {mask}")
+    if abs(mask["fps"] - expected_fps) > 0.01:
+        raise SystemExit(f"preflight failed: src_mask fps {mask['fps']:.4f} != expected {expected_fps:.4f}: {mask}")
 if src_ref_required and not src_ref_images:
     raise SystemExit("preflight failed: required src_ref_images are missing")
 for image in src_ref_images:
@@ -493,6 +549,8 @@ report = {
     "src_ref_image_count": len(src_ref_images),
     "copied_src_ref_image_count": len(copied_refs),
     "max_input_duration_drift_seconds": max_drift,
+    "expected_frame_num": expected_frame_num,
+    "expected_fps": expected_fps,
     "passed": True,
 }
 (out_root / "metadata" / "preflight_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -594,7 +652,7 @@ if [[ ! -s "$RAW_VIDEO" ]]; then
   exit 1
 fi
 
-python3 - "$REFERENCE_VIDEO" "$RAW_VIDEO" "$VACE_DURATION_DRIFT_MAX" <<'PY'
+python3 - "$REFERENCE_VIDEO" "$RAW_VIDEO" "$VACE_DURATION_DRIFT_MAX" "$FRAME_NUM" "$VACE_SOURCE_FPS" <<'PY'
 import json
 import subprocess
 import sys
@@ -603,39 +661,68 @@ from pathlib import Path
 reference_video = Path(sys.argv[1])
 raw_video = Path(sys.argv[2])
 max_drift = float(sys.argv[3])
+expected_frame_num = int(sys.argv[4])
+expected_fps = float(sys.argv[5])
+
+def parse_fraction(value: str) -> float:
+    if "/" in value:
+        numerator, denominator = value.split("/", 1)
+        try:
+            denominator_float = float(denominator)
+            return float(numerator) / denominator_float if denominator_float else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 def probe(path: Path) -> dict:
     completed = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        ["ffprobe", "-v", "error", "-count_frames", "-print_format", "json", "-show_format", "-show_streams", str(path)],
         check=True,
         capture_output=True,
         text=True,
     )
     payload = json.loads(completed.stdout or "{}")
     video_stream = next((row for row in payload.get("streams", []) if row.get("codec_type") == "video"), {})
+    raw_frame_count = video_stream.get("nb_read_frames") or video_stream.get("nb_frames") or 0
+    try:
+        frame_count = int(raw_frame_count)
+    except (TypeError, ValueError):
+        frame_count = 0
     return {
         "path": str(path),
         "duration_seconds": float((payload.get("format") or {}).get("duration") or video_stream.get("duration") or 0.0),
         "width": int(video_stream.get("width") or 0),
         "height": int(video_stream.get("height") or 0),
+        "fps": parse_fraction(str(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "")),
+        "frame_count": frame_count,
         "has_video": bool(video_stream),
     }
 
 reference = probe(reference_video)
 raw = probe(raw_video)
 drift = abs(reference["duration_seconds"] - raw["duration_seconds"])
+errors = []
 if drift > max_drift:
-    raise SystemExit(
+    errors.append(
         f"raw VACE target duration drift {drift:.3f}s exceeds {max_drift:.3f}s: "
         f"reference={reference['duration_seconds']:.3f}s raw={raw['duration_seconds']:.3f}s"
     )
+if raw["frame_count"] != expected_frame_num:
+    errors.append(f"raw VACE target frame_count {raw['frame_count']} != expected {expected_frame_num}")
+if abs(raw["fps"] - expected_fps) > 0.01:
+    errors.append(f"raw VACE target fps {raw['fps']:.4f} != expected {expected_fps:.4f}")
+if errors:
+    raise SystemExit("; ".join(errors))
 PY
 
 ffmpeg -y -i "$RAW_VIDEO" -i "$REFERENCE_VIDEO" \
-  -map 0:v:0 -map 1:a? -c:v copy -c:a aac -shortest "$TARGET_VIDEO" \
+  -map 0:v:0 -map 1:a? -c:v copy -c:a aac "$TARGET_VIDEO" \
   > "$OUT_ROOT/logs/remux_audio.log" 2>&1
 
-python3 - "$OUT_ROOT" "$REFERENCE_VIDEO" "$RAW_VIDEO" "$TARGET_VIDEO" "$VACE_DURATION_DRIFT_MAX" "$KNOWN_PAIRS" <<'PY'
+python3 - "$OUT_ROOT" "$REFERENCE_VIDEO" "$RAW_VIDEO" "$TARGET_VIDEO" "$VACE_DURATION_DRIFT_MAX" "$KNOWN_PAIRS" "$FRAME_NUM" "$VACE_SOURCE_FPS" <<'PY'
 import json
 import subprocess
 import sys
@@ -647,6 +734,21 @@ raw_video = Path(sys.argv[3])
 target_video = Path(sys.argv[4])
 max_drift = float(sys.argv[5])
 known_pairs_path = Path(sys.argv[6])
+expected_frame_num = int(sys.argv[7])
+expected_fps = float(sys.argv[8])
+
+def parse_fraction(value: str) -> float:
+    if "/" in value:
+        numerator, denominator = value.split("/", 1)
+        try:
+            denominator_float = float(denominator)
+            return float(numerator) / denominator_float if denominator_float else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 def probe(path: Path) -> dict:
     completed = subprocess.run(
@@ -654,6 +756,7 @@ def probe(path: Path) -> dict:
             "ffprobe",
             "-v",
             "error",
+            "-count_frames",
             "-print_format",
             "json",
             "-show_format",
@@ -668,11 +771,18 @@ def probe(path: Path) -> dict:
     streams = payload.get("streams", []) if isinstance(payload, dict) else []
     video_stream = next((row for row in streams if row.get("codec_type") == "video"), {})
     audio_stream = next((row for row in streams if row.get("codec_type") == "audio"), {})
+    raw_frame_count = video_stream.get("nb_read_frames") or video_stream.get("nb_frames") or 0
+    try:
+        frame_count = int(raw_frame_count)
+    except (TypeError, ValueError):
+        frame_count = 0
     return {
         "path": str(path),
         "duration_seconds": float((payload.get("format") or {}).get("duration") or video_stream.get("duration") or 0.0),
         "width": int(video_stream.get("width") or 0),
         "height": int(video_stream.get("height") or 0),
+        "fps": parse_fraction(str(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "")),
+        "frame_count": frame_count,
         "has_video": bool(video_stream),
         "has_audio": bool(audio_stream),
     }
@@ -682,7 +792,15 @@ raw = probe(raw_video)
 target = probe(target_video)
 raw_drift = abs(reference["duration_seconds"] - raw["duration_seconds"])
 target_drift = abs(reference["duration_seconds"] - target["duration_seconds"])
-passed = raw_drift <= max_drift and target_drift <= max_drift and target["has_video"]
+passed = (
+    raw_drift <= max_drift
+    and target_drift <= max_drift
+    and raw["frame_count"] == expected_frame_num
+    and target["frame_count"] == expected_frame_num
+    and abs(raw["fps"] - expected_fps) <= 0.01
+    and abs(target["fps"] - expected_fps) <= 0.01
+    and target["has_video"]
+)
 metrics = {
     "reference": reference,
     "raw_generated_video": raw,
@@ -690,6 +808,8 @@ metrics = {
     "raw_duration_drift_seconds": round(raw_drift, 3),
     "target_duration_drift_seconds": round(target_drift, 3),
     "max_duration_drift_seconds": max_drift,
+    "expected_frame_num": expected_frame_num,
+    "expected_fps": expected_fps,
     "duration_gate": {"passed": passed, "errors": []},
 }
 if raw_drift > max_drift:
@@ -698,6 +818,14 @@ if target_drift > max_drift:
     metrics["duration_gate"]["errors"].append(f"target_duration_drift_seconds {target_drift:.3f} > {max_drift:.3f}")
 if not target["has_video"]:
     metrics["duration_gate"]["errors"].append("audio-remux target has no video stream")
+if raw["frame_count"] != expected_frame_num:
+    metrics["duration_gate"]["errors"].append(f"raw_frame_count {raw['frame_count']} != {expected_frame_num}")
+if target["frame_count"] != expected_frame_num:
+    metrics["duration_gate"]["errors"].append(f"target_frame_count {target['frame_count']} != {expected_frame_num}")
+if abs(raw["fps"] - expected_fps) > 0.01:
+    metrics["duration_gate"]["errors"].append(f"raw_fps {raw['fps']:.4f} != {expected_fps:.4f}")
+if abs(target["fps"] - expected_fps) > 0.01:
+    metrics["duration_gate"]["errors"].append(f"target_fps {target['fps']:.4f} != {expected_fps:.4f}")
 if target["has_video"] and (reference["width"], reference["height"]) != (target["width"], target["height"]):
     metrics["target_resize_note"] = (
         "target resolution differs from reference; Wan/VACE may resize internally via --size, "
