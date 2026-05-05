@@ -56,6 +56,8 @@ VACE_GPU_IDS=${VACE_GPU_IDS:-2,3,4,5}
 VACE_MAX_GPUS=${VACE_MAX_GPUS:-4}
 VACE_ULYSSES_SIZE=${VACE_ULYSSES_SIZE:-4}
 VACE_RING_SIZE=${VACE_RING_SIZE:-0}
+VACE_FRAME_NUM=${VACE_FRAME_NUM:-81}
+VACE_CLIP_SECONDS=${VACE_CLIP_SECONDS:-5}
 WAN_CKPT=${WAN_CKPT:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/Wan2.1/Wan2.1-VACE-14B}
 VACE_TASK=${VACE_TASK:-vace-14B}
 VACE_CONDA_ENV=${VACE_CONDA_ENV:-wan_vace}
@@ -102,6 +104,8 @@ Options:
   --image-device-map balanced|auto
   --mask-gpu-ids IDS
   --vace-gpu-ids IDS
+  --vace-frame-num N
+  --vace-clip-seconds N
   --timeout-seconds N
   --annotate-concurrency N
   -h, --help
@@ -134,6 +138,8 @@ while [[ $# -gt 0 ]]; do
     --image-device-map) IMAGE_GEN_DEVICE_MAP="$2"; shift 2 ;;
     --mask-gpu-ids) MASK_GPU_IDS="$2"; shift 2 ;;
     --vace-gpu-ids) VACE_GPU_IDS="$2"; shift 2 ;;
+    --vace-frame-num) VACE_FRAME_NUM="$2"; shift 2 ;;
+    --vace-clip-seconds) VACE_CLIP_SECONDS="$2"; shift 2 ;;
     --timeout-seconds) TIMEOUT_SECONDS="$2"; shift 2 ;;
     --annotate-concurrency) ANNOTATE_CONCURRENCY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -333,7 +339,7 @@ run_mask() {
 run_vace() {
   require_file "$VIDEO_EDIT_PLAN" "video edit plan"
   require_file "$GENERATED_MASK_MANIFEST" "generated mask manifest"
-  echo "[masked-vace-queue] stage=vace gpu_ids=$VACE_GPU_IDS top_k=$VACE_TOP_K"
+  echo "[masked-vace-queue] stage=vace gpu_ids=$VACE_GPU_IDS top_k=$VACE_TOP_K frame_num=$VACE_FRAME_NUM clip_seconds=$VACE_CLIP_SECONDS"
   local src_ref_args=()
   if [[ -s "$SRC_REF_IMAGE_SELECTION" ]]; then
     src_ref_args=(--src-ref-selection "$SRC_REF_IMAGE_SELECTION")
@@ -352,7 +358,9 @@ run_vace() {
     --conda-env "$VACE_CONDA_ENV" \
     --use-torchrun 1 \
     --ulysses-size "$VACE_ULYSSES_SIZE" \
-    --ring-size "$VACE_RING_SIZE"
+    --ring-size "$VACE_RING_SIZE" \
+    --frame-num "$VACE_FRAME_NUM" \
+    --vace-clip-seconds "$VACE_CLIP_SECONDS"
 }
 
 run_annotate() {

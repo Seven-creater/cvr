@@ -140,7 +140,46 @@ def _mask_gate_errors(mask_gate: dict[str, Any], metrics: dict[str, Any]) -> lis
         errors.append(f"nonempty_frame_ratio {nonempty:.4f} < min {min_nonempty:.4f}")
     if bool(mask_gate.get("mask_not_empty_all_frames")) and nonempty < 1.0:
         errors.append("mask is empty on at least one frame")
+    min_box_coverage = float(mask_gate.get("min_detected_keyframe_box_coverage", 0.0) or 0.0)
+    box_coverage = float(metrics.get("detected_keyframe_box_coverage", 0.0) or 0.0)
+    if box_coverage < min_box_coverage:
+        errors.append(f"detected_keyframe_box_coverage {box_coverage:.4f} < min {min_box_coverage:.4f}")
+    max_protected_overlap = mask_gate.get("max_protected_overlap_ratio")
+    if max_protected_overlap is not None:
+        protected_overlap = metrics.get("protected_overlap_ratio_max")
+        if protected_overlap is None:
+            if bool(mask_gate.get("require_protected_overlap_metrics")):
+                errors.append("protected overlap metrics are missing")
+        else:
+            protected_overlap_float = float(protected_overlap or 0.0)
+            max_protected_overlap_float = float(max_protected_overlap or 0.0)
+            if protected_overlap_float > max_protected_overlap_float:
+                errors.append(
+                    f"protected_overlap_ratio {protected_overlap_float:.4f} > max {max_protected_overlap_float:.4f}"
+                )
     return errors
+
+
+def _box_mask_overlap_ratio(mask: Any, boxes_xyxy: Any) -> float:
+    import numpy as np
+
+    if mask is None:
+        return 0.0
+    mask_bool = np.asarray(mask).astype(bool)
+    mask_area = float(mask_bool.sum())
+    if mask_area <= 0.0:
+        return 0.0
+    protected = np.zeros(mask_bool.shape, dtype=bool)
+    h, w = mask_bool.shape[:2]
+    for raw_box in np.asarray(boxes_xyxy):
+        x0, y0, x1, y1 = [int(round(float(value))) for value in raw_box[:4]]
+        x0 = max(0, min(w, x0))
+        x1 = max(0, min(w, x1))
+        y0 = max(0, min(h, y0))
+        y1 = max(0, min(h, y1))
+        if x1 > x0 and y1 > y0:
+            protected[y0:y1, x0:x1] = True
+    return float((mask_bool & protected).sum()) / mask_area
 
 
 def _run_grounded_sam2(
@@ -156,6 +195,7 @@ def _run_grounded_sam2(
     sam2_checkpoint: Path,
     box_threshold: float,
     text_threshold: float,
+    mask_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import sys
 
@@ -246,6 +286,56 @@ def _run_grounded_sam2(
                 union = 1 - union
             frame_masks[int(frame_idx)] = union
 
+        protected_overlap_details: list[dict[str, Any]] = []
+        protected_overlap_max: float | None = None
+        protected_queries = [
+            str(item).strip()
+            for item in (mask_gate or {}).get("protected_overlap_queries", [])
+            if str(item).strip()
+        ]
+        if protected_queries:
+            keyframe_mask = frame_masks.get(keyframe_idx)
+            frame_path = frame_paths[keyframe_idx]
+            image_source, image = load_image(str(frame_path))
+            h, w = image_source.shape[:2]
+            overlaps: list[float] = []
+            for protected_query in protected_queries:
+                try:
+                    protected_boxes, _protected_logits, protected_phrases = predict(
+                        model=grounding_model,
+                        image=image,
+                        caption=protected_query,
+                        box_threshold=box_threshold,
+                        text_threshold=text_threshold,
+                        device=device,
+                    )
+                    if protected_boxes is None or len(protected_boxes) == 0:
+                        protected_overlap_details.append(
+                            {"query": protected_query, "status": "not_detected", "overlap_ratio": 0.0}
+                        )
+                        continue
+                    boxes_np = protected_boxes.detach().cpu().numpy()
+                    protected_xyxy = np.zeros_like(boxes_np)
+                    protected_xyxy[:, 0] = (boxes_np[:, 0] - boxes_np[:, 2] / 2) * w
+                    protected_xyxy[:, 1] = (boxes_np[:, 1] - boxes_np[:, 3] / 2) * h
+                    protected_xyxy[:, 2] = (boxes_np[:, 0] + boxes_np[:, 2] / 2) * w
+                    protected_xyxy[:, 3] = (boxes_np[:, 1] + boxes_np[:, 3] / 2) * h
+                    overlap = _box_mask_overlap_ratio(keyframe_mask, protected_xyxy)
+                    overlaps.append(overlap)
+                    protected_overlap_details.append(
+                        {
+                            "query": protected_query,
+                            "status": "detected",
+                            "overlap_ratio": overlap,
+                            "detected_phrases": [str(item) for item in protected_phrases],
+                        }
+                    )
+                except Exception as exc:
+                    protected_overlap_details.append(
+                        {"query": protected_query, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+                    )
+            protected_overlap_max = max(overlaps) if overlaps else 0.0
+
         coverages: list[float] = []
         ious: list[float] = []
         nonempty_count = 0
@@ -272,7 +362,7 @@ def _run_grounded_sam2(
 
         fps = _ffprobe_fps(reference_video)
         _encode_mask_video(mask_dir, output_mask_video, fps)
-        return {
+        metrics = {
             "frame_count": len(frame_paths),
             "fps": fps,
             "mask_coverage_ratio_min": min(coverages) if coverages else 0.0,
@@ -286,6 +376,10 @@ def _run_grounded_sam2(
             "box_count": int(len(boxes_xyxy)),
             "device": device,
         }
+        if protected_overlap_details:
+            metrics["protected_overlap"] = protected_overlap_details
+            metrics["protected_overlap_ratio_max"] = protected_overlap_max if protected_overlap_max is not None else 0.0
+        return metrics
 
 
 def _florence_boxes(
@@ -295,16 +389,34 @@ def _florence_boxes(
     florence_model_dir: Path,
     device: str,
 ) -> tuple[Any, list[str]]:
-    import numpy as np
-    from PIL import Image
     from transformers import AutoModelForCausalLM, AutoProcessor
 
-    image = Image.open(image_path).convert("RGB")
     processor = AutoProcessor.from_pretrained(str(florence_model_dir), trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         str(florence_model_dir),
         trust_remote_code=True,
     ).eval().to(device)
+    return _florence_boxes_with_model(
+        image_path=image_path,
+        mask_query=mask_query,
+        processor=processor,
+        model=model,
+        device=device,
+    )
+
+
+def _florence_boxes_with_model(
+    *,
+    image_path: Path,
+    mask_query: str,
+    processor: Any,
+    model: Any,
+    device: str,
+) -> tuple[Any, list[str]]:
+    import numpy as np
+    from PIL import Image
+
+    image = Image.open(image_path).convert("RGB")
     task = "<OPEN_VOCABULARY_DETECTION>"
     prompt = task + mask_query
     inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
@@ -335,6 +447,7 @@ def _run_florence_sam2(
     grounded_sam2_code: Path,
     sam2_config: str,
     sam2_checkpoint: Path,
+    mask_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import sys
 
@@ -343,9 +456,15 @@ def _run_florence_sam2(
     import cv2
     import numpy as np
     import torch
+    from transformers import AutoModelForCausalLM, AutoProcessor
     from sam2.build_sam import build_sam2_video_predictor
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    processor = AutoProcessor.from_pretrained(str(florence_model_dir), trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        str(florence_model_dir),
+        trust_remote_code=True,
+    ).eval().to(device)
     with tempfile.TemporaryDirectory(prefix="florence_sam2_mask_") as tmp:
         tmp_dir = Path(tmp)
         frame_dir = tmp_dir / "frames"
@@ -359,10 +478,11 @@ def _run_florence_sam2(
         best_detection: dict[str, Any] | None = None
         for frame_idx in _sample_keyframe_indices(len(frame_paths)):
             try:
-                boxes_xyxy, labels = _florence_boxes(
+                boxes_xyxy, labels = _florence_boxes_with_model(
                     image_path=frame_paths[frame_idx],
                     mask_query=mask_query,
-                    florence_model_dir=florence_model_dir,
+                    processor=processor,
+                    model=model,
                     device=device,
                 )
             except RuntimeError:
@@ -411,6 +531,41 @@ def _run_florence_sam2(
                 union = 1 - union
             frame_masks[int(frame_idx)] = union
 
+        protected_overlap_details: list[dict[str, Any]] = []
+        protected_overlap_max: float | None = None
+        protected_queries = [
+            str(item).strip()
+            for item in (mask_gate or {}).get("protected_overlap_queries", [])
+            if str(item).strip()
+        ]
+        if protected_queries:
+            keyframe_mask = frame_masks.get(keyframe_idx)
+            overlaps: list[float] = []
+            for protected_query in protected_queries:
+                try:
+                    protected_boxes, protected_labels = _florence_boxes_with_model(
+                        image_path=frame_paths[keyframe_idx],
+                        mask_query=protected_query,
+                        processor=processor,
+                        model=model,
+                        device=device,
+                    )
+                    overlap = _box_mask_overlap_ratio(keyframe_mask, protected_boxes)
+                    overlaps.append(overlap)
+                    protected_overlap_details.append(
+                        {
+                            "query": protected_query,
+                            "status": "detected",
+                            "overlap_ratio": overlap,
+                            "detected_phrases": protected_labels,
+                        }
+                    )
+                except Exception as exc:
+                    protected_overlap_details.append(
+                        {"query": protected_query, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+                    )
+            protected_overlap_max = max(overlaps) if overlaps else 0.0
+
         coverages: list[float] = []
         ious: list[float] = []
         nonempty_count = 0
@@ -436,7 +591,7 @@ def _run_florence_sam2(
 
         fps = _ffprobe_fps(reference_video)
         _encode_mask_video(mask_dir, output_mask_video, fps)
-        return {
+        metrics = {
             "frame_count": len(frame_paths),
             "fps": fps,
             "mask_coverage_ratio_min": min(coverages) if coverages else 0.0,
@@ -451,6 +606,10 @@ def _run_florence_sam2(
             "device": device,
             "grounder": "florence2",
         }
+        if protected_overlap_details:
+            metrics["protected_overlap"] = protected_overlap_details
+            metrics["protected_overlap_ratio_max"] = protected_overlap_max if protected_overlap_max is not None else 0.0
+        return metrics
 
 
 def main() -> None:
@@ -496,6 +655,7 @@ def main() -> None:
             mask_video = Path(str(plan.get("mask_video") or row.get("mask_video", "")))
             if not mask_video.is_absolute():
                 mask_video = Path(args.mask_manifest_path).resolve().parent / mask_video
+            mask_gate = plan.get("mask_gate") if isinstance(plan.get("mask_gate"), dict) else {}
             if args.grounder == "florence2":
                 if florence_model_dir is None:
                     raise RuntimeError("--florence-model is required when --grounder florence2")
@@ -508,6 +668,7 @@ def main() -> None:
                     grounded_sam2_code=grounded_sam2_code,
                     sam2_config=str(args.sam2_config),
                     sam2_checkpoint=sam2_checkpoint,
+                    mask_gate=mask_gate,
                 )
             else:
                 if grounding_checkpoint is None:
@@ -524,8 +685,8 @@ def main() -> None:
                     sam2_checkpoint=sam2_checkpoint,
                     box_threshold=args.box_threshold,
                     text_threshold=args.text_threshold,
+                    mask_gate=mask_gate,
                 )
-            mask_gate = plan.get("mask_gate") if isinstance(plan.get("mask_gate"), dict) else {}
             gate_errors = _mask_gate_errors(mask_gate, metrics)
             if gate_errors:
                 raise RuntimeError("mask gate failed: " + "; ".join(gate_errors))

@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from scripts.generate_grounded_sam2_video_masks import _mask_gate_errors
+
 
 class ScriptTests(unittest.TestCase):
     def test_omni_detective_script_uses_own_repo_root(self) -> None:
@@ -158,6 +160,15 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--src-ref-selection", script)
         self.assertIn("resolve_existing_path", script)
         self.assertIn("candidates = [path]", script)
+        self.assertIn("FRAME_NUM=${FRAME_NUM:-81}", script)
+        self.assertIn("VACE_CLIP_SECONDS=${VACE_CLIP_SECONDS:-5}", script)
+        self.assertIn("VACE_DURATION_DRIFT_MAX=${VACE_DURATION_DRIFT_MAX:-0.5}", script)
+        self.assertIn("reference_for_vace", script)
+        self.assertIn("mask_for_vace", script)
+        self.assertIn("preflight_report.json", script)
+        self.assertIn("duration_metrics.json", script)
+        self.assertIn("vace_command.json", script)
+        self.assertIn("raw VACE target duration drift", script)
         self.assertIn("src_mask", script)
         self.assertNotIn("Negative constraints:", script)
         self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
@@ -176,6 +187,10 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--mask-manifest", script)
         self.assertIn("SRC_REF_SELECTION", script)
         self.assertIn("--src-ref-selection", script)
+        self.assertIn("FRAME_NUM=${FRAME_NUM:-81}", script)
+        self.assertIn("VACE_CLIP_SECONDS=${VACE_CLIP_SECONDS:-5}", script)
+        self.assertIn("--frame-num", script)
+        self.assertIn("--vace-clip-seconds", script)
         self.assertIn("synthetic_visual_candidate_pairs.jsonl", script)
         self.assertIn("synthetic_visual_target_manifest.jsonl", script)
         self.assertIn("batch_generation_report.md", script)
@@ -215,6 +230,58 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("torch_dtype=torch.float16", helper)
         self.assertIn("mask_temporal_stability", helper)
         self.assertIn("edit_background_inverse_subject", helper)
+        self.assertIn("min_detected_keyframe_box_coverage", helper)
+        self.assertIn("protected_overlap_queries", helper)
+        self.assertIn("protected_overlap_ratio_max", helper)
+
+    def test_grounded_sam2_mask_gate_rejects_low_replacement_coverage(self) -> None:
+        errors = _mask_gate_errors(
+            {"min_coverage_ratio": 0.01, "max_coverage_ratio": 0.15, "mask_not_empty_all_frames": True},
+            {
+                "mask_coverage_ratio_avg": 0.0025,
+                "mask_temporal_stability": 0.95,
+                "mask_nonempty_frame_ratio": 1.0,
+            },
+        )
+
+        self.assertTrue(any("avg_coverage" in error and "< min" in error for error in errors))
+
+    def test_grounded_sam2_mask_gate_rejects_weak_background_subject_mask(self) -> None:
+        errors = _mask_gate_errors(
+            {
+                "min_coverage_ratio": 0.20,
+                "max_coverage_ratio": 0.90,
+                "min_detected_keyframe_box_coverage": 0.10,
+                "mask_not_empty_all_frames": True,
+            },
+            {
+                "mask_coverage_ratio_avg": 0.04,
+                "detected_keyframe_box_coverage": 0.02,
+                "mask_temporal_stability": 0.95,
+                "mask_nonempty_frame_ratio": 1.0,
+            },
+        )
+
+        self.assertTrue(any("avg_coverage" in error for error in errors))
+        self.assertTrue(any("detected_keyframe_box_coverage" in error for error in errors))
+
+    def test_grounded_sam2_mask_gate_rejects_protected_overlap_for_clothing(self) -> None:
+        errors = _mask_gate_errors(
+            {
+                "min_coverage_ratio": 0.03,
+                "max_coverage_ratio": 0.30,
+                "max_protected_overlap_ratio": 0.18,
+                "require_protected_overlap_metrics": True,
+            },
+            {
+                "mask_coverage_ratio_avg": 0.12,
+                "mask_temporal_stability": 0.95,
+                "mask_nonempty_frame_ratio": 1.0,
+                "protected_overlap_ratio_max": 0.31,
+            },
+        )
+
+        self.assertTrue(any("protected_overlap_ratio" in error for error in errors))
 
     def test_prepare_grounded_sam2_env_script_installs_expected_packages(self) -> None:
         script = Path("scripts/prepare_grounded_sam2_env.sh").read_text(encoding="utf-8")
@@ -266,6 +333,12 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--annotate-concurrency", script)
         self.assertIn("--concurrency \"$ANNOTATE_CONCURRENCY\"", script)
         self.assertIn("VACE_GPU_IDS=${VACE_GPU_IDS:-2,3,4,5}", script)
+        self.assertIn("VACE_FRAME_NUM=${VACE_FRAME_NUM:-81}", script)
+        self.assertIn("VACE_CLIP_SECONDS=${VACE_CLIP_SECONDS:-5}", script)
+        self.assertIn("--vace-frame-num", script)
+        self.assertIn("--vace-clip-seconds", script)
+        self.assertIn("--frame-num \"$VACE_FRAME_NUM\"", script)
+        self.assertIn("--vace-clip-seconds \"$VACE_CLIP_SECONDS\"", script)
         self.assertIn("plan-stable-omni-clips", script)
         self.assertIn("cache-reference-understandings", script)
         self.assertIn("plan-src-ref-images", script)

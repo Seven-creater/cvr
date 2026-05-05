@@ -2687,18 +2687,19 @@ def select_src_ref_images(
             (_audit_src_ref_image_candidate(path, plan) for path in candidates),
             key=lambda item: (-float(item.get("score", 0.0)), str(item.get("path", ""))),
         )
+        eligible_audited = [item for item in audited if bool(item.get("eligible", True))]
         role = str(plan.get("src_ref_role", "")).strip()
         selection_limit = max(1, int(max_selected))
         if role == "replacement_object":
             selection_limit = min(selection_limit, 2)
-        selected_audits = audited[:selection_limit]
+        selected_audits = eligible_audited[:selection_limit]
         selection_method = "deterministic_src_ref_quality_audit"
         selection_reason = "selected highest-scoring candidate image(s) by deterministic VACE src_ref quality audit"
         omni_audit: dict[str, Any] | None = None
         raw_omni_audit: dict[str, Any] | None = None
-        if audit_client and audited:
+        if audit_client and eligible_audited:
             try:
-                candidate_image_paths = [str(item["path"]) for item in audited]
+                candidate_image_paths = [str(item["path"]) for item in eligible_audited]
                 omni_audit, raw_omni_audit = audit_client.audit_src_ref_images(
                     src_ref_plan=plan,
                     candidate_image_paths=candidate_image_paths,
@@ -2710,9 +2711,9 @@ def select_src_ref_images(
                     if isinstance(index, int) or str(index).isdigit()
                 ]
                 selected_audits = [
-                    audited[index - 1]
+                    eligible_audited[index - 1]
                     for index in selected_indices
-                    if 1 <= index <= len(audited)
+                    if 1 <= index <= len(eligible_audited)
                 ]
                 selection_method = "omni_src_ref_image_audit"
                 selection_reason = str(omni_audit.get("reason", "")).strip() or (
@@ -2743,6 +2744,10 @@ def select_src_ref_images(
         if selected:
             status = "selected"
             selected_count += 1
+        elif audited and not eligible_audited:
+            status = "rejected_by_deterministic_audit"
+            selection_reason = "all generated candidate images failed deterministic VACE src_ref quality gates"
+            audit_rejected_count += 1
         elif audited and audit_client:
             status = "rejected_by_omni_audit" if selection_method == "omni_src_ref_image_audit" else "omni_audit_failed"
             audit_rejected_count += int(selection_method == "omni_src_ref_image_audit")
@@ -2867,6 +2872,39 @@ def build_manual_review_bundle(
                 mask_copy_path = str(mask_copy)
             else:
                 missing_videos.append(str(mask_path or src_mask))
+        src_video_for_vace = str(generation.get("src_video_for_vace", "")).strip()
+        src_video_for_vace_copy_path = ""
+        if copy_videos and src_video_for_vace:
+            src_video_for_vace_path = _resolve_under_root(root_path, src_video_for_vace)
+            if src_video_for_vace_path.exists():
+                src_video_for_vace_copy = item_dir / "src_video_for_vace.mp4"
+                shutil.copy2(src_video_for_vace_path, src_video_for_vace_copy)
+                src_video_for_vace_copy_path = str(src_video_for_vace_copy)
+            else:
+                missing_videos.append(str(src_video_for_vace_path or src_video_for_vace))
+        postprocess = generation.get("postprocess", {}) if isinstance(generation.get("postprocess"), dict) else {}
+        raw_generated_video = str(postprocess.get("raw_generated_video", "")).strip()
+        raw_generated_video_copy_path = ""
+        if copy_videos and raw_generated_video:
+            raw_generated_path = _resolve_under_root(root_path, raw_generated_video)
+            if raw_generated_path.exists():
+                raw_generated_copy = item_dir / "raw_target.mp4"
+                shutil.copy2(raw_generated_path, raw_generated_copy)
+                raw_generated_video_copy_path = str(raw_generated_copy)
+            else:
+                missing_videos.append(str(raw_generated_path or raw_generated_video))
+        review_inputs_dir = str(generation.get("review_inputs_dir", "")).strip()
+        copied_review_inputs = ""
+        if copy_videos and review_inputs_dir:
+            review_inputs_path = _resolve_under_root(root_path, review_inputs_dir)
+            if review_inputs_path.exists() and review_inputs_path.is_dir():
+                copied_review_inputs_path = item_dir / "review_inputs"
+                if copied_review_inputs_path.exists():
+                    shutil.rmtree(copied_review_inputs_path)
+                shutil.copytree(review_inputs_path, copied_review_inputs_path)
+                copied_review_inputs = str(copied_review_inputs_path)
+            else:
+                missing_videos.append(str(review_inputs_path or review_inputs_dir))
 
         metadata = {
             "index": index,
@@ -2888,6 +2926,15 @@ def build_manual_review_bundle(
             "copied_src_ref_images": copied_src_ref_images,
             "src_mask": src_mask,
             "copied_src_mask": mask_copy_path,
+            "src_video_for_vace": src_video_for_vace,
+            "copied_src_video_for_vace": src_video_for_vace_copy_path,
+            "raw_generated_video": raw_generated_video,
+            "copied_raw_generated_video": raw_generated_video_copy_path,
+            "copied_review_inputs": copied_review_inputs,
+            "mask_metrics": generation.get("mask_metrics", {}),
+            "duration_metrics": generation.get("duration_metrics", {}),
+            "vace_command": generation.get("vace_command", {}),
+            "post_vace_verdict": generation.get("post_vace_verdict", {}),
         }
         (item_dir / "metadata.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2),
@@ -7421,6 +7468,35 @@ def _synthetic_edit_record_issues(
         and not postprocess.get("audio_copied_from_reference")
     ):
         issues.append("visual synthetic edits must record generation.postprocess.audio_copied_from_reference=true")
+    if difference_type in VISUAL_DIFFERENCE_TYPES and not is_audio_route:
+        src_ref_requirements = (
+            generation.get("src_ref_requirements", {}) if isinstance(generation.get("src_ref_requirements"), dict) else {}
+        )
+        src_ref_images = _normalize_list(generation.get("src_ref_images", []))
+        if src_ref_requirements.get("required") and not src_ref_images:
+            issues.append("visual synthetic VACE preflight missing required src_ref_images")
+        for src_ref_image in src_ref_images:
+            if not _resolve_under_root(root, src_ref_image).exists():
+                issues.append(f"visual synthetic selected src_ref_image does not exist: {src_ref_image}")
+        src_mask = str(generation.get("src_mask", "")).strip()
+        if src_mask and not _resolve_under_root(root, src_mask).exists():
+            issues.append(f"visual synthetic src_mask does not exist: {src_mask}")
+        src_video_for_vace = str(generation.get("src_video_for_vace", "")).strip()
+        if src_video_for_vace and not _resolve_under_root(root, src_video_for_vace).exists():
+            issues.append(f"visual synthetic src_video_for_vace does not exist: {src_video_for_vace}")
+        duration_metrics = generation.get("duration_metrics", {}) if isinstance(generation.get("duration_metrics"), dict) else {}
+        duration_gate = duration_metrics.get("duration_gate", {}) if isinstance(duration_metrics.get("duration_gate"), dict) else {}
+        if duration_gate and not _boolish(duration_gate.get("passed")):
+            gate_errors = _normalize_list(duration_gate.get("errors", []))
+            issues.append(
+                "visual synthetic duration gate failed"
+                + (": " + "; ".join(gate_errors) if gate_errors else "")
+            )
+        max_drift = _score_float(duration_metrics.get("max_duration_drift_seconds", 0.5))
+        for drift_field in ("raw_duration_drift_seconds", "target_duration_drift_seconds"):
+            drift = _score_float(duration_metrics.get(drift_field))
+            if drift > max_drift:
+                issues.append(f"visual synthetic {drift_field} {drift:.3f}s exceeds {max_drift:.3f}s")
     if is_audio_route:
         expected_event = _synthetic_audio_expected_event(record)
         if not expected_event:
@@ -7711,6 +7787,10 @@ def _manual_review_item_markdown(
         f"- competing_difference.passed: `{competing.get('passed')}`",
         f"- src_ref_images: `{json.dumps(metadata.get('src_ref_images', []), ensure_ascii=False)}`",
         f"- src_mask: `{metadata.get('src_mask', '')}`",
+        f"- src_video_for_vace: `{metadata.get('src_video_for_vace', '')}`",
+        f"- raw_generated_video: `{metadata.get('raw_generated_video', '')}`",
+        f"- duration_metrics: `{json.dumps(metadata.get('duration_metrics', {}), ensure_ascii=False)}`",
+        f"- mask_metrics: `{json.dumps(metadata.get('mask_metrics', {}), ensure_ascii=False)}`",
         "",
         "## 视频文件",
         "",
@@ -7728,6 +7808,12 @@ def _manual_review_item_markdown(
             lines.append(f"- `{copied}`")
     if metadata.get("copied_src_mask"):
         lines.extend(["", "## mask", "", f"- `{metadata.get('copied_src_mask')}`"])
+    if metadata.get("copied_src_video_for_vace"):
+        lines.extend(["", "## src_video_for_vace", "", f"- `{metadata.get('copied_src_video_for_vace')}`"])
+    if metadata.get("copied_raw_generated_video"):
+        lines.extend(["", "## raw target", "", f"- `{metadata.get('copied_raw_generated_video')}`"])
+    if metadata.get("copied_review_inputs"):
+        lines.extend(["", "## review_inputs", "", f"- `{metadata.get('copied_review_inputs')}`"])
     lines.extend(
         [
             "",
@@ -8354,26 +8440,40 @@ def _video_mask_mode(plan: dict[str, Any]) -> str:
 
 def _video_mask_gate_defaults(*, mask_mode: str = "", mask_query: str = "") -> dict[str, Any]:
     normalized_query = _normalized_phrase(mask_query)
+    protected_queries: list[str] = []
+    max_protected_overlap = 0.0
     if mask_mode in {"replace_masked_object", "remove_or_inpaint_masked_object"}:
-        min_coverage = 0.005
-        max_coverage = 0.20
+        min_coverage = 0.01
+        max_coverage = 0.15
+        min_detected_box_coverage = 0.005
     elif mask_mode == "edit_background_inverse_subject":
         min_coverage = 0.20
         max_coverage = 0.90
+        min_detected_box_coverage = 0.10
     elif any(marker in normalized_query for marker in ("clothing", "shirt", "jacket", "outfit")):
         min_coverage = 0.03
         max_coverage = 0.30
+        min_detected_box_coverage = 0.035
+        protected_queries = ["face", "hands", "ukulele", "guitar", "instrument", "microphone"]
+        max_protected_overlap = 0.18
     else:
         min_coverage = MIN_VIDEO_MASK_COVERAGE_RATIO
         max_coverage = MAX_VIDEO_MASK_COVERAGE_RATIO
-    return {
+        min_detected_box_coverage = 0.0
+    gate = {
         "min_coverage_ratio": min_coverage,
         "max_coverage_ratio": max_coverage,
         "min_temporal_stability": MIN_VIDEO_MASK_TEMPORAL_STABILITY,
         "min_nonempty_frame_ratio": MIN_VIDEO_MASK_NONEMPTY_FRAME_RATIO,
+        "min_detected_keyframe_box_coverage": min_detected_box_coverage,
         "mask_not_empty_all_frames": True,
         "mask_target_matches_query": True,
     }
+    if protected_queries:
+        gate["protected_overlap_queries"] = protected_queries
+        gate["max_protected_overlap_ratio"] = max_protected_overlap
+        gate["require_protected_overlap_metrics"] = True
+    return gate
 
 
 def _heuristic_stable_clip_selection(
@@ -8562,13 +8662,13 @@ def _src_ref_image_prompts(*, requirement: dict[str, Any], edit_plan: dict[str, 
     role = str(requirement.get("role", "")).strip()
     if role == "background_reference":
         return [
-            f"a clean 16:9 wide reference image of {target}, empty scene plate, natural camera perspective, no people, no text, no watermark",
-            f"{target}, wide empty background plate matching a talking-head video perspective, cinematic but realistic lighting, no foreground subject, no readable text",
+            f"a clean 16:9 horizontal wide reference image of {target}, empty scene plate, natural camera perspective, no people, no text, no watermark",
+            f"{target}, 16:9 landscape empty background plate matching a talking-head video perspective, cinematic but realistic lighting, no foreground subject, no readable text",
         ]
     if role == "clothing_reference":
         return [
-            f"a clean upper-body clothing reference photo of {target} on a neutral mannequin torso, front three-quarter view, no face, no text, no logo",
-            f"{target}, wearable jacket or shirt reference for a standing performer, clear sleeves and torso shape, neutral background, no watermark",
+            f"a clean upper-body clothing reference photo of {target} worn by a standing performer, full sleeves visible, natural arm openings, front three-quarter view, no face, no text, no logo",
+            f"{target}, wearable jacket or shirt reference for a standing musician, clear full sleeves and torso shape, neutral background, no watermark",
         ]
     return [
         f"a realistic {target}, isolated product reference, three-quarter view, plain white background, no hands, no people, no text, no logo",
@@ -8619,6 +8719,7 @@ def _audit_src_ref_image_candidate(path: Path, plan: dict[str, Any]) -> dict[str
                 score += 0.20
                 reasons.append("background candidate is close to 16:9")
             else:
+                score -= 0.35
                 warnings.append("background candidate is not close to 16:9")
         elif role == "clothing_reference":
             if 0.55 <= aspect <= 1.35:
@@ -8640,6 +8741,10 @@ def _audit_src_ref_image_candidate(path: Path, plan: dict[str, Any]) -> dict[str
         "score": round(max(0.0, min(1.0, score)), 3),
         "width": width,
         "height": height,
+        "eligible": not (role == "background_reference" and width > 0 and height > 0 and not (1.45 <= width / max(height, 1) <= 1.95)),
+        "hard_reject_reasons": ["background_src_ref_not_16x9"]
+        if role == "background_reference" and width > 0 and height > 0 and not (1.45 <= width / max(height, 1) <= 1.95)
+        else [],
         "reasons": reasons,
         "warnings": warnings,
     }
@@ -9159,7 +9264,10 @@ def _video_edit_plan_lint(
 
     if (_is_existing_object_replacement(difference, edit_text) or _is_object_removal(difference, edit_text)) and source_object:
         if not _annotation_mentions_object(reference_annotation, source_object):
-            warnings.append("edit_source_not_clearly_present_in_annotation")
+            if _is_existing_object_replacement(difference, edit_text):
+                errors.append("object_replacement_source_not_visible")
+            else:
+                warnings.append("edit_source_not_clearly_present_in_annotation")
     if _is_existing_object_replacement(difference, edit_text) and _reference_has_screen_text_risk(reference_annotation, source_object):
         errors.append("object_replacement_screen_or_visible_text_risk")
     if _is_object_removal(difference, edit_text) and _reference_has_seated_support_conflict(reference_annotation, source_object):

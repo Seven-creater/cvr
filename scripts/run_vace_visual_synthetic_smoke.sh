@@ -23,7 +23,10 @@ USE_TORCHRUN=${USE_TORCHRUN:-0}
 ULYSSES_SIZE=${ULYSSES_SIZE:-}
 RING_SIZE=${RING_SIZE:-0}
 SIZE=${SIZE:-832*480}
-FRAME_NUM=${FRAME_NUM:-49}
+FRAME_NUM=${FRAME_NUM:-81}
+VACE_CLIP_SECONDS=${VACE_CLIP_SECONDS:-5}
+VACE_INPUT_DURATION_DRIFT_MAX=${VACE_INPUT_DURATION_DRIFT_MAX:-0.15}
+VACE_DURATION_DRIFT_MAX=${VACE_DURATION_DRIFT_MAX:-0.5}
 SAMPLE_STEPS=${SAMPLE_STEPS:-25}
 SAMPLE_GUIDE_SCALE=${SAMPLE_GUIDE_SCALE:-5.0}
 OFFLOAD_MODEL=${OFFLOAD_MODEL:-False}
@@ -53,6 +56,8 @@ Options:
   --use-torchrun 0|1
   --ulysses-size N
   --ring-size N
+  --frame-num N
+  --vace-clip-seconds N
   --out-root PATH
   --allow-cpu-offload 0|1
   -h, --help
@@ -83,6 +88,8 @@ while [[ $# -gt 0 ]]; do
     --use-torchrun) USE_TORCHRUN="$2"; shift 2 ;;
     --ulysses-size) ULYSSES_SIZE="$2"; shift 2 ;;
     --ring-size) RING_SIZE="$2"; shift 2 ;;
+    --frame-num) FRAME_NUM="$2"; shift 2 ;;
+    --vace-clip-seconds) VACE_CLIP_SECONDS="$2"; shift 2 ;;
     --out-root) OUT_ROOT="$2"; shift 2 ;;
     --allow-cpu-offload) ALLOW_CPU_OFFLOAD="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -187,15 +194,23 @@ if not reference_path.exists():
 
 plan_id = str(plan.get("plan_id", "")).strip() or "visual_plan"
 safe_plan_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", plan_id)[:80]
+reference_video_original = reference_path
+reference_video_for_vace = out_root / "videos" / f"{safe_plan_id}_reference_for_vace.mp4"
 raw_video = out_root / "videos" / f"{safe_plan_id}_raw.mp4"
 target_video = out_root / "videos" / f"{safe_plan_id}_with_ref_audio.mp4"
 src_video_for_vace = out_root / "videos" / f"{safe_plan_id}_src_video_for_vace.mp4"
 src_mask = ""
+src_mask_original = ""
+src_mask_for_vace = out_root / "videos" / f"{safe_plan_id}_mask_for_vace.mp4"
+mask_metrics = {}
 if mask_manifest_path:
     mask_rows = [json.loads(line) for line in mask_manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     mask_matches = [row for row in mask_rows if str(row.get("plan_id", "")) == plan_id]
     if not mask_matches:
         raise SystemExit(f"mask manifest has no row for plan_id: {plan_id}")
+    mask_status = str(mask_matches[0].get("status", "")).strip()
+    if mask_status and mask_status != "generated":
+        raise SystemExit(f"mask manifest row is not generated for plan_id {plan_id}: {mask_status}")
     mask_raw = str(mask_matches[0].get("mask_video", "")).strip()
     if not mask_raw:
         raise SystemExit(f"mask manifest row is missing mask_video for plan_id: {plan_id}")
@@ -204,13 +219,18 @@ if mask_manifest_path:
         mask_path = mask_manifest_path.parent / mask_path
     if not mask_path.exists():
         raise SystemExit(f"mask video does not exist for plan_id {plan_id}: {mask_path}")
-    src_mask = str(mask_path)
+    src_mask_original = str(mask_path)
+    src_mask = str(src_mask_for_vace)
+    mask_metrics = mask_matches[0].get("mask_metrics", {}) if isinstance(mask_matches[0].get("mask_metrics"), dict) else {}
 
 src_ref_images = []
 if src_ref_selection_path:
     selection_rows = [json.loads(line) for line in src_ref_selection_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     selection_matches = [row for row in selection_rows if str(row.get("plan_id", "")) == plan_id]
     if selection_matches:
+        selection_status = str(selection_matches[0].get("status", "")).strip()
+        if (plan.get("src_ref_requirements") or {}).get("required") and selection_status != "selected":
+            raise SystemExit(f"required src_ref selection is not selected for plan_id {plan_id}: {selection_status}")
         for raw_image in selection_matches[0].get("selected_src_ref_images", []):
             image_path = resolve_existing_path(raw_image, [src_ref_selection_path.parent, data_root])
             if image_path is None or not image_path.exists():
@@ -239,7 +259,7 @@ selected_plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), en
 known_pair = {
     "proposal_id": f"synthetic_visual_pair_{safe_plan_id}",
     "source_type": "synthetic_edit",
-    "reference_video": str(reference_path),
+    "reference_video": str(reference_video_for_vace),
     "target_clip_id": f"synthetic_visual_target_{safe_plan_id}",
     "target_video": str(target_video),
     "edit_text": str(plan.get("edit_text", "")).strip(),
@@ -250,8 +270,9 @@ known_pair = {
     "generation": {
         "model": wan_ckpt.name or str(wan_ckpt),
         "model_route": route,
-        "source_video": str(reference_path),
-        "src_video_for_vace": str(src_video_for_vace if src_mask else reference_path),
+        "source_video": str(reference_video_for_vace),
+        "original_reference_video": str(reference_video_original),
+        "src_video_for_vace": str(src_video_for_vace if src_mask else reference_video_for_vace),
         "prompt": prompt,
         "source_prompt": str(plan.get("source_prompt", "")).strip(),
         "target_prompt": target_prompt,
@@ -261,9 +282,12 @@ known_pair = {
         "edit_region": edit_region,
         "mask_query": str(plan.get("mask_query", "")).strip(),
         "src_mask": src_mask,
+        "original_src_mask": src_mask_original,
         "src_ref_images": src_ref_images,
         "src_ref_requirements": plan.get("src_ref_requirements", {}),
+        "mask_metrics": mask_metrics,
         "video_edit_plan_id": plan_id,
+        "review_inputs_dir": str(out_root / "review_inputs"),
         "postprocess": {
             "audio_copied_from_reference": True,
             "raw_generated_video": str(raw_video),
@@ -272,7 +296,7 @@ known_pair = {
     "source_context": {
         "relation": "synthetic_from_reference",
         "score": 0.95,
-        "generation_source_video": str(reference_path),
+        "generation_source_video": str(reference_video_for_vace),
     },
 }
 manifest = {
@@ -294,12 +318,15 @@ manifest = {
 
 env_values = {
     "PLAN_ID": plan_id,
-    "REFERENCE_VIDEO": str(reference_path),
-    "SRC_VIDEO_FOR_VACE": str(src_video_for_vace if src_mask else reference_path),
+    "REFERENCE_VIDEO_ORIGINAL": str(reference_video_original),
+    "REFERENCE_VIDEO": str(reference_video_for_vace),
+    "SRC_VIDEO_FOR_VACE": str(src_video_for_vace if src_mask else reference_video_for_vace),
     "RAW_VIDEO": str(raw_video),
     "TARGET_VIDEO": str(target_video),
     "SRC_MASK": src_mask,
+    "SRC_MASK_ORIGINAL": src_mask_original,
     "SRC_REF_IMAGES": ",".join(src_ref_images),
+    "SRC_REF_REQUIRED": "1" if (plan.get("src_ref_requirements") or {}).get("required") else "0",
     "PROMPT": prompt,
     "KNOWN_PAIRS": str(out_root / "pairs" / "synthetic_visual_candidate_pairs.jsonl"),
     "TARGET_MANIFEST": str(out_root / "metadata" / "synthetic_visual_target_manifest.jsonl"),
@@ -313,6 +340,7 @@ source "$ENV_FILE"
 echo "[vace-smoke] start $(date)"
 echo "[vace-smoke] plan_id=$PLAN_ID"
 echo "[vace-smoke] reference=$REFERENCE_VIDEO"
+echo "[vace-smoke] original_reference=$REFERENCE_VIDEO_ORIGINAL"
 echo "[vace-smoke] src_video_for_vace=$SRC_VIDEO_FOR_VACE"
 echo "[vace-smoke] raw_video=$RAW_VIDEO"
 echo "[vace-smoke] target_video=$TARGET_VIDEO"
@@ -324,12 +352,41 @@ echo "[vace-smoke] vace_task=$VACE_TASK"
 echo "[vace-smoke] conda_env=$CONDA_ENV"
 echo "[vace-smoke] gpu_ids=$GPU_IDS offload_model=$OFFLOAD_MODEL t5_cpu=$T5_CPU allow_cpu_offload=$ALLOW_CPU_OFFLOAD"
 echo "[vace-smoke] ulysses_size=$ULYSSES_SIZE ring_size=$RING_SIZE"
+echo "[vace-smoke] frame_num=$FRAME_NUM vace_clip_seconds=$VACE_CLIP_SECONDS"
 echo "[vace-smoke] prompt=$PROMPT"
 
 mkdir -p "$OUT_ROOT/review_inputs/src_ref_images"
+
+if ! python3 - "$FRAME_NUM" <<'PY'; then
+import sys
+frame_num = int(sys.argv[1])
+if frame_num <= 0 or (frame_num - 1) % 4 != 0:
+    raise SystemExit(f"FRAME_NUM must be positive and 4n+1 for Wan/VACE, got {frame_num}")
+PY
+  exit 1
+fi
+
+ffmpeg -y -i "$REFERENCE_VIDEO_ORIGINAL" -t "$VACE_CLIP_SECONDS" \
+  -map 0:v:0 -map 0:a? -c:v libx264 -crf 18 -preset veryfast -c:a aac -movflags +faststart "$REFERENCE_VIDEO" \
+  > "$OUT_ROOT/logs/reference_for_vace.log" 2>&1 || {
+    echo "[vace-smoke] failed to create clipped reference=$REFERENCE_VIDEO" >&2
+    tail -80 "$OUT_ROOT/logs/reference_for_vace.log" >&2 || true
+    exit 1
+  }
+if [[ -n "${SRC_MASK_ORIGINAL:-}" ]]; then
+  ffmpeg -y -i "$SRC_MASK_ORIGINAL" -t "$VACE_CLIP_SECONDS" \
+    -map 0:v:0 -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p "$SRC_MASK" \
+    > "$OUT_ROOT/logs/src_mask_for_vace.log" 2>&1 || {
+      echo "[vace-smoke] failed to create clipped src_mask=$SRC_MASK" >&2
+      tail -80 "$OUT_ROOT/logs/src_mask_for_vace.log" >&2 || true
+      exit 1
+    }
+fi
+
 {
   echo "plan_id=$PLAN_ID"
   echo "reference=$REFERENCE_VIDEO"
+  echo "original_reference=$REFERENCE_VIDEO_ORIGINAL"
   echo "src_video_for_vace=$SRC_VIDEO_FOR_VACE"
   echo "src_mask=${SRC_MASK:-none}"
   echo "src_ref_images=${SRC_REF_IMAGES:-none}"
@@ -362,6 +419,84 @@ if [[ -n "${SRC_REF_IMAGES:-}" ]]; then
     cp "$image_path" "$OUT_ROOT/review_inputs/src_ref_images/$(printf '%03d' "$idx")_$(basename "$image_path")" || true
   done
 fi
+
+python3 - "$OUT_ROOT" "$REFERENCE_VIDEO" "$SRC_VIDEO_FOR_VACE" "${SRC_MASK:-}" "$SRC_REF_IMAGES" "$SRC_REF_REQUIRED" "$VACE_INPUT_DURATION_DRIFT_MAX" <<'PY'
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+out_root = Path(sys.argv[1])
+reference_video = Path(sys.argv[2])
+src_video = Path(sys.argv[3])
+src_mask = Path(sys.argv[4]) if sys.argv[4].strip() else None
+src_ref_images = [Path(item) for item in sys.argv[5].split(",") if item.strip()]
+src_ref_required = sys.argv[6] == "1"
+max_drift = float(sys.argv[7])
+
+def probe(path: Path) -> dict:
+    if not path.exists() or path.stat().st_size <= 0:
+        raise SystemExit(f"preflight missing required VACE input: {path}")
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout or "{}")
+    video_stream = next((row for row in payload.get("streams", []) if row.get("codec_type") == "video"), {})
+    return {
+        "path": str(path),
+        "duration_seconds": float((payload.get("format") or {}).get("duration") or video_stream.get("duration") or 0.0),
+        "width": int(video_stream.get("width") or 0),
+        "height": int(video_stream.get("height") or 0),
+        "has_video": bool(video_stream),
+    }
+
+reference = probe(reference_video)
+src = probe(src_video)
+if not reference["has_video"] or not src["has_video"]:
+    raise SystemExit("preflight failed: reference/src_video must both contain video streams")
+if (reference["width"], reference["height"]) != (src["width"], src["height"]):
+    raise SystemExit(f"preflight failed: reference/src_video size mismatch {reference} vs {src}")
+if abs(reference["duration_seconds"] - src["duration_seconds"]) > max_drift:
+    raise SystemExit(f"preflight failed: reference/src_video duration mismatch {reference} vs {src}")
+mask = None
+if src_mask is not None:
+    mask = probe(src_mask)
+    if (reference["width"], reference["height"]) != (mask["width"], mask["height"]):
+        raise SystemExit(f"preflight failed: reference/src_mask size mismatch {reference} vs {mask}")
+    if abs(reference["duration_seconds"] - mask["duration_seconds"]) > max_drift:
+        raise SystemExit(f"preflight failed: reference/src_mask duration mismatch {reference} vs {mask}")
+if src_ref_required and not src_ref_images:
+    raise SystemExit("preflight failed: required src_ref_images are missing")
+for image in src_ref_images:
+    if not image.exists() or image.stat().st_size <= 0:
+        raise SystemExit(f"preflight failed: selected src_ref_image missing: {image}")
+copied_refs = sorted((out_root / "review_inputs" / "src_ref_images").glob("*"))
+if src_ref_required and not copied_refs:
+    raise SystemExit("preflight failed: required src_ref_images were not copied into review_inputs")
+report = {
+    "reference": reference,
+    "src_video_for_vace": src,
+    "src_mask": mask,
+    "src_ref_image_count": len(src_ref_images),
+    "copied_src_ref_image_count": len(copied_refs),
+    "max_input_duration_drift_seconds": max_drift,
+    "passed": True,
+}
+(out_root / "metadata" / "preflight_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+PY
 
 if [[ ! -d "$WAN_CODE" ]]; then
   echo "[vace-smoke] missing WAN_CODE=$WAN_CODE" >&2
@@ -424,13 +559,34 @@ if [[ "$USE_TORCHRUN" == "1" ]]; then
   if [[ "$RING_SIZE" != "0" ]]; then
     DIST_ARGS+=(--ring_size "$RING_SIZE")
   fi
-  torchrun --nproc_per_node="$GPU_COUNT" "${GEN_ARGS[@]}" \
-    "${DIST_ARGS[@]}" \
-    > "$OUT_ROOT/logs/vace_generate.log" 2>&1
+  RUN_COMMAND=(torchrun --nproc_per_node="$GPU_COUNT" "${GEN_ARGS[@]}" "${DIST_ARGS[@]}")
 else
   echo "[vace-smoke] running single process with CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-  python "${GEN_ARGS[@]}" > "$OUT_ROOT/logs/vace_generate.log" 2>&1
+  RUN_COMMAND=(python "${GEN_ARGS[@]}")
 fi
+
+python3 - "$OUT_ROOT/metadata/vace_command.json" "$CUDA_VISIBLE_DEVICES" "${RUN_COMMAND[@]}" <<'PY'
+import json
+import shlex
+import sys
+from pathlib import Path
+
+out_path = Path(sys.argv[1])
+out_path.write_text(
+    json.dumps(
+        {
+            "cuda_visible_devices": sys.argv[2],
+            "argv": sys.argv[3:],
+            "shell_quoted": " ".join(shlex.quote(item) for item in sys.argv[3:]),
+        },
+        ensure_ascii=False,
+        indent=2,
+    ),
+    encoding="utf-8",
+)
+PY
+
+"${RUN_COMMAND[@]}" > "$OUT_ROOT/logs/vace_generate.log" 2>&1
 
 if [[ ! -s "$RAW_VIDEO" ]]; then
   echo "[vace-smoke] raw generation missing: $RAW_VIDEO" >&2
@@ -438,9 +594,143 @@ if [[ ! -s "$RAW_VIDEO" ]]; then
   exit 1
 fi
 
+python3 - "$REFERENCE_VIDEO" "$RAW_VIDEO" "$VACE_DURATION_DRIFT_MAX" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+reference_video = Path(sys.argv[1])
+raw_video = Path(sys.argv[2])
+max_drift = float(sys.argv[3])
+
+def probe(path: Path) -> dict:
+    completed = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout or "{}")
+    video_stream = next((row for row in payload.get("streams", []) if row.get("codec_type") == "video"), {})
+    return {
+        "path": str(path),
+        "duration_seconds": float((payload.get("format") or {}).get("duration") or video_stream.get("duration") or 0.0),
+        "width": int(video_stream.get("width") or 0),
+        "height": int(video_stream.get("height") or 0),
+        "has_video": bool(video_stream),
+    }
+
+reference = probe(reference_video)
+raw = probe(raw_video)
+drift = abs(reference["duration_seconds"] - raw["duration_seconds"])
+if drift > max_drift:
+    raise SystemExit(
+        f"raw VACE target duration drift {drift:.3f}s exceeds {max_drift:.3f}s: "
+        f"reference={reference['duration_seconds']:.3f}s raw={raw['duration_seconds']:.3f}s"
+    )
+PY
+
 ffmpeg -y -i "$RAW_VIDEO" -i "$REFERENCE_VIDEO" \
   -map 0:v:0 -map 1:a? -c:v copy -c:a aac -shortest "$TARGET_VIDEO" \
   > "$OUT_ROOT/logs/remux_audio.log" 2>&1
+
+python3 - "$OUT_ROOT" "$REFERENCE_VIDEO" "$RAW_VIDEO" "$TARGET_VIDEO" "$VACE_DURATION_DRIFT_MAX" "$KNOWN_PAIRS" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+out_root = Path(sys.argv[1])
+reference_video = Path(sys.argv[2])
+raw_video = Path(sys.argv[3])
+target_video = Path(sys.argv[4])
+max_drift = float(sys.argv[5])
+known_pairs_path = Path(sys.argv[6])
+
+def probe(path: Path) -> dict:
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout or "{}")
+    streams = payload.get("streams", []) if isinstance(payload, dict) else []
+    video_stream = next((row for row in streams if row.get("codec_type") == "video"), {})
+    audio_stream = next((row for row in streams if row.get("codec_type") == "audio"), {})
+    return {
+        "path": str(path),
+        "duration_seconds": float((payload.get("format") or {}).get("duration") or video_stream.get("duration") or 0.0),
+        "width": int(video_stream.get("width") or 0),
+        "height": int(video_stream.get("height") or 0),
+        "has_video": bool(video_stream),
+        "has_audio": bool(audio_stream),
+    }
+
+reference = probe(reference_video)
+raw = probe(raw_video)
+target = probe(target_video)
+raw_drift = abs(reference["duration_seconds"] - raw["duration_seconds"])
+target_drift = abs(reference["duration_seconds"] - target["duration_seconds"])
+passed = raw_drift <= max_drift and target_drift <= max_drift and target["has_video"]
+metrics = {
+    "reference": reference,
+    "raw_generated_video": raw,
+    "audio_remux_target": target,
+    "raw_duration_drift_seconds": round(raw_drift, 3),
+    "target_duration_drift_seconds": round(target_drift, 3),
+    "max_duration_drift_seconds": max_drift,
+    "duration_gate": {"passed": passed, "errors": []},
+}
+if raw_drift > max_drift:
+    metrics["duration_gate"]["errors"].append(f"raw_duration_drift_seconds {raw_drift:.3f} > {max_drift:.3f}")
+if target_drift > max_drift:
+    metrics["duration_gate"]["errors"].append(f"target_duration_drift_seconds {target_drift:.3f} > {max_drift:.3f}")
+if not target["has_video"]:
+    metrics["duration_gate"]["errors"].append("audio-remux target has no video stream")
+if target["has_video"] and (reference["width"], reference["height"]) != (target["width"], target["height"]):
+    metrics["target_resize_note"] = (
+        "target resolution differs from reference; Wan/VACE may resize internally via --size, "
+        "but duration/audio alignment still must pass"
+    )
+duration_path = out_root / "metadata" / "duration_metrics.json"
+duration_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+command_path = out_root / "metadata" / "vace_command.json"
+command = json.loads(command_path.read_text(encoding="utf-8")) if command_path.exists() else {}
+pairs = [json.loads(line) for line in known_pairs_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+for pair in pairs:
+    generation = pair.setdefault("generation", {})
+    generation["duration_metrics"] = metrics
+    generation["vace_command"] = command
+    generation["post_vace_verdict"] = {
+        "stage": "post_vace_pre_omni_validation",
+        "duration_gate_passed": passed,
+        "requires_omni_validation": True,
+    }
+known_pairs_path.write_text(
+    "".join(json.dumps(pair, ensure_ascii=False) + "\n" for pair in pairs),
+    encoding="utf-8",
+)
+if not passed:
+    raise SystemExit("post-VACE duration gate failed: " + "; ".join(metrics["duration_gate"]["errors"]))
+PY
+
+cp "$OUT_ROOT/metadata/preflight_report.json" "$OUT_ROOT/review_inputs/preflight_report.json" 2>/dev/null || true
+cp "$OUT_ROOT/metadata/duration_metrics.json" "$OUT_ROOT/review_inputs/duration_metrics.json" 2>/dev/null || true
+cp "$OUT_ROOT/metadata/vace_command.json" "$OUT_ROOT/review_inputs/vace_command.json" 2>/dev/null || true
+tail -120 "$OUT_ROOT/logs/vace_generate.log" > "$OUT_ROOT/review_inputs/vace_generate_tail.log" 2>/dev/null || true
+tail -80 "$OUT_ROOT/logs/remux_audio.log" > "$OUT_ROOT/review_inputs/remux_audio_tail.log" 2>/dev/null || true
 
 ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$TARGET_VIDEO" || true
 echo "[vace-smoke] known_pairs=$KNOWN_PAIRS"

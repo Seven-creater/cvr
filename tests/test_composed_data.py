@@ -39,6 +39,7 @@ from app.composed_data import (
     _source_context,
     _target_uniqueness_score,
     _video_edit_risk_assessment,
+    _audit_src_ref_image_candidate,
     annotate_clips,
     build_manual_review_bundle,
     build_ffmpeg_extract_command,
@@ -4612,6 +4613,48 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(0, summary["plan_count"])
             self.assertEqual(1, summary["skipped_reasons"]["plan_lint_object_replacement_screen_or_visible_text_risk"])
 
+    def test_plan_video_edits_rejects_replacement_when_source_object_not_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a man sits beside a small table in an office",
+                        "subjects": ["man", "table"],
+                        "object_counts": {"man": 1, "table": 1},
+                        "actions": ["sitting"],
+                        "scene": "office",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "cup_to_bottle",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "edit_text": "replace the cup with a bottle",
+                        "difference": {"type": "object_presence", "from": "cup", "to": "bottle"},
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["plan_lint_object_replacement_source_not_visible"])
+
     def test_plan_video_edits_rejects_removing_seated_support_object(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -5194,6 +5237,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("edit_background_inverse_subject", mask_plans[0]["mask_mode"])
             self.assertEqual(0.20, mask_plans[0]["mask_gate"]["min_coverage_ratio"])
             self.assertEqual(0.90, mask_plans[0]["mask_gate"]["max_coverage_ratio"])
+            self.assertEqual(0.10, mask_plans[0]["mask_gate"]["min_detected_keyframe_box_coverage"])
 
     def test_plan_src_ref_images_requires_references_for_object_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5341,6 +5385,59 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(records[0]["selected_src_ref_images"][0].endswith("candidate_002.png"))
             self.assertEqual("candidate 2 best matches the replacement object", records[0]["selection_reason"])
             self.assertIn("omni_audit", records[0])
+
+    def test_select_src_ref_images_rejects_square_background_reference(self) -> None:
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional local dependency
+            self.skipTest(f"Pillow unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            candidate_dir = root / "src_ref_images" / "lab_background"
+            candidate_dir.mkdir(parents=True)
+            Image.new("RGB", (1024, 1024), color=(20, 30, 40)).save(candidate_dir / "candidate_001.png")
+            plan_path = root / "pairs" / "src_ref_image_plan.jsonl"
+            self._write_jsonl(
+                plan_path,
+                [
+                    {
+                        "plan_id": "lab_background",
+                        "candidate_dir": str(candidate_dir),
+                        "required": True,
+                        "src_ref_role": "background_reference",
+                    }
+                ],
+            )
+
+            summary = select_src_ref_images(root=root, src_ref_image_plan_path=plan_path, max_selected=1)
+            records = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(0, summary["selected_plan_count"])
+            self.assertEqual(1, summary["audit_rejected_count"])
+            self.assertEqual("rejected_by_deterministic_audit", records[0]["status"])
+            self.assertIn("background_src_ref_not_16x9", records[0]["candidate_audit"][0]["hard_reject_reasons"])
+
+    def test_src_ref_background_candidate_audit_accepts_16x9_plate(self) -> None:
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional local dependency
+            self.skipTest(f"Pillow unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            candidate = Path(temp_dir) / "candidate_001.png"
+            Image.new("RGB", (1280, 720), color=(20, 30, 40)).save(candidate)
+
+            audit = _audit_src_ref_image_candidate(candidate, {"src_ref_role": "background_reference"})
+
+            self.assertTrue(audit["eligible"])
+            self.assertEqual([], audit["hard_reject_reasons"])
+            self.assertIn("background candidate is close to 16:9", audit["reasons"])
 
     def test_plan_video_edits_rejects_tiny_additive_attribute_revision_for_vace(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5795,8 +5892,15 @@ class ComposedDataTests(unittest.TestCase):
             root = Path(temp_dir)
             (root / "clips").mkdir(parents=True)
             (root / "synthetic").mkdir(parents=True)
+            (root / "src_ref").mkdir(parents=True)
+            (root / "review_inputs_src").mkdir(parents=True)
             (root / "clips" / "ref.mp4").write_bytes(b"reference-video")
             (root / "synthetic" / "target.mp4").write_bytes(b"target-video")
+            (root / "synthetic" / "src_video_for_vace.mp4").write_bytes(b"src-video")
+            (root / "synthetic" / "mask.mp4").write_bytes(b"mask-video")
+            (root / "synthetic" / "raw.mp4").write_bytes(b"raw-video")
+            (root / "src_ref" / "jacket.png").write_bytes(b"src-ref")
+            (root / "review_inputs_src" / "vace_prompt.txt").write_text("same shot target prompt", encoding="utf-8")
             pairs_path = root / "accepted.jsonl"
             self._write_jsonl(
                 pairs_path,
@@ -5813,6 +5917,21 @@ class ComposedDataTests(unittest.TestCase):
                         "verification": {"passed": True},
                         "observable_difference": {"passed": True},
                         "competing_difference": {"passed": True},
+                        "generation": {
+                            "model_route": "vace_controlled",
+                            "src_video_for_vace": "synthetic/src_video_for_vace.mp4",
+                            "src_mask": "synthetic/mask.mp4",
+                            "src_ref_images": ["src_ref/jacket.png"],
+                            "review_inputs_dir": "review_inputs_src",
+                            "mask_metrics": {"mask_coverage_ratio_avg": 0.12},
+                            "duration_metrics": {"duration_gate": {"passed": True}},
+                            "vace_command": {"argv": ["python", "generate.py"]},
+                            "post_vace_verdict": {"duration_gate_passed": True},
+                            "postprocess": {
+                                "audio_copied_from_reference": True,
+                                "raw_generated_video": "synthetic/raw.mp4",
+                            },
+                        },
                     }
                 ],
             )
@@ -5832,6 +5951,13 @@ class ComposedDataTests(unittest.TestCase):
             self.assertIn("change the robot body color", review_text)
             self.assertIn("A black and gold robot", review_text)
             self.assertIn("A bright yellow robot", review_text)
+            self.assertIn("src_video_for_vace", review_text)
+            self.assertIn("duration_metrics", review_text)
+            self.assertTrue((item_dir / "src_video_for_vace.mp4").exists())
+            self.assertTrue((item_dir / "mask.mp4").exists())
+            self.assertTrue((item_dir / "raw_target.mp4").exists())
+            self.assertTrue((item_dir / "src_ref_images" / "001_jacket_png").exists())
+            self.assertTrue((item_dir / "review_inputs" / "vace_prompt.txt").exists())
             self.assertTrue((item_dir / "metadata.json").exists())
             self.assertIn("sample_1", (output_dir / "index.md").read_text(encoding="utf-8"))
 
@@ -5911,6 +6037,46 @@ class ComposedDataTests(unittest.TestCase):
                 )
 
             self.assertTrue(any("audio_copied_from_reference=true" in issue for issue in issues))
+
+    def test_synthetic_visual_rejects_missing_required_src_ref_and_duration_gate_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={"duration_seconds": 5.0, "has_audio": True, "has_video": True},
+            ):
+                issues = _pair_record_acceptance_issues(
+                    root=root,
+                    record={
+                        "source_type": "synthetic_edit",
+                        "reference_video": "ref.mp4",
+                        "target_video": "target.mp4",
+                        "edit_text": "replace the cup with a bottle",
+                        "difference": {"type": "object_presence", "from": "cup", "to": "bottle"},
+                        "quality": {"visual_near_duplicate_score": 0.90},
+                        "source_context": {"relation": "synthetic_from_reference"},
+                        "generation": {
+                            "model_route": "vace_controlled",
+                            "src_ref_requirements": {"required": True},
+                            "src_ref_images": [],
+                            "duration_metrics": {
+                                "raw_duration_drift_seconds": 0.75,
+                                "target_duration_drift_seconds": 0.8,
+                                "max_duration_drift_seconds": 0.5,
+                                "duration_gate": {"passed": False, "errors": ["target_duration_drift_seconds 0.800 > 0.500"]},
+                            },
+                            "postprocess": {"audio_copied_from_reference": True},
+                        },
+                    },
+                    reference_annotation={"object_counts": {"cup": 1}},
+                    target_annotation={"object_counts": {"bottle": 1}},
+                )
+
+            self.assertTrue(any("missing required src_ref_images" in issue for issue in issues))
+            self.assertTrue(any("duration gate failed" in issue for issue in issues))
+            self.assertTrue(any("raw_duration_drift_seconds" in issue for issue in issues))
 
     def test_validate_pilot_dataset_builds_gallery_from_targets_and_negatives(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
