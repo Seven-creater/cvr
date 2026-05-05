@@ -178,6 +178,17 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("replacement_target_prompt_conflicts_with_source_state", script)
         self.assertIn("object_replacement_breaks_support_contact", script)
         self.assertIn("target_instance_description", script)
+        self.assertIn("VIDEO_MASK_SEMANTICS_VERSION = 2", script)
+        self.assertIn("VIDEO_MASK_POLARITY = \"white_generate_black_preserve\"", script)
+        self.assertIn("mask_semantics_version", script)
+        self.assertIn("mask_polarity", script)
+        self.assertIn("mask manifest row has stale/missing mask_semantics_version", script)
+        self.assertIn("mask manifest query does not match current plan", script)
+        self.assertIn("background inverse mask appears to edit the subject", script)
+        self.assertIn("src_video_contact.jpg", script)
+        self.assertIn("post_vace_verdict.json", script)
+        self.assertIn("semantic_gate_family", script)
+        self.assertIn("object_replacement", script)
         self.assertIn("raw_target_contact.jpg", script)
         self.assertIn("target_contact.jpg", script)
         self.assertIn("raw VACE target duration drift", script)
@@ -246,6 +257,16 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("mask_temporal_stability", helper)
         self.assertIn("edit_background_inverse_subject", helper)
         self.assertIn("min_detected_keyframe_box_coverage", helper)
+        self.assertIn("mask_semantics_version", helper)
+        self.assertIn("mask_polarity", helper)
+        self.assertIn("sampled_frame_indices", helper)
+        self.assertIn("detected_keyframe_index", helper)
+        self.assertIn("reference_frame_count", helper)
+        self.assertIn("generator_commit", helper)
+        self.assertIn("visible_span_ratio", helper)
+        self.assertIn("background_editable_ratio", helper)
+        self.assertIn("subject_overlap_ratio", helper)
+        self.assertIn("mask_target_instance_alignment", helper)
         self.assertIn("protected_overlap_queries", helper)
         self.assertIn("protected_overlap_ratio_max", helper)
         self.assertIn("min_protected_detections", helper)
@@ -268,11 +289,15 @@ class ScriptTests(unittest.TestCase):
                 "min_coverage_ratio": 0.20,
                 "max_coverage_ratio": 0.90,
                 "min_detected_keyframe_box_coverage": 0.10,
+                "max_subject_overlap_ratio": 0.20,
+                "min_background_editable_ratio": 0.20,
                 "mask_not_empty_all_frames": True,
             },
             {
                 "mask_coverage_ratio_avg": 0.04,
                 "detected_keyframe_box_coverage": 0.02,
+                "subject_overlap_ratio": 0.35,
+                "background_editable_ratio": 0.04,
                 "mask_temporal_stability": 0.95,
                 "mask_nonempty_frame_ratio": 1.0,
             },
@@ -280,6 +305,8 @@ class ScriptTests(unittest.TestCase):
 
         self.assertTrue(any("avg_coverage" in error for error in errors))
         self.assertTrue(any("detected_keyframe_box_coverage" in error for error in errors))
+        self.assertTrue(any("subject_overlap_ratio" in error for error in errors))
+        self.assertTrue(any("background_editable_ratio" in error for error in errors))
 
     def test_grounded_sam2_mask_gate_rejects_protected_overlap_for_clothing(self) -> None:
         errors = _mask_gate_errors(

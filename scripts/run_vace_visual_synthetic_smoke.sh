@@ -143,6 +143,9 @@ import shlex
 import sys
 from pathlib import Path
 
+VIDEO_MASK_SEMANTICS_VERSION = 2
+VIDEO_MASK_POLARITY = "white_generate_black_preserve"
+
 data_root = Path(sys.argv[1])
 plan_path = Path(sys.argv[2])
 mask_manifest_path = Path(sys.argv[3]) if sys.argv[3].strip() else None
@@ -171,6 +174,79 @@ def resolve_existing_path(raw_path, base_dirs):
 
 def normalize_phrase(value):
     return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+def normalize_list(value):
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+def absence_like(value):
+    key = normalize_phrase(value)
+    return key in {"", "no", "none", "nothing", "absent", "missing", "removed", "not present"}
+
+def is_clothing_edit(plan):
+    difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
+    text = normalize_phrase(
+        " ".join(
+            [
+                str(plan.get("exploration_family", "")),
+                str(plan.get("edit_text", "")),
+                str(plan.get("edit_token", "")),
+                str(plan.get("edit_region", "")),
+                str(difference.get("from", "")),
+                str(difference.get("to", "")),
+            ]
+        )
+    )
+    return any(marker in text.split() for marker in {"clothing", "outfit", "shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest"})
+
+def foreground_mask_query_from_annotation(annotation):
+    candidates = []
+    if isinstance(annotation, dict):
+        candidates.extend(normalize_list(annotation.get("main_subjects", [])))
+        candidates.extend(normalize_list(annotation.get("subjects", [])))
+        nested = annotation.get("reference_understanding")
+        if isinstance(nested, dict):
+            candidates.extend(normalize_list(nested.get("main_subjects", [])))
+        object_counts = annotation.get("object_counts", {})
+        if isinstance(object_counts, dict):
+            candidates.extend(str(key).strip() for key in object_counts if str(key).strip())
+    generic = {"background", "scene", "room", "wall", "floor", "table", "desk", "lighting", "camera motion"}
+    for candidate in candidates:
+        key = normalize_phrase(candidate)
+        if key and key not in generic and any(token in key.split() for token in ("man", "woman", "person", "girl", "boy", "robot", "vehicle", "car", "dog", "cat")):
+            return candidate[:120]
+    for candidate in candidates:
+        key = normalize_phrase(candidate)
+        if key and key not in generic:
+            return candidate[:120]
+    return "main subject"
+
+def expected_mask_query(plan, raw_query):
+    difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
+    query_key = normalize_phrase(raw_query)
+    family = normalize_phrase(plan.get("exploration_family", ""))
+    if is_clothing_edit(plan) or family.startswith("clothing") or any(marker in query_key for marker in ("clothing", "shirt", "jacket", "outfit")):
+        return "clothing"
+    if str(difference.get("type", "")).strip() == "scene" or "background" in normalize_phrase(plan.get("edit_region", "")):
+        annotation = plan.get("reference_understanding") if isinstance(plan.get("reference_understanding"), dict) else {}
+        return foreground_mask_query_from_annotation(annotation)
+    return raw_query
+
+def expected_mask_mode(plan, mask_query):
+    difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
+    edit_region = normalize_phrase(plan.get("edit_region", ""))
+    query_key = normalize_phrase(mask_query)
+    difference_type = str(difference.get("type", "")).strip()
+    if difference_type == "scene" or "background" in edit_region or query_key == "background":
+        return "edit_background_inverse_subject"
+    if difference_type == "object_presence" and absence_like(difference.get("to", "")):
+        return "remove_or_inpaint_masked_object"
+    if difference_type in {"object_presence", "object_count"}:
+        return "replace_masked_object"
+    return "edit_masked_region"
 
 def clothing_phrases(text):
     pattern = re.compile(
@@ -338,15 +414,47 @@ src_mask = ""
 src_mask_original = ""
 src_mask_for_vace = out_root / "videos" / f"{safe_plan_id}_mask_for_vace.mp4"
 mask_metrics = {}
+mask_manifest_row = {}
 if mask_manifest_path:
     mask_rows = [json.loads(line) for line in mask_manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     mask_matches = [row for row in mask_rows if str(row.get("plan_id", "")) == plan_id]
     if not mask_matches:
         raise SystemExit(f"mask manifest has no row for plan_id: {plan_id}")
-    mask_status = str(mask_matches[0].get("status", "")).strip()
+    mask_manifest_row = mask_matches[0]
+    mask_status = str(mask_manifest_row.get("status", "")).strip()
     if mask_status and mask_status != "generated":
         raise SystemExit(f"mask manifest row is not generated for plan_id {plan_id}: {mask_status}")
-    mask_raw = str(mask_matches[0].get("mask_video", "")).strip()
+    mask_semantics_version = int(mask_manifest_row.get("mask_semantics_version") or 0)
+    if mask_semantics_version < VIDEO_MASK_SEMANTICS_VERSION:
+        raise SystemExit(
+            f"mask manifest row has stale/missing mask_semantics_version for plan_id {plan_id}: "
+            f"{mask_semantics_version} < {VIDEO_MASK_SEMANTICS_VERSION}"
+        )
+    mask_polarity = str(mask_manifest_row.get("mask_polarity", "")).strip()
+    if mask_polarity != VIDEO_MASK_POLARITY:
+        raise SystemExit(f"mask manifest row has invalid mask_polarity for plan_id {plan_id}: {mask_polarity!r}")
+    manifest_mask_query = str(mask_manifest_row.get("mask_query", "")).strip()
+    manifest_mask_mode = str(mask_manifest_row.get("mask_mode", "")).strip()
+    expected_query = expected_mask_query(plan, str(plan.get("mask_query", "")).strip() or manifest_mask_query)
+    expected_mode = expected_mask_mode(plan, expected_query)
+    expected_query_key = normalize_phrase(expected_query)
+    manifest_query_key = normalize_phrase(manifest_mask_query)
+    if expected_query_key == "main subject" and manifest_query_key in {"background", "scene", "room"}:
+        raise SystemExit(
+            f"mask manifest query does not match current plan for plan_id {plan_id}: "
+            f"manifest={manifest_mask_query!r} expected=foreground subject query"
+        )
+    if manifest_mask_query and expected_query_key != "main subject" and manifest_query_key != expected_query_key:
+        raise SystemExit(
+            f"mask manifest query does not match current plan for plan_id {plan_id}: "
+            f"manifest={manifest_mask_query!r} expected={expected_query!r}"
+        )
+    if manifest_mask_mode and manifest_mask_mode != expected_mode:
+        raise SystemExit(
+            f"mask manifest mode does not match current plan for plan_id {plan_id}: "
+            f"manifest={manifest_mask_mode!r} expected={expected_mode!r}"
+        )
+    mask_raw = str(mask_manifest_row.get("mask_video", "")).strip()
     if not mask_raw:
         raise SystemExit(f"mask manifest row is missing mask_video for plan_id: {plan_id}")
     mask_path = Path(mask_raw)
@@ -356,7 +464,19 @@ if mask_manifest_path:
         raise SystemExit(f"mask video does not exist for plan_id {plan_id}: {mask_path}")
     src_mask_original = str(mask_path)
     src_mask = str(src_mask_for_vace)
-    mask_metrics = mask_matches[0].get("mask_metrics", {}) if isinstance(mask_matches[0].get("mask_metrics"), dict) else {}
+    mask_metrics = mask_manifest_row.get("mask_metrics", {}) if isinstance(mask_manifest_row.get("mask_metrics"), dict) else {}
+    if manifest_mask_mode == "edit_background_inverse_subject":
+        subject_overlap = mask_metrics.get("subject_overlap_ratio")
+        background_editable = mask_metrics.get("background_editable_ratio")
+        if subject_overlap is None or background_editable is None:
+            raise SystemExit(
+                f"background inverse mask is missing polarity metrics for plan_id {plan_id}: "
+                "subject_overlap_ratio/background_editable_ratio"
+            )
+        if float(subject_overlap or 0.0) > 0.20:
+            raise SystemExit(f"background inverse mask appears to edit the subject: subject_overlap_ratio={float(subject_overlap):.4f}")
+        if float(background_editable or 0.0) < 0.20:
+            raise SystemExit(f"background inverse mask editable background is too small: background_editable_ratio={float(background_editable):.4f}")
 
 src_ref_images = []
 if src_ref_selection_path:
@@ -418,13 +538,18 @@ known_pair = {
         "preserve_tokens": preserve_tokens,
         "negative_prompt": negative_prompt,
         "edit_region": edit_region,
-        "mask_query": str(plan.get("mask_query", "")).strip(),
+        "mask_query": str(mask_manifest_row.get("mask_query") or plan.get("mask_query", "")).strip(),
+        "mask_mode": str(mask_manifest_row.get("mask_mode", "")).strip(),
+        "mask_semantics_version": int(mask_manifest_row.get("mask_semantics_version") or 0),
+        "mask_polarity": str(mask_manifest_row.get("mask_polarity", "")).strip(),
         "target_instance_description": str(plan.get("target_instance_description", "")).strip(),
         "src_mask": src_mask,
         "original_src_mask": src_mask_original,
         "src_ref_images": src_ref_images,
         "src_ref_requirements": plan.get("src_ref_requirements", {}),
         "mask_metrics": mask_metrics,
+        "mask_target_instance_alignment": mask_manifest_row.get("mask_target_instance_alignment", {}),
+        "exploration_family": str(plan.get("exploration_family", "")).strip(),
         "video_edit_plan_id": plan_id,
         "review_inputs_dir": str(out_root / "review_inputs"),
         "postprocess": {
@@ -571,6 +696,8 @@ if [[ -n "${SRC_MASK:-}" ]]; then
       exit 1
     }
 fi
+ffmpeg -y -i "$SRC_VIDEO_FOR_VACE" -vf "fps=1,scale=240:-1,tile=5x1" -frames:v 1 \
+  "$OUT_ROOT/review_inputs/src_video_contact.jpg" > "$OUT_ROOT/logs/contact_src_video.log" 2>&1 || true
 if [[ -n "${SRC_REF_IMAGES:-}" ]]; then
   IFS=',' read -r -a SRC_REF_IMAGE_ARRAY <<< "$SRC_REF_IMAGES"
   idx=0
@@ -878,6 +1005,71 @@ expected_fps = float(sys.argv[8])
 def normalize_phrase(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", str(value).lower()))
 
+def absence_like(value: str) -> bool:
+    key = normalize_phrase(value)
+    return key in {"", "no", "none", "nothing", "absent", "missing", "removed", "not present"}
+
+def semantic_family(pair: dict) -> str:
+    generation = pair.get("generation", {}) if isinstance(pair.get("generation"), dict) else {}
+    difference = pair.get("difference", {}) if isinstance(pair.get("difference"), dict) else {}
+    text = normalize_phrase(
+        " ".join(
+            [
+                str(pair.get("edit_text", "")),
+                str(generation.get("edit_token", "")),
+                str(generation.get("exploration_family", "")),
+                str(difference.get("from", "")),
+                str(difference.get("to", "")),
+                str(difference.get("description", "")),
+            ]
+        )
+    )
+    difference_type = str(difference.get("type", "")).strip()
+    if "black jacket" in text:
+        return "black_jacket"
+    if any(marker in text.split() for marker in {"clothing", "outfit", "shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest"}):
+        return "clothing"
+    if difference_type == "scene" or "background change" in text or "background" in normalize_phrase(generation.get("edit_region", "")):
+        return "background"
+    if difference_type == "object_presence":
+        if absence_like(str(difference.get("to", ""))):
+            return "object_removal"
+        return "object_replacement"
+    if difference_type == "object_count":
+        return "object_replacement"
+    return ""
+
+def semantic_requirements_for_family(family: str) -> list[str]:
+    if family == "black_jacket":
+        return [
+            "target must show an open black long-sleeved jacket",
+            "target must not be a dark shirt, navy shirt, polo, or patterned shirt",
+            "face, hands, ukulele, microphone, action, audio, and duration must remain aligned with the reference",
+        ]
+    if family == "clothing":
+        return [
+            "target must match the requested clothing result, not a different garment class",
+            "protected face, hands, instruments, microphones, action, audio, and duration must remain aligned",
+        ]
+    if family == "background":
+        return [
+            "target must clearly show the requested background semantics",
+            "foreground subject identity, face, action, important objects, audio, and duration must remain aligned",
+        ]
+    if family == "object_replacement":
+        return [
+            "source object must disappear",
+            "target object must appear naturally in the masked region",
+            "unmasked subject, action, audio, and duration must remain aligned",
+        ]
+    if family == "object_removal":
+        return [
+            "source object must disappear",
+            "masked region must be naturally filled",
+            "unmasked subject, action, audio, and duration must remain aligned",
+        ]
+    return []
+
 def parse_fraction(value: str) -> float:
     if "/" in value:
         numerator, denominator = value.split("/", 1)
@@ -982,40 +1174,31 @@ for pair in pairs:
     generation = pair.setdefault("generation", {})
     generation["duration_metrics"] = metrics
     generation["vace_command"] = command
+    family = semantic_family(pair)
     verdict = {
         "stage": "post_vace_pre_omni_validation",
         "duration_gate_passed": passed,
         "requires_omni_validation": True,
     }
-    difference = pair.get("difference", {}) if isinstance(pair.get("difference"), dict) else {}
-    semantic_text = normalize_phrase(
-        " ".join(
-            [
-                str(pair.get("edit_text", "")),
-                str(difference.get("from", "")),
-                str(difference.get("to", "")),
-                str(difference.get("description", "")),
-            ]
-        )
-    )
-    if "black jacket" in semantic_text:
+    if family:
         verdict.update(
             {
                 "semantic_gate_required": True,
                 "semantic_gate_passed": False,
-                "semantic_requirements": [
-                    "target must show an open black long-sleeved jacket",
-                    "target must not be a dark shirt, navy shirt, polo, or patterned shirt",
-                    "face, hands, ukulele, microphone, action, audio, and duration must remain aligned with the reference",
-                ],
+                "semantic_gate_family": family,
+                "semantic_requirements": semantic_requirements_for_family(family),
                 "required_omni_questions": [
-                    "Does the target clearly show an open black long-sleeved jacket?",
-                    "Is the result not merely a dark shirt/navy shirt/polo?",
-                    "Are face, hands, ukulele, microphone, action, and audio preserved?",
+                    "Did the requested edit actually happen?",
+                    "Did the forbidden/source state disappear where required?",
+                    "Are protected identity, action, audio, and duration preserved?",
                 ],
             }
         )
     generation["post_vace_verdict"] = verdict
+    (out_root / "metadata" / "post_vace_verdict.json").write_text(
+        json.dumps(verdict, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 known_pairs_path.write_text(
     "".join(json.dumps(pair, ensure_ascii=False) + "\n" for pair in pairs),
     encoding="utf-8",
@@ -1032,6 +1215,7 @@ ffmpeg -y -i "$TARGET_VIDEO" -vf "fps=1,scale=240:-1,tile=5x1" -frames:v 1 \
 cp "$OUT_ROOT/metadata/preflight_report.json" "$OUT_ROOT/review_inputs/preflight_report.json" 2>/dev/null || true
 cp "$OUT_ROOT/metadata/duration_metrics.json" "$OUT_ROOT/review_inputs/duration_metrics.json" 2>/dev/null || true
 cp "$OUT_ROOT/metadata/vace_command.json" "$OUT_ROOT/review_inputs/vace_command.json" 2>/dev/null || true
+cp "$OUT_ROOT/metadata/post_vace_verdict.json" "$OUT_ROOT/review_inputs/post_vace_verdict.json" 2>/dev/null || true
 tail -120 "$OUT_ROOT/logs/vace_generate.log" > "$OUT_ROOT/review_inputs/vace_generate_tail.log" 2>/dev/null || true
 tail -80 "$OUT_ROOT/logs/remux_audio.log" > "$OUT_ROOT/review_inputs/remux_audio_tail.log" 2>/dev/null || true
 

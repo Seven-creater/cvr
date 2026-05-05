@@ -329,6 +329,36 @@ VACE_STRUCTURAL_CLOTHING_TARGET_MARKERS = {
 }
 VACE_OUTERWEAR_MARKERS = {"jacket", "coat", "blazer", "outerwear"}
 VACE_NON_OUTERWEAR_CLOTHING_MARKERS = {"shirt", "t shirt", "tee", "short sleeve", "short sleeved", "outfit", "clothing"}
+VIDEO_MASK_SEMANTICS_VERSION = 2
+VIDEO_MASK_POLARITY = "white_generate_black_preserve"
+VACE_GENERIC_PERSON_MASK_QUERIES = {"man", "woman", "person", "people", "subject", "main subject"}
+VACE_TINY_FULLFRAME_OBJECTS = {"cup", "mug"}
+VACE_WORN_OBJECT_MARKERS = {"backpack", "bag", "handbag", "purse", "satchel"}
+VACE_MULTI_SHOT_MASK_MARKERS = {
+    "various locations",
+    "multiple locations",
+    "different locations",
+    "various scenes",
+    "multiple scenes",
+    "scene changes",
+    "seen in various",
+    "montage",
+}
+VACE_CLOTHING_FORBIDDEN_RESULT_MARKERS = {"vest", "polo", "undershirt", "tank top", "sleeveless"}
+VACE_BACKGROUND_MAX_SUBJECT_OVERLAP_RATIO = 0.20
+VACE_SEMANTIC_PRESERVE_OBJECT_MARKERS = {
+    "beard",
+    "face",
+    "glasses",
+    "guitar",
+    "hat",
+    "instrument",
+    "man",
+    "microphone",
+    "person",
+    "ukulele",
+    "woman",
+}
 INTRACLIP_CHANGE_MARKERS = (
     "change from",
     "changes from",
@@ -2128,6 +2158,17 @@ def plan_video_edits(
             or _is_object_removal(difference, edit_text)
         ):
             mask_query = target_instance_description
+        mask_query = _video_mask_query_for_plan(
+            {
+                "difference": difference,
+                "edit_text": edit_text,
+                "edit_token": edit_token,
+                "edit_region": edit_region,
+                "exploration_family": str(candidate.get("exploration_family", "")).strip(),
+                "reference_understanding": _video_edit_reference_understanding(reference_annotation),
+            },
+            mask_query,
+        )
         target_prompt, preserve_tokens, negative_prompt, prompt_repairs = _repair_video_edit_prompt_contract(
             source_prompt=source_prompt,
             target_prompt=target_prompt,
@@ -2236,7 +2277,18 @@ def plan_video_edits(
                 "single_edit_token": True,
                 "requires_mask": route == "vace_controlled",
                 "outside_mask_visual_near_duplicate_min": MIN_SYNTHETIC_VISUAL_CONTEXT_SCORE,
-                "mask_gate": _video_mask_gate_defaults() if route == "vace_controlled" else {},
+                "mask_gate": _video_mask_gate_defaults(
+                    mask_mode=_video_mask_mode({"difference": difference, "edit_region": edit_region, "mask_query": mask_query}),
+                    mask_query=mask_query,
+                    plan={
+                        "difference": difference,
+                        "edit_text": edit_text,
+                        "edit_token": edit_token,
+                        "exploration_family": str(candidate.get("exploration_family", "")).strip(),
+                    },
+                )
+                if route == "vace_controlled"
+                else {},
             },
         }
         plans.append(plan)
@@ -2639,13 +2691,7 @@ def plan_video_masks(
             if isinstance(edit_plan.get("reference_understanding"), dict)
             else {},
         )
-        if (
-            str((edit_plan.get("difference") or {}).get("type", "")).strip() == "scene"
-            and _normalized_phrase(mask_query) == "background"
-        ):
-            mask_query = _foreground_mask_query_from_annotation(
-                edit_plan.get("reference_understanding") if isinstance(edit_plan.get("reference_understanding"), dict) else edit_plan
-            )
+        mask_query = _video_mask_query_for_plan(edit_plan, mask_query)
         if not mask_query:
             skipped_reasons["missing_mask_query"] += 1
             continue
@@ -2653,6 +2699,11 @@ def plan_video_masks(
         reference_path = _resolve_under_root(layout["root"], reference_video)
         if not reference_video or not reference_path.exists():
             skipped_reasons["missing_reference_video"] += 1
+            continue
+        mask_mode = _video_mask_mode({**edit_plan, "mask_query": mask_query})
+        maskability_issue = _video_maskability_issue(edit_plan, mask_query=mask_query, mask_mode=mask_mode)
+        if maskability_issue:
+            skipped_reasons[maskability_issue] += 1
             continue
         safe_id = _safe_id(plan_id)
         mask_video = mask_dir / f"{safe_id}_mask.mp4"
@@ -2662,7 +2713,9 @@ def plan_video_masks(
             "reference_video_absolute": str(reference_path),
             "mask_video": str(mask_video),
             "mask_query": mask_query,
-            "mask_mode": _video_mask_mode(edit_plan),
+            "mask_mode": mask_mode,
+            "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
+            "mask_polarity": VIDEO_MASK_POLARITY,
             "edit_region": str(edit_plan.get("edit_region", "")).strip(),
             "preserve_regions": _video_preserve_regions(
                 preserve_tokens=_normalize_list(edit_plan.get("preserve_tokens", [])),
@@ -2674,7 +2727,7 @@ def plan_video_masks(
                 "segmenter": "SAM2.1_video_predictor",
                 "wrapper": "Grounded-SAM-2",
             },
-            "mask_gate": _video_mask_gate_defaults(mask_mode=_video_mask_mode(edit_plan), mask_query=mask_query),
+            "mask_gate": _video_mask_gate_defaults(mask_mode=mask_mode, mask_query=mask_query, plan=edit_plan),
             "status": "planned",
         }
         mask_plans.append(mask_record)
@@ -2684,7 +2737,9 @@ def plan_video_masks(
                 "reference_video": reference_video,
                 "mask_video": str(mask_video),
                 "mask_query": mask_query,
-                "mask_mode": mask_record["mask_mode"],
+                "mask_mode": mask_mode,
+                "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
+                "mask_polarity": VIDEO_MASK_POLARITY,
                 "status": "planned",
             }
         )
@@ -2938,6 +2993,7 @@ def _manual_review_bundle_issues(metadata: dict[str, Any]) -> list[str]:
             "duration_metrics.json",
             "vace_command.json",
             "reference_contact.jpg",
+            "src_video_contact.jpg",
             "raw_target_contact.jpg",
             "target_contact.jpg",
         ]
@@ -7578,6 +7634,132 @@ def _semantic_verdict_text(record: dict[str, Any], target_annotation: dict[str, 
     return _normalized_phrase(" ".join(chunks))
 
 
+def _target_annotation_text(target_annotation: dict[str, Any]) -> str:
+    chunks: list[str] = [
+        str(target_annotation.get("summary", "")),
+        str(target_annotation.get("scene", "")),
+        json.dumps(target_annotation.get("attributes", {}), ensure_ascii=False),
+    ]
+    chunks.extend(_normalize_list(target_annotation.get("subjects", [])))
+    chunks.extend(_normalize_list(target_annotation.get("actions", [])))
+    chunks.extend(_normalize_object_counts(target_annotation.get("object_counts", {})).keys())
+    return _normalized_phrase(" ".join(chunks))
+
+
+def _semantic_target_markers(value: str, *, drop_tokens: set[str] | None = None) -> list[str]:
+    drops = set(drop_tokens or set())
+    markers: list[str] = []
+    for token in TOKEN_PATTERN.findall(_normalized_phrase(value)):
+        if token in STOPWORDS or token in drops or len(token) <= 2:
+            continue
+        if token not in markers:
+            markers.append(token)
+    return markers
+
+
+def _semantic_preserve_markers(preserve_tokens: list[str]) -> list[str]:
+    markers: list[str] = []
+    for token in preserve_tokens:
+        normalized = _normalized_phrase(token)
+        for marker in VACE_SEMANTIC_PRESERVE_OBJECT_MARKERS:
+            if marker in normalized and marker not in markers:
+                markers.append(marker)
+    return markers
+
+
+def _semantic_missing_preserve_markers(text: str, preserve_tokens: list[str]) -> list[str]:
+    return [
+        marker
+        for marker in _semantic_preserve_markers(preserve_tokens)
+        if marker not in text
+    ]
+
+
+def _post_vace_semantic_family(record: dict[str, Any], post_vace_verdict: dict[str, Any]) -> str:
+    explicit = _normalized_phrase(str(post_vace_verdict.get("semantic_gate_family", "")))
+    if explicit:
+        return explicit
+    generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
+    exploration_family = _normalized_phrase(str(generation.get("exploration_family", "")))
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    edit_text = str(record.get("edit_text", "")).strip()
+    edit_token = str(generation.get("edit_token") or record.get("edit_token") or "").strip()
+    if _is_black_jacket_target(difference, edit_text, edit_token):
+        return "black_jacket"
+    if exploration_family.startswith("clothing") or _is_clothing_edit(difference, edit_text, edit_token):
+        return "clothing"
+    if exploration_family == "background_change" or str(difference.get("type", "")).strip() == "scene":
+        return "background"
+    if _is_existing_object_replacement(difference, edit_text):
+        return "object_replacement"
+    if _is_object_removal(difference, edit_text):
+        return "object_removal"
+    return ""
+
+
+def _clothing_semantic_errors(record: dict[str, Any], target_annotation: dict[str, Any]) -> list[str]:
+    generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    edit_text = str(record.get("edit_text", "")).strip()
+    edit_token = str(generation.get("edit_token") or record.get("edit_token") or "").strip()
+    target_clothing = _video_edit_target_object(difference, edit_text, edit_token) or edit_token
+    target_text = _target_annotation_text(target_annotation)
+    errors: list[str] = []
+    garment_markers = [token for token in _semantic_target_markers(target_clothing) if token in VACE_CLOTHING_OBJECT_MARKERS]
+    descriptor_markers = [
+        token
+        for token in _semantic_target_markers(target_clothing, drop_tokens=VACE_CLOTHING_OBJECT_MARKERS | {"man", "woman", "person", "wearing", "solid", "deep", "bright"})
+    ]
+    if garment_markers and not all(marker in target_text for marker in garment_markers):
+        errors.append("target_annotation_missing_target_clothing")
+    if descriptor_markers and not any(marker in target_text for marker in descriptor_markers):
+        errors.append("target_annotation_missing_target_clothing_descriptor")
+    for marker in sorted(VACE_CLOTHING_FORBIDDEN_RESULT_MARKERS):
+        if marker in target_text:
+            errors.append(f"target_annotation_forbidden_clothing_result:{marker}")
+    for marker in _semantic_missing_preserve_markers(target_text, _normalize_list(generation.get("preserve_tokens", []))):
+        errors.append(f"target_annotation_missing_preserved_object:{marker}")
+    return errors
+
+
+def _background_semantic_errors(record: dict[str, Any], target_annotation: dict[str, Any]) -> list[str]:
+    generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    target_text = _target_annotation_text(target_annotation)
+    target_markers = _semantic_target_markers(
+        str(difference.get("to", "")).strip(),
+        drop_tokens={"background", "room", "scene", "original"},
+    )
+    errors: list[str] = []
+    if target_markers and not all(marker in target_text for marker in target_markers):
+        errors.append("target_annotation_missing_target_background")
+    for marker in _semantic_missing_preserve_markers(target_text, _normalize_list(generation.get("preserve_tokens", []))):
+        errors.append(f"target_annotation_missing_preserved_object:{marker}")
+    return errors
+
+
+def _object_edit_semantic_errors(
+    record: dict[str, Any],
+    target_annotation: dict[str, Any],
+    *,
+    removal_only: bool,
+) -> list[str]:
+    generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    edit_text = str(record.get("edit_text", "")).strip()
+    source_object = _video_edit_source_object(difference, edit_text)
+    target_object = _video_edit_target_object(difference, edit_text, str(generation.get("edit_token", "")).strip())
+    target_text = _target_annotation_text(target_annotation)
+    errors: list[str] = []
+    if source_object and _text_mentions_phrase(target_text, source_object):
+        errors.append("target_annotation_still_contains_source_object")
+    if not removal_only and target_object and not _text_mentions_phrase(target_text, target_object):
+        errors.append("target_annotation_missing_target_object")
+    for marker in _semantic_missing_preserve_markers(target_text, _normalize_list(generation.get("preserve_tokens", []))):
+        errors.append(f"target_annotation_missing_preserved_object:{marker}")
+    return errors
+
+
 def _black_jacket_semantic_errors(record: dict[str, Any], target_annotation: dict[str, Any]) -> list[str]:
     text = _semantic_verdict_text(record, target_annotation)
     errors: list[str] = []
@@ -7611,16 +7793,28 @@ def _apply_post_vace_semantic_verdict(
     )
     if not post_vace_verdict.get("semantic_gate_required"):
         return record
-    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
-    if not _is_black_jacket_target(difference, str(record.get("edit_text", ""))):
+    semantic_family = _post_vace_semantic_family(record, post_vace_verdict)
+    if not semantic_family:
         return record
 
-    errors = _black_jacket_semantic_errors(record, target_annotation)
+    if semantic_family == "black_jacket":
+        errors = _black_jacket_semantic_errors(record, target_annotation)
+    elif semantic_family == "clothing":
+        errors = _clothing_semantic_errors(record, target_annotation)
+    elif semantic_family == "background":
+        errors = _background_semantic_errors(record, target_annotation)
+    elif semantic_family == "object_replacement":
+        errors = _object_edit_semantic_errors(record, target_annotation, removal_only=False)
+    elif semantic_family == "object_removal":
+        errors = _object_edit_semantic_errors(record, target_annotation, removal_only=True)
+    else:
+        return record
     updated = dict(record)
     updated_generation = dict(generation)
     updated_verdict = dict(post_vace_verdict)
     updated_verdict.update(
         {
+            "semantic_gate_family": semantic_family,
             "semantic_gate_checked_from": "omni_validation_annotation",
             "semantic_gate_passed": not errors,
             "semantic_gate_errors": errors,
@@ -8700,6 +8894,104 @@ def _foreground_mask_query_from_annotation(annotation: dict[str, Any]) -> str:
     return "main subject"
 
 
+def _mask_query_is_generic_person(mask_query: str) -> bool:
+    return _normalized_phrase(mask_query) in VACE_GENERIC_PERSON_MASK_QUERIES
+
+
+def _video_mask_query_for_plan(plan: dict[str, Any], mask_query: str) -> str:
+    difference = plan.get("difference") if isinstance(plan.get("difference"), dict) else {}
+    edit_text = str(plan.get("edit_text", "")).strip()
+    edit_token = str(plan.get("edit_token", "")).strip()
+    exploration_family = _normalized_phrase(str(plan.get("exploration_family", "")))
+    reference_annotation = (
+        plan.get("reference_understanding") if isinstance(plan.get("reference_understanding"), dict) else {}
+    )
+    normalized_query = _normalized_phrase(mask_query)
+    if (
+        _is_clothing_edit(difference, edit_text, edit_token)
+        or exploration_family.startswith("clothing")
+        or any(marker in normalized_query for marker in ("clothing", "shirt", "jacket", "outfit"))
+    ):
+        return "clothing"
+    if str(difference.get("type", "")).strip() == "scene" or "background" in _normalized_phrase(
+        str(plan.get("edit_region", ""))
+    ):
+        return _foreground_mask_query_from_annotation(reference_annotation)
+    return mask_query
+
+
+def _reference_has_multi_shot_mask_risk(annotation: dict[str, Any]) -> bool:
+    text = _normalized_phrase(
+        " ".join(
+            [
+                str(annotation.get("summary", "")),
+                str(annotation.get("scene", "")),
+                str(annotation.get("stable_scene", "")),
+                " ".join(_normalize_list(annotation.get("actions", []))),
+                " ".join(_normalize_list(annotation.get("visible_text", []))),
+            ]
+        )
+    )
+    return any(marker in text for marker in VACE_MULTI_SHOT_MASK_MARKERS)
+
+
+def _reference_has_worn_object_conflict(annotation: dict[str, Any], source_object: str, edit_region: str) -> bool:
+    source_tokens = set(TOKEN_PATTERN.findall(_normalized_phrase(source_object)))
+    if not source_tokens & VACE_WORN_OBJECT_MARKERS:
+        return False
+    text = _normalized_phrase(
+        " ".join(
+            [
+                str(annotation.get("summary", "")),
+                str(annotation.get("scene", "")),
+                " ".join(_normalize_list(annotation.get("actions", []))),
+                edit_region,
+            ]
+        )
+    )
+    return any(marker in text for marker in ("wearing", "wears", "worn", "on back", "back", "shoulder", "holding"))
+
+
+def _video_maskability_issue(
+    plan: dict[str, Any],
+    *,
+    mask_query: str,
+    mask_mode: str,
+) -> str:
+    difference = plan.get("difference") if isinstance(plan.get("difference"), dict) else {}
+    edit_text = str(plan.get("edit_text", "")).strip()
+    source_object = _video_edit_source_object(difference, edit_text)
+    source_key = _normalized_phrase(source_object)
+    target_instance_description = str(plan.get("target_instance_description", "")).strip()
+    reference_annotation = (
+        plan.get("reference_understanding") if isinstance(plan.get("reference_understanding"), dict) else {}
+    )
+    if _reference_has_multi_shot_mask_risk(reference_annotation):
+        return "multi_shot_mask_route_unsupported"
+    if (
+        mask_mode in {"replace_masked_object", "remove_or_inpaint_masked_object"}
+        and source_key in VACE_TINY_FULLFRAME_OBJECTS
+    ):
+        return "small_object_too_tiny_for_fullframe_vace"
+    if (
+        mask_mode in {"replace_masked_object", "remove_or_inpaint_masked_object"}
+        and source_object
+        and _normalized_phrase(mask_query) == source_key
+        and _reference_has_multiple_visible_instances(reference_annotation, source_object)
+        and not target_instance_description
+    ):
+        return "ambiguous_multi_instance_mask_query"
+    if _reference_has_worn_object_conflict(
+        reference_annotation,
+        source_object,
+        str(plan.get("edit_region", "")).strip(),
+    ):
+        return "subject_contact_or_worn_object_high_risk"
+    if mask_mode == "edit_background_inverse_subject" and _mask_query_is_generic_person(mask_query):
+        return "background_subject_mask_query_too_generic"
+    return ""
+
+
 def _video_preserve_regions(
     *,
     preserve_tokens: list[str],
@@ -8740,11 +9032,30 @@ def _video_mask_mode(plan: dict[str, Any]) -> str:
     return "edit_masked_region"
 
 
-def _video_mask_gate_defaults(*, mask_mode: str = "", mask_query: str = "") -> dict[str, Any]:
+def _video_mask_gate_defaults(
+    *,
+    mask_mode: str = "",
+    mask_query: str = "",
+    plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     normalized_query = _normalized_phrase(mask_query)
+    family = _normalized_phrase(str((plan or {}).get("exploration_family", "")))
+    difference = (plan or {}).get("difference") if isinstance((plan or {}).get("difference"), dict) else {}
+    edit_text = str((plan or {}).get("edit_text", "")).strip()
+    edit_token = str((plan or {}).get("edit_token", "")).strip()
     protected_queries: list[str] = []
     max_protected_overlap = 0.0
-    if mask_mode in {"replace_masked_object", "remove_or_inpaint_masked_object"}:
+    if (
+        _is_clothing_edit(difference, edit_text, edit_token)
+        or family.startswith("clothing")
+        or any(marker in normalized_query for marker in ("clothing", "shirt", "jacket", "outfit"))
+    ):
+        min_coverage = 0.03
+        max_coverage = 0.30
+        min_detected_box_coverage = 0.035
+        protected_queries = ["face", "hands", "ukulele", "guitar", "instrument", "microphone"]
+        max_protected_overlap = 0.18
+    elif mask_mode in {"replace_masked_object", "remove_or_inpaint_masked_object"}:
         min_coverage = 0.01
         max_coverage = 0.15
         min_detected_box_coverage = 0.005
@@ -8752,12 +9063,6 @@ def _video_mask_gate_defaults(*, mask_mode: str = "", mask_query: str = "") -> d
         min_coverage = 0.20
         max_coverage = 0.90
         min_detected_box_coverage = 0.10
-    elif any(marker in normalized_query for marker in ("clothing", "shirt", "jacket", "outfit")):
-        min_coverage = 0.03
-        max_coverage = 0.30
-        min_detected_box_coverage = 0.035
-        protected_queries = ["face", "hands", "ukulele", "guitar", "instrument", "microphone"]
-        max_protected_overlap = 0.18
     else:
         min_coverage = MIN_VIDEO_MASK_COVERAGE_RATIO
         max_coverage = MAX_VIDEO_MASK_COVERAGE_RATIO
@@ -8776,6 +9081,9 @@ def _video_mask_gate_defaults(*, mask_mode: str = "", mask_query: str = "") -> d
         gate["max_protected_overlap_ratio"] = max_protected_overlap
         gate["min_protected_detections"] = 2
         gate["require_protected_overlap_metrics"] = True
+    if mask_mode == "edit_background_inverse_subject":
+        gate["max_subject_overlap_ratio"] = VACE_BACKGROUND_MAX_SUBJECT_OVERLAP_RATIO
+        gate["min_background_editable_ratio"] = min_coverage
     return gate
 
 
@@ -10570,6 +10878,10 @@ def _known_pair_generation_issues(record: dict[str, Any]) -> list[str]:
             issues.append("generation.src_video_for_vace is required for vace_controlled pairs")
         if not str(generation.get("src_mask", "")).strip():
             issues.append("generation.src_mask is required for vace_controlled pairs")
+        if int(generation.get("mask_semantics_version") or 0) < VIDEO_MASK_SEMANTICS_VERSION:
+            issues.append("generation.mask_semantics_version is required and must be current for vace_controlled pairs")
+        if str(generation.get("mask_polarity", "")).strip() != VIDEO_MASK_POLARITY:
+            issues.append("generation.mask_polarity must be white_generate_black_preserve for vace_controlled pairs")
         mask_metrics = generation.get("mask_metrics")
         if not isinstance(mask_metrics, dict) or not mask_metrics:
             issues.append("generation.mask_metrics is required for vace_controlled pairs")

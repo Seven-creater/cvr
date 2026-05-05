@@ -9,6 +9,26 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+VIDEO_MASK_SEMANTICS_VERSION = 2
+VIDEO_MASK_POLARITY = "white_generate_black_preserve"
+
+
+def _normalized_phrase(value: str) -> str:
+    return " ".join(part for part in "".join(ch.lower() if ch.isalnum() else " " for ch in str(value)).split() if part)
+
+
+def _git_head_short() -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return ""
+    return completed.stdout.strip()
+
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -144,6 +164,22 @@ def _mask_gate_errors(mask_gate: dict[str, Any], metrics: dict[str, Any]) -> lis
     box_coverage = float(metrics.get("detected_keyframe_box_coverage", 0.0) or 0.0)
     if box_coverage < min_box_coverage:
         errors.append(f"detected_keyframe_box_coverage {box_coverage:.4f} < min {min_box_coverage:.4f}")
+    max_subject_overlap = mask_gate.get("max_subject_overlap_ratio")
+    if max_subject_overlap is not None:
+        subject_overlap = float(metrics.get("subject_overlap_ratio", 0.0) or 0.0)
+        max_subject_overlap_float = float(max_subject_overlap or 0.0)
+        if subject_overlap > max_subject_overlap_float:
+            errors.append(
+                f"subject_overlap_ratio {subject_overlap:.4f} > max {max_subject_overlap_float:.4f}"
+            )
+    min_background_editable = mask_gate.get("min_background_editable_ratio")
+    if min_background_editable is not None:
+        background_editable = float(metrics.get("background_editable_ratio", 0.0) or 0.0)
+        min_background_editable_float = float(min_background_editable or 0.0)
+        if background_editable < min_background_editable_float:
+            errors.append(
+                f"background_editable_ratio {background_editable:.4f} < min {min_background_editable_float:.4f}"
+            )
     max_protected_overlap = mask_gate.get("max_protected_overlap_ratio")
     if max_protected_overlap is not None:
         protected_overlap = metrics.get("protected_overlap_ratio_max")
@@ -237,8 +273,9 @@ def _run_grounded_sam2(
             str(grounding_dino_checkpoint),
             device=device,
         )
+        sampled_frame_indices = _sample_keyframe_indices(len(frame_paths))
         best_detection: dict[str, Any] | None = None
-        for frame_idx in _sample_keyframe_indices(len(frame_paths)):
+        for frame_idx in sampled_frame_indices:
             frame_path = frame_paths[frame_idx]
             image_source, image = load_image(str(frame_path))
             boxes, logits, phrases = predict(
@@ -376,20 +413,35 @@ def _run_grounded_sam2(
 
         fps = _ffprobe_fps(reference_video)
         _encode_mask_video(mask_dir, output_mask_video, fps)
+        background_editable_ratio = sum(coverages) / len(coverages) if coverages else 0.0
+        subject_overlap_ratio = None
+        if mask_mode == "edit_background_inverse_subject":
+            subject_overlap_ratio = _box_mask_overlap_ratio(frame_masks.get(keyframe_idx), boxes_xyxy[:3])
         metrics = {
             "frame_count": len(frame_paths),
             "fps": fps,
+            "reference_frame_count": len(frame_paths),
+            "reference_fps": fps,
             "mask_coverage_ratio_min": min(coverages) if coverages else 0.0,
-            "mask_coverage_ratio_avg": sum(coverages) / len(coverages) if coverages else 0.0,
+            "mask_coverage_ratio_avg": background_editable_ratio,
             "mask_coverage_ratio_max": max(coverages) if coverages else 0.0,
             "mask_temporal_stability": sum(ious) / len(ious) if ious else 1.0,
             "mask_nonempty_frame_ratio": nonempty_count / len(coverages) if coverages else 0.0,
+            "visible_span_ratio": nonempty_count / len(coverages) if coverages else 0.0,
+            "reinit_count": 0,
+            "sampled_frame_indices": sampled_frame_indices,
             "detected_phrases": best_detection["phrases"],
             "detected_keyframe_index": keyframe_idx,
             "detected_keyframe_box_coverage": best_detection["box_coverage"],
             "box_count": int(len(boxes_xyxy)),
             "device": device,
+            "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
+            "mask_polarity": VIDEO_MASK_POLARITY,
+            "generator_commit": _git_head_short(),
         }
+        if subject_overlap_ratio is not None:
+            metrics["subject_overlap_ratio"] = subject_overlap_ratio
+            metrics["background_editable_ratio"] = background_editable_ratio
         if protected_overlap_details:
             metrics["protected_overlap"] = protected_overlap_details
             metrics["protected_overlap_ratio_max"] = protected_overlap_max if protected_overlap_max is not None else 0.0
@@ -489,8 +541,9 @@ def _run_florence_sam2(
         if not frame_paths:
             raise RuntimeError(f"no frames extracted from {reference_video}")
 
+        sampled_frame_indices = _sample_keyframe_indices(len(frame_paths))
         best_detection: dict[str, Any] | None = None
-        for frame_idx in _sample_keyframe_indices(len(frame_paths)):
+        for frame_idx in sampled_frame_indices:
             try:
                 boxes_xyxy, labels = _florence_boxes_with_model(
                     image_path=frame_paths[frame_idx],
@@ -605,21 +658,36 @@ def _run_florence_sam2(
 
         fps = _ffprobe_fps(reference_video)
         _encode_mask_video(mask_dir, output_mask_video, fps)
+        background_editable_ratio = sum(coverages) / len(coverages) if coverages else 0.0
+        subject_overlap_ratio = None
+        if mask_mode == "edit_background_inverse_subject":
+            subject_overlap_ratio = _box_mask_overlap_ratio(frame_masks.get(keyframe_idx), boxes_xyxy[:3])
         metrics = {
             "frame_count": len(frame_paths),
             "fps": fps,
+            "reference_frame_count": len(frame_paths),
+            "reference_fps": fps,
             "mask_coverage_ratio_min": min(coverages) if coverages else 0.0,
-            "mask_coverage_ratio_avg": sum(coverages) / len(coverages) if coverages else 0.0,
+            "mask_coverage_ratio_avg": background_editable_ratio,
             "mask_coverage_ratio_max": max(coverages) if coverages else 0.0,
             "mask_temporal_stability": sum(ious) / len(ious) if ious else 1.0,
             "mask_nonempty_frame_ratio": nonempty_count / len(coverages) if coverages else 0.0,
+            "visible_span_ratio": nonempty_count / len(coverages) if coverages else 0.0,
+            "reinit_count": 0,
+            "sampled_frame_indices": sampled_frame_indices,
             "detected_phrases": labels,
             "detected_keyframe_index": keyframe_idx,
             "detected_keyframe_box_coverage": best_detection["box_coverage"],
             "box_count": int(len(boxes_xyxy)),
             "device": device,
             "grounder": "florence2",
+            "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
+            "mask_polarity": VIDEO_MASK_POLARITY,
+            "generator_commit": _git_head_short(),
         }
+        if subject_overlap_ratio is not None:
+            metrics["subject_overlap_ratio"] = subject_overlap_ratio
+            metrics["background_editable_ratio"] = background_editable_ratio
         if protected_overlap_details:
             metrics["protected_overlap"] = protected_overlap_details
             metrics["protected_overlap_ratio_max"] = protected_overlap_max if protected_overlap_max is not None else 0.0
@@ -704,16 +772,46 @@ def main() -> None:
             gate_errors = _mask_gate_errors(mask_gate, metrics)
             if gate_errors:
                 raise RuntimeError("mask gate failed: " + "; ".join(gate_errors))
+            target_instance_description = str(plan.get("target_instance_description", "")).strip()
+            mask_target_instance_alignment = {}
+            if target_instance_description:
+                mask_target_instance_alignment = {
+                    "passed": False,
+                    "method": "not_checked",
+                    "reason": "target_instance_description requires external Omni/contact-sheet alignment review",
+                    "target_instance_description": target_instance_description,
+                }
             row.update(
                 {
                     "mask_video": str(mask_video),
                     "status": "generated",
                     "mask_metrics": metrics,
                     "mask_gate_result": {"passed": True, "errors": []},
+                    "mask_query": str(plan.get("mask_query", "")).strip(),
+                    "mask_mode": str(plan.get("mask_mode", "")).strip(),
+                    "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
+                    "mask_polarity": VIDEO_MASK_POLARITY,
+                    "sampled_frame_indices": metrics.get("sampled_frame_indices", []),
+                    "detected_keyframe_index": metrics.get("detected_keyframe_index"),
+                    "reference_frame_count": metrics.get("reference_frame_count"),
+                    "reference_fps": metrics.get("reference_fps"),
+                    "generator_commit": metrics.get("generator_commit", ""),
                 }
             )
+            if mask_target_instance_alignment:
+                row["mask_target_instance_alignment"] = mask_target_instance_alignment
         except Exception as exc:  # pragma: no cover - integration path
-            row.update({"status": "failed", "failure_reason": f"{type(exc).__name__}: {exc}"})
+            row.update(
+                {
+                    "status": "failed",
+                    "failure_reason": f"{type(exc).__name__}: {exc}",
+                    "mask_query": str(plan.get("mask_query", "")).strip(),
+                    "mask_mode": str(plan.get("mask_mode", "")).strip(),
+                    "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
+                    "mask_polarity": VIDEO_MASK_POLARITY,
+                    "generator_commit": _git_head_short(),
+                }
+            )
         output_records.append(row)
         report_rows.append(
             {

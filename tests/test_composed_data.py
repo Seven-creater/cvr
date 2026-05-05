@@ -3992,6 +3992,8 @@ class ComposedDataTests(unittest.TestCase):
                             "preserve_tokens": ["chair", "room", "camera motion"],
                             "src_video_for_vace": "clips/src_video_for_vace.mp4",
                             "src_mask": "clips/mask.mp4",
+                            "mask_semantics_version": 2,
+                            "mask_polarity": "white_generate_black_preserve",
                             "mask_metrics": {"mask_coverage_ratio_avg": 0.12},
                             "review_inputs_dir": "review_inputs",
                             "duration_metrics": {
@@ -5489,6 +5491,8 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("SAM2.1_video_predictor", mask_plans[0]["toolchain"]["segmenter"])
             self.assertEqual("robot_color", mask_manifest[0]["plan_id"])
             self.assertTrue(mask_manifest[0]["mask_video"].endswith("robot_color_mask.mp4"))
+            self.assertEqual(2, mask_manifest[0]["mask_semantics_version"])
+            self.assertEqual("white_generate_black_preserve", mask_manifest[0]["mask_polarity"])
 
     def test_background_plan_masks_foreground_subject_for_inverse_background_edit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5535,6 +5539,82 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(0.20, mask_plans[0]["mask_gate"]["min_coverage_ratio"])
             self.assertEqual(0.90, mask_plans[0]["mask_gate"]["max_coverage_ratio"])
             self.assertEqual(0.10, mask_plans[0]["mask_gate"]["min_detected_keyframe_box_coverage"])
+            self.assertEqual(0.20, mask_plans[0]["mask_gate"]["min_background_editable_ratio"])
+            self.assertEqual(0.20, mask_plans[0]["mask_gate"]["max_subject_overlap_ratio"])
+
+    def test_clothing_plan_masks_clothing_even_if_query_is_person(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "shirt_ref.mp4").write_bytes(b"video")
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "shirt_color",
+                        "reference_video": "clips/shirt_ref.mp4",
+                        "edit_text": "change the patterned shirt to a solid black shirt",
+                        "difference": {"type": "attribute", "from": "patterned shirt", "to": "solid black shirt"},
+                        "model_route": "vace_controlled",
+                        "exploration_family": "clothing_color",
+                        "edit_token": "solid black shirt",
+                        "edit_region": "shirt",
+                        "mask_query": "man",
+                        "preserve_tokens": ["face", "hands", "ukulele", "microphone"],
+                    }
+                ],
+            )
+
+            summary = plan_video_masks(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                output_path=root / "pairs" / "video_mask_plan.jsonl",
+                mask_manifest_path=root / "pairs" / "video_mask_manifest.jsonl",
+            )
+            mask_plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["mask_plan_count"])
+            self.assertEqual("clothing", mask_plans[0]["mask_query"])
+            self.assertEqual(0.03, mask_plans[0]["mask_gate"]["min_coverage_ratio"])
+            self.assertEqual(0.30, mask_plans[0]["mask_gate"]["max_coverage_ratio"])
+            self.assertEqual(2, mask_plans[0]["mask_gate"]["min_protected_detections"])
+
+    def test_plan_video_masks_skips_tiny_fullframe_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "cup_ref.mp4").write_bytes(b"video")
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "cup_bottle",
+                        "reference_video": "clips/cup_ref.mp4",
+                        "edit_text": "replace the cup with a bottle",
+                        "difference": {"type": "object_presence", "from": "cup", "to": "bottle"},
+                        "model_route": "vace_controlled",
+                        "edit_token": "bottle",
+                        "edit_region": "cup",
+                        "mask_query": "cup",
+                    }
+                ],
+            )
+
+            summary = plan_video_masks(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                output_path=root / "pairs" / "video_mask_plan.jsonl",
+                mask_manifest_path=root / "pairs" / "video_mask_manifest.jsonl",
+            )
+
+            self.assertEqual(0, summary["mask_plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["small_object_too_tiny_for_fullframe_vace"])
 
     def test_plan_src_ref_images_requires_references_for_object_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6391,6 +6471,7 @@ class ComposedDataTests(unittest.TestCase):
             (root / "review_inputs_src" / "vace_command.json").write_text("{}", encoding="utf-8")
             (root / "review_inputs_src" / "reference_contact.jpg").write_bytes(b"reference-contact")
             (root / "review_inputs_src" / "mask_contact.jpg").write_bytes(b"mask-contact")
+            (root / "review_inputs_src" / "src_video_contact.jpg").write_bytes(b"src-video-contact")
             (root / "review_inputs_src" / "raw_target_contact.jpg").write_bytes(b"raw-contact")
             (root / "review_inputs_src" / "target_contact.jpg").write_bytes(b"target-contact")
             pairs_path = root / "accepted.jsonl"
@@ -6784,6 +6865,67 @@ class ComposedDataTests(unittest.TestCase):
         self.assertEqual("failed_semantic_gate", verdict["stage"])
         self.assertIn("target_annotation_missing_black_jacket", verdict["semantic_gate_errors"])
         self.assertIn("target_annotation_forbidden_marker:dark shirt", verdict["semantic_gate_errors"])
+
+    def test_post_vace_semantic_verdict_rejects_shirt_edit_that_becomes_vest(self) -> None:
+        record = {
+            "edit_text": "change the patterned shirt to a solid black shirt",
+            "difference": {"type": "attribute", "from": "patterned shirt", "to": "solid black shirt"},
+            "generation": {
+                "exploration_family": "clothing_color",
+                "edit_token": "solid black shirt",
+                "preserve_tokens": ["man", "ukulele", "microphone"],
+                "post_vace_verdict": {
+                    "semantic_gate_required": True,
+                    "semantic_gate_passed": False,
+                },
+            },
+        }
+
+        updated = _apply_post_vace_semantic_verdict(
+            record,
+            target_annotation={
+                "summary": "A man in a dark vest plays a ukulele near a microphone.",
+                "subjects": ["man"],
+                "actions": ["playing ukulele"],
+                "object_counts": {"ukulele": 1, "microphone": 1},
+            },
+        )
+
+        verdict = updated["generation"]["post_vace_verdict"]
+        self.assertFalse(verdict["semantic_gate_passed"])
+        self.assertEqual("clothing", verdict["semantic_gate_family"])
+        self.assertIn("target_annotation_missing_target_clothing", verdict["semantic_gate_errors"])
+        self.assertIn("target_annotation_forbidden_clothing_result:vest", verdict["semantic_gate_errors"])
+
+    def test_post_vace_semantic_verdict_rejects_background_target_unchanged(self) -> None:
+        record = {
+            "edit_text": "change the background to a futuristic laboratory",
+            "difference": {"type": "scene", "from": "brick wall background", "to": "futuristic laboratory background"},
+            "generation": {
+                "exploration_family": "background_change",
+                "preserve_tokens": ["man", "ukulele", "microphone"],
+                "post_vace_verdict": {
+                    "semantic_gate_required": True,
+                    "semantic_gate_passed": False,
+                },
+            },
+        }
+
+        updated = _apply_post_vace_semantic_verdict(
+            record,
+            target_annotation={
+                "summary": "A blurry man performs in front of the same brick wall background.",
+                "subjects": ["man"],
+                "actions": ["performing"],
+                "object_counts": {},
+            },
+        )
+
+        verdict = updated["generation"]["post_vace_verdict"]
+        self.assertFalse(verdict["semantic_gate_passed"])
+        self.assertEqual("background", verdict["semantic_gate_family"])
+        self.assertIn("target_annotation_missing_target_background", verdict["semantic_gate_errors"])
+        self.assertIn("target_annotation_missing_preserved_object:ukulele", verdict["semantic_gate_errors"])
 
     def test_validate_pilot_dataset_builds_gallery_from_targets_and_negatives(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
