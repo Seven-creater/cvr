@@ -4626,6 +4626,90 @@ class ComposedDataTests(unittest.TestCase):
             self.assertNotIn("Change only", plans[0]["target_prompt"])
             self.assertTrue(plans[0]["plan_lint"]["passed"])
 
+    def test_plan_video_edits_keeps_exploration_risk_relaxation_after_model_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "musician_ref.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "musician_ref",
+                        "output_path": "clips/musician_ref.mp4",
+                        "summary": "a man in a blue fedora and patterned shirt plays a ukulele and sings",
+                        "subjects": ["man"],
+                        "object_counts": {"man": 1, "ukulele": 1, "microphone": 1},
+                        "actions": ["playing ukulele", "singing"],
+                        "scene": "brick wall",
+                        "visible_text": ["S"],
+                        "storyline": ["plays ukulele", "sings", "moves in place"],
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "seed",
+                        "reference_video": "clips/musician_ref.mp4",
+                        "reference_caption": "a man in a patterned shirt plays ukulele",
+                        "edit_text": "exploration seed",
+                        "difference": {"type": "attribute", "from": "reference video", "to": "visual edit"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "edit_text": "change the outfit into a black jacket",
+                    "difference": {
+                        "type": "attribute",
+                        "from": "man wearing blue and white patterned shirt",
+                        "to": "man wearing black jacket",
+                    },
+                    "source_prompt": "A man in a blue fedora and patterned shirt plays a ukulele and sings into a microphone against a brick wall.",
+                    "target_prompt": "A man in a blue fedora and a black jacket plays a ukulele and sings into a microphone against a brick wall.",
+                    "edit_token": "black jacket",
+                    "preserve_tokens": ["man", "ukulele", "microphone", "camera motion", "lighting"],
+                    "negative_prompt": "Do not change the man, ukulele, microphone, camera motion, lighting, timing, or visible text.",
+                    "edit_region": "clothing",
+                    "mask_query": "clothing",
+                    "model_route": "vace_controlled",
+                    "reason": "The clothing is visible and maskable.",
+                    "repaired_fields": [],
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client):
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=1,
+                    planning_mode="exploration",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertEqual("black jacket", plans[0]["edit_token"])
+            self.assertEqual("exploration_high", plans[0]["visual_edit_risk"]["risk_level"])
+            self.assertTrue(plans[0]["visual_edit_risk"]["vace_exploration_relaxed"])
+            self.assertIn("visible_text_present", plans[0]["visual_edit_risk"]["relaxed_risk_reasons"])
+            self.assertTrue(plans[0]["plan_lint"]["passed"])
+            self.assertNotIn("model_planner_revised_to_high_risk_high", summary["skipped_reasons"])
+
     def test_plan_video_edits_rejects_screen_text_object_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -1958,6 +1958,8 @@ def plan_video_edits(
                     difference_type = planned_difference_type
                     route = planned_difference_route
                     risk = _video_edit_risk_assessment(reference_annotation, difference_type=difference_type)
+                    if planning_mode == "exploration":
+                        risk = _relax_visual_exploration_risk(risk, candidate)
                     if safe_visual_ideation_used:
                         risk = _relax_safe_visual_ideation_risk(risk, candidate)
                     if not risk["allow_generation"]:
