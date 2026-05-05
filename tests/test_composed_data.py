@@ -41,6 +41,7 @@ from app.composed_data import (
     _source_context,
     _target_uniqueness_score,
     _video_edit_risk_assessment,
+    _video_edit_plan_lint,
     _audit_src_ref_image_candidate,
     annotate_clips,
     build_manual_review_bundle,
@@ -4872,6 +4873,127 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(0, summary["plan_count"])
             self.assertEqual(1, summary["skipped_reasons"]["plan_lint_object_removal_breaks_seated_support"])
 
+    def test_plan_video_edits_rejects_replacing_seated_support_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "a young girl sits in a chair holding a toy",
+                        "subjects": ["young girl", "chair"],
+                        "object_counts": {"young girl": 1, "chair": 1},
+                        "actions": ["sitting"],
+                        "scene": "indoor room",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "replace_chair",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "edit_text": "replace the chair with a stool",
+                        "difference": {"type": "object_presence", "from": "chair", "to": "stool"},
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["plan_lint_object_replacement_breaks_support_contact"])
+
+    def test_plan_video_edits_rejects_ambiguous_multi_instance_mask_query(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "ref_visual",
+                        "output_path": "clips/ref_visual.mp4",
+                        "summary": "two empty chairs are visible on a stage",
+                        "subjects": ["stage", "chair"],
+                        "object_counts": {"chair": 2, "stage": 1},
+                        "actions": [],
+                        "scene": "stage",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "replace_chair",
+                        "reference_video": "clips/ref_visual.mp4",
+                        "edit_text": "replace the chair with a stool",
+                        "difference": {"type": "object_presence", "from": "chair", "to": "stool"},
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["plan_lint_ambiguous_multi_instance_mask_query"])
+
+    def test_video_edit_plan_lint_rejects_replacement_prompt_source_state_conflict(self) -> None:
+        lint = _video_edit_plan_lint(
+            source_prompt="A flutist is sitting on a chair on stage.",
+            target_prompt=(
+                "A flutist is sitting on a chair on stage. Replace only the chair with stool. "
+                "The same shot shows stool in the original chair location; no chair is visible."
+            ),
+            edit_text="replace the chair with a stool",
+            difference={"type": "object_presence", "from": "chair", "to": "stool"},
+            edit_token="stool",
+            preserve_tokens=["flutist", "stage"],
+            negative_prompt="preserve the flutist and stage",
+            reference_annotation={
+                "summary": "A flutist is sitting on a chair on stage.",
+                "subjects": ["flutist", "chair"],
+                "object_counts": {"chair": 1},
+                "actions": ["sitting"],
+            },
+            mask_query="chair",
+        )
+
+        self.assertIn("replacement_target_prompt_conflicts_with_source_state", lint["errors"])
+
+    def test_video_edit_plan_lint_rejects_visible_text_or_logo_edit(self) -> None:
+        lint = _video_edit_plan_lint(
+            source_prompt="A hand reveals hologram text reading made in Slovenia.",
+            target_prompt="A hand reveals hologram text reading made in Macedonia.",
+            edit_text="made in macedonia",
+            difference={"type": "attribute", "from": "made in Slovenia", "to": "made in Macedonia"},
+            edit_token="made in macedonia",
+            preserve_tokens=["hand", "hologram"],
+            negative_prompt="preserve the hand and hologram",
+            reference_annotation={"summary": "A hand reveals text.", "visible_text": ["MADE IN SLOVENIA"]},
+        )
+
+        self.assertIn("visible_text_or_logo_edit", lint["errors"])
+
     def test_plan_video_edits_uses_model_prompt_planner_when_configured(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -6267,6 +6389,10 @@ class ComposedDataTests(unittest.TestCase):
             (root / "review_inputs_src" / "preflight_report.json").write_text("{}", encoding="utf-8")
             (root / "review_inputs_src" / "duration_metrics.json").write_text("{}", encoding="utf-8")
             (root / "review_inputs_src" / "vace_command.json").write_text("{}", encoding="utf-8")
+            (root / "review_inputs_src" / "reference_contact.jpg").write_bytes(b"reference-contact")
+            (root / "review_inputs_src" / "mask_contact.jpg").write_bytes(b"mask-contact")
+            (root / "review_inputs_src" / "raw_target_contact.jpg").write_bytes(b"raw-contact")
+            (root / "review_inputs_src" / "target_contact.jpg").write_bytes(b"target-contact")
             pairs_path = root / "accepted.jsonl"
             self._write_jsonl(
                 pairs_path,

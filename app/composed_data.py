@@ -233,6 +233,49 @@ VACE_SCREEN_TEXT_OBJECTS = {
     "tv",
 }
 VACE_SEATED_SUPPORT_OBJECTS = {"bench", "chair", "seat", "sofa", "stool"}
+VACE_GENERIC_MULTI_INSTANCE_MASK_OBJECTS = {
+    "bag",
+    "bench",
+    "bottle",
+    "box",
+    "chair",
+    "cup",
+    "desk",
+    "glass",
+    "man",
+    "person",
+    "phone",
+    "seat",
+    "sofa",
+    "stool",
+    "table",
+    "woman",
+}
+VACE_TEXT_OR_LOGO_EDIT_MARKERS = {
+    "caption",
+    "country",
+    "flag",
+    "letter",
+    "letters",
+    "logo",
+    "made in",
+    "map",
+    "ocr",
+    "subtitle",
+    "text",
+    "tourism",
+    "touristy",
+    "watermark",
+    "word",
+}
+VACE_BROAD_SCENE_EDIT_MARKERS = {
+    "make it like",
+    "turn their",
+    "turn the scene",
+    "turn this",
+    "turn it into",
+    "loose stock pair",
+}
 VACE_CLOTHING_OBJECT_MARKERS = {
     "clothing",
     "outfit",
@@ -2076,6 +2119,15 @@ def plan_video_edits(
                 and _normalized_phrase(planned_mask_query) == "background"
             ):
                 mask_query = planned_mask_query
+        target_instance_description = str(
+            candidate.get("target_instance_description")
+            or raw_planner_output.get("target_instance_description", "")
+        ).strip()
+        if target_instance_description and (
+            _is_existing_object_replacement(difference, edit_text)
+            or _is_object_removal(difference, edit_text)
+        ):
+            mask_query = target_instance_description
         target_prompt, preserve_tokens, negative_prompt, prompt_repairs = _repair_video_edit_prompt_contract(
             source_prompt=source_prompt,
             target_prompt=target_prompt,
@@ -2102,6 +2154,8 @@ def plan_video_edits(
             preserve_tokens=preserve_tokens,
             negative_prompt=negative_prompt,
             reference_annotation=reference_annotation,
+            mask_query=mask_query,
+            target_instance_description=target_instance_description,
         )
         if not plan_lint["passed"]:
             skipped_by_type[difference_type or "unknown"] += 1
@@ -2154,6 +2208,7 @@ def plan_video_edits(
             "negative_prompt": negative_prompt,
             "edit_region": edit_region,
             "mask_query": mask_query,
+            "target_instance_description": target_instance_description,
             "preserve_regions": preserve_regions,
             "mask_plan": mask_plan_name,
             "control_plan": control_plan,
@@ -2877,7 +2932,18 @@ def _manual_review_bundle_issues(metadata: dict[str, Any]) -> list[str]:
         issues.append("incomplete_review_bundle: missing review_inputs_dir")
     else:
         review_inputs_path = Path(copied_review_inputs)
-        for filename in ("vace_prompt.txt", "preflight_report.json", "duration_metrics.json", "vace_command.json"):
+        required_review_inputs = [
+            "vace_prompt.txt",
+            "preflight_report.json",
+            "duration_metrics.json",
+            "vace_command.json",
+            "reference_contact.jpg",
+            "raw_target_contact.jpg",
+            "target_contact.jpg",
+        ]
+        if route == "vace_controlled":
+            required_review_inputs.append("mask_contact.jpg")
+        for filename in required_review_inputs:
             if not (review_inputs_path / filename).exists():
                 issues.append(f"incomplete_review_bundle: missing review_inputs/{filename}")
     if not metadata.get("duration_metrics"):
@@ -8292,7 +8358,11 @@ def _video_edit_exploration_candidates(candidate: dict[str, Any], annotation: di
         if not normalized_object or normalized_object in {"person", "man", "woman", "people", "hand", "hands"}:
             continue
         replacement = VACE_EXPLORATION_OBJECT_REPLACEMENTS.get(normalized_object)
-        if replacement and replacement_count < 2:
+        if (
+            replacement
+            and replacement_count < 2
+            and not _reference_has_seated_support_conflict(annotation, object_name)
+        ):
             replacement_count += 1
             candidates.append(
                 build(
@@ -8793,7 +8863,10 @@ def _stable_edit_targets_from_understanding(
             )
     object_names = list(_normalize_object_counts(annotation.get("object_counts", {})).keys())
     for source_name, replacement in VACE_EXPLORATION_OBJECT_REPLACEMENTS.items():
-        if any(_text_mentions_phrase(name, source_name) for name in object_names):
+        if any(_text_mentions_phrase(name, source_name) for name in object_names) and not _reference_has_seated_support_conflict(
+            annotation,
+            source_name,
+        ):
             targets.append(
                 {
                     "target": source_name,
@@ -9431,6 +9504,29 @@ def _target_prompt_source_clothing_conflicts(*, source_prompt: str, target_promp
     return conflicts
 
 
+def _replacement_source_prompt_for_target(source_prompt: str, *, source_object: str, target_object: str) -> str:
+    prompt = str(source_prompt).strip()
+    source = _normalized_phrase(source_object)
+    target = str(target_object).strip()
+    if not prompt or not source or not target:
+        return prompt
+    source_regex = re.escape(str(source_object).strip())
+    target_with_article = target if re.match(r"^(?:a|an|the)\s+", target, flags=re.IGNORECASE) else f"a {target}"
+    contact_pattern = re.compile(
+        rf"\b(?P<subject>[^.]*?)\b(?P<verb>sits|sit|sitting|seated)\s+(?P<prep>on|in)\s+"
+        rf"(?:(?:a|an|the)\s+)?{source_regex}\b",
+        flags=re.IGNORECASE,
+    )
+    match = contact_pattern.search(prompt)
+    if match:
+        subject = match.group("subject").strip()
+        subject = re.sub(r"\b(?:is|are|was|were)$", "", subject, flags=re.IGNORECASE).strip()
+        subject = subject if subject else "The subject"
+        replacement = f"{subject} is seated on {target_with_article}"
+        return (prompt[: match.start()] + replacement + prompt[match.end() :]).strip()
+    return re.sub(source_regex, target, prompt, count=1, flags=re.IGNORECASE).strip()
+
+
 def _video_edit_target_prompt(
     *,
     source_prompt: str,
@@ -9443,6 +9539,11 @@ def _video_edit_target_prompt(
     from_value = _video_edit_source_object(difference, edit_text)
     if _is_existing_object_replacement(difference, edit_text):
         target = _video_edit_target_object(difference, edit_text)
+        base_prompt = _replacement_source_prompt_for_target(
+            source_prompt,
+            source_object=from_value,
+            target_object=target,
+        )
         edit_clause = (
             f"Replace only the {from_value} with {target}. "
             f"The same shot shows {target} in the original {from_value} location; no {from_value} is visible."
@@ -9476,7 +9577,7 @@ def _video_edit_target_prompt(
         edit_clause = f"Change only the audio event: {edit_text}."
     else:
         edit_clause = f"Apply only this edit: {edit_text}."
-    return f"{source_prompt} {edit_clause}".strip()
+    return f"{base_prompt if _is_existing_object_replacement(difference, edit_text) else source_prompt} {edit_clause}".strip()
 
 
 def _video_edit_preserve_tokens(
@@ -9724,6 +9825,117 @@ def _reference_has_seated_support_conflict(annotation: dict[str, Any], source_ob
     return any(marker in text for marker in ("sit", "sits", "sitting", "seated", "seat", "sits in", "sits on"))
 
 
+def _target_instance_allows_support_edit(target_instance_description: str) -> bool:
+    text = _normalized_phrase(target_instance_description)
+    if not text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "empty",
+            "far right",
+            "far left",
+            "no one sitting",
+            "not occupied",
+            "unoccupied",
+            "unused",
+            "without anyone",
+        )
+    )
+
+
+def _reference_has_multiple_visible_instances(annotation: dict[str, Any], source_object: str) -> bool:
+    source_key = _normalized_phrase(source_object)
+    if not source_key:
+        return False
+    source_tokens = set(TOKEN_PATTERN.findall(source_key))
+    if not source_tokens & VACE_GENERIC_MULTI_INSTANCE_MASK_OBJECTS:
+        return False
+    counts = _normalize_object_counts(annotation.get("object_counts", {}))
+    for raw_name, count in counts.items():
+        if count > 1 and (
+            _normalized_phrase(raw_name) == source_key
+            or _text_mentions_phrase(raw_name, source_object)
+            or _text_mentions_phrase(source_object, raw_name)
+        ):
+            return True
+    text = _normalized_phrase(
+        " ".join(
+            [
+                str(annotation.get("summary", "")),
+                str(annotation.get("scene", "")),
+                " ".join(_normalize_list(annotation.get("subjects", []))),
+            ]
+        )
+    )
+    plural_markers = {f"{token}s" for token in source_tokens} | {f"{token}es" for token in source_tokens}
+    if source_key.endswith("y"):
+        plural_markers.add(source_key[:-1] + "ies")
+    return any(marker in text for marker in plural_markers)
+
+
+def _target_prompt_conflicts_with_replacement_source_state(target_prompt: str, source_object: str) -> bool:
+    source_key = _normalized_phrase(source_object)
+    if not source_key or not _target_prompt_contract_mentions_absence(target_prompt, source_object):
+        return False
+    text = _normalized_phrase(target_prompt)
+    state_patterns = [
+        f"sitting on {source_key}",
+        f"sitting in {source_key}",
+        f"sits on {source_key}",
+        f"sits in {source_key}",
+        f"seated on {source_key}",
+        f"seated in {source_key}",
+        f"standing on {source_key}",
+        f"lying on {source_key}",
+    ]
+    articles = ("a", "an", "the")
+    state_patterns.extend(
+        f"{prefix} {article} {source_key}"
+        for prefix in (
+            "sitting on",
+            "sitting in",
+            "sits on",
+            "sits in",
+            "seated on",
+            "seated in",
+            "standing on",
+            "lying on",
+        )
+        for article in articles
+    )
+    return any(pattern in text for pattern in state_patterns)
+
+
+def _webvid_style_edit_lint_errors(
+    *,
+    source_prompt: str,
+    target_prompt: str,
+    edit_text: str,
+    difference: dict[str, Any],
+) -> list[str]:
+    text = _normalized_phrase(
+        " ".join(
+            [
+                source_prompt,
+                target_prompt,
+                edit_text,
+                str(difference.get("from", "")),
+                str(difference.get("to", "")),
+                str(difference.get("description", "")),
+            ]
+        )
+    )
+    errors: list[str] = []
+    if any(marker in text for marker in VACE_TEXT_OR_LOGO_EDIT_MARKERS):
+        errors.append("visible_text_or_logo_edit")
+    if any(marker in text for marker in VACE_BROAD_SCENE_EDIT_MARKERS):
+        errors.append("broad_scene_or_subject_replacement")
+    if "shutterstock" in text or "stock clip" in text:
+        errors.append("loose_stock_pair_not_vace_editable")
+    return errors
+
+
 def _video_edit_plan_lint(
     *,
     source_prompt: str,
@@ -9734,6 +9946,8 @@ def _video_edit_plan_lint(
     preserve_tokens: list[str],
     negative_prompt: str,
     reference_annotation: dict[str, Any],
+    mask_query: str = "",
+    target_instance_description: str = "",
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -9747,6 +9961,11 @@ def _video_edit_plan_lint(
         errors.append("target_prompt_contains_add_only_no")
     if _is_existing_object_replacement(difference, edit_text) and "add only" in target_key:
         errors.append("replacement_target_prompt_uses_add_instead_of_replace")
+    if _is_existing_object_replacement(difference, edit_text) and _target_prompt_conflicts_with_replacement_source_state(
+        target_prompt,
+        source_object,
+    ):
+        errors.append("replacement_target_prompt_conflicts_with_source_state")
     if source_key and (source_key in preserve_keys or any(source_key == key for key in preserve_keys)):
         errors.append("preserve_tokens_lock_edit_source")
     if source_key and source_key in negative_key:
@@ -9784,8 +10003,27 @@ def _video_edit_plan_lint(
                 warnings.append("edit_source_not_clearly_present_in_annotation")
     if _is_existing_object_replacement(difference, edit_text) and _reference_has_screen_text_risk(reference_annotation, source_object):
         errors.append("object_replacement_screen_or_visible_text_risk")
+    if _is_existing_object_replacement(difference, edit_text) and _reference_has_seated_support_conflict(reference_annotation, source_object):
+        if not _target_instance_allows_support_edit(target_instance_description):
+            errors.append("object_replacement_breaks_support_contact")
     if _is_object_removal(difference, edit_text) and _reference_has_seated_support_conflict(reference_annotation, source_object):
         errors.append("object_removal_breaks_seated_support")
+    if (
+        (_is_existing_object_replacement(difference, edit_text) or _is_object_removal(difference, edit_text))
+        and source_object
+        and _normalized_phrase(mask_query) == _normalized_phrase(source_object)
+        and _reference_has_multiple_visible_instances(reference_annotation, source_object)
+        and not str(target_instance_description).strip()
+    ):
+        errors.append("ambiguous_multi_instance_mask_query")
+    errors.extend(
+        _webvid_style_edit_lint_errors(
+            source_prompt=source_prompt,
+            target_prompt=target_prompt,
+            edit_text=edit_text,
+            difference=difference,
+        )
+    )
 
     return {
         "passed": not errors,
@@ -10313,6 +10551,20 @@ def _known_pair_generation_issues(record: dict[str, Any]) -> list[str]:
     )
     if structural_clothing_reason and route == "vace_controlled":
         issues.append("structural clothing edit requires try-on route instead of vace_controlled")
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    edit_text = str(record.get("edit_text", "")).strip()
+    source_object = _video_edit_source_object(difference, edit_text)
+    if route == "vace_controlled" and _is_existing_object_replacement(difference, edit_text):
+        if _target_prompt_conflicts_with_replacement_source_state(
+            str(generation.get("target_prompt", "")).strip(),
+            source_object,
+        ):
+            issues.append("replacement target prompt conflicts with source object state")
+        if _reference_has_seated_support_conflict(
+            {"summary": str(generation.get("source_prompt", "")).strip(), "actions": []},
+            source_object,
+        ) and not _target_instance_allows_support_edit(str(generation.get("target_instance_description", "")).strip()):
+            issues.append("support-contact object replacement requires a non-VACE route or explicit unoccupied target instance")
     if route == "vace_controlled":
         if not str(generation.get("src_video_for_vace", "")).strip():
             issues.append("generation.src_video_for_vace is required for vace_controlled pairs")
@@ -10321,6 +10573,12 @@ def _known_pair_generation_issues(record: dict[str, Any]) -> list[str]:
         mask_metrics = generation.get("mask_metrics")
         if not isinstance(mask_metrics, dict) or not mask_metrics:
             issues.append("generation.mask_metrics is required for vace_controlled pairs")
+        target_instance_description = str(generation.get("target_instance_description", "")).strip()
+        mask_alignment = generation.get("mask_target_instance_alignment")
+        if target_instance_description and not (
+            isinstance(mask_alignment, dict) and _boolish(mask_alignment.get("passed"))
+        ):
+            issues.append("generation.mask_target_instance_alignment.passed=true is required for target-instance edits")
     return issues
 
 

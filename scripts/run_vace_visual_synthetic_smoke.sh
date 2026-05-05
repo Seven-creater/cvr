@@ -266,6 +266,9 @@ def visual_prompt_errors(plan):
     difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
     edit_text = normalize_phrase(plan.get("edit_text", ""))
     target_text = normalize_phrase(plan.get("target_prompt", ""))
+    source_text = normalize_phrase(plan.get("source_prompt", ""))
+    source_object = normalize_phrase(str(difference.get("from", "")))
+    target_instance = normalize_phrase(plan.get("target_instance_description", ""))
     errors = []
     if "add only no" in target_text:
         errors.append("target_prompt_contains_add_only_no")
@@ -273,6 +276,29 @@ def visual_prompt_errors(plan):
         errors.append("replacement_target_prompt_uses_add_instead_of_replace")
     if str(difference.get("type", "")).strip() == "object_presence" and "replace" in edit_text and "replace" not in target_text:
         errors.append("replacement_target_prompt_missing_replace")
+    absence_mentions = source_object and (f"no {source_object}" in target_text or f"without {source_object}" in target_text)
+    source_state_patterns = []
+    for prefix in ("sitting on", "sitting in", "sits on", "sits in", "seated on", "seated in", "standing on"):
+        source_state_patterns.append(f"{prefix} {source_object}")
+        for article in ("a", "an", "the"):
+            source_state_patterns.append(f"{prefix} {article} {source_object}")
+    if "replace" in edit_text and absence_mentions and any(pattern in target_text for pattern in source_state_patterns):
+        errors.append("replacement_target_prompt_conflicts_with_source_state")
+    seated_support_objects = {"bench", "chair", "seat", "sofa", "stool"}
+    support_contact = source_object in seated_support_objects and any(
+        marker in source_text
+        for marker in ("sit", "sits", "sitting", "seated", "seat", "sits in", "sits on")
+    )
+    target_instance_safe = any(
+        marker in target_instance
+        for marker in ("empty", "far right", "far left", "no one sitting", "not occupied", "unoccupied", "unused")
+    )
+    if "replace" in edit_text and support_contact and not target_instance_safe:
+        errors.append("object_replacement_breaks_support_contact")
+    plan_lint = plan.get("plan_lint", {}) if isinstance(plan.get("plan_lint"), dict) else {}
+    for error in plan_lint.get("errors", []) if isinstance(plan_lint.get("errors", []), list) else []:
+        if str(error).strip() and str(error).strip() not in errors:
+            errors.append(str(error).strip())
     return errors
 
 rows = [json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -393,6 +419,7 @@ known_pair = {
         "negative_prompt": negative_prompt,
         "edit_region": edit_region,
         "mask_query": str(plan.get("mask_query", "")).strip(),
+        "target_instance_description": str(plan.get("target_instance_description", "")).strip(),
         "src_mask": src_mask,
         "original_src_mask": src_mask_original,
         "src_ref_images": src_ref_images,
@@ -996,6 +1023,11 @@ known_pairs_path.write_text(
 if not passed:
     raise SystemExit("post-VACE duration gate failed: " + "; ".join(metrics["duration_gate"]["errors"]))
 PY
+
+ffmpeg -y -i "$RAW_VIDEO" -vf "fps=1,scale=240:-1,tile=5x1" -frames:v 1 \
+  "$OUT_ROOT/review_inputs/raw_target_contact.jpg" > "$OUT_ROOT/logs/contact_raw_target.log" 2>&1 || true
+ffmpeg -y -i "$TARGET_VIDEO" -vf "fps=1,scale=240:-1,tile=5x1" -frames:v 1 \
+  "$OUT_ROOT/review_inputs/target_contact.jpg" > "$OUT_ROOT/logs/contact_target.log" 2>&1 || true
 
 cp "$OUT_ROOT/metadata/preflight_report.json" "$OUT_ROOT/review_inputs/preflight_report.json" 2>/dev/null || true
 cp "$OUT_ROOT/metadata/duration_metrics.json" "$OUT_ROOT/review_inputs/duration_metrics.json" 2>/dev/null || true
