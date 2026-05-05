@@ -243,6 +243,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("min_detected_keyframe_box_coverage", helper)
         self.assertIn("protected_overlap_queries", helper)
         self.assertIn("protected_overlap_ratio_max", helper)
+        self.assertIn("min_protected_detections", helper)
 
     def test_grounded_sam2_mask_gate_rejects_low_replacement_coverage(self) -> None:
         errors = _mask_gate_errors(
@@ -292,6 +293,29 @@ class ScriptTests(unittest.TestCase):
         )
 
         self.assertTrue(any("protected_overlap_ratio" in error for error in errors))
+
+    def test_grounded_sam2_mask_gate_rejects_missing_protected_detections_for_clothing(self) -> None:
+        errors = _mask_gate_errors(
+            {
+                "min_coverage_ratio": 0.03,
+                "max_coverage_ratio": 0.30,
+                "min_protected_detections": 2,
+            },
+            {
+                "mask_coverage_ratio_avg": 0.12,
+                "mask_temporal_stability": 0.95,
+                "mask_nonempty_frame_ratio": 1.0,
+                "protected_overlap": [{"query": "face", "status": "detected", "overlap_ratio": 0.02}],
+            },
+        )
+
+        self.assertTrue(any("protected_detection_count" in error for error in errors))
+
+    def test_vace_smoke_script_lints_clothing_prompt_conflicts(self) -> None:
+        script = Path("scripts/run_vace_visual_synthetic_smoke.sh").read_text(encoding="utf-8")
+
+        self.assertIn("target_prompt_uses_operation_instruction_for_clothing_edit", script)
+        self.assertIn("target_prompt_preserves_source_clothing", script)
 
     def test_prepare_grounded_sam2_env_script_installs_expected_packages(self) -> None:
         script = Path("scripts/prepare_grounded_sam2_env.sh").read_text(encoding="utf-8")

@@ -4571,6 +4571,61 @@ class ComposedDataTests(unittest.TestCase):
             self.assertNotIn("cup", plans[0]["negative_prompt"].lower())
             self.assertTrue(plans[0]["plan_lint"]["passed"])
 
+    def test_plan_video_edits_rewrites_clothing_prompt_without_source_clothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "musician_ref",
+                        "output_path": "clips/musician_ref.mp4",
+                        "summary": "a man in a blue fedora and patterned shirt plays a ukulele",
+                        "subjects": ["man"],
+                        "object_counts": {"man": 1, "ukulele": 1, "microphone": 1},
+                        "actions": ["playing ukulele"],
+                        "scene": "brick wall",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "black_jacket",
+                        "reference_video": "clips/musician_ref.mp4",
+                        "edit_text": "change the outfit into a black jacket",
+                        "difference": {
+                            "type": "attribute",
+                            "from": "original outfit",
+                            "to": "black jacket",
+                        },
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertIn("black jacket", plans[0]["target_prompt"])
+            self.assertIn("blue fedora", plans[0]["target_prompt"])
+            self.assertNotIn("patterned shirt", plans[0]["target_prompt"])
+            self.assertNotIn("Change only", plans[0]["target_prompt"])
+            self.assertTrue(plans[0]["plan_lint"]["passed"])
+
     def test_plan_video_edits_rejects_screen_text_object_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

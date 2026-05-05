@@ -169,6 +169,70 @@ def resolve_existing_path(raw_path, base_dirs):
             return candidate
     return candidates[0]
 
+def normalize_phrase(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+def clothing_phrases(text):
+    pattern = re.compile(
+        r"\b(?:(?:a|an|the)\s+)?(?:(?:[a-z][a-z-]*)\s+){0,4}"
+        r"(?:clothing|outfit|shirt|jacket|coat|dress|hoodie|sweater|vest)\b",
+        flags=re.IGNORECASE,
+    )
+    phrases = []
+    seen = set()
+    for match in pattern.finditer(str(text)):
+        phrase = match.group(0).strip(" .,;:")
+        if " and " in phrase.lower():
+            phrase = re.split(r"\s+and\s+", phrase, flags=re.IGNORECASE)[-1].strip()
+        phrase = re.sub(r"^(?:a|an|the)\s+", "", phrase, flags=re.IGNORECASE).strip()
+        key = normalize_phrase(phrase)
+        if key and key not in seen:
+            phrases.append(phrase)
+            seen.add(key)
+    return phrases
+
+def target_object(plan):
+    difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
+    to_value = str(difference.get("to", "")).strip()
+    if to_value and normalize_phrase(to_value) not in {"no", "none", "nothing", "absent"}:
+        return to_value
+    edit_text = str(plan.get("edit_text", "")).strip()
+    match = re.search(r"\bwith\s+(?:a\s+|an\s+|the\s+)?(.+?)(?:\.|$)", edit_text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return str(plan.get("edit_token", "")).strip()
+
+def clothing_prompt_errors(plan):
+    difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
+    if str(difference.get("type", "")).strip() != "attribute":
+        return []
+    combined = normalize_phrase(
+        " ".join(
+            [
+                str(plan.get("edit_text", "")),
+                str(plan.get("edit_token", "")),
+                str(difference.get("from", "")),
+                str(difference.get("to", "")),
+                str(difference.get("description", "")),
+            ]
+        )
+    )
+    clothing_markers = {"clothing", "outfit", "shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest"}
+    if not any(marker in combined.split() for marker in clothing_markers):
+        return []
+    source_prompt = str(plan.get("source_prompt", "")).strip()
+    target_prompt = str(plan.get("target_prompt", "")).strip()
+    target_key = normalize_phrase(target_object(plan))
+    target_text = normalize_phrase(target_prompt)
+    errors = []
+    if "change only" in target_text:
+        errors.append("target_prompt_uses_operation_instruction_for_clothing_edit")
+    for source_clothing in clothing_phrases(source_prompt):
+        source_key = normalize_phrase(source_clothing)
+        if source_key and source_key != target_key and source_key in target_text:
+            errors.append(f"target_prompt_preserves_source_clothing:{source_clothing}")
+    return errors
+
 rows = [json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 if not rows:
     raise SystemExit(f"empty video edit plan: {plan_path}")
@@ -255,6 +319,9 @@ edit_region = str(plan.get("edit_region", "")).strip()
 preserve_tokens = [str(item).strip() for item in plan.get("preserve_tokens", []) if str(item).strip()]
 if not target_prompt:
     raise SystemExit("selected plan has empty target_prompt")
+prompt_errors = clothing_prompt_errors(plan)
+if prompt_errors:
+    raise SystemExit("selected plan failed target prompt lint: " + "; ".join(prompt_errors))
 prompt = target_prompt
 
 selected_plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")

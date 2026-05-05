@@ -157,6 +157,20 @@ def _mask_gate_errors(mask_gate: dict[str, Any], metrics: dict[str, Any]) -> lis
                 errors.append(
                     f"protected_overlap_ratio {protected_overlap_float:.4f} > max {max_protected_overlap_float:.4f}"
                 )
+    min_protected_detections = int(mask_gate.get("min_protected_detections", 0) or 0)
+    if min_protected_detections > 0:
+        protected_details = metrics.get("protected_overlap", [])
+        if not isinstance(protected_details, list):
+            protected_details = []
+        detected_count = sum(
+            1
+            for item in protected_details
+            if isinstance(item, dict) and str(item.get("status", "")).strip() == "detected"
+        )
+        if detected_count < min_protected_detections:
+            errors.append(
+                f"protected_detection_count {detected_count} < min {min_protected_detections}"
+            )
     return errors
 
 

@@ -233,6 +233,19 @@ VACE_SCREEN_TEXT_OBJECTS = {
     "tv",
 }
 VACE_SEATED_SUPPORT_OBJECTS = {"bench", "chair", "seat", "sofa", "stool"}
+VACE_CLOTHING_OBJECT_MARKERS = {
+    "clothing",
+    "outfit",
+    "shirt",
+    "jacket",
+    "coat",
+    "dress",
+    "hoodie",
+    "sweater",
+    "vest",
+    "pants",
+    "skirt",
+}
 INTRACLIP_CHANGE_MARKERS = (
     "change from",
     "changes from",
@@ -1860,6 +1873,7 @@ def plan_video_edits(
             source_prompt=source_prompt,
             edit_text=edit_text,
             difference=difference,
+            edit_token=edit_token,
         )
         preserve_tokens = _video_edit_preserve_tokens(reference_annotation, difference, edit_token)
         negative_prompt = _video_edit_negative_prompt(preserve_tokens, risk=risk)
@@ -2038,9 +2052,11 @@ def plan_video_edits(
             planner_metadata["repaired_fields"] = sorted(set(repaired_fields))
             planner_metadata["post_lint_repaired"] = True
         plan_lint = _video_edit_plan_lint(
+            source_prompt=source_prompt,
             target_prompt=target_prompt,
             edit_text=edit_text,
             difference=difference,
+            edit_token=edit_token,
             preserve_tokens=preserve_tokens,
             negative_prompt=negative_prompt,
             reference_annotation=reference_annotation,
@@ -8472,6 +8488,7 @@ def _video_mask_gate_defaults(*, mask_mode: str = "", mask_query: str = "") -> d
     if protected_queries:
         gate["protected_overlap_queries"] = protected_queries
         gate["max_protected_overlap_ratio"] = max_protected_overlap
+        gate["min_protected_detections"] = 2
         gate["require_protected_overlap_metrics"] = True
     return gate
 
@@ -8667,8 +8684,8 @@ def _src_ref_image_prompts(*, requirement: dict[str, Any], edit_plan: dict[str, 
         ]
     if role == "clothing_reference":
         return [
-            f"a clean upper-body clothing reference photo of {target} worn by a standing performer, full sleeves visible, natural arm openings, front three-quarter view, no face, no text, no logo",
-            f"{target}, wearable jacket or shirt reference for a standing musician, clear full sleeves and torso shape, neutral background, no watermark",
+            f"a realistic cropped upper-body photo of a person wearing {target}, full sleeves visible, arms slightly bent as if holding a small instrument, front three-quarter view, no face, no text, no logo",
+            f"a standing musician torso wearing {target}, natural human shoulder and sleeve fit, arms visible, neutral background, no product catalog layout, no watermark",
         ]
     return [
         f"a realistic {target}, isolated product reference, three-quarter view, plain white background, no hands, no people, no text, no logo",
@@ -8684,7 +8701,7 @@ def _src_ref_image_negative_prompt(requirement: dict[str, Any]) -> str:
     if role == "background_reference":
         return f"people, foreground subject, readable signs, {base}"
     if role == "clothing_reference":
-        return f"face, full person identity, body pose, readable brand logo, {base}"
+        return f"flat lay, hanger, empty jacket, ghost mannequin, product catalog, face, full person identity, readable brand logo, {base}"
     return base
 
 
@@ -8990,7 +9007,99 @@ def _filter_video_edit_preserve_tokens(
     return filtered
 
 
-def _video_edit_target_prompt(*, source_prompt: str, edit_text: str, difference: dict[str, Any]) -> str:
+def _indefinite_article_for_phrase(phrase: str) -> str:
+    key = _normalized_phrase(phrase)
+    if not key:
+        return "a"
+    return "an" if key[0] in {"a", "e", "i", "o", "u"} else "a"
+
+
+def _article_clothing_phrase(phrase: str) -> str:
+    value = str(phrase).strip()
+    key = _normalized_phrase(value)
+    if not value or key.startswith(("a ", "an ", "the ")):
+        return value
+    if key.endswith("clothing"):
+        return value
+    return f"{_indefinite_article_for_phrase(value)} {value}"
+
+
+def _is_clothing_edit(difference: dict[str, Any], edit_text: str = "", edit_token: str = "") -> bool:
+    difference_type = str(difference.get("type", "")).strip()
+    if difference_type != "attribute":
+        return False
+    target = _normalized_phrase(_video_edit_target_object(difference, edit_text, edit_token))
+    combined = _normalized_phrase(
+        " ".join(
+            [
+                str(edit_text),
+                str(edit_token),
+                str(difference.get("from", "")),
+                str(difference.get("to", "")),
+                str(difference.get("description", "")),
+            ]
+        )
+    )
+    return any(marker in target.split() for marker in VACE_CLOTHING_OBJECT_MARKERS) or any(
+        marker in combined for marker in ("outfit", "clothing", "shirt", "jacket", "coat", "dress", "hoodie", "sweater")
+    )
+
+
+def _source_clothing_phrases(text: str) -> list[str]:
+    pattern = re.compile(
+        r"\b(?:(?:a|an|the)\s+)?(?:(?:[a-z][a-z-]*)\s+){0,4}"
+        r"(?:clothing|outfit|shirt|jacket|coat|dress|hoodie|sweater|vest)\b",
+        flags=re.IGNORECASE,
+    )
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for match in pattern.finditer(str(text)):
+        phrase = match.group(0).strip(" .,;:")
+        if " and " in phrase.lower():
+            phrase = re.split(r"\s+and\s+", phrase, flags=re.IGNORECASE)[-1].strip()
+        phrase = re.sub(r"^(?:a|an|the)\s+", "", phrase, flags=re.IGNORECASE).strip()
+        key = _normalized_phrase(phrase)
+        if not key or key in seen:
+            continue
+        phrases.append(phrase)
+        seen.add(key)
+    return phrases
+
+
+def _clothing_target_prompt(*, source_prompt: str, edit_text: str, difference: dict[str, Any], edit_token: str = "") -> str:
+    target = _video_edit_target_object(difference, edit_text, edit_token) or edit_token or str(difference.get("to", "")).strip()
+    target = target or "target clothing"
+    target_with_article = _article_clothing_phrase(target)
+    prompt = str(source_prompt).strip()
+    for source_clothing in _source_clothing_phrases(prompt):
+        source_key = _normalized_phrase(source_clothing)
+        target_key = _normalized_phrase(target)
+        if source_key and source_key != target_key:
+            prompt = re.sub(re.escape(source_clothing), target_with_article, prompt, count=1, flags=re.IGNORECASE)
+            break
+    if _normalized_phrase(target) not in _normalized_phrase(prompt):
+        prompt = f"{prompt.rstrip('.')} wearing {target_with_article}."
+    return prompt.strip()
+
+
+def _target_prompt_source_clothing_conflicts(*, source_prompt: str, target_prompt: str, target_clothing: str) -> list[str]:
+    target_key = _normalized_phrase(target_clothing)
+    target_text = _normalized_phrase(target_prompt)
+    conflicts: list[str] = []
+    for source_clothing in _source_clothing_phrases(source_prompt):
+        source_key = _normalized_phrase(source_clothing)
+        if source_key and source_key != target_key and source_key in target_text:
+            conflicts.append(source_clothing)
+    return conflicts
+
+
+def _video_edit_target_prompt(
+    *,
+    source_prompt: str,
+    edit_text: str,
+    difference: dict[str, Any],
+    edit_token: str = "",
+) -> str:
     difference_type = str(difference.get("type", "")).strip()
     to_value = str(difference.get("to", "")).strip()
     from_value = _video_edit_source_object(difference, edit_text)
@@ -9009,6 +9118,13 @@ def _video_edit_target_prompt(*, source_prompt: str, edit_text: str, difference:
         edit_clause = f"Add only {to_value}."
     elif difference_type == "object_count" and to_value:
         edit_clause = f"Change only the count to {to_value}."
+    elif _is_clothing_edit(difference, edit_text, edit_token):
+        return _clothing_target_prompt(
+            source_prompt=source_prompt,
+            edit_text=edit_text,
+            difference=difference,
+            edit_token=edit_token,
+        )
     elif difference_type == "attribute":
         edit_clause = f"Change only the specified attribute: {edit_text}."
     elif difference_type == "scene":
@@ -9153,7 +9269,12 @@ def _repair_video_edit_prompt_contract(
     normalized_target = _normalized_phrase(target_prompt)
     if _is_existing_object_replacement(difference, edit_text):
         if "add only" in normalized_target or "replace" not in normalized_target:
-            target_prompt = _video_edit_target_prompt(source_prompt=source_prompt, edit_text=edit_text, difference=difference)
+            target_prompt = _video_edit_target_prompt(
+                source_prompt=source_prompt,
+                edit_text=edit_text,
+                difference=difference,
+                edit_token=edit_token,
+            )
             repairs.append("target_prompt_rewritten_for_object_replacement")
         elif not _target_prompt_contract_mentions_absence(target_prompt, source_object):
             target_prompt = f"{target_prompt.rstrip('.')} No {source_object} is visible."
@@ -9162,11 +9283,33 @@ def _repair_video_edit_prompt_contract(
         if "add only no" in normalized_target or (
             "remove" not in normalized_target and not _target_prompt_contract_mentions_absence(target_prompt, source_object)
         ):
-            target_prompt = _video_edit_target_prompt(source_prompt=source_prompt, edit_text=edit_text, difference=difference)
+            target_prompt = _video_edit_target_prompt(
+                source_prompt=source_prompt,
+                edit_text=edit_text,
+                difference=difference,
+                edit_token=edit_token,
+            )
             repairs.append("target_prompt_rewritten_for_object_removal")
         elif not _target_prompt_contract_mentions_absence(target_prompt, source_object):
             target_prompt = f"{target_prompt.rstrip('.')} No {source_object} is visible."
             repairs.append("target_prompt_added_source_absence")
+    elif _is_clothing_edit(difference, edit_text, edit_token):
+        target_clothing = _video_edit_target_object(difference, edit_text, edit_token) or edit_token
+        if (
+            "change only" in normalized_target
+            or _target_prompt_source_clothing_conflicts(
+                source_prompt=source_prompt,
+                target_prompt=target_prompt,
+                target_clothing=target_clothing,
+            )
+        ):
+            target_prompt = _video_edit_target_prompt(
+                source_prompt=source_prompt,
+                edit_text=edit_text,
+                difference=difference,
+                edit_token=edit_token,
+            )
+            repairs.append("target_prompt_rewritten_for_clothing_edit")
 
     filtered_preserve = _filter_video_edit_preserve_tokens(
         preserve_tokens,
@@ -9238,9 +9381,11 @@ def _reference_has_seated_support_conflict(annotation: dict[str, Any], source_ob
 
 def _video_edit_plan_lint(
     *,
+    source_prompt: str,
     target_prompt: str,
     edit_text: str,
     difference: dict[str, Any],
+    edit_token: str,
     preserve_tokens: list[str],
     negative_prompt: str,
     reference_annotation: dict[str, Any],
@@ -9261,6 +9406,16 @@ def _video_edit_plan_lint(
         errors.append("preserve_tokens_lock_edit_source")
     if source_key and source_key in negative_key:
         errors.append("negative_prompt_locks_edit_source")
+    if _is_clothing_edit(difference, edit_text, edit_token):
+        target_clothing = _video_edit_target_object(difference, edit_text, edit_token) or edit_token
+        if "change only" in target_key:
+            errors.append("clothing_target_prompt_uses_operation_instruction")
+        if _target_prompt_source_clothing_conflicts(
+            source_prompt=source_prompt,
+            target_prompt=target_prompt,
+            target_clothing=target_clothing,
+        ):
+            errors.append("target_prompt_preserves_source_clothing")
 
     if (_is_existing_object_replacement(difference, edit_text) or _is_object_removal(difference, edit_text)) and source_object:
         if not _annotation_mentions_object(reference_annotation, source_object):
