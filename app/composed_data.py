@@ -8911,6 +8911,7 @@ def _src_ref_requirement_for_video_plan(plan: dict[str, Any]) -> dict[str, Any]:
 def _src_ref_image_prompts(*, requirement: dict[str, Any], edit_plan: dict[str, Any]) -> list[str]:
     target = str(requirement.get("target", "")).strip() or "target object"
     role = str(requirement.get("role", "")).strip()
+    source_object = str(requirement.get("source_object", "")).strip()
     if role == "clothing_reference" and _is_black_jacket_target(
         edit_plan.get("difference", {}) if isinstance(edit_plan.get("difference"), dict) else {},
         str(edit_plan.get("edit_text", "")),
@@ -8932,6 +8933,17 @@ def _src_ref_image_prompts(*, requirement: dict[str, Any], edit_plan: dict[str, 
         return [
             f"a realistic cropped upper-body photo of a person wearing {target_with_article}, garment silhouette clearly visible, arms slightly bent as if holding a small instrument, front three-quarter view, no face, no text, no logo",
             f"a standing musician torso wearing {target_with_article}, natural human shoulder fit, arms visible, neutral background, no product catalog layout, no watermark",
+        ]
+    if role == "replacement_object":
+        source_hint = f" matching the viewpoint and scale of a {source_object}" if source_object else ""
+        if _normalized_phrase(source_object) in {"cup", "mug", "glass"} and "bottle" in _normalized_phrase(target):
+            return [
+                f"a realistic small tabletop {target}{source_hint}, upright on a plain studio surface, three-quarter view, cup-sized proportion, no hands, no people, no text, no logo",
+                f"{target}, small bottle reference for replacing a {source_object} on a table, visible side profile and cap, neutral lighting, plain background, no watermark",
+            ]
+        return [
+            f"a realistic {target}, isolated product reference{source_hint}, three-quarter view, plain white background, no hands, no people, no text, no logo",
+            f"{target}, clean object reference image with visible side and top shape, centered, neutral lighting, plain background, perspective suitable to replace a {source_object or 'source object'} in a live-action shot, no watermark",
         ]
     return [
         f"a realistic {target}, isolated product reference, three-quarter view, plain white background, no hands, no people, no text, no logo",

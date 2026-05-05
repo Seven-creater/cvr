@@ -5461,7 +5461,45 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(plans[0]["required"])
             self.assertEqual("replacement_object", plans[0]["src_ref_role"])
             self.assertIn("tablet", plans[0]["image_prompts"][0])
+            self.assertIn("matching the viewpoint and scale of a phone", plans[0]["image_prompts"][0])
             self.assertEqual(1, summary["skipped_reasons"]["src_ref_not_needed"])
+
+    def test_plan_src_ref_images_uses_tabletop_prompt_for_cup_to_bottle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "cup_to_bottle",
+                        "reference_video": "clips/ref.mp4",
+                        "edit_text": "replace the cup with a bottle",
+                        "difference": {"type": "object_presence", "from": "cup", "to": "bottle"},
+                        "model_route": "vace_controlled",
+                        "edit_token": "bottle",
+                        "edit_region": "tabletop object",
+                        "exploration_family": "object_replacement",
+                    }
+                ],
+            )
+
+            summary = plan_src_ref_images(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                image_root=root / "src_ref_images",
+            )
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            self.assertIn("small tabletop bottle", plans[0]["image_prompts"][0])
+            self.assertIn("cup-sized proportion", plans[0]["image_prompts"][0])
+            self.assertIn("replacing a cup on a table", plans[0]["image_prompts"][1])
 
     def test_plan_src_ref_images_sets_16x9_size_for_background_reference(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
