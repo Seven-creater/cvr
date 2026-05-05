@@ -56,6 +56,26 @@ def _find_file(path: Path, patterns: tuple[str, ...]) -> Path:
     raise FileNotFoundError(f"cannot find any of {patterns} under {path}")
 
 
+def _find_grounding_dino_checkpoint(path: Path) -> Path:
+    if path.is_file():
+        if path.suffix == ".safetensors":
+            raise ValueError(
+                f"GroundingDINO load_model uses torch.load and cannot read safetensors checkpoints: {path}"
+            )
+        return path
+    try:
+        return _find_file(path, ("*.pth", "*.pt", "*.bin"))
+    except FileNotFoundError as exc:
+        safetensors = sorted(path.rglob("*.safetensors")) if path.exists() else []
+        if safetensors:
+            raise FileNotFoundError(
+                "GroundingDINO checkpoint directory only contains safetensors files, "
+                "but GroundingDINO load_model expects a torch checkpoint (.pth/.pt/.bin). "
+                f"First safetensors file: {safetensors[0]}"
+            ) from exc
+        raise
+
+
 def _find_dir(path: Path, markers: tuple[str, ...]) -> Path:
     if path.is_dir() and all((path / marker).exists() for marker in markers):
         return path
@@ -846,7 +866,7 @@ def main() -> None:
     grounding_config = Path(args.grounding_dino_config)
     grounding_checkpoint = None
     if args.grounder in {"auto", "groundingdino"}:
-        grounding_checkpoint = _find_file(Path(args.grounding_dino_checkpoint), ("*.pth", "*.pt", "*.safetensors"))
+        grounding_checkpoint = _find_grounding_dino_checkpoint(Path(args.grounding_dino_checkpoint))
     florence_model_dir = None
     if args.grounder in {"auto", "florence2"} and args.florence_model:
         florence_model_dir = _find_dir(Path(args.florence_model), ("config.json",))

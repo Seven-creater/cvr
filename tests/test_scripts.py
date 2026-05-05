@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
 from pathlib import Path
 
-from scripts.generate_grounded_sam2_video_masks import _mask_gate_errors
+from scripts.generate_grounded_sam2_video_masks import _find_grounding_dino_checkpoint, _mask_gate_errors
 
 
 class ScriptTests(unittest.TestCase):
@@ -273,6 +274,16 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("protected_overlap_queries", helper)
         self.assertIn("protected_overlap_ratio_max", helper)
         self.assertIn("min_protected_detections", helper)
+
+    def test_grounding_dino_checkpoint_prefers_torch_bin_over_safetensors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_dir = Path(temp_dir) / "checkpoints"
+            checkpoint_dir.mkdir()
+            (checkpoint_dir / "model.safetensors").write_bytes(b"not a torch checkpoint")
+            expected = checkpoint_dir / "pytorch_model.bin"
+            expected.write_bytes(b"torch checkpoint placeholder")
+
+            self.assertEqual(expected, _find_grounding_dino_checkpoint(checkpoint_dir))
 
     def test_grounded_sam2_mask_gate_rejects_low_replacement_coverage(self) -> None:
         errors = _mask_gate_errors(
