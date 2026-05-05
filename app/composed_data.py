@@ -246,6 +246,29 @@ VACE_CLOTHING_OBJECT_MARKERS = {
     "pants",
     "skirt",
 }
+VACE_BLACK_JACKET_REQUIRED_PHRASE = "open black long-sleeved jacket"
+VACE_BLACK_JACKET_PROMPT = (
+    "A man in a blue fedora wearing an open black long-sleeved jacket over the same black T-shirt "
+    "plays a ukulele and sings into a microphone against the same brick wall."
+)
+VACE_BLACK_JACKET_SRC_REF_TARGET = "open black long-sleeved jacket over a black T-shirt"
+VACE_BLACK_JACKET_FORBIDDEN_PROMPT_MARKERS = {
+    "patterned shirt",
+    "dark shirt",
+    "navy shirt",
+    "polo",
+    "black clothing",
+    "change only",
+}
+VACE_CLOTHING_SRC_REF_ARTIFACT_MARKERS = {
+    "empty jacket",
+    "flat lay",
+    "hanger",
+    "ghost mannequin",
+    "mannequin",
+    "product catalog",
+    "catalog",
+}
 INTRACLIP_CHANGE_MARKERS = (
     "change from",
     "changes from",
@@ -2710,6 +2733,8 @@ def select_src_ref_images(
         selection_limit = max(1, int(max_selected))
         if role == "replacement_object":
             selection_limit = min(selection_limit, 2)
+        if role == "clothing_reference":
+            selection_limit = 1
         selected_audits = eligible_audited[:selection_limit]
         selection_method = "deterministic_src_ref_quality_audit"
         selection_reason = "selected highest-scoring candidate image(s) by deterministic VACE src_ref quality audit"
@@ -3247,6 +3272,10 @@ def validate_known_pairs(
             }
             proposed_count += 1
 
+        record = _apply_post_vace_semantic_verdict(
+            record,
+            target_annotation=target_annotation,
+        )
         record = _prepare_record_for_acceptance(
             record,
             reference_annotation=reference_annotation,
@@ -7376,6 +7405,87 @@ def _reject_record_with_acceptance_issues(record: dict[str, Any], acceptance_iss
     return updated
 
 
+def _semantic_verdict_text(record: dict[str, Any], target_annotation: dict[str, Any]) -> str:
+    verification = record.get("verification", {}) if isinstance(record.get("verification"), dict) else {}
+    chunks: list[str] = [
+        str(record.get("target_caption", "")),
+        str(target_annotation.get("summary", "")),
+        str(target_annotation.get("scene", "")),
+        json.dumps(target_annotation.get("attributes", {}), ensure_ascii=False),
+    ]
+    chunks.extend(_normalize_list(target_annotation.get("subjects", [])))
+    chunks.extend(_normalize_list(target_annotation.get("actions", [])))
+    chunks.extend(_normalize_object_counts(target_annotation.get("object_counts", {})).keys())
+    for section_name in ("caption_delta", "edit_projection", "edit_necessity"):
+        section = verification.get(section_name, {}) if isinstance(verification.get(section_name), dict) else {}
+        chunks.extend(
+            [
+                str(section.get("projected_target_caption", "")),
+                str(section.get("reason", "")),
+                " ".join(_normalize_list(section.get("concrete_differences", []))),
+                " ".join(_normalize_list(section.get("missing_requirements", []))),
+            ]
+        )
+    return _normalized_phrase(" ".join(chunks))
+
+
+def _black_jacket_semantic_errors(record: dict[str, Any], target_annotation: dict[str, Any]) -> list[str]:
+    text = _semantic_verdict_text(record, target_annotation)
+    errors: list[str] = []
+    if not ("black" in text and "jacket" in text):
+        errors.append("target_annotation_missing_black_jacket")
+    if "open" not in text:
+        errors.append("target_annotation_missing_open_jacket_structure")
+    if not any(marker in text for marker in ("long sleeve", "long sleeved", "long sleeves", "sleeves")):
+        errors.append("target_annotation_missing_long_sleeves")
+    for marker in ("dark shirt", "navy shirt", "polo", "patterned shirt"):
+        if marker in text:
+            errors.append(f"target_annotation_forbidden_marker:{marker}")
+    for marker in ("ukulele", "microphone"):
+        if marker not in text:
+            errors.append(f"target_annotation_missing_preserved_object:{marker}")
+    if not any(marker in text for marker in ("man", "person", "face")):
+        errors.append("target_annotation_missing_preserved_subject")
+    if not any(marker in text for marker in ("play", "plays", "playing")):
+        errors.append("target_annotation_missing_preserved_ukulele_action")
+    return errors
+
+
+def _apply_post_vace_semantic_verdict(
+    record: dict[str, Any],
+    *,
+    target_annotation: dict[str, Any],
+) -> dict[str, Any]:
+    generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
+    post_vace_verdict = (
+        generation.get("post_vace_verdict", {}) if isinstance(generation.get("post_vace_verdict"), dict) else {}
+    )
+    if not post_vace_verdict.get("semantic_gate_required"):
+        return record
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    if not _is_black_jacket_target(difference, str(record.get("edit_text", ""))):
+        return record
+
+    errors = _black_jacket_semantic_errors(record, target_annotation)
+    updated = dict(record)
+    updated_generation = dict(generation)
+    updated_verdict = dict(post_vace_verdict)
+    updated_verdict.update(
+        {
+            "semantic_gate_checked_from": "omni_validation_annotation",
+            "semantic_gate_passed": not errors,
+            "semantic_gate_errors": errors,
+        }
+    )
+    if errors:
+        updated_verdict["stage"] = "failed_semantic_gate"
+    else:
+        updated_verdict["stage"] = "passed_semantic_gate"
+    updated_generation["post_vace_verdict"] = updated_verdict
+    updated["generation"] = updated_generation
+    return updated
+
+
 def _pair_record_acceptance_issues(
     *,
     root: Path,
@@ -7515,6 +7625,13 @@ def _synthetic_edit_record_issues(
             drift = _score_float(duration_metrics.get(drift_field))
             if drift > max_drift:
                 issues.append(f"visual synthetic {drift_field} {drift:.3f}s exceeds {max_drift:.3f}s")
+        post_vace_verdict = (
+            generation.get("post_vace_verdict", {}) if isinstance(generation.get("post_vace_verdict"), dict) else {}
+        )
+        if post_vace_verdict.get("semantic_gate_required") and not _boolish(
+            post_vace_verdict.get("semantic_gate_passed")
+        ):
+            issues.append("visual synthetic post-VACE semantic gate has not passed")
     if is_audio_route:
         expected_event = _synthetic_audio_expected_event(record)
         if not expected_event:
@@ -8649,6 +8766,8 @@ def _src_ref_requirement_for_video_plan(plan: dict[str, Any]) -> dict[str, Any]:
             "reason": "background replacement benefits from a clean background reference image",
         }
     if family == "clothing_type" or any(token in edit_text for token in ("shirt", "jacket", "dress", "outfit", "clothing")) and "replace" in edit_text:
+        if _is_black_jacket_target(difference, str(plan.get("edit_text", "")), edit_token):
+            target = VACE_BLACK_JACKET_SRC_REF_TARGET
         return {
             "required": True,
             "recommended": True,
@@ -8679,15 +8798,27 @@ def _src_ref_requirement_for_video_plan(plan: dict[str, Any]) -> dict[str, Any]:
 def _src_ref_image_prompts(*, requirement: dict[str, Any], edit_plan: dict[str, Any]) -> list[str]:
     target = str(requirement.get("target", "")).strip() or "target object"
     role = str(requirement.get("role", "")).strip()
+    if role == "clothing_reference" and _is_black_jacket_target(
+        edit_plan.get("difference", {}) if isinstance(edit_plan.get("difference"), dict) else {},
+        str(edit_plan.get("edit_text", "")),
+        str(edit_plan.get("edit_token", "")),
+    ):
+        target = VACE_BLACK_JACKET_SRC_REF_TARGET
     if role == "background_reference":
         return [
             f"a clean 16:9 horizontal wide reference image of {target}, empty scene plate, natural camera perspective, no people, no text, no watermark",
             f"{target}, 16:9 landscape empty background plate matching a talking-head video perspective, cinematic but realistic lighting, no foreground subject, no readable text",
         ]
     if role == "clothing_reference":
+        target_with_article = _article_clothing_phrase(target)
+        if _normalized_phrase(VACE_BLACK_JACKET_REQUIRED_PHRASE) in _normalized_phrase(target):
+            return [
+                f"cropped upper-body photo of a standing musician wearing {target_with_article}, arms bent as if holding a small instrument, shoulders and full sleeves visible, no face, no text, no logo",
+                f"a realistic human torso wearing {target_with_article}, open jacket front and sleeve structure visible, arms slightly bent, neutral background, no product catalog layout, no watermark",
+            ]
         return [
-            f"a realistic cropped upper-body photo of a person wearing {target}, full sleeves visible, arms slightly bent as if holding a small instrument, front three-quarter view, no face, no text, no logo",
-            f"a standing musician torso wearing {target}, natural human shoulder and sleeve fit, arms visible, neutral background, no product catalog layout, no watermark",
+            f"a realistic cropped upper-body photo of a person wearing {target_with_article}, full sleeves visible, arms slightly bent as if holding a small instrument, front three-quarter view, no face, no text, no logo",
+            f"a standing musician torso wearing {target_with_article}, natural human shoulder and sleeve fit, arms visible, neutral background, no product catalog layout, no watermark",
         ]
     return [
         f"a realistic {target}, isolated product reference, three-quarter view, plain white background, no hands, no people, no text, no logo",
@@ -8755,15 +8886,28 @@ def _audit_src_ref_image_candidate(path: Path, plan: dict[str, Any]) -> dict[str
     if any(token in name_key for token in ("text", "logo", "watermark", "person", "hand", "face")):
         score -= 0.25
         warnings.append("filename suggests a forbidden visual artifact")
+    clothing_artifact_reasons = (
+        ["clothing_src_ref_product_or_empty_jacket_artifact"]
+        if role == "clothing_reference"
+        and any(marker in name_key for marker in VACE_CLOTHING_SRC_REF_ARTIFACT_MARKERS)
+        else []
+    )
+    if clothing_artifact_reasons:
+        score -= 0.50
+        warnings.append("filename suggests an empty/product/mannequin clothing reference")
+    background_reject_reasons = (
+        ["background_src_ref_not_16x9"]
+        if role == "background_reference" and width > 0 and height > 0 and not (1.45 <= width / max(height, 1) <= 1.95)
+        else []
+    )
+    hard_reject_reasons = background_reject_reasons + clothing_artifact_reasons
     return {
         "path": str(path),
         "score": round(max(0.0, min(1.0, score)), 3),
         "width": width,
         "height": height,
-        "eligible": not (role == "background_reference" and width > 0 and height > 0 and not (1.45 <= width / max(height, 1) <= 1.95)),
-        "hard_reject_reasons": ["background_src_ref_not_16x9"]
-        if role == "background_reference" and width > 0 and height > 0 and not (1.45 <= width / max(height, 1) <= 1.95)
-        else [],
+        "eligible": not hard_reject_reasons,
+        "hard_reject_reasons": hard_reject_reasons,
         "reasons": reasons,
         "warnings": warnings,
     }
@@ -9047,6 +9191,38 @@ def _is_clothing_edit(difference: dict[str, Any], edit_text: str = "", edit_toke
     )
 
 
+def _is_black_jacket_target(difference: dict[str, Any], edit_text: str = "", edit_token: str = "") -> bool:
+    text = _normalized_phrase(
+        " ".join(
+            [
+                _video_edit_target_object(difference, edit_text, edit_token),
+                str(edit_text),
+                str(edit_token),
+                str(difference.get("to", "")),
+                str(difference.get("description", "")),
+            ]
+        )
+    )
+    return "black jacket" in text
+
+
+def _black_jacket_target_prompt(source_prompt: str) -> str:
+    source_key = _normalized_phrase(source_prompt)
+    musician_markers = {"blue fedora", "ukulele", "microphone", "brick wall"}
+    if len([marker for marker in musician_markers if marker in source_key]) >= 3:
+        return VACE_BLACK_JACKET_PROMPT
+    prompt = str(source_prompt).strip()
+    target_with_article = _article_clothing_phrase(VACE_BLACK_JACKET_SRC_REF_TARGET)
+    for source_clothing in _source_clothing_phrases(prompt):
+        source_key = _normalized_phrase(source_clothing)
+        if source_key and source_key not in {"black jacket", _normalized_phrase(VACE_BLACK_JACKET_SRC_REF_TARGET)}:
+            prompt = re.sub(re.escape(source_clothing), target_with_article, prompt, count=1, flags=re.IGNORECASE)
+            break
+    if _normalized_phrase(VACE_BLACK_JACKET_REQUIRED_PHRASE) not in _normalized_phrase(prompt):
+        prompt = f"{prompt.rstrip('.')} wearing {target_with_article}."
+    return prompt.strip()
+
+
 def _source_clothing_phrases(text: str) -> list[str]:
     pattern = re.compile(
         r"\b(?:(?:a|an|the)\s+)?(?:(?:[a-z][a-z-]*)\s+){0,4}"
@@ -9069,6 +9245,8 @@ def _source_clothing_phrases(text: str) -> list[str]:
 
 
 def _clothing_target_prompt(*, source_prompt: str, edit_text: str, difference: dict[str, Any], edit_token: str = "") -> str:
+    if _is_black_jacket_target(difference, edit_text, edit_token):
+        return _black_jacket_target_prompt(source_prompt)
     target = _video_edit_target_object(difference, edit_text, edit_token) or edit_token or str(difference.get("to", "")).strip()
     target = target or "target clothing"
     target_with_article = _article_clothing_phrase(target)
@@ -9299,6 +9477,13 @@ def _repair_video_edit_prompt_contract(
         target_clothing = _video_edit_target_object(difference, edit_text, edit_token) or edit_token
         if (
             "change only" in normalized_target
+            or (
+                _is_black_jacket_target(difference, edit_text, edit_token)
+                and (
+                    _normalized_phrase(VACE_BLACK_JACKET_REQUIRED_PHRASE) not in normalized_target
+                    or any(marker in normalized_target for marker in VACE_BLACK_JACKET_FORBIDDEN_PROMPT_MARKERS)
+                )
+            )
             or _target_prompt_source_clothing_conflicts(
                 source_prompt=source_prompt,
                 target_prompt=target_prompt,
@@ -9418,6 +9603,12 @@ def _video_edit_plan_lint(
             target_clothing=target_clothing,
         ):
             errors.append("target_prompt_preserves_source_clothing")
+        if _is_black_jacket_target(difference, edit_text, edit_token):
+            if _normalized_phrase(VACE_BLACK_JACKET_REQUIRED_PHRASE) not in target_key:
+                errors.append("black_jacket_target_prompt_missing_open_black_long_sleeved_jacket")
+            for marker in sorted(VACE_BLACK_JACKET_FORBIDDEN_PROMPT_MARKERS):
+                if marker in target_key:
+                    errors.append(f"black_jacket_target_prompt_forbidden_marker:{marker}")
 
     if (_is_existing_object_replacement(difference, edit_text) or _is_object_removal(difference, edit_text)) and source_object:
         if not _annotation_mentions_object(reference_annotation, source_object):

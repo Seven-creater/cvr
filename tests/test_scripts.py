@@ -316,6 +316,9 @@ class ScriptTests(unittest.TestCase):
 
         self.assertIn("target_prompt_uses_operation_instruction_for_clothing_edit", script)
         self.assertIn("target_prompt_preserves_source_clothing", script)
+        self.assertIn("black_jacket_target_prompt_missing_open_black_long_sleeved_jacket", script)
+        self.assertIn("black_jacket_target_prompt_forbidden_marker", script)
+        self.assertIn("semantic_gate_required", script)
 
     def test_prepare_grounded_sam2_env_script_installs_expected_packages(self) -> None:
         script = Path("scripts/prepare_grounded_sam2_env.sh").read_text(encoding="utf-8")

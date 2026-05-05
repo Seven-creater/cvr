@@ -231,6 +231,12 @@ def clothing_prompt_errors(plan):
         source_key = normalize_phrase(source_clothing)
         if source_key and source_key != target_key and source_key in target_text:
             errors.append(f"target_prompt_preserves_source_clothing:{source_clothing}")
+    if "black jacket" in combined:
+        if "open black long sleeved jacket" not in target_text:
+            errors.append("black_jacket_target_prompt_missing_open_black_long_sleeved_jacket")
+        for marker in ("patterned shirt", "dark shirt", "navy shirt", "polo", "black clothing", "change only"):
+            if marker in target_text:
+                errors.append(f"black_jacket_target_prompt_forbidden_marker:{marker}")
     return errors
 
 rows = [json.loads(line) for line in plan_path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -721,6 +727,7 @@ fi
 
 python3 - "$REFERENCE_VIDEO" "$RAW_VIDEO" "$VACE_DURATION_DRIFT_MAX" "$FRAME_NUM" "$VACE_SOURCE_FPS" <<'PY'
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -803,6 +810,9 @@ max_drift = float(sys.argv[5])
 known_pairs_path = Path(sys.argv[6])
 expected_frame_num = int(sys.argv[7])
 expected_fps = float(sys.argv[8])
+
+def normalize_phrase(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(value).lower()))
 
 def parse_fraction(value: str) -> float:
     if "/" in value:
@@ -908,11 +918,40 @@ for pair in pairs:
     generation = pair.setdefault("generation", {})
     generation["duration_metrics"] = metrics
     generation["vace_command"] = command
-    generation["post_vace_verdict"] = {
+    verdict = {
         "stage": "post_vace_pre_omni_validation",
         "duration_gate_passed": passed,
         "requires_omni_validation": True,
     }
+    difference = pair.get("difference", {}) if isinstance(pair.get("difference"), dict) else {}
+    semantic_text = normalize_phrase(
+        " ".join(
+            [
+                str(pair.get("edit_text", "")),
+                str(difference.get("from", "")),
+                str(difference.get("to", "")),
+                str(difference.get("description", "")),
+            ]
+        )
+    )
+    if "black jacket" in semantic_text:
+        verdict.update(
+            {
+                "semantic_gate_required": True,
+                "semantic_gate_passed": False,
+                "semantic_requirements": [
+                    "target must show an open black long-sleeved jacket",
+                    "target must not be a dark shirt, navy shirt, polo, or patterned shirt",
+                    "face, hands, ukulele, microphone, action, audio, and duration must remain aligned with the reference",
+                ],
+                "required_omni_questions": [
+                    "Does the target clearly show an open black long-sleeved jacket?",
+                    "Is the result not merely a dark shirt/navy shirt/polo?",
+                    "Are face, hands, ukulele, microphone, action, and audio preserved?",
+                ],
+            }
+        )
+    generation["post_vace_verdict"] = verdict
 known_pairs_path.write_text(
     "".join(json.dumps(pair, ensure_ascii=False) + "\n" for pair in pairs),
     encoding="utf-8",
