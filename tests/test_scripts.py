@@ -186,6 +186,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("mask manifest query does not match current plan", script)
         self.assertIn("background inverse mask appears to edit the subject", script)
         self.assertIn("low_contrast_dark_clothing_color_edit", script)
+        self.assertIn("multi_subject_background_mask_route_unsupported", script)
         self.assertIn("return \"torso clothing\"", script)
         self.assertIn("src_video_contact.jpg", script)
         self.assertIn("post_vace_verdict.json", script)

@@ -236,6 +236,33 @@ def low_contrast_dark_clothing_edit(plan):
         and any(marker in target for marker in VACE_DARK_COLOR_MARKERS)
     )
 
+def multiple_foreground_subjects(plan):
+    annotation = plan.get("reference_understanding") if isinstance(plan.get("reference_understanding"), dict) else {}
+    subject_terms = set()
+    for value in normalize_list(annotation.get("main_subjects", [])) + normalize_list(annotation.get("subjects", [])):
+        key = normalize_phrase(value)
+        if key and any(token in key.split() for token in ("man", "woman", "person", "girl", "boy")):
+            subject_terms.add(key)
+    if len(subject_terms) > 1:
+        return True
+    counts = annotation.get("object_counts", {})
+    if isinstance(counts, dict):
+        for name, count in counts.items():
+            try:
+                count_value = int(count)
+            except (TypeError, ValueError):
+                count_value = 0
+            key = normalize_phrase(name)
+            if count_value > 1 and any(token in key.split() for token in ("man", "woman", "person", "girl", "boy")):
+                return True
+    stable_scene_raw = str(annotation.get("stable_scene", ""))
+    stable_scene = normalize_phrase(stable_scene_raw)
+    return " and " in stable_scene_raw.lower() and sum(
+        1
+        for marker in ("room", "studio", "wall", "background", "scene")
+        if marker in stable_scene
+    ) >= 2
+
 def foreground_mask_query_from_annotation(annotation):
     candidates = []
     if isinstance(annotation, dict):
@@ -443,6 +470,8 @@ if route != "vace_controlled":
     raise SystemExit(f"selected plan route must be vace_controlled for this smoke, got {route!r}")
 if low_contrast_dark_clothing_edit(plan):
     raise SystemExit("selected plan failed maskability lint: low_contrast_dark_clothing_color_edit")
+if expected_mask_mode(plan, expected_mask_query(plan, str(plan.get("mask_query", "")).strip())) == "edit_background_inverse_subject" and multiple_foreground_subjects(plan):
+    raise SystemExit("selected plan failed maskability lint: multi_subject_background_mask_route_unsupported")
 
 reference_raw = str(plan.get("reference_video", "")).strip()
 if not reference_raw:

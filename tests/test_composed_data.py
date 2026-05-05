@@ -5617,6 +5617,43 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(0, summary["mask_plan_count"])
             self.assertEqual(1, summary["skipped_reasons"]["low_contrast_dark_clothing_color_edit"])
 
+    def test_plan_video_masks_skips_multi_subject_background_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "talk_show_ref.mp4").write_bytes(b"video")
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "background_two_speakers",
+                        "reference_video": "clips/talk_show_ref.mp4",
+                        "edit_text": "change the background to a futuristic laboratory",
+                        "difference": {"type": "scene", "from": "original background", "to": "futuristic laboratory background"},
+                        "model_route": "vace_controlled",
+                        "exploration_family": "background_change",
+                        "edit_token": "background",
+                        "edit_region": "background",
+                        "mask_query": "background",
+                        "reference_understanding": {
+                            "main_subjects": ["man with white beard and hat", "man with glasses"],
+                            "stable_scene": "indoor studio with a green hexagonal wall and a dark room with a plant",
+                        },
+                    }
+                ],
+            )
+
+            summary = plan_video_masks(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                output_path=root / "pairs" / "video_mask_plan.jsonl",
+                mask_manifest_path=root / "pairs" / "video_mask_manifest.jsonl",
+            )
+
+            self.assertEqual(0, summary["mask_plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["multi_subject_background_mask_route_unsupported"])
+
     def test_plan_video_masks_skips_tiny_fullframe_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

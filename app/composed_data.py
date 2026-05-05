@@ -8966,6 +8966,34 @@ def _reference_has_worn_object_conflict(annotation: dict[str, Any], source_objec
     return any(marker in text for marker in ("wearing", "wears", "worn", "on back", "back", "shoulder", "holding"))
 
 
+def _reference_has_multiple_foreground_subjects(annotation: dict[str, Any]) -> bool:
+    subject_terms: set[str] = set()
+    for value in (
+        _normalize_list(annotation.get("main_subjects", []))
+        + _normalize_list(annotation.get("subjects", []))
+    ):
+        key = _normalized_phrase(value)
+        if not key:
+            continue
+        if any(token in key.split() for token in ("man", "woman", "person", "girl", "boy")):
+            subject_terms.add(key)
+    if len(subject_terms) > 1:
+        return True
+    counts = _normalize_object_counts(annotation.get("object_counts", {}))
+    for name, count in counts.items():
+        key = _normalized_phrase(name)
+        if count > 1 and any(token in key.split() for token in ("man", "woman", "person", "girl", "boy")):
+            return True
+    stable_scene = _normalized_phrase(str(annotation.get("stable_scene", "")))
+    if " and " in str(annotation.get("stable_scene", "")).lower() and sum(
+        1
+        for marker in ("room", "studio", "wall", "background", "scene")
+        if marker in stable_scene
+    ) >= 2:
+        return True
+    return False
+
+
 def _is_low_contrast_dark_clothing_edit(plan: dict[str, Any]) -> bool:
     difference = plan.get("difference") if isinstance(plan.get("difference"), dict) else {}
     edit_text = str(plan.get("edit_text", "")).strip()
@@ -9028,6 +9056,8 @@ def _video_maskability_issue(
         and _reference_has_multiple_visible_instances(reference_annotation, mask_query)
     ):
         return "ambiguous_foreground_subject_for_background_mask"
+    if mask_mode == "edit_background_inverse_subject" and _reference_has_multiple_foreground_subjects(reference_annotation):
+        return "multi_subject_background_mask_route_unsupported"
     return ""
 
 
