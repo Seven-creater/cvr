@@ -5534,7 +5534,7 @@ class ComposedDataTests(unittest.TestCase):
                 if line.strip()
             ]
 
-            self.assertEqual("man with white beard", mask_plans[0]["mask_query"])
+            self.assertEqual("man", mask_plans[0]["mask_query"])
             self.assertEqual("edit_background_inverse_subject", mask_plans[0]["mask_mode"])
             self.assertEqual(0.20, mask_plans[0]["mask_gate"]["min_coverage_ratio"])
             self.assertEqual(0.90, mask_plans[0]["mask_gate"]["max_coverage_ratio"])
@@ -5579,10 +5579,43 @@ class ComposedDataTests(unittest.TestCase):
             ]
 
             self.assertEqual(1, summary["mask_plan_count"])
-            self.assertEqual("clothing", mask_plans[0]["mask_query"])
+            self.assertEqual("shirt", mask_plans[0]["mask_query"])
             self.assertEqual(0.03, mask_plans[0]["mask_gate"]["min_coverage_ratio"])
             self.assertEqual(0.30, mask_plans[0]["mask_gate"]["max_coverage_ratio"])
             self.assertEqual(2, mask_plans[0]["mask_gate"]["min_protected_detections"])
+
+    def test_plan_video_masks_skips_low_contrast_dark_clothing_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "shirt_ref.mp4").write_bytes(b"video")
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "black_to_navy_shirt",
+                        "reference_video": "clips/shirt_ref.mp4",
+                        "edit_text": "change the clothing color to deep navy blue",
+                        "difference": {"type": "attribute", "from": "black shirt", "to": "deep navy blue shirt"},
+                        "model_route": "vace_controlled",
+                        "exploration_family": "clothing_color",
+                        "edit_token": "shirt",
+                        "edit_region": "man's shirt",
+                        "mask_query": "shirt",
+                    }
+                ],
+            )
+
+            summary = plan_video_masks(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                output_path=root / "pairs" / "video_mask_plan.jsonl",
+                mask_manifest_path=root / "pairs" / "video_mask_manifest.jsonl",
+            )
+
+            self.assertEqual(0, summary["mask_plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["low_contrast_dark_clothing_color_edit"])
 
     def test_plan_video_masks_skips_tiny_fullframe_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

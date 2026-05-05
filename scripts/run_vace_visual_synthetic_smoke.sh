@@ -145,6 +145,7 @@ from pathlib import Path
 
 VIDEO_MASK_SEMANTICS_VERSION = 2
 VIDEO_MASK_POLARITY = "white_generate_black_preserve"
+VACE_DARK_COLOR_MARKERS = {"black", "dark", "navy", "deep navy", "deep navy blue", "charcoal"}
 
 data_root = Path(sys.argv[1])
 plan_path = Path(sys.argv[2])
@@ -202,6 +203,39 @@ def is_clothing_edit(plan):
     )
     return any(marker in text.split() for marker in {"clothing", "outfit", "shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest"})
 
+def source_object(plan):
+    difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
+    value = str(difference.get("from", "")).strip()
+    if value and not absence_like(value):
+        return value
+    match = re.search(r"\breplace\s+(?:the\s+)?(.+?)\s+with\b", str(plan.get("edit_text", "")), flags=re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+def target_object(plan):
+    difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
+    value = str(difference.get("to", "")).strip()
+    if value and not absence_like(value):
+        return value
+    match = re.search(r"\bwith\s+(?:a\s+|an\s+|the\s+)?(.+?)(?:\.|$)", str(plan.get("edit_text", "")), flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return str(plan.get("edit_token", "")).strip()
+
+def low_contrast_dark_clothing_edit(plan):
+    if not is_clothing_edit(plan):
+        return False
+    source = normalize_phrase(source_object(plan))
+    target = normalize_phrase(target_object(plan))
+    if not source or not target:
+        return False
+    clothing_markers = {"clothing", "outfit", "shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest", "pants", "skirt"}
+    return (
+        any(marker in source.split() for marker in clothing_markers)
+        and any(marker in target.split() for marker in clothing_markers)
+        and any(marker in source for marker in VACE_DARK_COLOR_MARKERS)
+        and any(marker in target for marker in VACE_DARK_COLOR_MARKERS)
+    )
+
 def foreground_mask_query_from_annotation(annotation):
     candidates = []
     if isinstance(annotation, dict):
@@ -216,8 +250,10 @@ def foreground_mask_query_from_annotation(annotation):
     generic = {"background", "scene", "room", "wall", "floor", "table", "desk", "lighting", "camera motion"}
     for candidate in candidates:
         key = normalize_phrase(candidate)
-        if key and key not in generic and any(token in key.split() for token in ("man", "woman", "person", "girl", "boy", "robot", "vehicle", "car", "dog", "cat")):
-            return candidate[:120]
+        if key and key not in generic:
+            for token in ("man", "woman", "person", "girl", "boy", "robot", "vehicle", "car", "dog", "cat"):
+                if token in key.split():
+                    return token
     for candidate in candidates:
         key = normalize_phrase(candidate)
         if key and key not in generic:
@@ -229,7 +265,19 @@ def expected_mask_query(plan, raw_query):
     query_key = normalize_phrase(raw_query)
     family = normalize_phrase(plan.get("exploration_family", ""))
     if is_clothing_edit(plan) or family.startswith("clothing") or any(marker in query_key for marker in ("clothing", "shirt", "jacket", "outfit")):
-        return "clothing"
+        for value in (
+            str((plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}).get("from", "")),
+            str((plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}).get("to", "")),
+            str(plan.get("edit_region", "")),
+            str(raw_query),
+            str(plan.get("edit_token", "")),
+            str(plan.get("edit_text", "")),
+        ):
+            value_key = normalize_phrase(value)
+            for marker in ("shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest", "pants", "skirt"):
+                if marker in value_key.split():
+                    return marker
+        return "torso clothing"
     if str(difference.get("type", "")).strip() == "scene" or "background" in normalize_phrase(plan.get("edit_region", "")):
         annotation = plan.get("reference_understanding") if isinstance(plan.get("reference_understanding"), dict) else {}
         return foreground_mask_query_from_annotation(annotation)
@@ -393,6 +441,8 @@ else:
 route = str(plan.get("model_route", "")).strip()
 if route != "vace_controlled":
     raise SystemExit(f"selected plan route must be vace_controlled for this smoke, got {route!r}")
+if low_contrast_dark_clothing_edit(plan):
+    raise SystemExit("selected plan failed maskability lint: low_contrast_dark_clothing_color_edit")
 
 reference_raw = str(plan.get("reference_video", "")).strip()
 if not reference_raw:

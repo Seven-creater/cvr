@@ -345,6 +345,7 @@ VACE_MULTI_SHOT_MASK_MARKERS = {
     "montage",
 }
 VACE_CLOTHING_FORBIDDEN_RESULT_MARKERS = {"vest", "polo", "undershirt", "tank top", "sleeveless"}
+VACE_DARK_COLOR_MARKERS = {"black", "dark", "navy", "deep navy", "deep navy blue", "charcoal"}
 VACE_BACKGROUND_MAX_SUBJECT_OVERLAP_RATIO = 0.20
 VACE_SEMANTIC_PRESERVE_OBJECT_MARKERS = {
     "beard",
@@ -8884,8 +8885,9 @@ def _foreground_mask_query_from_annotation(annotation: dict[str, Any]) -> str:
         key = _normalized_phrase(item)
         if not item or key in generic:
             continue
-        if any(token in key.split() for token in ("man", "woman", "person", "girl", "boy", "robot", "vehicle", "car", "dog", "cat")):
-            return item[:120]
+        for token in ("man", "woman", "person", "girl", "boy", "robot", "vehicle", "car", "dog", "cat"):
+            if token in key.split():
+                return token
     for candidate in candidates:
         item = str(candidate).strip()
         key = _normalized_phrase(item)
@@ -8912,7 +8914,19 @@ def _video_mask_query_for_plan(plan: dict[str, Any], mask_query: str) -> str:
         or exploration_family.startswith("clothing")
         or any(marker in normalized_query for marker in ("clothing", "shirt", "jacket", "outfit"))
     ):
-        return "clothing"
+        for value in (
+            str(difference.get("from", "")),
+            str(difference.get("to", "")),
+            str(plan.get("edit_region", "")),
+            mask_query,
+            edit_token,
+            edit_text,
+        ):
+            value_key = _normalized_phrase(value)
+            for marker in ("shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest", "pants", "skirt"):
+                if marker in value_key.split():
+                    return marker
+        return "torso clothing"
     if str(difference.get("type", "")).strip() == "scene" or "background" in _normalized_phrase(
         str(plan.get("edit_region", ""))
     ):
@@ -8952,6 +8966,25 @@ def _reference_has_worn_object_conflict(annotation: dict[str, Any], source_objec
     return any(marker in text for marker in ("wearing", "wears", "worn", "on back", "back", "shoulder", "holding"))
 
 
+def _is_low_contrast_dark_clothing_edit(plan: dict[str, Any]) -> bool:
+    difference = plan.get("difference") if isinstance(plan.get("difference"), dict) else {}
+    edit_text = str(plan.get("edit_text", "")).strip()
+    edit_token = str(plan.get("edit_token", "")).strip()
+    if not _is_clothing_edit(difference, edit_text, edit_token):
+        return False
+    source = _normalized_phrase(_video_edit_source_object(difference, edit_text))
+    target = _normalized_phrase(_video_edit_target_object(difference, edit_text, edit_token))
+    if not source or not target:
+        return False
+
+    def has_dark_marker(text: str) -> bool:
+        return any(marker in text for marker in VACE_DARK_COLOR_MARKERS)
+
+    source_has_garment = any(marker in source.split() for marker in VACE_CLOTHING_OBJECT_MARKERS)
+    target_has_garment = any(marker in target.split() for marker in VACE_CLOTHING_OBJECT_MARKERS)
+    return source_has_garment and target_has_garment and has_dark_marker(source) and has_dark_marker(target)
+
+
 def _video_maskability_issue(
     plan: dict[str, Any],
     *,
@@ -8966,6 +8999,8 @@ def _video_maskability_issue(
     reference_annotation = (
         plan.get("reference_understanding") if isinstance(plan.get("reference_understanding"), dict) else {}
     )
+    if _is_low_contrast_dark_clothing_edit(plan):
+        return "low_contrast_dark_clothing_color_edit"
     if _reference_has_multi_shot_mask_risk(reference_annotation):
         return "multi_shot_mask_route_unsupported"
     if (
@@ -8987,8 +9022,12 @@ def _video_maskability_issue(
         str(plan.get("edit_region", "")).strip(),
     ):
         return "subject_contact_or_worn_object_high_risk"
-    if mask_mode == "edit_background_inverse_subject" and _mask_query_is_generic_person(mask_query):
-        return "background_subject_mask_query_too_generic"
+    if (
+        mask_mode == "edit_background_inverse_subject"
+        and _mask_query_is_generic_person(mask_query)
+        and _reference_has_multiple_visible_instances(reference_annotation, mask_query)
+    ):
+        return "ambiguous_foreground_subject_for_background_mask"
     return ""
 
 
