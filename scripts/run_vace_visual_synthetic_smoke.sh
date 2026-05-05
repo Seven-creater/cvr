@@ -143,7 +143,7 @@ import shlex
 import sys
 from pathlib import Path
 
-VIDEO_MASK_SEMANTICS_VERSION = 2
+VIDEO_MASK_SEMANTICS_VERSION = 3
 VIDEO_MASK_POLARITY = "white_generate_black_preserve"
 VACE_DARK_COLOR_MARKERS = {"black", "dark", "navy", "deep navy", "deep navy blue", "charcoal"}
 
@@ -201,7 +201,7 @@ def is_clothing_edit(plan):
             ]
         )
     )
-    return any(marker in text.split() for marker in {"clothing", "outfit", "shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest"})
+    return any(marker in text.split() for marker in {"clothing", "outfit", "shirt", "jacket", "coat", "dress", "blouse", "robe", "hoodie", "sweater", "vest"})
 
 def source_object(plan):
     difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
@@ -291,7 +291,7 @@ def expected_mask_query(plan, raw_query):
     difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
     query_key = normalize_phrase(raw_query)
     family = normalize_phrase(plan.get("exploration_family", ""))
-    if is_clothing_edit(plan) or family.startswith("clothing") or any(marker in query_key for marker in ("clothing", "shirt", "jacket", "outfit")):
+    if is_clothing_edit(plan) or family.startswith("clothing") or any(marker in query_key for marker in ("clothing", "shirt", "jacket", "outfit", "blouse", "robe")):
         for value in (
             str((plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}).get("from", "")),
             str((plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}).get("to", "")),
@@ -301,7 +301,7 @@ def expected_mask_query(plan, raw_query):
             str(plan.get("edit_text", "")),
         ):
             value_key = normalize_phrase(value)
-            for marker in ("shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest", "pants", "skirt"):
+            for marker in ("shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest", "pants", "skirt", "blouse", "robe"):
                 if marker in value_key.split():
                     return marker
         return "torso clothing"
@@ -310,11 +310,31 @@ def expected_mask_query(plan, raw_query):
         return foreground_mask_query_from_annotation(annotation)
     return raw_query
 
+def expected_mask_query_candidates(plan, raw_query, manifest_row=None):
+    values = [expected_mask_query(plan, raw_query), raw_query]
+    for source in (plan, manifest_row if isinstance(manifest_row, dict) else {}):
+        raw_candidates = source.get("mask_query_candidates", []) if isinstance(source, dict) else []
+        if isinstance(raw_candidates, list):
+            values.extend(str(item).strip() for item in raw_candidates if str(item).strip())
+    seen = set()
+    candidates = []
+    for value in values:
+        key = normalize_phrase(value)
+        if key and key not in seen:
+            seen.add(key)
+            candidates.append(value)
+    return candidates
+
 def expected_mask_mode(plan, mask_query):
     difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
     edit_region = normalize_phrase(plan.get("edit_region", ""))
     query_key = normalize_phrase(mask_query)
     difference_type = str(difference.get("type", "")).strip()
+    if query_key != "background" and (
+        is_clothing_edit(plan)
+        or any(marker in query_key.split() for marker in {"clothing", "outfit", "shirt", "jacket", "coat", "dress", "blouse", "robe", "hoodie", "sweater", "vest"})
+    ):
+        return "edit_masked_region"
     if difference_type == "scene" or "background" in edit_region or query_key == "background":
         return "edit_background_inverse_subject"
     if difference_type == "object_presence" and absence_like(difference.get("to", "")):
@@ -515,18 +535,20 @@ if mask_manifest_path:
     manifest_mask_query = str(mask_manifest_row.get("mask_query", "")).strip()
     manifest_mask_mode = str(mask_manifest_row.get("mask_mode", "")).strip()
     expected_query = expected_mask_query(plan, str(plan.get("mask_query", "")).strip() or manifest_mask_query)
+    expected_queries = expected_mask_query_candidates(plan, str(plan.get("mask_query", "")).strip() or manifest_mask_query, mask_manifest_row)
     expected_mode = expected_mask_mode(plan, expected_query)
     expected_query_key = normalize_phrase(expected_query)
+    expected_query_keys = {normalize_phrase(item) for item in expected_queries if normalize_phrase(item)}
     manifest_query_key = normalize_phrase(manifest_mask_query)
     if expected_query_key == "main subject" and manifest_query_key in {"background", "scene", "room"}:
         raise SystemExit(
             f"mask manifest query does not match current plan for plan_id {plan_id}: "
             f"manifest={manifest_mask_query!r} expected=foreground subject query"
         )
-    if manifest_mask_query and expected_query_key != "main subject" and manifest_query_key != expected_query_key:
+    if manifest_mask_query and expected_query_key != "main subject" and manifest_query_key not in expected_query_keys:
         raise SystemExit(
             f"mask manifest query does not match current plan for plan_id {plan_id}: "
-            f"manifest={manifest_mask_query!r} expected={expected_query!r}"
+            f"manifest={manifest_mask_query!r} expected one of={expected_queries!r}"
         )
     if manifest_mask_mode and manifest_mask_mode != expected_mode:
         raise SystemExit(

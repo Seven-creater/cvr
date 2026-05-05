@@ -3992,7 +3992,7 @@ class ComposedDataTests(unittest.TestCase):
                             "preserve_tokens": ["chair", "room", "camera motion"],
                             "src_video_for_vace": "clips/src_video_for_vace.mp4",
                             "src_mask": "clips/mask.mp4",
-                            "mask_semantics_version": 2,
+                            "mask_semantics_version": 3,
                             "mask_polarity": "white_generate_black_preserve",
                             "mask_metrics": {"mask_coverage_ratio_avg": 0.12},
                             "review_inputs_dir": "review_inputs",
@@ -5491,7 +5491,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("SAM2.1_video_predictor", mask_plans[0]["toolchain"]["segmenter"])
             self.assertEqual("robot_color", mask_manifest[0]["plan_id"])
             self.assertTrue(mask_manifest[0]["mask_video"].endswith("robot_color_mask.mp4"))
-            self.assertEqual(2, mask_manifest[0]["mask_semantics_version"])
+            self.assertEqual(3, mask_manifest[0]["mask_semantics_version"])
             self.assertEqual("white_generate_black_preserve", mask_manifest[0]["mask_polarity"])
 
     def test_background_plan_masks_foreground_subject_for_inverse_background_edit(self) -> None:
@@ -5535,12 +5535,55 @@ class ComposedDataTests(unittest.TestCase):
             ]
 
             self.assertEqual("man", mask_plans[0]["mask_query"])
+            self.assertIn("man with white beard", mask_plans[0]["mask_query_candidates"])
             self.assertEqual("edit_background_inverse_subject", mask_plans[0]["mask_mode"])
             self.assertEqual(0.20, mask_plans[0]["mask_gate"]["min_coverage_ratio"])
             self.assertEqual(0.90, mask_plans[0]["mask_gate"]["max_coverage_ratio"])
             self.assertEqual(0.10, mask_plans[0]["mask_gate"]["min_detected_keyframe_box_coverage"])
             self.assertEqual(0.20, mask_plans[0]["mask_gate"]["min_background_editable_ratio"])
             self.assertEqual(0.20, mask_plans[0]["mask_gate"]["max_subject_overlap_ratio"])
+            self.assertEqual(0.04, mask_plans[0]["mask_gate"]["min_foreground_subject_coverage_ratio"])
+            self.assertEqual(0.70, mask_plans[0]["mask_gate"]["max_foreground_subject_coverage_ratio"])
+
+    def test_background_family_with_garment_mask_uses_local_edit_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "robe_ref.mp4").write_bytes(b"video")
+            edit_plan_path = root / "pairs" / "video_edit_plan.jsonl"
+            self._write_jsonl(
+                edit_plan_path,
+                [
+                    {
+                        "plan_id": "robe_color",
+                        "reference_video": "clips/robe_ref.mp4",
+                        "edit_text": "change the character's robe from red to blue",
+                        "difference": {"type": "scene", "from": "red robe", "to": "blue robe"},
+                        "model_route": "vace_controlled",
+                        "exploration_family": "background_change",
+                        "edit_token": "blue robe",
+                        "edit_region": "character robe",
+                        "mask_query": "robe",
+                    }
+                ],
+            )
+
+            summary = plan_video_masks(
+                root=root,
+                video_edit_plan_path=edit_plan_path,
+                output_path=root / "pairs" / "video_mask_plan.jsonl",
+                mask_manifest_path=root / "pairs" / "video_mask_manifest.jsonl",
+            )
+            mask_plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["mask_plan_count"])
+            self.assertEqual("robe", mask_plans[0]["mask_query"])
+            self.assertEqual("edit_masked_region", mask_plans[0]["mask_mode"])
+            self.assertIn("character robe", mask_plans[0]["mask_query_candidates"])
 
     def test_clothing_plan_masks_clothing_even_if_query_is_person(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

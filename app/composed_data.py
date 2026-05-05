@@ -283,6 +283,8 @@ VACE_CLOTHING_OBJECT_MARKERS = {
     "jacket",
     "coat",
     "dress",
+    "blouse",
+    "robe",
     "hoodie",
     "sweater",
     "vest",
@@ -328,8 +330,8 @@ VACE_STRUCTURAL_CLOTHING_TARGET_MARKERS = {
     "blazer",
 }
 VACE_OUTERWEAR_MARKERS = {"jacket", "coat", "blazer", "outerwear"}
-VACE_NON_OUTERWEAR_CLOTHING_MARKERS = {"shirt", "t shirt", "tee", "short sleeve", "short sleeved", "outfit", "clothing"}
-VIDEO_MASK_SEMANTICS_VERSION = 2
+VACE_NON_OUTERWEAR_CLOTHING_MARKERS = {"shirt", "t shirt", "tee", "short sleeve", "short sleeved", "outfit", "clothing", "blouse", "robe"}
+VIDEO_MASK_SEMANTICS_VERSION = 3
 VIDEO_MASK_POLARITY = "white_generate_black_preserve"
 VACE_GENERIC_PERSON_MASK_QUERIES = {"man", "woman", "person", "people", "subject", "main subject"}
 VACE_TINY_FULLFRAME_OBJECTS = {"cup", "mug"}
@@ -347,6 +349,8 @@ VACE_MULTI_SHOT_MASK_MARKERS = {
 VACE_CLOTHING_FORBIDDEN_RESULT_MARKERS = {"vest", "polo", "undershirt", "tank top", "sleeveless"}
 VACE_DARK_COLOR_MARKERS = {"black", "dark", "navy", "deep navy", "deep navy blue", "charcoal"}
 VACE_BACKGROUND_MAX_SUBJECT_OVERLAP_RATIO = 0.20
+VACE_BACKGROUND_MIN_FOREGROUND_SUBJECT_COVERAGE_RATIO = 0.04
+VACE_BACKGROUND_MAX_FOREGROUND_SUBJECT_COVERAGE_RATIO = 0.70
 VACE_SEMANTIC_PRESERVE_OBJECT_MARKERS = {
     "beard",
     "face",
@@ -2706,6 +2710,7 @@ def plan_video_masks(
         if maskability_issue:
             skipped_reasons[maskability_issue] += 1
             continue
+        mask_query_candidates = _video_mask_query_candidates_for_plan(edit_plan, mask_query)
         safe_id = _safe_id(plan_id)
         mask_video = mask_dir / f"{safe_id}_mask.mp4"
         mask_record = {
@@ -2714,6 +2719,7 @@ def plan_video_masks(
             "reference_video_absolute": str(reference_path),
             "mask_video": str(mask_video),
             "mask_query": mask_query,
+            "mask_query_candidates": mask_query_candidates,
             "mask_mode": mask_mode,
             "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
             "mask_polarity": VIDEO_MASK_POLARITY,
@@ -2738,6 +2744,7 @@ def plan_video_masks(
                 "reference_video": reference_video,
                 "mask_video": str(mask_video),
                 "mask_query": mask_query,
+                "mask_query_candidates": mask_query_candidates,
                 "mask_mode": mask_mode,
                 "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
                 "mask_polarity": VIDEO_MASK_POLARITY,
@@ -8896,8 +8903,78 @@ def _foreground_mask_query_from_annotation(annotation: dict[str, Any]) -> str:
     return "main subject"
 
 
+def _foreground_mask_query_candidates_from_annotation(annotation: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    if isinstance(annotation, dict):
+        candidates.extend(_normalize_list(annotation.get("main_subjects", [])))
+        candidates.extend(_normalize_list(annotation.get("subjects", [])))
+        reference_understanding = annotation.get("reference_understanding")
+        if isinstance(reference_understanding, dict):
+            candidates.extend(_normalize_list(reference_understanding.get("main_subjects", [])))
+        candidates.extend(_normalize_object_counts(annotation.get("object_counts", {})).keys())
+    generic = {"background", "scene", "room", "wall", "floor", "table", "desk", "lighting", "camera motion"}
+    ordered: list[str] = []
+    primary = _foreground_mask_query_from_annotation(annotation)
+    if primary:
+        ordered.append(primary)
+    for candidate in candidates:
+        item = str(candidate).strip()
+        key = _normalized_phrase(item)
+        if item and key not in generic:
+            ordered.append(item[:120])
+            for token in ("man", "woman", "person", "girl", "boy", "robot", "vehicle", "car", "dog", "cat"):
+                if token in key.split():
+                    ordered.append(token)
+                    break
+    return _dedupe_strings(ordered)[:6] or ["main subject"]
+
+
 def _mask_query_is_generic_person(mask_query: str) -> bool:
     return _normalized_phrase(mask_query) in VACE_GENERIC_PERSON_MASK_QUERIES
+
+
+def _video_mask_query_candidates_for_plan(plan: dict[str, Any], primary_query: str) -> list[str]:
+    difference = plan.get("difference") if isinstance(plan.get("difference"), dict) else {}
+    edit_text = str(plan.get("edit_text", "")).strip()
+    edit_token = str(plan.get("edit_token", "")).strip()
+    exploration_family = _normalized_phrase(str(plan.get("exploration_family", "")))
+    reference_annotation = (
+        plan.get("reference_understanding") if isinstance(plan.get("reference_understanding"), dict) else {}
+    )
+    normalized_query = _normalized_phrase(primary_query)
+    candidates: list[str] = [primary_query]
+    if (
+        _is_clothing_edit(difference, edit_text, edit_token)
+        or exploration_family.startswith("clothing")
+        or any(marker in normalized_query for marker in ("clothing", "shirt", "jacket", "outfit", "blouse", "robe"))
+    ):
+        for value in (
+            str(difference.get("from", "")),
+            str(difference.get("to", "")),
+            str(plan.get("edit_region", "")),
+            primary_query,
+            edit_token,
+            edit_text,
+        ):
+            value_key = _normalized_phrase(value)
+            for marker in ("shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest", "pants", "skirt", "blouse", "robe"):
+                if marker in value_key.split():
+                    candidates.append(marker)
+                    candidates.append(f"torso {marker}")
+                    if marker == "robe":
+                        candidates.append("character robe")
+                    break
+        candidates.extend(["torso clothing", "clothing"])
+    elif str(difference.get("type", "")).strip() == "scene" or "background" in _normalized_phrase(
+        str(plan.get("edit_region", ""))
+    ):
+        candidates.extend(_foreground_mask_query_candidates_from_annotation(reference_annotation))
+    else:
+        for value in (str(plan.get("edit_region", "")), edit_token, str(difference.get("from", ""))):
+            value = value.strip()
+            if value:
+                candidates.append(value[:120])
+    return _dedupe_strings([item for item in candidates if str(item).strip()])[:8]
 
 
 def _video_mask_query_for_plan(plan: dict[str, Any], mask_query: str) -> str:
@@ -8912,7 +8989,7 @@ def _video_mask_query_for_plan(plan: dict[str, Any], mask_query: str) -> str:
     if (
         _is_clothing_edit(difference, edit_text, edit_token)
         or exploration_family.startswith("clothing")
-        or any(marker in normalized_query for marker in ("clothing", "shirt", "jacket", "outfit"))
+        or any(marker in normalized_query for marker in ("clothing", "shirt", "jacket", "outfit", "blouse", "robe"))
     ):
         for value in (
             str(difference.get("from", "")),
@@ -8923,7 +9000,7 @@ def _video_mask_query_for_plan(plan: dict[str, Any], mask_query: str) -> str:
             edit_text,
         ):
             value_key = _normalized_phrase(value)
-            for marker in ("shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest", "pants", "skirt"):
+            for marker in ("shirt", "jacket", "coat", "dress", "hoodie", "sweater", "vest", "pants", "skirt", "blouse", "robe"):
                 if marker in value_key.split():
                     return marker
         return "torso clothing"
@@ -9092,6 +9169,20 @@ def _video_mask_mode(plan: dict[str, Any]) -> str:
     edit_region = _normalized_phrase(str(plan.get("edit_region", "")))
     mask_query = _normalized_phrase(str(plan.get("mask_query", "")))
     difference_type = str(difference.get("type", "")).strip()
+    combined = _normalized_phrase(
+        " ".join(
+            [
+                str(plan.get("edit_text", "")),
+                str(plan.get("edit_token", "")),
+                str(plan.get("edit_region", "")),
+                str(difference.get("from", "")),
+                str(difference.get("to", "")),
+                str(plan.get("mask_query", "")),
+            ]
+        )
+    )
+    if mask_query != "background" and any(marker in combined for marker in VACE_CLOTHING_OBJECT_MARKERS):
+        return "edit_masked_region"
     if difference_type == "scene" or "background" in edit_region or mask_query == "background":
         return "edit_background_inverse_subject"
     if difference_type == "object_presence" and _absence_like_phrase(str(difference.get("to", ""))):
@@ -9153,6 +9244,10 @@ def _video_mask_gate_defaults(
     if mask_mode == "edit_background_inverse_subject":
         gate["max_subject_overlap_ratio"] = VACE_BACKGROUND_MAX_SUBJECT_OVERLAP_RATIO
         gate["min_background_editable_ratio"] = min_coverage
+        gate["min_foreground_subject_coverage_ratio"] = VACE_BACKGROUND_MIN_FOREGROUND_SUBJECT_COVERAGE_RATIO
+        gate["max_foreground_subject_coverage_ratio"] = VACE_BACKGROUND_MAX_FOREGROUND_SUBJECT_COVERAGE_RATIO
+        gate["min_foreground_subject_temporal_stability"] = MIN_VIDEO_MASK_TEMPORAL_STABILITY
+        gate["min_foreground_subject_nonempty_frame_ratio"] = MIN_VIDEO_MASK_NONEMPTY_FRAME_RATIO
     return gate
 
 

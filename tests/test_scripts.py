@@ -178,7 +178,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("replacement_target_prompt_conflicts_with_source_state", script)
         self.assertIn("object_replacement_breaks_support_contact", script)
         self.assertIn("target_instance_description", script)
-        self.assertIn("VIDEO_MASK_SEMANTICS_VERSION = 2", script)
+        self.assertIn("VIDEO_MASK_SEMANTICS_VERSION = 3", script)
         self.assertIn("VIDEO_MASK_POLARITY = \"white_generate_black_preserve\"", script)
         self.assertIn("mask_semantics_version", script)
         self.assertIn("mask_polarity", script)
@@ -294,6 +294,10 @@ class ScriptTests(unittest.TestCase):
                 "min_detected_keyframe_box_coverage": 0.10,
                 "max_subject_overlap_ratio": 0.20,
                 "min_background_editable_ratio": 0.20,
+                "min_foreground_subject_coverage_ratio": 0.04,
+                "max_foreground_subject_coverage_ratio": 0.70,
+                "min_foreground_subject_temporal_stability": 0.75,
+                "min_foreground_subject_nonempty_frame_ratio": 0.90,
                 "mask_not_empty_all_frames": True,
             },
             {
@@ -301,6 +305,9 @@ class ScriptTests(unittest.TestCase):
                 "detected_keyframe_box_coverage": 0.02,
                 "subject_overlap_ratio": 0.35,
                 "background_editable_ratio": 0.04,
+                "foreground_subject_coverage_ratio_avg": 0.96,
+                "foreground_subject_temporal_stability": 0.40,
+                "foreground_subject_nonempty_frame_ratio": 0.50,
                 "mask_temporal_stability": 0.95,
                 "mask_nonempty_frame_ratio": 1.0,
             },
@@ -310,6 +317,9 @@ class ScriptTests(unittest.TestCase):
         self.assertTrue(any("detected_keyframe_box_coverage" in error for error in errors))
         self.assertTrue(any("subject_overlap_ratio" in error for error in errors))
         self.assertTrue(any("background_editable_ratio" in error for error in errors))
+        self.assertTrue(any("foreground_subject_coverage_ratio" in error for error in errors))
+        self.assertTrue(any("foreground_subject_temporal_stability" in error for error in errors))
+        self.assertTrue(any("foreground_subject_nonempty_frame_ratio" in error for error in errors))
 
     def test_grounded_sam2_mask_gate_rejects_protected_overlap_for_clothing(self) -> None:
         errors = _mask_gate_errors(

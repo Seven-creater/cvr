@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-VIDEO_MASK_SEMANTICS_VERSION = 2
+VIDEO_MASK_SEMANTICS_VERSION = 3
 VIDEO_MASK_POLARITY = "white_generate_black_preserve"
 
 
@@ -180,6 +180,38 @@ def _mask_gate_errors(mask_gate: dict[str, Any], metrics: dict[str, Any]) -> lis
             errors.append(
                 f"background_editable_ratio {background_editable:.4f} < min {min_background_editable_float:.4f}"
             )
+    min_foreground_coverage = mask_gate.get("min_foreground_subject_coverage_ratio")
+    if min_foreground_coverage is not None:
+        foreground_coverage = float(metrics.get("foreground_subject_coverage_ratio_avg", 0.0) or 0.0)
+        min_foreground_coverage_float = float(min_foreground_coverage or 0.0)
+        if foreground_coverage < min_foreground_coverage_float:
+            errors.append(
+                f"foreground_subject_coverage_ratio {foreground_coverage:.4f} < min {min_foreground_coverage_float:.4f}"
+            )
+    max_foreground_coverage = mask_gate.get("max_foreground_subject_coverage_ratio")
+    if max_foreground_coverage is not None:
+        foreground_coverage = float(metrics.get("foreground_subject_coverage_ratio_avg", 0.0) or 0.0)
+        max_foreground_coverage_float = float(max_foreground_coverage or 0.0)
+        if foreground_coverage > max_foreground_coverage_float:
+            errors.append(
+                f"foreground_subject_coverage_ratio {foreground_coverage:.4f} > max {max_foreground_coverage_float:.4f}"
+            )
+    min_foreground_stability = mask_gate.get("min_foreground_subject_temporal_stability")
+    if min_foreground_stability is not None:
+        foreground_stability = float(metrics.get("foreground_subject_temporal_stability", 0.0) or 0.0)
+        min_foreground_stability_float = float(min_foreground_stability or 0.0)
+        if foreground_stability < min_foreground_stability_float:
+            errors.append(
+                f"foreground_subject_temporal_stability {foreground_stability:.4f} < min {min_foreground_stability_float:.4f}"
+            )
+    min_foreground_nonempty = mask_gate.get("min_foreground_subject_nonempty_frame_ratio")
+    if min_foreground_nonempty is not None:
+        foreground_nonempty = float(metrics.get("foreground_subject_nonempty_frame_ratio", 0.0) or 0.0)
+        min_foreground_nonempty_float = float(min_foreground_nonempty or 0.0)
+        if foreground_nonempty < min_foreground_nonempty_float:
+            errors.append(
+                f"foreground_subject_nonempty_frame_ratio {foreground_nonempty:.4f} < min {min_foreground_nonempty_float:.4f}"
+            )
     max_protected_overlap = mask_gate.get("max_protected_overlap_ratio")
     if max_protected_overlap is not None:
         protected_overlap = metrics.get("protected_overlap_ratio_max")
@@ -230,6 +262,59 @@ def _box_mask_overlap_ratio(mask: Any, boxes_xyxy: Any) -> float:
         if x1 > x0 and y1 > y0:
             protected[y0:y1, x0:x1] = True
     return float((mask_bool & protected).sum()) / mask_area
+
+
+def _mask_overlap_ratio(mask: Any, protected_mask: Any) -> float:
+    import numpy as np
+
+    if mask is None or protected_mask is None:
+        return 0.0
+    mask_bool = np.asarray(mask).astype(bool)
+    protected_bool = np.asarray(protected_mask).astype(bool)
+    if mask_bool.shape != protected_bool.shape:
+        return 0.0
+    protected_area = float(protected_bool.sum())
+    if protected_area <= 0.0:
+        return 0.0
+    return float((mask_bool & protected_bool).sum()) / protected_area
+
+
+def _mask_sequence_metrics(masks_by_frame: dict[int, Any], frame_count: int) -> dict[str, float]:
+    import numpy as np
+
+    template_shape = (1, 1)
+    for value in masks_by_frame.values():
+        candidate = np.asarray(value)
+        if candidate.size:
+            template_shape = candidate.shape[:2]
+            break
+    coverages: list[float] = []
+    ious: list[float] = []
+    nonempty_count = 0
+    last_mask: np.ndarray | None = None
+    for idx in range(frame_count):
+        mask = masks_by_frame.get(idx)
+        if mask is None:
+            mask = np.zeros(template_shape, dtype="uint8")
+        mask_bool = np.asarray(mask).astype(bool)
+        if mask_bool.shape[:2] != template_shape:
+            mask_bool = np.zeros(template_shape, dtype=bool)
+        coverage = float(mask_bool.mean())
+        coverages.append(coverage)
+        if coverage > 0.0:
+            nonempty_count += 1
+        if last_mask is not None:
+            intersection = float(np.logical_and(last_mask, mask_bool).sum())
+            union = float(np.logical_or(last_mask, mask_bool).sum())
+            ious.append(intersection / union if union > 0 else 0.0)
+        last_mask = mask_bool.copy()
+    return {
+        "coverage_min": min(coverages) if coverages else 0.0,
+        "coverage_avg": sum(coverages) / len(coverages) if coverages else 0.0,
+        "coverage_max": max(coverages) if coverages else 0.0,
+        "temporal_stability": sum(ious) / len(ious) if ious else 1.0,
+        "nonempty_frame_ratio": nonempty_count / len(coverages) if coverages else 0.0,
+    }
 
 
 def _run_grounded_sam2(
@@ -327,12 +412,14 @@ def _run_grounded_sam2(
                 box=box,
             )
 
+        raw_frame_masks: dict[int, np.ndarray] = {}
         frame_masks: dict[int, np.ndarray] = {}
         for frame_idx, _object_ids, mask_logits in predictor.propagate_in_video(inference_state):
             masks = (mask_logits > 0.0).detach().cpu().numpy()
             if masks.ndim == 4:
                 masks = masks[:, 0]
             union = np.any(masks, axis=0).astype("uint8")
+            raw_frame_masks[int(frame_idx)] = union.copy()
             if mask_mode == "edit_background_inverse_subject":
                 union = 1 - union
             frame_masks[int(frame_idx)] = union
@@ -415,8 +502,10 @@ def _run_grounded_sam2(
         _encode_mask_video(mask_dir, output_mask_video, fps)
         background_editable_ratio = sum(coverages) / len(coverages) if coverages else 0.0
         subject_overlap_ratio = None
+        foreground_metrics: dict[str, float] = {}
         if mask_mode == "edit_background_inverse_subject":
-            subject_overlap_ratio = _box_mask_overlap_ratio(frame_masks.get(keyframe_idx), boxes_xyxy[:3])
+            foreground_metrics = _mask_sequence_metrics(raw_frame_masks, len(frame_paths))
+            subject_overlap_ratio = _mask_overlap_ratio(frame_masks.get(keyframe_idx), raw_frame_masks.get(keyframe_idx))
         metrics = {
             "frame_count": len(frame_paths),
             "fps": fps,
@@ -442,6 +531,11 @@ def _run_grounded_sam2(
         if subject_overlap_ratio is not None:
             metrics["subject_overlap_ratio"] = subject_overlap_ratio
             metrics["background_editable_ratio"] = background_editable_ratio
+            metrics["foreground_subject_coverage_ratio_min"] = foreground_metrics.get("coverage_min", 0.0)
+            metrics["foreground_subject_coverage_ratio_avg"] = foreground_metrics.get("coverage_avg", 0.0)
+            metrics["foreground_subject_coverage_ratio_max"] = foreground_metrics.get("coverage_max", 0.0)
+            metrics["foreground_subject_temporal_stability"] = foreground_metrics.get("temporal_stability", 0.0)
+            metrics["foreground_subject_nonempty_frame_ratio"] = foreground_metrics.get("nonempty_frame_ratio", 0.0)
         if protected_overlap_details:
             metrics["protected_overlap"] = protected_overlap_details
             metrics["protected_overlap_ratio_max"] = protected_overlap_max if protected_overlap_max is not None else 0.0
@@ -588,12 +682,14 @@ def _run_florence_sam2(
                 box=box,
             )
 
+        raw_frame_masks: dict[int, np.ndarray] = {}
         frame_masks: dict[int, np.ndarray] = {}
         for frame_idx, _object_ids, mask_logits in predictor.propagate_in_video(inference_state):
             masks = (mask_logits > 0.0).detach().cpu().numpy()
             if masks.ndim == 4:
                 masks = masks[:, 0]
             union = np.any(masks, axis=0).astype("uint8")
+            raw_frame_masks[int(frame_idx)] = union.copy()
             if mask_mode == "edit_background_inverse_subject":
                 union = 1 - union
             frame_masks[int(frame_idx)] = union
@@ -660,8 +756,10 @@ def _run_florence_sam2(
         _encode_mask_video(mask_dir, output_mask_video, fps)
         background_editable_ratio = sum(coverages) / len(coverages) if coverages else 0.0
         subject_overlap_ratio = None
+        foreground_metrics: dict[str, float] = {}
         if mask_mode == "edit_background_inverse_subject":
-            subject_overlap_ratio = _box_mask_overlap_ratio(frame_masks.get(keyframe_idx), boxes_xyxy[:3])
+            foreground_metrics = _mask_sequence_metrics(raw_frame_masks, len(frame_paths))
+            subject_overlap_ratio = _mask_overlap_ratio(frame_masks.get(keyframe_idx), raw_frame_masks.get(keyframe_idx))
         metrics = {
             "frame_count": len(frame_paths),
             "fps": fps,
@@ -688,10 +786,37 @@ def _run_florence_sam2(
         if subject_overlap_ratio is not None:
             metrics["subject_overlap_ratio"] = subject_overlap_ratio
             metrics["background_editable_ratio"] = background_editable_ratio
+            metrics["foreground_subject_coverage_ratio_min"] = foreground_metrics.get("coverage_min", 0.0)
+            metrics["foreground_subject_coverage_ratio_avg"] = foreground_metrics.get("coverage_avg", 0.0)
+            metrics["foreground_subject_coverage_ratio_max"] = foreground_metrics.get("coverage_max", 0.0)
+            metrics["foreground_subject_temporal_stability"] = foreground_metrics.get("temporal_stability", 0.0)
+            metrics["foreground_subject_nonempty_frame_ratio"] = foreground_metrics.get("nonempty_frame_ratio", 0.0)
         if protected_overlap_details:
             metrics["protected_overlap"] = protected_overlap_details
             metrics["protected_overlap_ratio_max"] = protected_overlap_max if protected_overlap_max is not None else 0.0
         return metrics
+
+
+def _mask_query_candidates(plan: dict[str, Any]) -> list[str]:
+    raw_candidates = plan.get("mask_query_candidates", [])
+    values: list[str] = []
+    if isinstance(raw_candidates, list):
+        values.extend(str(item).strip() for item in raw_candidates if str(item).strip())
+    primary = str(plan.get("mask_query", "")).strip()
+    if primary:
+        values.insert(0, primary)
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for value in values:
+        key = _normalized_phrase(value)
+        if key and key not in seen:
+            seen.add(key)
+            candidates.append(value)
+    return candidates or [primary or "object"]
+
+
+def _candidate_mask_video_path(mask_video: Path, attempt_index: int) -> Path:
+    return mask_video.with_name(f"{mask_video.stem}__candidate_{attempt_index:02d}{mask_video.suffix}")
 
 
 def main() -> None:
@@ -732,46 +857,85 @@ def main() -> None:
     for plan in mask_plans[: args.max_masks if args.max_masks and args.max_masks > 0 else None]:
         plan_id = str(plan.get("plan_id", "")).strip()
         row = manifest_by_plan.get(plan_id, {"plan_id": plan_id})
+        attempts: list[dict[str, Any]] = []
         try:
             reference_video = _resolve_video(root, str(plan.get("reference_video", "")))
             mask_video = Path(str(plan.get("mask_video") or row.get("mask_video", "")))
             if not mask_video.is_absolute():
                 mask_video = Path(args.mask_manifest_path).resolve().parent / mask_video
             mask_gate = plan.get("mask_gate") if isinstance(plan.get("mask_gate"), dict) else {}
-            if args.grounder == "florence2":
-                if florence_model_dir is None:
-                    raise RuntimeError("--florence-model is required when --grounder florence2")
-                metrics = _run_florence_sam2(
-                    reference_video=reference_video,
-                    output_mask_video=mask_video,
-                    mask_query=str(plan.get("mask_query", "")).strip(),
-                    mask_mode=str(plan.get("mask_mode", "")).strip(),
-                    florence_model_dir=florence_model_dir,
-                    grounded_sam2_code=grounded_sam2_code,
-                    sam2_config=str(args.sam2_config),
-                    sam2_checkpoint=sam2_checkpoint,
-                    mask_gate=mask_gate,
-                )
-            else:
-                if grounding_checkpoint is None:
-                    raise RuntimeError("GroundingDINO checkpoint is required")
-                metrics = _run_grounded_sam2(
-                    reference_video=reference_video,
-                    output_mask_video=mask_video,
-                    mask_query=str(plan.get("mask_query", "")).strip(),
-                    mask_mode=str(plan.get("mask_mode", "")).strip(),
-                    grounded_sam2_code=grounded_sam2_code,
-                    grounding_dino_config=grounding_config,
-                    grounding_dino_checkpoint=grounding_checkpoint,
-                    sam2_config=str(args.sam2_config),
-                    sam2_checkpoint=sam2_checkpoint,
-                    box_threshold=args.box_threshold,
-                    text_threshold=args.text_threshold,
-                    mask_gate=mask_gate,
-                )
-            gate_errors = _mask_gate_errors(mask_gate, metrics)
-            if gate_errors:
-                raise RuntimeError("mask gate failed: " + "; ".join(gate_errors))
+            metrics: dict[str, Any] | None = None
+            selected_query = ""
+            for attempt_index, candidate_query in enumerate(_mask_query_candidates(plan), start=1):
+                candidate_video = _candidate_mask_video_path(mask_video, attempt_index)
+                try:
+                    if candidate_video.exists():
+                        candidate_video.unlink()
+                    if args.grounder == "florence2":
+                        if florence_model_dir is None:
+                            raise RuntimeError("--florence-model is required when --grounder florence2")
+                        candidate_metrics = _run_florence_sam2(
+                            reference_video=reference_video,
+                            output_mask_video=candidate_video,
+                            mask_query=candidate_query,
+                            mask_mode=str(plan.get("mask_mode", "")).strip(),
+                            florence_model_dir=florence_model_dir,
+                            grounded_sam2_code=grounded_sam2_code,
+                            sam2_config=str(args.sam2_config),
+                            sam2_checkpoint=sam2_checkpoint,
+                            mask_gate=mask_gate,
+                        )
+                    else:
+                        if grounding_checkpoint is None:
+                            raise RuntimeError("GroundingDINO checkpoint is required")
+                        candidate_metrics = _run_grounded_sam2(
+                            reference_video=reference_video,
+                            output_mask_video=candidate_video,
+                            mask_query=candidate_query,
+                            mask_mode=str(plan.get("mask_mode", "")).strip(),
+                            grounded_sam2_code=grounded_sam2_code,
+                            grounding_dino_config=grounding_config,
+                            grounding_dino_checkpoint=grounding_checkpoint,
+                            sam2_config=str(args.sam2_config),
+                            sam2_checkpoint=sam2_checkpoint,
+                            box_threshold=args.box_threshold,
+                            text_threshold=args.text_threshold,
+                            mask_gate=mask_gate,
+                        )
+                    gate_errors = _mask_gate_errors(mask_gate, candidate_metrics)
+                    attempts.append(
+                        {
+                            "mask_query": candidate_query,
+                            "status": "generated" if not gate_errors else "failed_gate",
+                            "gate_errors": gate_errors,
+                            "mask_metrics": candidate_metrics,
+                        }
+                    )
+                    if gate_errors:
+                        if candidate_video.exists():
+                            candidate_video.unlink()
+                        continue
+                    mask_video.parent.mkdir(parents=True, exist_ok=True)
+                    if mask_video.exists():
+                        mask_video.unlink()
+                    shutil.move(str(candidate_video), str(mask_video))
+                    metrics = candidate_metrics
+                    selected_query = candidate_query
+                    break
+                except Exception as attempt_exc:
+                    if candidate_video.exists():
+                        candidate_video.unlink()
+                    attempts.append(
+                        {
+                            "mask_query": candidate_query,
+                            "status": "error",
+                            "error": f"{type(attempt_exc).__name__}: {attempt_exc}",
+                        }
+                    )
+            if metrics is None:
+                last = attempts[-1] if attempts else {"error": "no mask query candidates"}
+                reason = last.get("error") or "mask gate failed: " + "; ".join(last.get("gate_errors", []))
+                raise RuntimeError(str(reason))
             target_instance_description = str(plan.get("target_instance_description", "")).strip()
             mask_target_instance_alignment = {}
             if target_instance_description:
@@ -787,7 +951,9 @@ def main() -> None:
                     "status": "generated",
                     "mask_metrics": metrics,
                     "mask_gate_result": {"passed": True, "errors": []},
-                    "mask_query": str(plan.get("mask_query", "")).strip(),
+                    "mask_query": selected_query,
+                    "mask_query_candidates": _mask_query_candidates(plan),
+                    "mask_attempts": attempts,
                     "mask_mode": str(plan.get("mask_mode", "")).strip(),
                     "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
                     "mask_polarity": VIDEO_MASK_POLARITY,
@@ -806,6 +972,8 @@ def main() -> None:
                     "status": "failed",
                     "failure_reason": f"{type(exc).__name__}: {exc}",
                     "mask_query": str(plan.get("mask_query", "")).strip(),
+                    "mask_query_candidates": _mask_query_candidates(plan),
+                    "mask_attempts": attempts,
                     "mask_mode": str(plan.get("mask_mode", "")).strip(),
                     "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
                     "mask_polarity": VIDEO_MASK_POLARITY,
@@ -816,7 +984,7 @@ def main() -> None:
         report_rows.append(
             {
                 "plan_id": plan_id,
-                "mask_query": plan.get("mask_query"),
+                "mask_query": row.get("mask_query", plan.get("mask_query")),
                 "status": row.get("status"),
                 "mask_video": row.get("mask_video"),
                 "failure_reason": row.get("failure_reason", ""),
