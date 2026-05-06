@@ -15,6 +15,9 @@ BASE_URL=${BASE_URL:-http://127.0.0.1:8093/v1}
 SOURCE_CLIPS=${SOURCE_CLIPS:-$ROOT/metadata/source_clips_all.jsonl}
 MAX_SOURCE_VIDEOS=${MAX_SOURCE_VIDEOS:-80}
 SEGMENT_SECONDS=${SEGMENT_SECONDS:-8}
+CONCURRENCY=${CONCURRENCY:-1}
+MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-10}
+ANNOTATION_MAX_PASSES=${ANNOTATION_MAX_PASSES:-3}
 MODEL_STAGE=${MODEL_STAGE:-instruct}
 GPU_IDS=${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-}}
 MAX_GPUS=${MAX_GPUS:-6}
@@ -31,6 +34,9 @@ Options:
   --source-clips PATH
   --max-source-videos N
   --segment-seconds N
+  --concurrency N
+  --max-accepted-pairs N
+  --annotation-max-passes N
   --model-stage VALUE
   --gpu-ids IDS
   --max-gpus N
@@ -66,6 +72,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --segment-seconds)
       SEGMENT_SECONDS="$2"
+      shift 2
+      ;;
+    --concurrency)
+      CONCURRENCY="$2"
+      shift 2
+      ;;
+    --max-accepted-pairs)
+      MAX_ACCEPTED_PAIRS="$2"
+      shift 2
+      ;;
+    --annotation-max-passes)
+      ANNOTATION_MAX_PASSES="$2"
       shift 2
       ;;
     --model-stage)
@@ -134,6 +152,7 @@ echo "[omni-detective] base_url=$BASE_URL"
 echo "[omni-detective] model=$MODEL"
 echo "[resource-policy] one Omni model per run; do not keep Captioner/Instruct/Thinking loaded together"
 echo "[resource-policy] model_stage=$MODEL_STAGE gpu_ids=${GPU_IDS:-unset} gpu_count=$GPU_COUNT max_gpus=$MAX_GPUS"
+echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS annotation_max_passes=$ANNOTATION_MAX_PASSES"
 curl -fsS "$BASE_URL/models"
 echo
 
@@ -157,15 +176,38 @@ python -m app.composed_data extract-clips \
 
 echo "[omni-detective] extraction done $(date)"
 
-python -m app.composed_data detective-annotate-clips \
-  --root "$ROOT" \
-  --clips-manifest-path "$RUN_ROOT/extracted_event_clips.jsonl" \
-  --output-path "$RUN_ROOT/detective_annotations.jsonl" \
-  --base-url "$BASE_URL" \
-  --api-key EMPTY \
-  --model "$MODEL" \
-  --timeout-seconds 300 \
-  --overwrite
+ANNOTATION_TARGET_COUNT=$(grep -cve '^[[:space:]]*$' "$RUN_ROOT/extracted_event_clips.jsonl" || true)
+ANNOTATION_PASS=1
+while [ "$ANNOTATION_PASS" -le "$ANNOTATION_MAX_PASSES" ]; do
+  echo "[omni-detective] annotation pass $ANNOTATION_PASS/$ANNOTATION_MAX_PASSES target_clips=$ANNOTATION_TARGET_COUNT $(date)"
+  set +e
+  python -m app.composed_data detective-annotate-clips \
+    --root "$ROOT" \
+    --clips-manifest-path "$RUN_ROOT/extracted_event_clips.jsonl" \
+    --output-path "$RUN_ROOT/detective_annotations.jsonl" \
+    --base-url "$BASE_URL" \
+    --api-key EMPTY \
+    --model "$MODEL" \
+    --timeout-seconds 300 \
+    --concurrency "$CONCURRENCY" \
+    --overwrite
+  ANNOTATION_STATUS=$?
+  set -e
+  ANNOTATION_DONE_COUNT=0
+  if [ -f "$RUN_ROOT/detective_annotations.jsonl" ]; then
+    ANNOTATION_DONE_COUNT=$(grep -cve '^[[:space:]]*$' "$RUN_ROOT/detective_annotations.jsonl" || true)
+  fi
+  echo "[omni-detective] annotation pass $ANNOTATION_PASS exit=$ANNOTATION_STATUS done=$ANNOTATION_DONE_COUNT/$ANNOTATION_TARGET_COUNT"
+  if [ "$ANNOTATION_STATUS" -eq 0 ] && [ "$ANNOTATION_DONE_COUNT" -ge "$ANNOTATION_TARGET_COUNT" ]; then
+    break
+  fi
+  if [ "$ANNOTATION_PASS" -ge "$ANNOTATION_MAX_PASSES" ]; then
+    echo "[omni-detective] annotation incomplete after $ANNOTATION_MAX_PASSES passes; inspect $RUN_ROOT/detective_annotations.jsonl and $RUN_ROOT/logs" >&2
+    exit 3
+  fi
+  ANNOTATION_PASS=$((ANNOTATION_PASS + 1))
+  sleep 10
+done
 
 echo "[omni-detective] annotation done $(date)"
 
@@ -179,7 +221,7 @@ python -m app.composed_data propose-group-pairs \
   --api-key EMPTY \
   --model "$MODEL" \
   --timeout-seconds 300 \
-  --max-accepted-pairs 10 \
+  --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
   --overwrite
 
 echo "[omni-detective] group proposal and judge done $(date)"
@@ -194,6 +236,16 @@ else
   echo "[omni-detective] no accepted pairs; skip validate-pilot"
 fi
 
+if [ -s "$RUN_ROOT/accepted_pairs.jsonl" ]; then
+  python -m app.composed_data build-review-bundle \
+    --root "$ROOT" \
+    --pairs-path "$RUN_ROOT/accepted_pairs.jsonl" \
+    --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
+    --output-dir "$RUN_ROOT/manual_review_bundle"
+else
+  echo "[omni-detective] no accepted pairs; skip manual review bundle"
+fi
+
 echo "[verify] outputs"
 ls -lh "$RUN_ROOT/clip_plan_detective.jsonl"
 ls -lh "$RUN_ROOT/clip_groups.jsonl"
@@ -202,6 +254,7 @@ ls -lh "$RUN_ROOT/detective_annotations.jsonl"
 ls -lh "$RUN_ROOT/judged_pair_proposals.jsonl"
 ls -lh "$RUN_ROOT/accepted_pairs.jsonl" || true
 ls -lh "$RUN_ROOT/gallery.jsonl" || true
+ls -ld "$RUN_ROOT/manual_review_bundle" || true
 cat "$RUN_ROOT/pilot_review.md" || true
 
 echo "[omni-detective] done $(date)"

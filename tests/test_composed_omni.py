@@ -167,6 +167,10 @@ class ComposedOmniClientTests(unittest.TestCase):
         request_body = json.loads(request.data.decode("utf-8"))
         self.assertEqual({"type": "json_object"}, request_body["response_format"])
         self.assertEqual("instruct-model", request_body["model"])
+        system_prompt = request_body["messages"][0]["content"]
+        self.assertIn("compare 1-3 possible differences internally", system_prompt)
+        self.assertIn("Reject vague edit_text", system_prompt)
+        self.assertIn("include both from/to text", system_prompt)
         self.assertEqual(22.0, request_holder["timeout"])
 
     def test_plan_video_edit_materializes_reference_video_and_normalizes_plan(self) -> None:

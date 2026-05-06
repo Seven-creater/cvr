@@ -47,32 +47,23 @@ MIN_PAIR_CONTEXT_SCORE = 0.03
 MAX_PAIR_CHANGED_TYPES = 5
 MIN_PAIR_EDIT_MATCH_SCORE = 0.15
 PAIR_PRIORITY = (
-    "object_count",
-    "object_presence",
-    "action",
-    "audio_event",
-    "attribute",
-    "scene",
-    "speech",
-    "visible_text",
-)
-HIGH_CONTEXT_PAIR_PRIORITY = (
-    "object_count",
-    "object_presence",
-    "action",
     "audio_event",
     "speech",
     "visible_text",
+    "object_presence",
+    "object_count",
+    "action",
     "attribute",
     "scene",
 )
+HIGH_CONTEXT_PAIR_PRIORITY = PAIR_PRIORITY
 DIVERSE_PAIR_BUCKET_TARGETS = {
-    "object_count": 3,
-    "action": 3,
     "audio_event": 4,
     "speech": 3,
-    "object_presence": 3,
     "visible_text": 3,
+    "object_presence": 3,
+    "object_count": 3,
+    "action": 3,
     "attribute": 2,
     "scene": 1,
 }
@@ -531,6 +522,7 @@ GENERIC_EDIT_TEXT_PHRASES = {
     "change the mood",
     "make it better",
     "make it cinematic",
+    "make it nice",
     "make it more cinematic",
     "make the video better",
     "make the scene better",
@@ -817,13 +809,19 @@ EDIT_TEXT_VISUAL_LEAK_TOKENS = {
 EDIT_TEXT_AUDIO_TOKENS = NON_SPEECH_AUDIO_TOKENS | {"audio", "sound", "sounds", "effect", "effects"}
 EDIT_TEXT_VISIBLE_TEXT_TOKENS = {"caption", "ocr", "on", "screen", "text", "subtitle", "subtitles"}
 EDIT_TEXT_SPEECH_TOKENS = GENERIC_SPEECH_TOKENS | {"transcript", "spoken", "says", "say", "topic", "topics"}
+NATURAL_PAIR_GATE_LABELS = {
+    "bad_imperative_edit_text": "bad_imperative_edit_text: edit_text is vague, malformed, or not an edit command",
+    "too_similar_without_observable_delta": "too_similar_without_observable_delta: near-duplicate visual pair has no frame-backed delta",
+    "too_broad_or_loose_pair": "too_broad_or_loose_pair: broad scene change without enough shared context",
+    "ocr_template_risk": "ocr_template_risk: visible-text edit lacks reliable OCR evidence or target uniqueness",
+}
 FINAL_ACCEPT_BUCKET_TARGETS = {
-    "object_count": 2,
-    "object_presence": 3,
-    "action": 2,
     "audio_event": 2,
     "speech": 2,
     "visible_text": 2,
+    "object_presence": 3,
+    "object_count": 2,
+    "action": 2,
     "attribute": 2,
     "scene": 1,
 }
@@ -4944,7 +4942,7 @@ def _edit_text_quality_payload(
 
     malformed_presence = _edit_text_has_malformed_presence(text)
     if malformed_presence:
-        bad_patterns.append("edit_text uses malformed object-presence wording")
+        bad_patterns.append("edit_text uses malformed or vague edit wording")
 
     score = 1.0
     for failed, penalty in (
@@ -4980,6 +4978,16 @@ def _edit_text_quality_passes(payload: dict[str, Any]) -> bool:
         and bool(payload.get("not_caption_like"))
         and bool(payload.get("no_modality_leakage"))
         and not payload.get("bad_patterns")
+    )
+
+
+def _edit_text_quality_has_bad_imperative(payload: dict[str, Any]) -> bool:
+    bad_patterns = " ".join(str(item) for item in payload.get("bad_patterns", []))
+    return bool(
+        not payload.get("is_imperative_edit")
+        or "too broad" in bad_patterns
+        or "malformed" in bad_patterns
+        or "empty" in bad_patterns
     )
 
 
@@ -5082,7 +5090,10 @@ def _edit_text_no_modality_leakage(
 
 def _edit_text_has_malformed_presence(edit_text: str) -> bool:
     normalized = _normalized_phrase(edit_text)
-    return bool(normalized.startswith("change no ") and " into " in normalized and re.search(r"\b\d+\b", normalized))
+    if normalized.startswith("change no ") and " into " in normalized and re.search(r"\b\d+\b", normalized):
+        return True
+    tokens = normalized.split()
+    return bool(tokens[:2] == ["make", "the"] and len(tokens) <= 3)
 
 
 def _observable_difference_gate(
@@ -5448,6 +5459,7 @@ def _apply_structured_gate_quality(
     quality["observable_difference_passed"] = 1.0 if observable_difference.get("passed") else 0.0
     quality["observable_difference_frame_backed"] = 1.0 if observable_difference.get("frame_backed") else 0.0
     quality["near_duplicate_without_delta"] = 1.0 if observable_difference.get("near_duplicate_risk") == "high" and not observable_difference.get("passed") else 0.0
+    quality["bad_imperative_edit_text"] = 1.0 if _edit_text_quality_has_bad_imperative(edit_text_quality) else 0.0
 
 
 def _competing_difference_gate(
@@ -5509,6 +5521,63 @@ def _audio_event_independent_evidence_gate(
     }
 
 
+def _natural_pair_quality_gate(
+    *,
+    record: dict[str, Any],
+    edit_text_quality: dict[str, Any],
+    observable_difference: dict[str, Any],
+) -> dict[str, Any]:
+    if str(record.get("source_type", "natural")).strip() == "synthetic_edit":
+        return {"passed": True, "failure_codes": [], "failure_reason": ""}
+
+    quality = record.get("quality", {}) if isinstance(record.get("quality"), dict) else {}
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
+    edit_text = str(record.get("edit_text", "")).strip()
+    normalized_edit = _normalized_phrase(edit_text)
+    failure_codes: list[str] = []
+
+    if _edit_text_quality_has_bad_imperative(edit_text_quality):
+        failure_codes.append("bad_imperative_edit_text")
+
+    if (
+        difference_type in VISUAL_DIFFERENCE_TYPES
+        and _score_float(quality.get("visual_near_duplicate_score")) >= MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE
+        and not _boolish(observable_difference.get("frame_backed"))
+    ):
+        failure_codes.append("too_similar_without_observable_delta")
+
+    if difference_type == "scene":
+        same_context = _score_float(quality.get("same_context_score"))
+        source_context = record.get("source_context", {}) if isinstance(record.get("source_context"), dict) else {}
+        relation = str(source_context.get("relation", "")).strip()
+        loose_edit = (
+            normalized_edit.startswith("make it ")
+            or normalized_edit.startswith("make it like")
+            or normalized_edit.startswith("turn it into")
+        )
+        if same_context < 0.75 or relation == "cross_dataset" or loose_edit:
+            failure_codes.append("too_broad_or_loose_pair")
+
+    if difference_type == "visible_text":
+        has_from_to = bool(str(difference.get("from", "")).strip() and str(difference.get("to", "")).strip())
+        if (
+            not has_from_to
+            or not _boolish(observable_difference.get("passed"))
+            or not _boolish(observable_difference.get("frame_backed"))
+            or _score_float(quality.get("target_uniqueness_score")) < MIN_ACCEPT_TARGET_UNIQUENESS_SCORE
+        ):
+            failure_codes.append("ocr_template_risk")
+
+    failure_codes = _dedupe_strings(failure_codes)
+    reasons = [NATURAL_PAIR_GATE_LABELS[code] for code in failure_codes if code in NATURAL_PAIR_GATE_LABELS]
+    return {
+        "passed": not failure_codes,
+        "failure_codes": failure_codes,
+        "failure_reason": "; ".join(reasons),
+    }
+
+
 def _is_audio_absence_edit_phrase(value: str) -> bool:
     return _is_non_speech_absence_audio_phrase(value) or _absence_like_phrase(value)
 
@@ -5560,6 +5629,18 @@ def _ensure_structured_gate_fields(
         edit_text_quality=edit_text_quality,
         observable_difference=observable_difference,
     )
+    natural_pair_gate = dict(record.get("natural_pair_gate") or {})
+    if not natural_pair_gate:
+        natural_pair_gate = _natural_pair_quality_gate(
+            record={**record, "quality": quality},
+            edit_text_quality=edit_text_quality,
+            observable_difference=observable_difference,
+        )
+    for code in NATURAL_PAIR_GATE_LABELS:
+        quality[code] = 0.0
+    for code in natural_pair_gate.get("failure_codes", []):
+        if code in NATURAL_PAIR_GATE_LABELS:
+            quality[code] = 1.0
     competing_difference = dict(record.get("competing_difference") or {})
     if not competing_difference:
         competing_difference = _competing_difference_gate(
@@ -5635,12 +5716,18 @@ def _ensure_structured_gate_fields(
             passed=bool(audio_event_evidence.get("passed", True)),
             reason=str(audio_event_evidence.get("failure_reason", "")).strip(),
         )
+        _sync_local_gate_failure(
+            verification,
+            passed=bool(natural_pair_gate.get("passed", True)),
+            reason=str(natural_pair_gate.get("failure_reason", "")).strip(),
+        )
         verification["passed"] = _verification_accepts(verification)
         verification["failures"] = _verification_failures(verification)
         record["verification"] = verification
     record["quality"] = quality
     record["edit_text_quality"] = edit_text_quality
     record["observable_difference"] = observable_difference
+    record["natural_pair_gate"] = natural_pair_gate
     record["competing_difference"] = competing_difference
     record["audio_event_evidence"] = audio_event_evidence
     return record
@@ -5773,6 +5860,10 @@ def _carry_local_gate_quality(target_quality: dict[str, Any], source_quality: di
         "observable_difference_passed",
         "observable_difference_frame_backed",
         "near_duplicate_without_delta",
+        "bad_imperative_edit_text",
+        "too_similar_without_observable_delta",
+        "too_broad_or_loose_pair",
+        "ocr_template_risk",
         "competing_difference_passed",
         "audio_event_independent_evidence_passed",
         "synthetic_context_override",
@@ -7464,6 +7555,7 @@ def _compose_reject_reason(
     failures.extend(_structured_edit_text_failures(quality))
     if _observable_difference_rejects(quality):
         failures.append("observable_difference gate found no concrete visual delta evidence")
+    failures.extend(_natural_pair_quality_failures(quality))
     if _score_float(quality.get("competing_difference_passed", 1.0)) < 1.0:
         failures.append("single_main_difference failed: competing stronger difference")
     if _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0:
@@ -7529,6 +7621,7 @@ def _judge_accepts(
         and _score_float(quality.get("intraclip_change_conflict")) < 1.0
         and not _structured_edit_text_failures(quality)
         and not _observable_difference_rejects(quality)
+        and not _natural_pair_quality_failures(quality)
         and _score_float(quality.get("competing_difference_passed", 1.0)) >= 1.0
         and _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) >= 1.0
     )
@@ -7619,6 +7712,14 @@ def _structured_edit_text_failures(quality: dict[str, Any]) -> list[str]:
         ("edit_text_no_modality_leakage", "edit_text leaks another modality"),
     ):
         if key in quality and _score_float(quality.get(key)) < 1.0:
+            failures.append(label)
+    return failures
+
+
+def _natural_pair_quality_failures(quality: dict[str, Any]) -> list[str]:
+    failures: list[str] = []
+    for key, label in NATURAL_PAIR_GATE_LABELS.items():
+        if _score_float(quality.get(key)) >= 1.0:
             failures.append(label)
     return failures
 
@@ -8127,6 +8228,7 @@ def _pair_record_acceptance_issues(
         issues.extend(_structured_edit_text_failures(quality))
         if _observable_difference_rejects(quality):
             issues.append("observable_difference gate found no concrete visual delta evidence")
+        issues.extend(_natural_pair_quality_failures(quality))
         if _score_float(quality.get("competing_difference_passed", 1.0)) < 1.0:
             issues.append("single_main_difference failed: competing stronger difference")
         if _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0:

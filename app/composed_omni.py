@@ -397,16 +397,18 @@ def _pair_proposal_system_prompt() -> str:
         '"difference": {"type": string, "from": string, "to": string, "description": string}, '
         '"proposal_reason": string}. '
         f"Allowed difference.type values: {difference_types}. "
+        "First compare 1-3 possible differences internally, then choose the single most concrete and verifiable difference; mention the discarded alternatives briefly in proposal_reason, not as extra JSON fields. "
         "If the main subject/person/object appears or disappears, use object_presence rather than subject. "
-        "Prefer fine-grained action, audio_event, object_count, or object_presence changes over broad scene changes when both apply. "
+        "Prefer transcript-backed speech, non-speech audio_event, visible_text, object_presence, object_count, action, or attribute changes over broad scene changes when both apply. "
         "Use action only when the action itself changes and both clips contain action/storyline/event evidence for that change. "
         "Do not label object appearance, color/attribute, visible text, speech topic, or scene/background changes as action. "
         "Use speech only for concrete spoken-language content, speaker, tone, or dialogue changes with transcript-backed speech evidence. "
         "Use audio_event only for non-speech sounds such as music, applause, machinery, footsteps, wind, animals, or environmental sounds. "
         "Never label a pure speech topic or narration change as audio_event. "
-        "Use scene only when the location or background is the primary edit. "
+        "Use scene only when the location or background is the primary edit and the two clips still share strong context; reject loose stock-like scene shifts. "
         "Keep edit_text short and only describe the change from reference to target. "
         "edit_text must be an imperative edit, not a caption. "
+        "Reject vague edit_text such as 'make the school', 'make it nice', or 'make it a touristy country'. "
         "Do not copy a full reference_caption or target_caption into edit_text. "
         "Do not mention visual subjects in audio_event edit_text. "
         "Do not mention speech/topic/content in audio_event edit_text. "
@@ -419,6 +421,7 @@ def _pair_proposal_system_prompt() -> str:
         "Bad audio_event: add a woman with blonde hair to the audio. Bad audio_event: add speech or no background noise to the audio. "
         "Good speech: change the speech from discussing cold email to discussing affiliate marketing. Bad speech: change the man to talk about another topic. "
         "Good visible_text: change on-screen text from cold email to mass emails. Bad visible_text: change the whole speech and on-screen text. "
+        "For visible_text, include both from/to text in edit_text; never output only the target text. "
         "Prefer a single key difference instead of multiple simultaneous changes."
     )
 
@@ -433,8 +436,10 @@ def _pair_judge_system_prompt() -> str:
         '"hard_negative_quality": "good"|"weak"|"bad", "accept": boolean, "reject_reason": string}. '
         "Accept only when the reference does not satisfy the edit, the target does satisfy it, "
         "there is one main difference, the context is similar, and negatives are close but wrong. "
+        "Reject if the pair is a near-duplicate without a visible/audible/textual delta, or if it needs multiple broad changes to map reference to target. "
         "For speech edits, require transcript-backed speech evidence on both sides and audio_required=true; generic 'talking' or 'speaking to camera' is not enough. "
         "For audio_event edits, accept only non-speech sound/music/environment changes; reject if the audio difference is only speech or narration content. "
+        "For visible_text edits, require concrete OCR/on-screen text evidence on both sides and a target that is unique beyond template similarity. "
         "Use scores from 0.0 to 1.0."
     )
 
@@ -456,8 +461,10 @@ def _pair_verification_system_prompt() -> str:
         '"target_satisfies": boolean, "score": number, "failure_reason": string}}. '
         "Reject pairs where the reference and target captions are semantically equivalent, "
         "where no concrete visual/audio/text difference is present, or where the edit is not necessary. "
+        "Reject broad stock-pair shifts where the edit would require changing the whole clip instead of one primary difference. "
         "For speech pairs, state what the reference speech says and what the target speech says; if either side lacks transcript-backed speech content, mark difference_matches_edit=false. "
         "For audio_event pairs, reject speech-only/narration-only changes as audio_event; audio_event must be non-language sound evidence. "
+        "For visible_text pairs, quote the observed reference and target on-screen text and reject if either side lacks OCR evidence. "
         "In edit_text_quality_check, reject caption-like edit_text, modality leakage, multiple primary differences, and cases where reference already satisfies the edit. "
         "The projected target caption should describe what the reference would become after applying the edit."
     )

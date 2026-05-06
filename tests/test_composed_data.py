@@ -33,6 +33,7 @@ from app.composed_data import (
     _pair_verification_counts,
     _maybe_reorient_candidate_for_model_fields,
     _model_difference_prefers_reverse_direction,
+    _natural_pair_quality_gate,
     _prepare_record_for_acceptance,
     _repair_pair_model_fields,
     _select_final_accepted_records,
@@ -2405,6 +2406,81 @@ class ComposedDataTests(unittest.TestCase):
         self.assertFalse(quality["not_caption_like"])
         self.assertLess(quality["score"], 0.75)
 
+    def test_edit_text_quality_rejects_vague_mannul_edit(self) -> None:
+        quality = _edit_text_quality_payload(
+            edit_text="make the school",
+            difference={"type": "attribute", "from": "school pf fish", "to": "school of fish"},
+            modalities=["visual"],
+            reference_caption="School pf fish",
+            target_caption="School of fish",
+        )
+
+        self.assertIn("edit_text uses malformed or vague edit wording", quality["bad_patterns"])
+        self.assertLess(quality["score"], 0.75)
+
+    def test_visible_text_edit_requires_from_to_ocr_style_instruction(self) -> None:
+        weak = _edit_text_quality_payload(
+            edit_text="made in macedonia",
+            difference={"type": "visible_text", "from": "made in slovenia", "to": "made in macedonia"},
+            modalities=["visual"],
+            reference_caption="Hand reveals hologram - made in slovenia",
+            target_caption="Hand reveals hologram - made in macedonia",
+        )
+        strong = _edit_text_quality_payload(
+            edit_text="change on-screen text from made in slovenia to made in macedonia",
+            difference={"type": "visible_text", "from": "made in slovenia", "to": "made in macedonia"},
+            modalities=["visual"],
+            reference_caption="Hand reveals hologram - made in slovenia",
+            target_caption="Hand reveals hologram - made in macedonia",
+        )
+
+        self.assertFalse(weak["is_imperative_edit"])
+        self.assertFalse(weak["matches_difference_type"])
+        self.assertGreaterEqual(strong["score"], 0.75)
+
+    def test_natural_pair_gate_rejects_near_duplicate_without_delta(self) -> None:
+        gate = _natural_pair_quality_gate(
+            record={
+                "edit_text": "make it a bell",
+                "difference": {"type": "attribute", "from": "asterisk icon", "to": "bell icon"},
+                "quality": {"visual_near_duplicate_score": 0.9999},
+            },
+            edit_text_quality={"score": 1.0, "is_imperative_edit": True, "bad_patterns": []},
+            observable_difference={"passed": False, "frame_backed": False},
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("too_similar_without_observable_delta", gate["failure_codes"])
+
+    def test_natural_pair_gate_rejects_broad_scene_shift(self) -> None:
+        gate = _natural_pair_quality_gate(
+            record={
+                "edit_text": "make it like a cancun beach",
+                "difference": {"type": "scene", "from": "sandy beach", "to": "cancun beach"},
+                "quality": {"same_context_score": 0.70},
+                "source_context": {"relation": "same_dataset"},
+            },
+            edit_text_quality={"score": 1.0, "is_imperative_edit": True, "bad_patterns": []},
+            observable_difference={"passed": True, "frame_backed": True},
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("too_broad_or_loose_pair", gate["failure_codes"])
+
+    def test_natural_pair_gate_marks_ocr_template_risk_without_evidence(self) -> None:
+        gate = _natural_pair_quality_gate(
+            record={
+                "edit_text": "change on-screen text from made in slovenia to made in macedonia",
+                "difference": {"type": "visible_text", "from": "made in slovenia", "to": "made in macedonia"},
+                "quality": {"target_uniqueness_score": 0.60},
+            },
+            edit_text_quality={"score": 1.0, "is_imperative_edit": True, "bad_patterns": []},
+            observable_difference={"passed": True, "frame_backed": True},
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("ocr_template_risk", gate["failure_codes"])
+
     def test_observable_difference_gate_rejects_caption_only_visual_delta(self) -> None:
         gate = _observable_difference_gate(
             reference_annotation={
@@ -3495,7 +3571,7 @@ class ComposedDataTests(unittest.TestCase):
         self.assertIsNotNone(difference)
         self.assertEqual("speech", difference["type"])
 
-    def test_high_context_priority_prefers_object_change_over_visible_text(self) -> None:
+    def test_high_context_priority_prefers_visible_text_for_fusion_pairs(self) -> None:
         reference = {
             "object_counts": {"person": 1},
             "actions": ["speaking"],
@@ -3520,9 +3596,9 @@ class ComposedDataTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(difference)
-        self.assertEqual("object_presence", difference["type"])
+        self.assertEqual("visible_text", difference["type"])
 
-    def test_high_context_priority_keeps_object_change_ahead_of_audio_event(self) -> None:
+    def test_high_context_priority_prefers_audio_event_for_fusion_pairs(self) -> None:
         reference = {
             "object_counts": {"person": 1},
             "actions": ["speaking"],
@@ -3547,7 +3623,7 @@ class ComposedDataTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(difference)
-        self.assertEqual("object_presence", difference["type"])
+        self.assertEqual("audio_event", difference["type"])
 
     def test_pair_candidates_keep_low_context_pairs_with_available_negatives(self) -> None:
         annotations = [

@@ -41,6 +41,22 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("omni_detective_pilot_20260422", script)
         self.assertIn("omni_detective_pilot", script)
 
+    def test_omni_detective_script_accepts_natural_pair_controls(self) -> None:
+        script = Path("scripts/run_omni_detective_pilot.sh").read_text(encoding="utf-8")
+
+        self.assertIn("CONCURRENCY=${CONCURRENCY:-1}", script)
+        self.assertIn("MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-10}", script)
+        self.assertIn("ANNOTATION_MAX_PASSES=${ANNOTATION_MAX_PASSES:-3}", script)
+        self.assertIn("--concurrency", script)
+        self.assertIn("--max-accepted-pairs", script)
+        self.assertIn("--annotation-max-passes", script)
+        self.assertIn('--concurrency "$CONCURRENCY"', script)
+        self.assertIn('--max-accepted-pairs "$MAX_ACCEPTED_PAIRS"', script)
+        self.assertIn("annotation pass $ANNOTATION_PASS/$ANNOTATION_MAX_PASSES", script)
+        self.assertIn("done=$ANNOTATION_DONE_COUNT/$ANNOTATION_TARGET_COUNT", script)
+        self.assertIn("build-review-bundle", script)
+        self.assertIn("manual_review_bundle", script)
+
     def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
         script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")
 
