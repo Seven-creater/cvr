@@ -466,6 +466,33 @@ def visual_prompt_errors(plan):
     )
     if "replace" in edit_text and support_contact and not target_instance_safe:
         errors.append("object_replacement_breaks_support_contact")
+    if str(difference.get("type", "")).strip() in {"scene", "background"} and "background" in " ".join([
+        edit_text,
+        normalize_phrase(difference.get("from", "")),
+        normalize_phrase(difference.get("to", "")),
+        normalize_phrase(plan.get("edit_region", "")),
+        normalize_phrase(plan.get("mask_query", "")),
+    ]):
+        source_markers = []
+        source_background_text = " ".join([source_text, normalize_phrase(difference.get("from", ""))])
+        for marker in ("sunlit room", "indoor room", "same room", "window", "door"):
+            marker_key = normalize_phrase(marker)
+            if marker_key in source_background_text:
+                source_markers.append(marker_key)
+        if any(marker in target_text for marker in source_markers):
+            errors.append("target_prompt_contains_source_background")
+        preserve_text = normalize_phrase(" ".join(str(item) for item in plan.get("preserve_tokens", [])))
+        if any(marker in preserve_text for marker in source_markers + ["lighting", "layout"]):
+            errors.append("preserve_tokens_contain_source_background")
+        preserve_region_text = normalize_phrase(" ".join(str(item) for item in plan.get("preserve_regions", [])))
+        if any(marker in preserve_region_text for marker in ("window", "door", "room", "wall", "background")):
+            errors.append("preserve_regions_contain_source_background_region")
+        negative_text = normalize_phrase(plan.get("negative_prompt", ""))
+        if (
+            ("preserve" in negative_text or "do not change" in negative_text)
+            and ("lighting" in negative_text or "layout" in negative_text)
+        ):
+            errors.append("background_replace_contains_source_layout_or_lighting_lock")
     plan_lint = plan.get("plan_lint", {}) if isinstance(plan.get("plan_lint"), dict) else {}
     for error in plan_lint.get("errors", []) if isinstance(plan_lint.get("errors", []), list) else []:
         if str(error).strip() and str(error).strip() not in errors:

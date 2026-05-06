@@ -383,6 +383,39 @@ VACE_BACKGROUND_TARGET_SYNONYMS = {
     "lab": {"laboratory", "lab"},
     "futuristic": {"futuristic", "sci fi", "science fiction", "high tech", "hi tech"},
 }
+VACE_BACKGROUND_REPLACE_PRESERVE_DENY_MARKERS = {
+    "background",
+    "door",
+    "lighting",
+    "layout",
+    "original background",
+    "room",
+    "source background",
+    "sunlit room",
+    "wall",
+    "window",
+}
+VACE_BACKGROUND_REPLACE_REGION_DENY_MARKERS = {
+    "background",
+    "door",
+    "room",
+    "wall",
+    "window",
+}
+VACE_BACKGROUND_REPLACE_LOCK_DENY_PATTERNS = {
+    "do not change lighting",
+    "do not change layout",
+    "preserve lighting",
+    "preserve lighting exactly",
+    "preserve layout",
+    "preserve layout exactly",
+    "preserve source background",
+}
+VACE_BACKGROUND_REPLACE_NEGATIVE_PROMPT = (
+    "do not change the subject identity, face, hair, glasses, pose, body position, mouth motion, "
+    "or camera framing. no extra people, no text, no flicker, no unstable background, no distorted face, "
+    "no duplicated body parts, no deformed hands, no blurry face."
+)
 VACE_SEMANTIC_PRESERVE_OBJECT_MARKERS = {
     "beard",
     "face",
@@ -2025,7 +2058,7 @@ def plan_video_edits(
             difference=difference,
             edit_token=edit_token,
         )
-        preserve_tokens = _video_edit_preserve_tokens(reference_annotation, difference, edit_token)
+        preserve_tokens = _video_edit_preserve_tokens(reference_annotation, difference, edit_token, edit_text=edit_text)
         negative_prompt = _video_edit_negative_prompt(preserve_tokens, risk=risk)
         planner_metadata: dict[str, Any] = {
             "stage": "heuristic_prompt_planner",
@@ -2217,6 +2250,22 @@ def plan_video_edits(
             mask_query=mask_query,
             risk=risk,
         )
+        background_replace_plan = _is_background_replace_edit(
+            difference,
+            edit_text,
+            edit_region=edit_region,
+            mask_query=mask_query,
+            target_prompt=target_prompt,
+        )
+        if background_replace_plan:
+            repaired_risk = _background_replace_risk_locks(risk)
+            if repaired_risk != risk:
+                risk = repaired_risk
+                prompt_repairs.append("visual_edit_risk_locks_rewritten_for_background_replace")
+            repaired_preserve_regions = _filter_background_replace_preserve_regions(planned_preserve_regions)
+            if repaired_preserve_regions != planned_preserve_regions:
+                planned_preserve_regions = repaired_preserve_regions
+                prompt_repairs.append("preserve_regions_rewritten_for_background_replace")
         if prompt_repairs:
             planner_metadata = dict(planner_metadata)
             repaired_fields = list(planner_metadata.get("repaired_fields", []))
@@ -2233,6 +2282,8 @@ def plan_video_edits(
             negative_prompt=negative_prompt,
             reference_annotation=reference_annotation,
             mask_query=mask_query,
+            preserve_regions=planned_preserve_regions,
+            risk=risk,
             target_instance_description=target_instance_description,
         )
         if not plan_lint["passed"]:
@@ -2256,6 +2307,8 @@ def plan_video_edits(
             edit_region=edit_region,
             reference_annotation=reference_annotation,
         )
+        if background_replace_plan:
+            preserve_regions = _filter_background_replace_preserve_regions(preserve_regions)
         if planned_preserve_regions:
             preserve_regions = planned_preserve_regions
         mask_plan_name = "grounded_sam2_video_mask" if route == "vace_controlled" else (
@@ -9926,6 +9979,164 @@ def _video_edit_exclusion_keys(difference: dict[str, Any], *, edit_token: str = 
     return exclusions
 
 
+def _is_background_replace_edit(
+    difference: dict[str, Any],
+    edit_text: str = "",
+    *,
+    edit_region: str = "",
+    mask_query: str = "",
+    target_prompt: str = "",
+) -> bool:
+    if str(difference.get("type", "")).strip() not in {"scene", "background"}:
+        return False
+    source = _normalized_phrase(str(difference.get("from", "")).strip())
+    target = _normalized_phrase(str(difference.get("to", "")).strip())
+    if not source or not target or source == target:
+        return False
+    text = _normalized_phrase(
+        " ".join(
+            [
+                str(edit_text),
+                str(edit_region),
+                str(mask_query),
+                str(target_prompt),
+                str(difference.get("description", "")),
+                source,
+                target,
+            ]
+        )
+    )
+    background_region = (
+        "background" in text
+        or _normalized_phrase(edit_region) == "scene"
+        or _normalized_phrase(mask_query) == "background"
+    )
+    replace_verb = any(
+        marker in text
+        for marker in (
+            "background to",
+            "change background",
+            "change the background",
+            "replace background",
+            "replace the background",
+            "set the background",
+            "swap background",
+        )
+    )
+    return background_region and (replace_verb or "background" in source or "background" in target)
+
+
+def _is_background_replace_lock_denied(value: str) -> bool:
+    key = _normalized_phrase(value)
+    if "do not preserve source background" in key:
+        return False
+    if "preserve" in key and ("lighting" in key or "layout" in key):
+        return True
+    if "do not change" in key and ("lighting" in key or "layout" in key):
+        return True
+    return any(pattern in key for pattern in VACE_BACKGROUND_REPLACE_LOCK_DENY_PATTERNS)
+
+
+def _background_replace_target_background(difference: dict[str, Any], edit_text: str = "", edit_token: str = "") -> str:
+    target = str(difference.get("to", "") or edit_token or "").strip()
+    if not target:
+        match = re.search(r"\bbackground\s+(?:to|into|with)\s+(.+?)(?:\.|$)", str(edit_text), flags=re.IGNORECASE)
+        if match:
+            target = match.group(1).strip()
+    target_key = _normalized_phrase(target)
+    if "laboratory" in target_key or "lab" in target_key:
+        return (
+            "a clean blue-white futuristic laboratory interior, with smooth illuminated wall panels "
+            "and lab benches in the background"
+        )
+    target = re.sub(r"\boriginal\b", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"\bbackground\b", "", target, flags=re.IGNORECASE).strip(" .,;:")
+    if not target:
+        target = "the requested new environment"
+    article = _indefinite_article_for_phrase(target)
+    return f"{article} {target} background"
+
+
+def _background_replace_foreground_clause(source_prompt: str) -> str:
+    prompt = str(source_prompt).strip().rstrip(".")
+    if not prompt:
+        return "The foreground subject"
+    prompt = re.split(r"\.\s*(?:scene:|main subjects:|actions:)", prompt, maxsplit=1, flags=re.IGNORECASE)[0]
+    patterns = [
+        r"\s+in\s+front\s+of\s+(?:a|an|the)?\s*[^.,;]*(?:background|room|wall|window|door|office|kitchen|studio|stage|street)[^.,;]*",
+        r"\s+(?:in|inside|within|against|before)\s+(?:a|an|the)?\s*[^.,;]*(?:background|room|wall|window|door|office|kitchen|studio|stage|street)[^.,;]*",
+        r"\s+with\s+(?:a|an|the)?\s*[^.,;]*(?:background|room|wall|window|door)[^.,;]*",
+    ]
+    for pattern in patterns:
+        prompt = re.sub(pattern, "", prompt, flags=re.IGNORECASE).strip()
+    prompt = re.sub(r"\s+", " ", prompt).strip(" .,;:")
+    return prompt or "The foreground subject"
+
+
+def _background_replace_target_prompt(source_prompt: str, difference: dict[str, Any], edit_text: str = "", edit_token: str = "") -> str:
+    foreground = _background_replace_foreground_clause(source_prompt)
+    target_background = _background_replace_target_background(difference, edit_text, edit_token)
+    framing = "stable frontal medium-close-up framing" if "to the camera" in _normalized_phrase(source_prompt) else "stable camera framing"
+    return f"{foreground} in {target_background}, {framing}."
+
+
+def _filter_background_replace_preserve_tokens(preserve_tokens: list[str]) -> list[str]:
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for raw_item in preserve_tokens:
+        item = str(raw_item).strip()
+        key = _normalized_phrase(item)
+        if not item or not key or key in seen:
+            continue
+        if key in VACE_BACKGROUND_REPLACE_PRESERVE_DENY_MARKERS:
+            continue
+        if any(marker in key for marker in VACE_BACKGROUND_REPLACE_PRESERVE_DENY_MARKERS):
+            continue
+        filtered.append(item)
+        seen.add(key)
+    if not any(_normalized_phrase(item) == "camera framing" for item in filtered):
+        filtered.append("camera framing")
+    if not any("timing" in _normalized_phrase(item) for item in filtered):
+        filtered.append("motion timing")
+    return filtered[:10]
+
+
+def _filter_background_replace_preserve_regions(preserve_regions: list[str]) -> list[str]:
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for raw_item in preserve_regions:
+        item = str(raw_item).strip()
+        key = _normalized_phrase(item)
+        if not item or not key or key in seen:
+            continue
+        if key in VACE_BACKGROUND_REPLACE_REGION_DENY_MARKERS:
+            continue
+        if any(marker in key for marker in VACE_BACKGROUND_REPLACE_REGION_DENY_MARKERS):
+            continue
+        filtered.append(item)
+        seen.add(key)
+    return filtered
+
+
+def _background_replace_risk_locks(risk: dict[str, Any] | None) -> dict[str, Any]:
+    updated = dict(risk or {})
+    locks = [
+        str(item).strip()
+        for item in updated.get("locks", [])
+        if str(item).strip() and not _is_background_replace_lock_denied(str(item))
+    ]
+    for lock in (
+        "preserve foreground identity and face",
+        "preserve foreground pose, speaking motion, and timing",
+        "preserve camera framing",
+        "do not preserve source background layout or lighting",
+    ):
+        if lock not in locks:
+            locks.append(lock)
+    updated["locks"] = locks
+    return updated
+
+
 def _filter_video_edit_preserve_tokens(
     preserve_tokens: list[str],
     *,
@@ -10164,6 +10375,8 @@ def _video_edit_target_prompt(
     elif difference_type == "attribute":
         edit_clause = f"Change only the specified attribute: {edit_text}."
     elif difference_type == "scene":
+        if _is_background_replace_edit(difference, edit_text):
+            return _background_replace_target_prompt(source_prompt, difference, edit_text, edit_token)
         target = to_value or str(difference.get("description", "")).strip() or edit_text
         edit_clause = (
             f"The same subject, camera, action timing, and layout are preserved while the background becomes {target}."
@@ -10181,6 +10394,7 @@ def _video_edit_preserve_tokens(
     annotation: dict[str, Any],
     difference: dict[str, Any],
     edit_token: str,
+    edit_text: str = "",
 ) -> list[str]:
     values: list[str] = []
     values.extend(_normalize_list(annotation.get("subjects", [])))
@@ -10195,6 +10409,9 @@ def _video_edit_preserve_tokens(
         difference=difference,
         edit_token=edit_token,
     )
+    if _is_background_replace_edit(difference, edit_text):
+        preserved = _filter_background_replace_preserve_tokens(preserved)
+        return preserved[:10]
     return preserved[:8]
 
 
@@ -10353,6 +10570,19 @@ def _repair_video_edit_prompt_contract(
                 edit_token=edit_token,
             )
             repairs.append("target_prompt_rewritten_for_clothing_edit")
+
+    if _is_background_replace_edit(difference, edit_text, mask_query=mask_query, target_prompt=target_prompt):
+        repaired_target_prompt = _background_replace_target_prompt(source_prompt, difference, edit_text, edit_token)
+        if _normalized_phrase(repaired_target_prompt) != _normalized_phrase(target_prompt):
+            target_prompt = repaired_target_prompt
+            repairs.append("target_prompt_rewritten_for_background_replace")
+        repaired_preserve = _filter_background_replace_preserve_tokens(preserve_tokens)
+        if repaired_preserve != preserve_tokens:
+            preserve_tokens = repaired_preserve
+            repairs.append("preserve_tokens_rewritten_for_background_replace")
+        if _normalized_phrase(negative_prompt) != _normalized_phrase(VACE_BACKGROUND_REPLACE_NEGATIVE_PROMPT):
+            negative_prompt = VACE_BACKGROUND_REPLACE_NEGATIVE_PROMPT
+            repairs.append("negative_prompt_rewritten_for_background_replace")
 
     filtered_preserve = _filter_video_edit_preserve_tokens(
         preserve_tokens,
@@ -10544,6 +10774,8 @@ def _video_edit_plan_lint(
     negative_prompt: str,
     reference_annotation: dict[str, Any],
     mask_query: str = "",
+    preserve_regions: list[str] | None = None,
+    risk: dict[str, Any] | None = None,
     target_instance_description: str = "",
 ) -> dict[str, Any]:
     errors: list[str] = []
@@ -10567,6 +10799,29 @@ def _video_edit_plan_lint(
         errors.append("preserve_tokens_lock_edit_source")
     if source_key and source_key in negative_key:
         errors.append("negative_prompt_locks_edit_source")
+    if _is_background_replace_edit(difference, edit_text, mask_query=mask_query, target_prompt=target_prompt):
+        source_background_markers = _background_source_markers(
+            {
+                "reference_caption": source_prompt,
+                "difference": difference,
+                "generation": {
+                    "source_prompt": source_prompt,
+                    "preserve_regions": preserve_regions or [],
+                },
+            }
+        )
+        for marker in source_background_markers:
+            if _text_mentions_phrase(target_key, marker):
+                errors.append("target_prompt_contains_source_background")
+                break
+        preserve_text = _normalized_phrase(" ".join(preserve_tokens))
+        if any(_text_mentions_phrase(preserve_text, marker) for marker in source_background_markers):
+            errors.append("preserve_tokens_contain_source_background")
+        preserve_region_text = _normalized_phrase(" ".join(preserve_regions or []))
+        if any(_text_mentions_phrase(preserve_region_text, marker) for marker in VACE_BACKGROUND_REPLACE_REGION_DENY_MARKERS):
+            errors.append("preserve_regions_contain_source_background_region")
+        if any(_is_background_replace_lock_denied(item) for item in [negative_prompt] + _normalize_list((risk or {}).get("locks", []))):
+            errors.append("background_replace_contains_source_layout_or_lighting_lock")
     if _is_clothing_edit(difference, edit_text, edit_token):
         structural_clothing_reason = _structural_clothing_edit_reason(
             difference,

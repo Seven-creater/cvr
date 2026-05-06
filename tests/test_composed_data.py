@@ -4668,6 +4668,100 @@ class ComposedDataTests(unittest.TestCase):
             self.assertNotIn("Change only", plans[0]["target_prompt"])
             self.assertTrue(plans[0]["plan_lint"]["passed"])
 
+    def test_plan_video_edits_repairs_background_replace_prompt_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "woman_ref.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "woman_ref",
+                        "output_path": "clips/woman_ref.mp4",
+                        "summary": "A woman with curly red hair and glasses speaks to the camera in a sunlit room.",
+                        "subjects": ["woman"],
+                        "object_counts": {"woman": 1, "glasses": 1, "window": 1, "door": 1},
+                        "actions": ["speaking"],
+                        "scene": "sunlit room",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "woman_lab",
+                        "reference_video": "clips/woman_ref.mp4",
+                        "reference_caption": "A woman with curly red hair and glasses speaks in a sunlit room.",
+                        "edit_text": "change the background to a futuristic laboratory",
+                        "difference": {"type": "scene", "from": "sunlit room background", "to": "futuristic laboratory background"},
+                    }
+                ],
+            )
+
+            fake_client = mock.Mock()
+            fake_client.plan_video_edit.return_value = (
+                {
+                    "should_generate": True,
+                    "source_prompt": "A woman with curly red hair and glasses speaks to the camera in a sunlit room.",
+                    "target_prompt": (
+                        "A woman with curly red hair and glasses speaks to the camera in a sunlit room "
+                        "with a futuristic laboratory background."
+                    ),
+                    "edit_token": "futuristic laboratory background",
+                    "preserve_tokens": ["woman", "curly red hair", "glasses", "speaking", "sunlit room", "lighting", "layout"],
+                    "negative_prompt": "Do not change the woman, lighting, timing, layout, sunlit room, window, or door.",
+                    "edit_region": "background",
+                    "mask_query": "background",
+                    "preserve_regions": ["woman", "window", "door"],
+                    "model_route": "vace_controlled",
+                    "reason": "Background can be changed while preserving the woman.",
+                    "repaired_fields": [],
+                },
+                {"raw": "planner"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=fake_client):
+                summary = plan_video_edits(
+                    root=root,
+                    pair_candidates_path=candidates_path,
+                    clip_annotations_path=annotations_path,
+                    max_plans=5,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["plan_count"])
+            plan = plans[0]
+            target_key = plan["target_prompt"].lower()
+            self.assertIn("futuristic laboratory", target_key)
+            self.assertIn("stable frontal medium-close-up framing", target_key)
+            self.assertNotIn("sunlit room", target_key)
+            self.assertNotIn("window", target_key)
+            self.assertNotIn("door", target_key)
+            self.assertNotIn("lighting", [item.lower() for item in plan["preserve_tokens"]])
+            self.assertNotIn("layout", [item.lower() for item in plan["preserve_tokens"]])
+            self.assertNotIn("sunlit room", [item.lower() for item in plan["preserve_tokens"]])
+            self.assertNotIn("window", [item.lower() for item in plan["preserve_regions"]])
+            self.assertNotIn("door", [item.lower() for item in plan["preserve_regions"]])
+            self.assertIn("camera framing", [item.lower() for item in plan["preserve_tokens"]])
+            self.assertNotIn("sunlit room", plan["negative_prompt"].lower())
+            self.assertNotIn("window", plan["negative_prompt"].lower())
+            self.assertNotIn("door", plan["negative_prompt"].lower())
+            self.assertFalse(any("layout exactly" in lock.lower() for lock in plan["visual_edit_risk"]["locks"]))
+            self.assertIn("target_prompt_rewritten_for_background_replace", plan["planner"]["repaired_fields"])
+            self.assertIn("preserve_regions_rewritten_for_background_replace", plan["planner"]["repaired_fields"])
+            self.assertTrue(plan["plan_lint"]["passed"])
+
     def test_plan_video_edits_rejects_structural_clothing_after_model_revision(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

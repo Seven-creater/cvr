@@ -49,12 +49,11 @@ PLAN_RUN: /data02/usr/wangqihao/Demo/test/cvr_clean_main/runs/omni_stable_all_ca
 
 ```text
 branch: codex/vace-pipeline-hardening
-GitHub 已推送 HEAD: ffb8a3d Prefer torch GroundingDINO checkpoints
-本地额外 commit: 2d1fc41 Fallback from HF GroundingDINO checkpoints
-状态: 本地 ahead 1，因本机 DNS 无法解析 github.com，2d1fc41 暂未推送
+本地 HEAD: 持续在 codex/vace-pipeline-hardening 上追加 hardening commit
+状态: 本地可能 ahead origin；服务器执行前必须先 git fetch / pull 最新可见远端
 ```
 
-也就是说，服务器目前能通过 GitHub 拉到 `ffb8a3d`，但还拉不到本地最新的 `2d1fc41`。
+如果本机 DNS/SSH 暂时无法解析 GitHub，最新本地 commit 可能尚未推送。服务器 AI 不应根据旧 commit 结论继续跑实验，必须先确认远端 HEAD。
 
 ## 3. 数据与 plan 进展
 
@@ -185,7 +184,43 @@ ffb8a3d Prefer torch GroundingDINO checkpoints
 2d1fc41 Fallback from HF GroundingDINO checkpoints
 ```
 
-`2d1fc41` 的作用是：`--grounder auto` 遇到 HF 格式 GroundingDINO checkpoint 时自动退到 Florence-2。但因为本机暂时无法解析 GitHub，这个 commit 还没有推到远端。
+`2d1fc41` 的作用是：`--grounder auto` 遇到 HF 格式 GroundingDINO checkpoint 时自动退到 Florence-2。服务器执行前需要确认远端是否已经包含这个 commit；如果没有，仍应显式使用 `--grounder florence2`。
+
+### 4.5 background replacement prompt 冲突修复
+
+`mannul5` 暴露的背景替换失败不是 mask / 帧率 / remux 问题，而是 planner 把 source 背景锁进了 VACE prompt 与 preserve 约束：
+
+```text
+错误 target_prompt:
+A woman ... speaks to the camera in a sunlit room with a futuristic laboratory background.
+
+错误 preserve / locks:
+sunlit room, window, door, preserve lighting exactly, preserve layout exactly
+```
+
+这会让 VACE 同时收到互相冲突的信号：
+
+```text
+把背景换成 futuristic laboratory
+保留原 sunlit room / window / door / lighting / layout
+```
+
+因此现在把 `background_replace` 写成 deterministic repair rule，而不是继续让 Omni planner 自由发挥：
+
+- `target_prompt` 必须是最终状态描述，只描述目标画面。
+- VACE prompt 中不能出现 source 背景词：`sunlit room`、`window`、`door`、`original room`、`source background`。
+- `preserve_tokens` 只保留前景主体、身份、脸、头发、眼镜、动作、嘴型、姿态、时序、camera framing。
+- `preserve_regions` 只保留前景主体区域，禁止保留 `window/door/room/wall/background`。
+- `negative_prompt` 只防人物坏、闪烁、伪影、额外人物；不再写 `preserve lighting/layout`。
+- `visual_edit_risk.locks` 只保留 foreground identity / pose / timing / camera framing，并显式禁止保留 source background layout or lighting。
+
+修复后的 VACE prompt 形态应类似：
+
+```text
+A woman with curly red hair and glasses speaks to the camera in a clean blue-white futuristic laboratory interior, with smooth illuminated wall panels and lab benches in the background, stable frontal medium-close-up framing.
+```
+
+旧 plan 或旧 review bundle 只要仍包含 `sunlit room/window/door/layout/lighting` 这类 source 背景锁，就必须被 plan lint / smoke preflight 拒绝，不能进入 VACE。
 
 ## 5. 当前遇到的问题
 

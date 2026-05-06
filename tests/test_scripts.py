@@ -194,6 +194,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("semantic_gate_family", script)
         self.assertIn("original room, windows, doors, walls, or brick wall must not remain visible", script)
         self.assertIn("blue tint, blue overlay, or style wash", script)
+        self.assertIn("target_prompt_contains_source_background", script)
+        self.assertIn("background_replace_contains_source_layout_or_lighting_lock", script)
         self.assertIn("object_replacement", script)
         self.assertIn("raw_target_contact.jpg", script)
         self.assertIn("target_contact.jpg", script)
