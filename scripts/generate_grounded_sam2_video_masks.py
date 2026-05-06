@@ -56,16 +56,50 @@ def _find_file(path: Path, patterns: tuple[str, ...]) -> Path:
     raise FileNotFoundError(f"cannot find any of {patterns} under {path}")
 
 
+def _looks_like_huggingface_pytorch_checkpoint(path: Path) -> bool:
+    return (
+        path.name == "pytorch_model.bin"
+        and (
+            (path.parent / "config.json").exists()
+            or (path.parent / "model.safetensors").exists()
+            or (path.parent / "tokenizer.json").exists()
+        )
+    )
+
+
 def _find_grounding_dino_checkpoint(path: Path) -> Path:
     if path.is_file():
         if path.suffix == ".safetensors":
             raise ValueError(
                 f"GroundingDINO load_model uses torch.load and cannot read safetensors checkpoints: {path}"
             )
+        if _looks_like_huggingface_pytorch_checkpoint(path):
+            raise ValueError(
+                "GroundingDINO load_model expects a torch checkpoint dict with a 'model' key, "
+                f"but this looks like a HuggingFace pytorch_model.bin checkpoint: {path}"
+            )
         return path
     try:
-        return _find_file(path, ("*.pth", "*.pt", "*.bin"))
+        return _find_file(path, ("*.pth", "*.pt"))
     except FileNotFoundError as exc:
+        bin_matches = [
+            candidate
+            for candidate in sorted(path.rglob("*.bin")) if path.exists()
+            if not _looks_like_huggingface_pytorch_checkpoint(candidate)
+        ]
+        if bin_matches:
+            return bin_matches[0]
+        hf_bins = [
+            candidate
+            for candidate in sorted(path.rglob("*.bin")) if path.exists()
+            if _looks_like_huggingface_pytorch_checkpoint(candidate)
+        ]
+        if hf_bins:
+            raise FileNotFoundError(
+                "GroundingDINO checkpoint directory only contains HuggingFace-format "
+                "pytorch_model.bin files, but GroundingDINO load_model expects a torch "
+                f"checkpoint dict with a 'model' key. First HF bin: {hf_bins[0]}"
+            ) from exc
         safetensors = sorted(path.rglob("*.safetensors")) if path.exists() else []
         if safetensors:
             raise FileNotFoundError(
@@ -865,11 +899,28 @@ def main() -> None:
     grounded_sam2_code = Path(args.grounded_sam2_code)
     grounding_config = Path(args.grounding_dino_config)
     grounding_checkpoint = None
+    grounding_checkpoint_error = ""
     if args.grounder in {"auto", "groundingdino"}:
-        grounding_checkpoint = _find_grounding_dino_checkpoint(Path(args.grounding_dino_checkpoint))
+        try:
+            grounding_checkpoint = _find_grounding_dino_checkpoint(Path(args.grounding_dino_checkpoint))
+        except Exception as exc:
+            if args.grounder == "groundingdino":
+                raise
+            grounding_checkpoint_error = f"{type(exc).__name__}: {exc}"
     florence_model_dir = None
     if args.grounder in {"auto", "florence2"} and args.florence_model:
         florence_model_dir = _find_dir(Path(args.florence_model), ("config.json",))
+    effective_grounder = args.grounder
+    if args.grounder == "auto":
+        if grounding_checkpoint is not None:
+            effective_grounder = "groundingdino"
+        elif florence_model_dir is not None:
+            effective_grounder = "florence2"
+        else:
+            raise RuntimeError(
+                "auto grounder could not find a usable GroundingDINO checkpoint or Florence-2 model. "
+                f"GroundingDINO error: {grounding_checkpoint_error}"
+            )
     sam2_checkpoint = _find_file(Path(args.sam2_checkpoint), ("*.pt", "*.pth"))
 
     output_records: list[dict[str, Any]] = []
@@ -891,7 +942,7 @@ def main() -> None:
                 try:
                     if candidate_video.exists():
                         candidate_video.unlink()
-                    if args.grounder == "florence2":
+                    if effective_grounder == "florence2":
                         if florence_model_dir is None:
                             raise RuntimeError("--florence-model is required when --grounder florence2")
                         candidate_metrics = _run_florence_sam2(

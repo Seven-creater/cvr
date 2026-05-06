@@ -275,12 +275,23 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("protected_overlap_ratio_max", helper)
         self.assertIn("min_protected_detections", helper)
 
-    def test_grounding_dino_checkpoint_prefers_torch_bin_over_safetensors(self) -> None:
+    def test_grounding_dino_checkpoint_rejects_huggingface_bin(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_dir = Path(temp_dir) / "checkpoints"
             checkpoint_dir.mkdir()
             (checkpoint_dir / "model.safetensors").write_bytes(b"not a torch checkpoint")
-            expected = checkpoint_dir / "pytorch_model.bin"
+            (checkpoint_dir / "config.json").write_text("{}", encoding="utf-8")
+            (checkpoint_dir / "pytorch_model.bin").write_bytes(b"huggingface state dict placeholder")
+
+            with self.assertRaisesRegex(FileNotFoundError, "HuggingFace-format"):
+                _find_grounding_dino_checkpoint(checkpoint_dir)
+
+    def test_grounding_dino_checkpoint_accepts_non_hf_torch_bin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_dir = Path(temp_dir) / "checkpoints"
+            checkpoint_dir.mkdir()
+            (checkpoint_dir / "model.safetensors").write_bytes(b"not a torch checkpoint")
+            expected = checkpoint_dir / "groundingdino_model.bin"
             expected.write_bytes(b"torch checkpoint placeholder")
 
             self.assertEqual(expected, _find_grounding_dino_checkpoint(checkpoint_dir))
