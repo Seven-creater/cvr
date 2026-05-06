@@ -6924,6 +6924,50 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(any("duration gate failed" in issue for issue in issues))
             self.assertTrue(any("raw_duration_drift_seconds" in issue for issue in issues))
 
+    def test_synthetic_visual_requires_duration_gate_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={"duration_seconds": 5.0, "has_audio": True, "has_video": True},
+            ):
+                issues = _pair_record_acceptance_issues(
+                    root=root,
+                    record={
+                        "source_type": "synthetic_edit",
+                        "reference_video": "ref.mp4",
+                        "target_video": "target.mp4",
+                        "edit_text": "change the robot body color to yellow",
+                        "difference": {"type": "attribute", "from": "black robot", "to": "yellow robot"},
+                        "quality": {"visual_near_duplicate_score": 0.90},
+                        "source_context": {"relation": "synthetic_from_reference"},
+                        "generation": {
+                            "model": "wan-vace",
+                            "source_video": "ref.mp4",
+                            "model_route": "vace_controlled",
+                            "prompt": "A yellow robot rotates.",
+                            "source_prompt": "A black robot rotates.",
+                            "target_prompt": "A yellow robot rotates.",
+                            "preserve_tokens": ["robot", "rotation", "camera framing"],
+                            "src_video_for_vace": "ref.mp4",
+                            "src_mask": "target.mp4",
+                            "mask_semantics_version": 3,
+                            "mask_polarity": "white_generate_black_preserve",
+                            "mask_metrics": {"mask_coverage_ratio_avg": 0.2},
+                            "review_inputs_dir": ".",
+                            "duration_metrics": {"duration_drift_seconds": 11.96},
+                            "post_vace_verdict": {"semantic_gate_required": True, "semantic_gate_passed": True},
+                            "postprocess": {"audio_copied_from_reference": True, "raw_generated_video": "target.mp4"},
+                        },
+                    },
+                    reference_annotation={"object_counts": {"robot": 1}},
+                    target_annotation={"object_counts": {"robot": 1}},
+                )
+
+            self.assertTrue(any("duration gate is required" in issue for issue in issues))
+
     def test_synthetic_visual_rejects_unpassed_post_vace_semantic_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

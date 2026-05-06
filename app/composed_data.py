@@ -8174,7 +8174,9 @@ def _synthetic_edit_record_issues(
             issues.append(f"visual synthetic src_video_for_vace does not exist: {src_video_for_vace}")
         duration_metrics = generation.get("duration_metrics", {}) if isinstance(generation.get("duration_metrics"), dict) else {}
         duration_gate = duration_metrics.get("duration_gate", {}) if isinstance(duration_metrics.get("duration_gate"), dict) else {}
-        if duration_gate and not _boolish(duration_gate.get("passed")):
+        if not duration_gate:
+            issues.append("visual synthetic duration gate is required")
+        elif not _boolish(duration_gate.get("passed")):
             gate_errors = _normalize_list(duration_gate.get("errors", []))
             issues.append(
                 "visual synthetic duration gate failed"
@@ -11478,6 +11480,12 @@ def _known_pair_generation_issues(record: dict[str, Any]) -> list[str]:
     duration_metrics = generation.get("duration_metrics")
     if not isinstance(duration_metrics, dict) or not duration_metrics:
         issues.append("generation.duration_metrics is required for synthetic visual pairs")
+    else:
+        duration_gate = duration_metrics.get("duration_gate")
+        if not isinstance(duration_gate, dict):
+            issues.append("generation.duration_metrics.duration_gate is required for synthetic visual pairs")
+        elif not _boolish(duration_gate.get("passed")):
+            issues.append("generation.duration_metrics.duration_gate.passed=true is required for synthetic visual pairs")
     post_vace_verdict = generation.get("post_vace_verdict")
     if not isinstance(post_vace_verdict, dict) or not post_vace_verdict:
         issues.append("generation.post_vace_verdict is required for synthetic visual pairs")
