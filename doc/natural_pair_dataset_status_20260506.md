@@ -20,7 +20,27 @@ Synthetic video editing remains available for controlled experiments, but it is 
   - `too_similar_without_observable_delta`
   - `too_broad_or_loose_pair`
   - `ocr_template_risk`
+  - `audio_event_too_similar`
+  - `visible_text_fragment_edit`
 - Accepted natural pairs must still pass Omni judge, video-level verification, and local structured gates.
+
+## Latest Smoke
+
+`cf4489a` completed end-to-end with 236/236 unique clip annotations, 40 judged
+pair proposals, and 3 accepted pairs. The run proved the staged resume and
+fail-fast script behavior, but the accepted set is still too small and two
+accepted examples exposed weak-delta risks:
+
+- `audio_event`: `replace the low-frequency electronic hum with a low electronic hum`
+  is nearly a same-event rewrite rather than a useful edit.
+- `visible_text`: `Singapore's Manufacturing -> Singapore` keeps only a
+  fragment of the source OCR text.
+
+The current fix keeps those cases out of `accepted_pairs.jsonl` by requiring
+audio event from/to values to be semantically distinct and visible-text targets
+not to be simple fragments of the source text. The next smoke should increase
+`--max-proposals` after pulling the new commit, because the previous 40
+proposals produced too few diverse accepted pairs.
 
 ## Mannul Boundary Table
 
@@ -61,10 +81,10 @@ nohup bash scripts/run_omni_detective_pilot.sh \
   --segment-seconds 8 \
   --concurrency 1 \
   --max-accepted-pairs 20 \
-  --max-proposals 40 \
+  --max-proposals 120 \
   --annotation-max-passes 5 \
   --annotation-pass-timeout-seconds 900 \
-  --propose-timeout-seconds 900 \
+  --propose-timeout-seconds 600 \
   --model-stage instruct \
   > "$RUN_ROOT/logs/omni_detective_pair.log" 2>&1 &
 ```
@@ -85,10 +105,10 @@ nohup bash scripts/run_omni_detective_pilot.sh \
   --base-url "$BASE_URL" \
   --concurrency 1 \
   --max-accepted-pairs 20 \
-  --max-proposals 40 \
+  --max-proposals 120 \
   --annotation-max-passes 5 \
   --annotation-pass-timeout-seconds 900 \
-  --propose-timeout-seconds 900 \
+  --propose-timeout-seconds 600 \
   --start-stage annotate \
   --model-stage instruct \
   > "$RUN_ROOT/logs/omni_detective_resume.log" 2>&1 &

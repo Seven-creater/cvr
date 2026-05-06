@@ -2655,6 +2655,72 @@ class ComposedDataTests(unittest.TestCase):
         self.assertFalse(gate["passed"])
         self.assertIn("ocr_template_risk", gate["failure_codes"])
 
+    def test_natural_pair_gate_rejects_visible_text_fragment_edit(self) -> None:
+        gate = _natural_pair_quality_gate(
+            record={
+                "edit_text": "change on-screen text from Singapore's Manufacturing to Singapore",
+                "difference": {
+                    "type": "visible_text",
+                    "from": "Singapore's Manufacturing",
+                    "to": "Singapore",
+                },
+                "quality": {"target_uniqueness_score": 0.95},
+            },
+            edit_text_quality={"score": 1.0, "is_imperative_edit": True, "bad_patterns": []},
+            observable_difference={"passed": True, "frame_backed": True},
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("visible_text_fragment_edit", gate["failure_codes"])
+
+    def test_natural_pair_gate_allows_distinct_visible_text_replacement(self) -> None:
+        gate = _natural_pair_quality_gate(
+            record={
+                "edit_text": "change on-screen text from Singapore's Manufacturing to SCHOLAR",
+                "difference": {
+                    "type": "visible_text",
+                    "from": "Singapore's Manufacturing",
+                    "to": "SCHOLAR",
+                },
+                "quality": {"target_uniqueness_score": 0.95},
+            },
+            edit_text_quality={"score": 1.0, "is_imperative_edit": True, "bad_patterns": []},
+            observable_difference={"passed": True, "frame_backed": True},
+        )
+
+        self.assertTrue(gate["passed"])
+
+    def test_natural_pair_gate_rejects_audio_event_too_similar(self) -> None:
+        gate = _natural_pair_quality_gate(
+            record={
+                "edit_text": "replace the low-frequency electronic hum with a low electronic hum",
+                "difference": {
+                    "type": "audio_event",
+                    "from": "low-frequency electronic hum",
+                    "to": "low electronic hum",
+                },
+                "quality": {},
+            },
+            edit_text_quality={"score": 1.0, "is_imperative_edit": True, "bad_patterns": []},
+            observable_difference={"passed": True, "frame_backed": True},
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("audio_event_too_similar", gate["failure_codes"])
+
+    def test_natural_pair_gate_allows_absent_to_audio_event(self) -> None:
+        gate = _natural_pair_quality_gate(
+            record={
+                "edit_text": "add a whoosh to the audio",
+                "difference": {"type": "audio_event", "from": "no whoosh", "to": "whoosh"},
+                "quality": {},
+            },
+            edit_text_quality={"score": 1.0, "is_imperative_edit": True, "bad_patterns": []},
+            observable_difference={"passed": True, "frame_backed": True},
+        )
+
+        self.assertTrue(gate["passed"])
+
     def test_observable_difference_gate_rejects_caption_only_visual_delta(self) -> None:
         gate = _observable_difference_gate(
             reference_annotation={

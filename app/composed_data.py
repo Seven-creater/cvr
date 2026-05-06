@@ -814,7 +814,11 @@ NATURAL_PAIR_GATE_LABELS = {
     "too_similar_without_observable_delta": "too_similar_without_observable_delta: near-duplicate visual pair has no frame-backed delta",
     "too_broad_or_loose_pair": "too_broad_or_loose_pair: broad scene change without enough shared context",
     "ocr_template_risk": "ocr_template_risk: visible-text edit lacks reliable OCR evidence or target uniqueness",
+    "audio_event_too_similar": "audio_event_too_similar: audio_event from/to values are too similar to be a useful edit",
+    "visible_text_fragment_edit": "visible_text_fragment_edit: target visible text is only a fragment of the source text",
 }
+VISIBLE_TEXT_FRAGMENT_MIN_SOURCE_TOKENS = 2
+VISIBLE_TEXT_FRAGMENT_MAX_TARGET_TOKEN_RATIO = 0.75
 FINAL_ACCEPT_BUCKET_TARGETS = {
     "audio_event": 2,
     "speech": 2,
@@ -4886,6 +4890,41 @@ def _difference_value_similarity(left: str, right: str) -> float:
     return overlap / max(1, min(len(left_tokens), len(right_tokens)))
 
 
+def _difference_values_are_too_similar(left: str, right: str, *, threshold: float = 0.85) -> bool:
+    left_absent = _absence_like_phrase(left) or _is_audio_absence_edit_phrase(left)
+    right_absent = _absence_like_phrase(right) or _is_audio_absence_edit_phrase(right)
+    if left_absent != right_absent:
+        return False
+    left_norm = _normalized_phrase(_strip_presence_prefix(left))
+    right_norm = _normalized_phrase(_strip_presence_prefix(right))
+    if not left_norm or not right_norm:
+        return False
+    return _difference_value_similarity(left_norm, right_norm) >= threshold
+
+
+def _visible_text_fragment_edit(difference: dict[str, Any]) -> bool:
+    from_norm = _normalized_phrase(str(difference.get("from", "")))
+    to_norm = _normalized_phrase(str(difference.get("to", "")))
+    if not from_norm or not to_norm or from_norm == to_norm:
+        return bool(from_norm and to_norm and from_norm == to_norm)
+    from_tokens = _tokenize_text(from_norm)
+    to_tokens = _tokenize_text(to_norm)
+    if (
+        not from_tokens
+        or not to_tokens
+        or len(from_tokens) < VISIBLE_TEXT_FRAGMENT_MIN_SOURCE_TOKENS
+        or len(to_tokens) >= len(from_tokens)
+    ):
+        return False
+    target_is_source_subspan = to_norm in from_norm
+    target_tokens_are_subset = to_tokens <= from_tokens
+    target_ratio = len(to_tokens) / max(1, len(from_tokens))
+    return bool(
+        (target_is_source_subspan or target_tokens_are_subset)
+        and target_ratio <= VISIBLE_TEXT_FRAGMENT_MAX_TARGET_TOKEN_RATIO
+    )
+
+
 def _repair_pair_model_fields(
     *,
     model_fields: dict[str, Any],
@@ -5596,6 +5635,14 @@ def _natural_pair_quality_gate(
             or _score_float(quality.get("target_uniqueness_score")) < MIN_ACCEPT_TARGET_UNIQUENESS_SCORE
         ):
             failure_codes.append("ocr_template_risk")
+        if has_from_to and _visible_text_fragment_edit(difference):
+            failure_codes.append("visible_text_fragment_edit")
+
+    if difference_type == "audio_event" and _difference_values_are_too_similar(
+        str(difference.get("from", "")),
+        str(difference.get("to", "")),
+    ):
+        failure_codes.append("audio_event_too_similar")
 
     failure_codes = _dedupe_strings(failure_codes)
     reasons = [NATURAL_PAIR_GATE_LABELS[code] for code in failure_codes if code in NATURAL_PAIR_GATE_LABELS]
