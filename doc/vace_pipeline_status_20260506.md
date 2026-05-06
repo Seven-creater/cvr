@@ -2,6 +2,63 @@
 
 Last updated: 2026-05-06
 
+## 0. 当前总览
+
+### 0.1 我们现在处在什么阶段
+
+当前项目还没有进入“稳定批量生成视觉目标视频”的阶段，而是在做 **VACE capability map**：
+
+```text
+目的不是立刻多跑，而是弄清楚：
+哪些编辑类型可以生产；
+哪些只能小规模实验；
+哪些应自动拒绝，避免浪费 GPU。
+```
+
+已经明确的一点是：数据集最终可以有很多种类和数量，但 accepted synthetic pairs 的门槛不能靠放低来凑数量。探索阶段可以记录失败，生产阶段必须严格：
+
+```text
+mask gate passed
+duration gate passed
+semantic gate passed
+review bundle complete
+```
+
+### 0.2 当前最重要的结论
+
+| 问题 | 当前结论 |
+|---|---|
+| VACE 输入契约 | 已基本修好：`src_video + src_mask + src_ref_images + target prompt`，81f@16fps exact-frame |
+| 普通 masked VACE 做完整背景替换 | 不稳定，常变成 blue overlay / style wash，不作为 production 默认路线 |
+| composite-first-frame 背景替换 | `mannul7` 证明可行，是当前最值得继续复现的视觉路线 |
+| mask 生成 | 仍是最大瓶颈，尤其是多场景 clip、小目标、衣物/乐器遮挡 |
+| 当前 35 个 plan | 大部分被正确拒绝；不是“没跑成”，而是发现原始候选质量不适合 VACE |
+| 下一步 | 用脚本化 composite route 复现 2-3 条 talking-head background replacement，同时继续筛更适合的 source clips |
+
+### 0.3 当前能力地图
+
+| 编辑类型 | 当前状态 | 原因 / 备注 | 下一步 |
+|---|---|---|---|
+| deterministic audio route | 已验证可生产 | 画面不变，只改非语言音频事件，已通过 10/10 | 可作为稳定数据来源继续扩大 |
+| talking-head background replacement + composite-first-frame | 初步可行 | `mannul7` 成功生成真实 futuristic lab 背景，前景人物保留 | 复现 2-3 条，再决定是否批量 |
+| plain masked background replacement | 默认禁用 | `mannul5/mannul6` 只生成蓝色叠加，原房间结构残留 | 只保留为 experiment / restyle |
+| background restyle / soft repaint | 接近可行但未稳定 | 可能适合“风格化原背景”，不适合“房间换成实验室” | 需要单独定义轻量目标和验收 |
+| existing large object / robot / vehicle attribute edit | 值得继续找样本 | 理论上较适合 VACE，但当前 plan 里很多没有真实 vehicle 或有可见文字 | 重新从 stable clips 中筛更大、更清晰、无文字目标 |
+| clothing color / material | 高风险 | mask 经常覆盖乐器/手/身体，VACE 容易变成 vest/polo/dark shirt | 只保留低风险“已有衣物颜色/材质”实验 |
+| structural clothing / try-on | 不走默认 VACE | black jacket/coat/blazer 属于虚拟试衣级别，已多次失败 | 未来单独做 try-on-first-frame route |
+| small object replacement/removal | 当前自动拒绝 | cup/mug/chair 等覆盖太小或多实例，full-frame VACE 不稳定 | 需要重新裁切到目标显著，或不用这条 route |
+| seated support edit | 自动拒绝 | chair/stool/seat 与人物承重关系冲突 | 不进生产 |
+| text/logo/screen edit | 自动拒绝 | OCR/屏幕文字风险高，VACE 容易生成乱码 | 不进生产 |
+| multi-scene / montage clip | 自动拒绝或 mask 阶段停止 | Florence-2/SAM2 只能在约 25% 帧检测目标，过不了稳定性 gate | 先筛单镜头稳定短片 |
+
+### 0.4 当前最直接的下一步
+
+1. 服务器拉取最新 `codex/vace-pipeline-hardening`，确认 HEAD 至少为 `8e827ab`。
+2. 用脚本化 `run_vace_visual_synthetic_smoke.sh` 复跑 `ef8f2818` composite-first-frame，不再手工拼 mannul7 流程。
+3. 如果复现成功，再筛 2-3 条 **单场景、单主体、人物全程在画面中** 的 talking-head background replacement。
+4. 并行做一轮新的 source clip 筛选，不再从当前 35 条坏 plan 里硬挖数量。
+5. accepted pairs 只收同时通过 duration / semantic / bundle / mask gate 的结果；失败样本继续进入 capability report。
+
 ## 1. 当前结论
 
 当前视觉合成路线还没有稳定进入“批量生成目标视频”的阶段。真正的瓶颈已经从 VACE 本身前移到 **mask 生成、route 选择与诚实验收**：
@@ -65,7 +122,7 @@ PLAN_RUN: /data02/usr/wangqihao/Demo/test/cvr_clean_main/runs/omni_stable_all_ca
 
 ```text
 branch: codex/vace-pipeline-hardening
-远端 HEAD: 仍需以最新 codex/vace-pipeline-hardening 为准
+当前已推送 HEAD: 8e827ab Support composite first-frame VACE smoke
 状态: 本地与 origin/codex/vace-pipeline-hardening 已同步
 ```
 
@@ -77,6 +134,13 @@ git rev-parse --short HEAD
 ```
 
 如果没有包含 `98e0070` 之后的 background route 降级修复，不要继续跑 background VACE。
+
+当前服务器下一次执行应确认：
+
+```text
+git rev-parse --short HEAD
+# 期望: 8e827ab 或更新
+```
 
 ## 3. 数据与 plan 进展
 
@@ -470,6 +534,33 @@ generation.duration_metrics.duration_gate.passed=true
 
 ## 6. 当前推荐下一步
 
+### 6.0 总体策略
+
+现在不要把“数量”理解成“所有 plan 都硬跑 VACE”。更合理的策略是分两层：
+
+```text
+探索层：多试类别，记录失败原因，完善 capability map。
+生产层：只收 gate 全通过的样本，宁缺毋滥。
+```
+
+短期目标不是直接生成上千条视觉样本，而是先找到 2-3 个可重复的高产类别。当前最有希望的是：
+
+1. composite-first-frame talking-head background replacement。
+2. deterministic audio synthetic。
+3. 更干净 source clips 上的 existing object / large attribute edit。
+4. 静态或近静态视频中的局部颜色 / 材质变化。
+
+当前不建议继续在这批 35 条 plan 里反复调阈值。更应该把新筛选规则前移到 clip/plan 阶段：
+
+```text
+单镜头
+主体/目标全程可见
+目标覆盖面积足够
+无可见文字
+无承重/接触关系
+无多实例歧义
+```
+
 ### 6.1 服务器下一步执行方向
 
 先不要扩大跑批，也不要再跑 plain masked background replacement。服务器下一步应拉取最新 `codex/vace-pipeline-hardening`，使用脚本化 `vace_bg_replace_composite_first_frame_mv2v` 路线做 2-3 条小批量复现。
@@ -505,6 +596,16 @@ python -m unittest tests.test_scripts tests.test_composed_data -v
 ```
 
 如果测试通过，再重新生成 ef8f2818 或其它单场景 talking-head background_replace 的 smoke。不要复用 mannul5/mannul6 的旧 plan，也不要复用旧 review bundle。
+
+建议服务器先做这一条最小闭环：
+
+```text
+1. 拉最新 HEAD。
+2. 确认 ef8f2818 的 v3 mask、selected src_ref_image、prompt、policy 都存在。
+3. 直接跑 run_vace_visual_synthetic_smoke.sh。
+4. 检查 review bundle 是否包含 composite_frame0、composite src_video/mask contact、raw target、target、duration_metrics、post_vace_verdict。
+5. 如果 semantic gate 通过，再把该样本标记为 composite-first-frame 可复现。
+```
 
 新 plan 必须人工/脚本确认：
 
