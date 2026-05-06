@@ -146,6 +146,8 @@ from pathlib import Path
 VIDEO_MASK_SEMANTICS_VERSION = 3
 VIDEO_MASK_POLARITY = "white_generate_black_preserve"
 VACE_BG_REPLACE_COMPOSITE_ROUTE = "vace_bg_replace_composite_first_frame_mv2v"
+DETERMINISTIC_BG_COMPOSITE_ROUTE = "deterministic_foreground_background_composite"
+GUIDED_COMPOSITE_REFINE_VACE_ROUTE = "guided_composite_refine_vace"
 VACE_DARK_COLOR_MARKERS = {"black", "dark", "navy", "deep navy", "deep navy blue", "charcoal"}
 
 data_root = Path(sys.argv[1])
@@ -501,11 +503,15 @@ def visual_prompt_errors(plan):
             plan.get("background_replace_route", "")
             or policy.get("recommended_route", "")
         )
-        composite_route = normalize_phrase(VACE_BG_REPLACE_COMPOSITE_ROUTE)
-        if background_route != composite_route and os.environ.get("ALLOW_PLAIN_BACKGROUND_REPLACE", "0").strip() != "1":
+        allowed_background_routes = {
+            normalize_phrase(VACE_BG_REPLACE_COMPOSITE_ROUTE),
+            normalize_phrase(DETERMINISTIC_BG_COMPOSITE_ROUTE),
+            normalize_phrase(GUIDED_COMPOSITE_REFINE_VACE_ROUTE),
+        }
+        if background_route not in allowed_background_routes and os.environ.get("ALLOW_PLAIN_BACKGROUND_REPLACE", "0").strip() != "1":
             errors.append(
                 "background_replace_plain_masked_vace_disabled:"
-                + str(policy.get("recommended_route", "vace_bg_replace_composite_first_frame_mv2v"))
+                + str(policy.get("recommended_route", "deterministic_foreground_background_composite"))
             )
     if str(difference.get("type", "")).strip() in {"scene", "background"} and "background" in " ".join([
         edit_text,
@@ -693,6 +699,11 @@ prompt_errors = visual_prompt_errors(plan) + clothing_prompt_errors(plan)
 if prompt_errors:
     raise SystemExit("selected plan failed target prompt lint: " + "; ".join(prompt_errors))
 prompt = target_prompt
+background_replace_route = str(
+    plan.get("background_replace_route")
+    or (plan.get("background_replace_policy") or {}).get("recommended_route", "")
+).strip()
+requires_vace = background_replace_route != DETERMINISTIC_BG_COMPOSITE_ROUTE
 
 selected_plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -708,8 +719,10 @@ known_pair = {
     "hard_negatives": [],
     "quality": {"visual_near_duplicate_score": 0.90},
     "generation": {
-        "model": wan_ckpt.name or str(wan_ckpt),
+        "model": "ffmpeg-deterministic-composite" if not requires_vace else (wan_ckpt.name or str(wan_ckpt)),
         "model_route": route,
+        "generation_route": background_replace_route or route,
+        "requires_vace": requires_vace,
         "source_video": str(reference_video_for_vace),
         "original_reference_video": str(reference_video_original),
         "src_video_for_vace": str(src_video_for_vace if src_mask else reference_video_for_vace),
@@ -733,10 +746,7 @@ known_pair = {
         "mask_target_instance_alignment": mask_manifest_row.get("mask_target_instance_alignment", {}),
         "exploration_family": str(plan.get("exploration_family", "")).strip(),
         "video_edit_plan_id": plan_id,
-        "background_replace_route": str(
-            plan.get("background_replace_route")
-            or (plan.get("background_replace_policy") or {}).get("recommended_route", "")
-        ).strip(),
+        "background_replace_route": background_replace_route,
         "background_replace_policy": plan.get("background_replace_policy", {}),
         "review_inputs_dir": str(out_root / "review_inputs"),
         "postprocess": {
@@ -782,6 +792,7 @@ env_values = {
         plan.get("background_replace_route")
         or (plan.get("background_replace_policy") or {}).get("recommended_route", "")
     ).strip(),
+    "REQUIRES_VACE": "1" if requires_vace else "0",
     "PROMPT": prompt,
     "KNOWN_PAIRS": str(out_root / "pairs" / "synthetic_visual_candidate_pairs.jsonl"),
     "TARGET_MANIFEST": str(out_root / "metadata" / "synthetic_visual_target_manifest.jsonl"),
@@ -1139,6 +1150,249 @@ report = {
 }
 (out_root / "metadata" / "preflight_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
+
+DETERMINISTIC_BG_COMPOSITE_ROUTE="deterministic_foreground_background_composite"
+if [[ "${BACKGROUND_REPLACE_ROUTE:-}" == "$DETERMINISTIC_BG_COMPOSITE_ROUTE" ]]; then
+  if [[ -z "${SRC_MASK:-}" ]]; then
+    echo "[vace-smoke] deterministic foreground/background composite requires src_mask" >&2
+    exit 1
+  fi
+  if [[ -z "${SRC_REF_IMAGES:-}" ]]; then
+    echo "[vace-smoke] deterministic foreground/background composite requires at least one src_ref_image" >&2
+    exit 1
+  fi
+  IFS=',' read -r -a SRC_REF_IMAGE_ARRAY <<< "$SRC_REF_IMAGES"
+  PRIMARY_SRC_REF_IMAGE="${SRC_REF_IMAGE_ARRAY[0]}"
+  if [[ ! -s "$PRIMARY_SRC_REF_IMAGE" ]]; then
+    echo "[vace-smoke] deterministic composite missing primary src_ref_image: $PRIMARY_SRC_REF_IMAGE" >&2
+    exit 1
+  fi
+
+  echo "[vace-smoke] deterministic composite route: building fixed background target without Wan/VACE"
+  python3 scripts/build_deterministic_masked_composite.py \
+    --reference "$REFERENCE_VIDEO" \
+    --mask "$SRC_MASK" \
+    --src-ref-image "$PRIMARY_SRC_REF_IMAGE" \
+    --raw-output "$RAW_VIDEO" \
+    --target-output "$TARGET_VIDEO" \
+    --out-root "$OUT_ROOT" \
+    --fps "$VACE_SOURCE_FPS" \
+    --frame-num "$FRAME_NUM" \
+    > "$OUT_ROOT/logs/deterministic_composite.log" 2>&1 || {
+      echo "[vace-smoke] deterministic composite failed" >&2
+      tail -120 "$OUT_ROOT/logs/deterministic_composite.log" >&2 || true
+      exit 1
+    }
+
+  python3 - "$OUT_ROOT/metadata/deterministic_composite_command.json" \
+    "$REFERENCE_VIDEO" "$SRC_MASK" "$PRIMARY_SRC_REF_IMAGE" "$RAW_VIDEO" "$TARGET_VIDEO" <<'PY'
+import json
+import shlex
+import sys
+from pathlib import Path
+
+out_path = Path(sys.argv[1])
+argv = [
+    "python3",
+    "scripts/build_deterministic_masked_composite.py",
+    "--reference",
+    sys.argv[2],
+    "--mask",
+    sys.argv[3],
+    "--src-ref-image",
+    sys.argv[4],
+    "--raw-output",
+    sys.argv[5],
+    "--target-output",
+    sys.argv[6],
+]
+payload = {
+    "requires_vace": False,
+    "route": "deterministic_foreground_background_composite",
+    "argv": argv,
+    "shell_quoted": " ".join(shlex.quote(item) for item in argv),
+}
+out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+(out_path.parent / "vace_command.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+PY
+
+  python3 - "$OUT_ROOT" "$REFERENCE_VIDEO" "$RAW_VIDEO" "$TARGET_VIDEO" "$VACE_DURATION_DRIFT_MAX" "$KNOWN_PAIRS" "$FRAME_NUM" "$VACE_SOURCE_FPS" <<'PY'
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+out_root = Path(sys.argv[1])
+reference_video = Path(sys.argv[2])
+raw_video = Path(sys.argv[3])
+target_video = Path(sys.argv[4])
+max_drift = float(sys.argv[5])
+known_pairs_path = Path(sys.argv[6])
+expected_frame_num = int(sys.argv[7])
+expected_fps = float(sys.argv[8])
+
+def normalize_phrase(value):
+    return " ".join(re.findall(r"[a-z0-9]+", str(value).lower()))
+
+def semantic_family(pair):
+    generation = pair.get("generation", {}) if isinstance(pair.get("generation"), dict) else {}
+    difference = pair.get("difference", {}) if isinstance(pair.get("difference"), dict) else {}
+    if str(difference.get("type", "")).strip() in {"scene", "background"}:
+        return "background"
+    if "background" in normalize_phrase(generation.get("edit_region", "")):
+        return "background"
+    return ""
+
+def parse_fraction(value):
+    if "/" in value:
+        numerator, denominator = value.split("/", 1)
+        try:
+            denominator_float = float(denominator)
+            return float(numerator) / denominator_float if denominator_float else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+def probe(path):
+    completed = subprocess.run(
+        ["ffprobe", "-v", "error", "-count_frames", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout or "{}")
+    streams = payload.get("streams", []) if isinstance(payload, dict) else []
+    video_stream = next((row for row in streams if row.get("codec_type") == "video"), {})
+    audio_stream = next((row for row in streams if row.get("codec_type") == "audio"), {})
+    raw_frame_count = video_stream.get("nb_read_frames") or video_stream.get("nb_frames") or 0
+    try:
+        frame_count = int(raw_frame_count)
+    except (TypeError, ValueError):
+        frame_count = 0
+    return {
+        "path": str(path),
+        "duration_seconds": float((payload.get("format") or {}).get("duration") or video_stream.get("duration") or 0.0),
+        "width": int(video_stream.get("width") or 0),
+        "height": int(video_stream.get("height") or 0),
+        "fps": parse_fraction(str(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "")),
+        "frame_count": frame_count,
+        "has_video": bool(video_stream),
+        "has_audio": bool(audio_stream),
+    }
+
+reference = probe(reference_video)
+raw = probe(raw_video)
+target = probe(target_video)
+raw_drift = abs(reference["duration_seconds"] - raw["duration_seconds"])
+target_drift = abs(reference["duration_seconds"] - target["duration_seconds"])
+passed = (
+    raw_drift <= max_drift
+    and target_drift <= max_drift
+    and raw["frame_count"] == expected_frame_num
+    and target["frame_count"] == expected_frame_num
+    and abs(raw["fps"] - expected_fps) <= 0.01
+    and abs(target["fps"] - expected_fps) <= 0.01
+    and target["has_video"]
+)
+metrics = {
+    "reference": reference,
+    "raw_generated_video": raw,
+    "audio_remux_target": target,
+    "raw_duration_drift_seconds": round(raw_drift, 3),
+    "target_duration_drift_seconds": round(target_drift, 3),
+    "max_duration_drift_seconds": max_drift,
+    "expected_frame_num": expected_frame_num,
+    "expected_fps": expected_fps,
+    "duration_gate": {"passed": passed, "errors": []},
+}
+if raw_drift > max_drift:
+    metrics["duration_gate"]["errors"].append(f"raw_duration_drift_seconds {raw_drift:.3f} > {max_drift:.3f}")
+if target_drift > max_drift:
+    metrics["duration_gate"]["errors"].append(f"target_duration_drift_seconds {target_drift:.3f} > {max_drift:.3f}")
+if raw["frame_count"] != expected_frame_num:
+    metrics["duration_gate"]["errors"].append(f"raw_frame_count {raw['frame_count']} != {expected_frame_num}")
+if target["frame_count"] != expected_frame_num:
+    metrics["duration_gate"]["errors"].append(f"target_frame_count {target['frame_count']} != {expected_frame_num}")
+if abs(raw["fps"] - expected_fps) > 0.01:
+    metrics["duration_gate"]["errors"].append(f"raw_fps {raw['fps']:.4f} != {expected_fps:.4f}")
+if abs(target["fps"] - expected_fps) > 0.01:
+    metrics["duration_gate"]["errors"].append(f"target_fps {target['fps']:.4f} != {expected_fps:.4f}")
+(out_root / "metadata" / "duration_metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+command_path = out_root / "metadata" / "deterministic_composite_command.json"
+command = json.loads(command_path.read_text(encoding="utf-8")) if command_path.exists() else {}
+composite_metrics_path = out_root / "metadata" / "deterministic_composite_metrics.json"
+composite_metrics = json.loads(composite_metrics_path.read_text(encoding="utf-8")) if composite_metrics_path.exists() else {}
+pairs = [json.loads(line) for line in known_pairs_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+for pair in pairs:
+    generation = pair.setdefault("generation", {})
+    generation["requires_vace"] = False
+    generation["generation_route"] = "deterministic_foreground_background_composite"
+    generation["background_replace_route"] = "deterministic_foreground_background_composite"
+    generation["duration_metrics"] = metrics
+    generation["deterministic_composite_metrics"] = composite_metrics
+    generation["vace_command"] = command
+    generation["deterministic_composite_command"] = command
+    family = semantic_family(pair)
+    verdict = {
+        "stage": "post_composite_pre_omni_validation",
+        "duration_gate_passed": passed,
+        "requires_omni_validation": True,
+        "requires_vace": False,
+    }
+    if family:
+        verdict.update(
+            {
+                "semantic_gate_required": True,
+                "semantic_gate_passed": False,
+                "semantic_gate_family": family,
+                "semantic_requirements": [
+                    "target must clearly use the fixed selected background plate semantics",
+                    "source background elements such as the original room, windows, doors, or walls must not remain visible",
+                    "foreground subject identity, face, action, audio, and duration must remain aligned",
+                    "edge artifacts, hard halos, or mask flicker must be small enough for manual acceptance",
+                ],
+                "required_omni_questions": [
+                    "Did the deterministic composite replace the background with the selected reference plate?",
+                    "Did the original source background disappear?",
+                    "Are foreground identity, action, audio, duration, and mask edges acceptable?",
+                ],
+            }
+        )
+    generation["post_vace_verdict"] = verdict
+    generation["post_vace_or_composite_verdict"] = verdict
+    (out_root / "metadata" / "post_vace_verdict.json").write_text(json.dumps(verdict, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_root / "metadata" / "post_vace_or_composite_verdict.json").write_text(json.dumps(verdict, ensure_ascii=False, indent=2), encoding="utf-8")
+known_pairs_path.write_text("".join(json.dumps(pair, ensure_ascii=False) + "\n" for pair in pairs), encoding="utf-8")
+if not passed:
+    raise SystemExit("post-composite duration gate failed: " + "; ".join(metrics["duration_gate"]["errors"]))
+PY
+
+  ffmpeg -y -i "$RAW_VIDEO" -vf "fps=1,scale=240:-1,tile=5x1" -frames:v 1 \
+    "$OUT_ROOT/review_inputs/raw_target_contact.jpg" > "$OUT_ROOT/logs/contact_raw_target.log" 2>&1 || true
+  ffmpeg -y -i "$TARGET_VIDEO" -vf "fps=1,scale=240:-1,tile=5x1" -frames:v 1 \
+    "$OUT_ROOT/review_inputs/target_contact.jpg" > "$OUT_ROOT/logs/contact_target.log" 2>&1 || true
+  cp "$OUT_ROOT/review_inputs/composite_target_contact.jpg" "$OUT_ROOT/review_inputs/deterministic_candidate_contact.jpg" 2>/dev/null || true
+  cp "$OUT_ROOT/metadata/preflight_report.json" "$OUT_ROOT/review_inputs/preflight_report.json" 2>/dev/null || true
+  cp "$OUT_ROOT/metadata/duration_metrics.json" "$OUT_ROOT/review_inputs/duration_metrics.json" 2>/dev/null || true
+  cp "$OUT_ROOT/metadata/deterministic_composite_command.json" "$OUT_ROOT/review_inputs/deterministic_composite_command.json" 2>/dev/null || true
+  cp "$OUT_ROOT/metadata/vace_command.json" "$OUT_ROOT/review_inputs/vace_command.json" 2>/dev/null || true
+  cp "$OUT_ROOT/metadata/deterministic_composite_metrics.json" "$OUT_ROOT/review_inputs/deterministic_composite_metrics.json" 2>/dev/null || true
+  cp "$OUT_ROOT/metadata/post_vace_verdict.json" "$OUT_ROOT/review_inputs/post_vace_verdict.json" 2>/dev/null || true
+  cp "$OUT_ROOT/metadata/post_vace_or_composite_verdict.json" "$OUT_ROOT/review_inputs/post_vace_or_composite_verdict.json" 2>/dev/null || true
+  tail -120 "$OUT_ROOT/logs/deterministic_composite.log" > "$OUT_ROOT/review_inputs/deterministic_composite_tail.log" 2>/dev/null || true
+  tail -80 "$OUT_ROOT/logs/deterministic_remux_audio.log" > "$OUT_ROOT/review_inputs/remux_audio_tail.log" 2>/dev/null || true
+
+  ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$TARGET_VIDEO" || true
+  echo "[vace-smoke] known_pairs=$KNOWN_PAIRS"
+  echo "[vace-smoke] target_manifest=$TARGET_MANIFEST"
+  echo "[vace-smoke] deterministic composite done $(date)"
+  exit 0
+fi
 
 if [[ ! -d "$WAN_CODE" ]]; then
   echo "[vace-smoke] missing WAN_CODE=$WAN_CODE" >&2

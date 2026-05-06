@@ -741,6 +741,8 @@ def _build_video_edit_planner_user_content(
         "- Do not propose naked small-object insertion such as a sticker, plant, badge, nose ring, poster, label, logo, or text unless a deterministic mask/overlay editor is explicitly available.\n"
         "- If the candidate edit is not suitable but another local visual edit is suitable for this exact reference, output the safer revised edit_text and difference.\n"
         "- The safest VACE edit is usually a large, visible attribute change on the main subject, not adding a new object to the background.\n"
+        "- If the edit can be achieved by fixing a selected reference image or background plate into the masked region, prefer that deterministic route first and reserve VACE for seam repair, harmonization, or hidden-content synthesis.\n"
+        "- For full background replacement in a stable talking-head shot, prefer a fixed foreground/background composite route before a full generative background edit.\n"
         "- Do not plan visible-text edits unless OCR-backed text editing is explicitly available.\n"
         "- Do not plan audio_event or speech edits for a video editor.\n"
         "- Do not use a universal edit. The edit must fit objects/actions visible in this reference video.\n"

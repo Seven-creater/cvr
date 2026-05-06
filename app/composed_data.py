@@ -97,12 +97,18 @@ MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE = 0.995
 VISUAL_DIFFERENCE_TYPES = {"object_count", "object_presence", "attribute", "action", "scene", "visible_text"}
 VACE_BG_REPLACE_COMPOSITE_ROUTE = "vace_bg_replace_composite_first_frame_mv2v"
 DETERMINISTIC_BG_COMPOSITE_ROUTE = "deterministic_foreground_background_composite"
+DETERMINISTIC_MASKED_REFERENCE_PASTE_ROUTE = "deterministic_masked_reference_paste"
+GUIDED_COMPOSITE_REFINE_VACE_ROUTE = "guided_composite_refine_vace"
+VACE_FULL_GENERATIVE_ROUTE = "vace_full_generative"
 SYNTHETIC_VISUAL_ROUTES = {
     "vace_controlled",
     "ltx2_retake",
     "tokenflow_style",
     VACE_BG_REPLACE_COMPOSITE_ROUTE,
     DETERMINISTIC_BG_COMPOSITE_ROUTE,
+    DETERMINISTIC_MASKED_REFERENCE_PASTE_ROUTE,
+    GUIDED_COMPOSITE_REFINE_VACE_ROUTE,
+    VACE_FULL_GENERATIVE_ROUTE,
 }
 SYNTHETIC_AUDIO_ROUTES = {"deterministic_overlay", "foleycrafter_temporal", "frieren_benchmark", "audio_deterministic"}
 VACE_ATTRIBUTE_MARKERS = {
@@ -2285,11 +2291,15 @@ def plan_video_edits(
             suitability = dict(suitability)
             suitability.update(
                 {
-                    "production_allowed": False,
+                    "production_allowed": True,
                     "plain_masked_vace_production": False,
-                    "recommended_route": VACE_BG_REPLACE_COMPOSITE_ROUTE,
-                    "reason": "background_replace_requires_composite_first_frame",
-                    "priority": "experimental",
+                    "recommended_route": DETERMINISTIC_BG_COMPOSITE_ROUTE,
+                    "fallback_route": VACE_BG_REPLACE_COMPOSITE_ROUTE,
+                    "refine_route": GUIDED_COMPOSITE_REFINE_VACE_ROUTE,
+                    "reason": "background_replace_prefers_fixed_deterministic_composite",
+                    "priority": "production_candidate",
+                    "requires_vace": False,
+                    "route_decision_source": "omni_planner_plus_local_policy",
                 }
             )
         if prompt_repairs:
@@ -2385,6 +2395,15 @@ def plan_video_edits(
             "plan_lint": plan_lint,
             "visual_edit_risk": risk,
             "background_replace_policy": background_replace_policy,
+            "route_execution_order": (
+                [
+                    DETERMINISTIC_BG_COMPOSITE_ROUTE,
+                    GUIDED_COMPOSITE_REFINE_VACE_ROUTE,
+                    VACE_BG_REPLACE_COMPOSITE_ROUTE,
+                ]
+                if background_replace_plan
+                else [route]
+            ),
             "planning_mode": planning_mode,
             "exploration_family": str(candidate.get("exploration_family", "")).strip(),
             "exploration_goal": str(candidate.get("exploration_goal", "")).strip(),
@@ -3098,10 +3117,12 @@ def _manual_review_bundle_issues(metadata: dict[str, Any]) -> list[str]:
     route = _synthetic_generation_route(generation)
     if route not in SYNTHETIC_VISUAL_ROUTES:
         return []
+    background_route = _background_replace_actual_route(generation)
+    deterministic_background = background_route == DETERMINISTIC_BG_COMPOSITE_ROUTE
     issues: list[str] = []
     if not metadata.get("copied_src_video_for_vace"):
         issues.append("incomplete_review_bundle: missing src_video_for_vace")
-    if route == "vace_controlled" and not metadata.get("copied_src_mask"):
+    if (route == "vace_controlled" or deterministic_background) and not metadata.get("copied_src_mask"):
         issues.append("incomplete_review_bundle: missing src_mask")
     if not metadata.get("copied_raw_generated_video"):
         issues.append("incomplete_review_bundle: missing raw_generated_video")
@@ -3125,8 +3146,19 @@ def _manual_review_bundle_issues(metadata: dict[str, Any]) -> list[str]:
             "raw_target_contact.jpg",
             "target_contact.jpg",
         ]
-        if route == "vace_controlled":
+        if route == "vace_controlled" or deterministic_background:
             required_review_inputs.append("mask_contact.jpg")
+        if deterministic_background:
+            required_review_inputs.extend(
+                [
+                    "src_ref_plate.png",
+                    "alpha_contact.jpg",
+                    "composite_target_contact.jpg",
+                    "deterministic_composite_metrics.json",
+                    "deterministic_composite_command.json",
+                    "post_vace_or_composite_verdict.json",
+                ]
+            )
         for filename in required_review_inputs:
             if not (review_inputs_path / filename).exists():
                 issues.append(f"incomplete_review_bundle: missing review_inputs/{filename}")
@@ -3136,6 +3168,8 @@ def _manual_review_bundle_issues(metadata: dict[str, Any]) -> list[str]:
         issues.append("incomplete_review_bundle: missing mask_metrics")
     if not metadata.get("post_vace_verdict"):
         issues.append("incomplete_review_bundle: missing post_vace_verdict")
+    if deterministic_background and not metadata.get("deterministic_composite_metrics"):
+        issues.append("incomplete_review_bundle: missing deterministic_composite_metrics")
     return issues
 
 
@@ -3290,6 +3324,8 @@ def build_manual_review_bundle(
             "mask_metrics": generation.get("mask_metrics", {}),
             "duration_metrics": generation.get("duration_metrics", {}),
             "vace_command": generation.get("vace_command", {}),
+            "deterministic_composite_metrics": generation.get("deterministic_composite_metrics", {}),
+            "post_vace_or_composite_verdict": generation.get("post_vace_or_composite_verdict", generation.get("post_vace_verdict", {})),
             "post_vace_verdict": generation.get("post_vace_verdict", {}),
         }
         review_bundle_issues = _manual_review_bundle_issues(metadata)
@@ -3302,7 +3338,11 @@ def build_manual_review_bundle(
             encoding="utf-8",
         )
         (item_dir / "semantic_evaluation_result.json").write_text(
-            json.dumps(metadata.get("post_vace_verdict", {}), ensure_ascii=False, indent=2),
+            json.dumps(metadata.get("post_vace_or_composite_verdict", metadata.get("post_vace_verdict", {})), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (item_dir / "post_vace_or_composite_verdict.json").write_text(
+            json.dumps(metadata.get("post_vace_or_composite_verdict", {}), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         (item_dir / "mask_metrics.json").write_text(
@@ -8117,6 +8157,8 @@ def _synthetic_edit_record_issues(
     generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
     route = _synthetic_generation_route(generation)
     is_audio_route = _is_audio_synthetic_route(route)
+    background_route = _background_replace_actual_route(generation)
+    deterministic_background = background_route == DETERMINISTIC_BG_COMPOSITE_ROUTE
     source_context = record.get("source_context", {}) if isinstance(record.get("source_context"), dict) else {}
     relation = str(source_context.get("relation", "")).strip()
     visual_score = _score_float(quality.get("visual_near_duplicate_score"))
@@ -8174,11 +8216,17 @@ def _synthetic_edit_record_issues(
             if not _resolve_under_root(root, src_ref_image).exists():
                 issues.append(f"visual synthetic selected src_ref_image does not exist: {src_ref_image}")
         src_mask = str(generation.get("src_mask", "")).strip()
-        if src_mask and not _resolve_under_root(root, src_mask).exists():
-            issues.append(f"visual synthetic src_mask does not exist: {src_mask}")
+        if route == "vace_controlled" or deterministic_background:
+            if not src_mask:
+                issues.append("visual synthetic src_mask is required for masked visual routes")
+            elif not _resolve_under_root(root, src_mask).exists():
+                issues.append(f"visual synthetic src_mask does not exist: {src_mask}")
         src_video_for_vace = str(generation.get("src_video_for_vace", "")).strip()
-        if src_video_for_vace and not _resolve_under_root(root, src_video_for_vace).exists():
-            issues.append(f"visual synthetic src_video_for_vace does not exist: {src_video_for_vace}")
+        if route == "vace_controlled" or deterministic_background:
+            if not src_video_for_vace:
+                issues.append("visual synthetic src_video_for_vace is required for masked visual routes")
+            elif not _resolve_under_root(root, src_video_for_vace).exists():
+                issues.append(f"visual synthetic src_video_for_vace does not exist: {src_video_for_vace}")
         duration_metrics = generation.get("duration_metrics", {}) if isinstance(generation.get("duration_metrics"), dict) else {}
         duration_gate = duration_metrics.get("duration_gate", {}) if isinstance(duration_metrics.get("duration_gate"), dict) else {}
         if not duration_gate:
@@ -8201,6 +8249,10 @@ def _synthetic_edit_record_issues(
             post_vace_verdict.get("semantic_gate_passed")
         ):
             issues.append("visual synthetic post-VACE semantic gate has not passed")
+        if deterministic_background:
+            deterministic_metrics = generation.get("deterministic_composite_metrics", {})
+            if not isinstance(deterministic_metrics, dict) or not deterministic_metrics:
+                issues.append("visual synthetic deterministic background route requires deterministic_composite_metrics")
     if is_audio_route:
         expected_event = _synthetic_audio_expected_event(record)
         if not expected_event:
@@ -10109,10 +10161,14 @@ def _background_replace_route_policy() -> dict[str, Any]:
     return {
         "plain_masked_vace_production": False,
         "plain_masked_vace_allowed_for": ["background_restyle", "soft_repaint", "low_structural_delta"],
-        "recommended_route": VACE_BG_REPLACE_COMPOSITE_ROUTE,
-        "fallback_route": DETERMINISTIC_BG_COMPOSITE_ROUTE,
-        "requires_composite_first_frame": True,
-        "reason": "full background replacement preserved the source room layout under plain masked VACE; require a composite first-frame anchor before production",
+        "recommended_route": DETERMINISTIC_BG_COMPOSITE_ROUTE,
+        "fallback_route": VACE_BG_REPLACE_COMPOSITE_ROUTE,
+        "refine_route": GUIDED_COMPOSITE_REFINE_VACE_ROUTE,
+        "requires_composite_first_frame": False,
+        "requires_fixed_reference_plate": True,
+        "requires_vace": False,
+        "deterministic_composite_production": True,
+        "reason": "full background replacement should fix the target background plate by deterministic compositing; VACE is reserved for optional seam or generative repair",
     }
 
 
@@ -11429,6 +11485,9 @@ def _known_pair_base_quality(
 
 
 def _synthetic_generation_route(generation: dict[str, Any]) -> str:
+    actual_route = str(generation.get("generation_route", "")).strip()
+    if actual_route:
+        return actual_route
     route = str(generation.get("model_route", "")).strip()
     if route:
         return route
@@ -11469,7 +11528,11 @@ def _plain_background_replacement_vace_issue(record: dict[str, Any], generation:
     ):
         return ""
     actual_route = _background_replace_actual_route(generation)
-    if actual_route in {VACE_BG_REPLACE_COMPOSITE_ROUTE, DETERMINISTIC_BG_COMPOSITE_ROUTE}:
+    if actual_route in {
+        VACE_BG_REPLACE_COMPOSITE_ROUTE,
+        DETERMINISTIC_BG_COMPOSITE_ROUTE,
+        GUIDED_COMPOSITE_REFINE_VACE_ROUTE,
+    }:
         return ""
     return "full background replacement requires composite-first-frame or deterministic composite route; plain masked VACE is experiment-only"
 

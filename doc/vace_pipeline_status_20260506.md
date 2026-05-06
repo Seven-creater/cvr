@@ -30,19 +30,23 @@ review bundle complete
 |---|---|
 | VACE 输入契约 | 已基本修好：`src_video + src_mask + src_ref_images + target prompt`，81f@16fps exact-frame |
 | 普通 masked VACE 做完整背景替换 | 不稳定，常变成 blue overlay / style wash，不作为 production 默认路线 |
-| composite-first-frame 背景替换 | `mannul7` 和 `mannul8` 证明可复现，是当前最值得继续扩样的视觉路线 |
+| 固定优先视觉路由 | 新默认策略：能确定性固定/贴参考图就不让 VACE 猜；VACE 只做必须生成、修边、补遮挡或复杂 inpaint |
+| deterministic foreground/background composite | 背景替换 production 默认路线：用前景 mask 保留人物，把选中的 16:9 背景 plate 固定到底层，完全跳过 Wan/VACE |
+| composite-first-frame / guided VACE | 保留为 fallback/refine：`mannul7` 和 `mannul8` 证明可行，但现在排在 deterministic composite 后面 |
 | mask 生成 | 已开始改成 adaptive diagnostic mask：尽量生成全长稀疏 mask，但是否进 VACE 仍由质量 tier 决定 |
 | 当前 35 个 plan | 大部分被正确拒绝；不是“没跑成”，而是发现原始候选质量不适合 VACE |
-| 下一步 | 先用 adaptive mask 路线复跑历史失败 mask，不跑 VACE；只有 `usable_for_vace=true` 的 mask 再进入下一轮 smoke |
+| 下一步 | 先用 adaptive mask 路线复跑历史失败 mask；对 `usable_for_vace=true` 的样本先走 deterministic/paste route，只有必须生成时才进入 VACE smoke |
 
 ### 0.3 当前能力地图
 
 | 编辑类型 | 当前状态 | 原因 / 备注 | 下一步 |
 |---|---|---|---|
 | deterministic audio route | 已验证可生产 | 画面不变，只改非语言音频事件，已通过 10/10 | 可作为稳定数据来源继续扩大 |
-| talking-head background replacement + composite-first-frame | 初步可行 | `mannul7` 成功，`mannul8` 通过脚本化 route 复现；前景人物保留，原房间消失 | 再找 2-3 条不同 talking-head clip，验证是否可泛化 |
+| talking-head background replacement + fixed composite | 新 production 默认候选 | 背景可直接由 src_ref plate 固定铺底，mask 只负责保留人物；不再让 VACE 整块重猜背景 | 先用 `ef8f2818` 和 2-3 条单主体 clip 跑 deterministic smoke，不跑 VACE |
+| talking-head background replacement + composite-first-frame | fallback / refine | `mannul7` 成功，`mannul8` 通过脚本化 route 复现；证明 VACE 可在强首帧锚点下工作 | deterministic 边缘差但语义正确时，再用 VACE 小 mask 修边 |
 | plain masked background replacement | 默认禁用 | `mannul5/mannul6` 只生成蓝色叠加，原房间结构残留 | 只保留为 experiment / restyle |
 | background restyle / soft repaint | 接近可行但未稳定 | 可能适合“风格化原背景”，不适合“房间换成实验室” | 需要单独定义轻量目标和验收 |
+| deterministic masked reference paste | 新增候选 | 图标、平面物体、静态区域、简单贴图类编辑不应交给 VACE 猜 | 先挑平面/近静态样本做 1 条 paste smoke |
 | existing large object / robot / vehicle attribute edit | 值得继续找样本 | 理论上较适合 VACE，但当前 plan 里很多没有真实 vehicle 或有可见文字 | 重新从 stable clips 中筛更大、更清晰、无文字目标 |
 | clothing color / material | 高风险 | mask 经常覆盖乐器/手/身体，VACE 容易变成 vest/polo/dark shirt | 只保留低风险“已有衣物颜色/材质”实验 |
 | structural clothing / try-on | 不走默认 VACE | black jacket/coat/blazer 属于虚拟试衣级别，已多次失败 | 未来单独做 try-on-first-frame route |
@@ -53,11 +57,12 @@ review bundle complete
 
 ### 0.4 当前最直接的下一步
 
-1. 服务器拉取最新 `codex/vace-pipeline-hardening`，确认包含 `adaptive_repair_v1` mask 改造。
+1. 服务器拉取最新 `codex/vace-pipeline-hardening`，确认包含 `adaptive_repair_v1` mask 改造和 fixed-first route。
 2. 先复跑 10 条历史 mask 失败样本，只生成 mask，不跑 VACE。
 3. 汇报每条的 `mask_quality_tier`、`usable_for_vace`、`visible_spans`、`reinit_count`、`failure_reasons`。
-4. 只有 `status=generated`、`mask_quality_tier in {excellent, usable_for_vace}`、`usable_for_vace=true` 的样本才允许进入 VACE smoke。
-5. accepted pairs 只收同时通过 duration / semantic / bundle / mask gate 的结果；诊断 mask 继续进入 capability report。
+4. 对 `usable_for_vace=true` 的 background replacement，先跑 `deterministic_foreground_background_composite`；不要直接跑 Wan/VACE。
+5. 只有 deterministic/paste 不能表达，或者只需要修边/补遮挡时，才进入 `guided_composite_refine_vace` / `vace_full_generative`。
+6. accepted pairs 只收同时通过 duration / semantic / bundle / mask gate 的结果；诊断 mask 继续进入 capability report。
 
 ## 1. 当前结论
 
@@ -77,22 +82,33 @@ src_video + src_mask + optional src_ref_images + target prompt -> VACE target
 
 其中 `src_mask` 白区是生成区域，黑区是保留区域；`src_video` 的编辑区域需要置灰为 127；prompt 应描述目标视频，而不是写操作指令。
 
-截至 `fcbf033 Repair background replacement prompt conflicts` 之后，又根据 `mannul6` 复跑结果确认：即使 prompt / mask / src_ref / frame 对齐全部正确，plain masked VACE 对 talking-head full background replacement 仍然只产生 blue overlay / style wash，不是真正的空间背景重构。随后 `98e0070 Disable plain background replacement VACE route` 禁用了 full background replacement 的 plain masked production route，并要求切到 composite-first-frame。
+截至 `fcbf033 Repair background replacement prompt conflicts` 之后，又根据 `mannul6` 复跑结果确认：即使 prompt / mask / src_ref / frame 对齐全部正确，plain masked VACE 对 talking-head full background replacement 仍然只产生 blue overlay / style wash，不是真正的空间背景重构。随后 `98e0070 Disable plain background replacement VACE route` 禁用了 full background replacement 的 plain masked production route，并切到 composite-first-frame。最新 fixed-first 改造进一步把默认 production route 前移到 deterministic foreground/background composite：能固定背景图时先固定，VACE 只作为 fallback/refine。
 
-`mannul7` 结果证明：`vace_bg_replace_composite_first_frame_mv2v` 能把同一 woman 前景保留下来，并真实生成 futuristic laboratory 背景，而不是蓝色叠加。随后 `mannul8` 用脚本化 composite route 对同一 `ef8f2818` plan 做了复现，review bundle 完整，duration gate 与 semantic gate 均通过。这说明问题已经从“路线是否可行”推进到“能否在更多合适 clip 上复现”。
+`mannul7` 结果证明：`vace_bg_replace_composite_first_frame_mv2v` 能把同一 woman 前景保留下来，并真实生成 futuristic laboratory 背景，而不是蓝色叠加。随后 `mannul8` 用脚本化 composite route 对同一 `ef8f2818` plan 做了复现，review bundle 完整，duration gate 与 semantic gate 均通过。
 
-当前已经完成五类关键修复：
+但 `mannul8` 也暴露了另一层问题：即使 mask 很好，生成式编辑仍可能在不该猜的地方猜错。背景替换、图标/平面贴图、静态区域替换这类任务本质上更适合“固定参考图 + mask 合成”。因此最新路线已经从“有好 mask 就交给 VACE”改成：
+
+```text
+能固定的，先固定。
+能直接贴参考图的，先贴参考图。
+只有必须生成隐藏内容、修边、补遮挡或做复杂 inpaint 时，才用 VACE。
+```
+
+Omni 的角色也相应调整：Omni planner 需要在生成 plan 时判断任务是否可 deterministic composite / masked reference paste，并把推荐路线写进 plan；本地 route policy 再做硬兜底，防止背景替换这类任务重新滑回 plain masked VACE。
+
+当前已经完成九类关键修复：
 
 1. **输入契约修复**：VACE 输入强制 exact-frame，`reference/src_video/src_mask` 对齐到 `81f@16fps`，避免 5 秒输入生成 9 秒 target。
 2. **诚实验收修复**：duration gate、mask provenance gate、semantic gate、review bundle completeness gate 已经能拦住假阳性。
 3. **background replacement prompt 修复**：planner 不再把 source 背景词和 preserve locks 带进 VACE prompt，避免 “换成 lab” 和 “保留 sunlit room/window/door/layout/lighting” 互相打架。
-4. **background replacement route 降级**：full background replacement 不再允许作为 plain masked VACE production route；默认推荐切到 `vace_bg_replace_composite_first_frame_mv2v`，否则保留为 experiment-only。
+4. **background replacement route 降级**：full background replacement 不再允许作为 plain masked VACE production route；当前默认推荐 `deterministic_foreground_background_composite`，`vace_bg_replace_composite_first_frame_mv2v` 作为 fallback/refine。
 5. **composite-first-frame 初步验证**：`mannul7` 的 9/9 review bundle 完整，语义门通过；`mannul8` 通过脚本化 route 复现同 plan，preflight / duration / semantic gate 均通过。
 6. **background plan 前移拒绝**：`plan_video_edits` 现在会在规划阶段直接拒绝多场景和多主体的 background scene edit，避免这类样本继续走到 mask 阶段白跑。
-7. **composite-first-frame 脚本化**：`run_vace_visual_synthetic_smoke.sh` 现在能根据 `background_replace_policy.recommended_route=vace_bg_replace_composite_first_frame_mv2v` 自动构造 `composite_frame0`、composite `src_video`、composite `src_mask` 和对应 contact sheet，不再依赖服务器手工拼接。
+7. **composite-first-frame 脚本化**：`run_vace_visual_synthetic_smoke.sh` 仍能根据 fallback route 自动构造 `composite_frame0`、composite `src_video`、composite `src_mask` 和对应 contact sheet，不再依赖服务器手工拼接。
 8. **adaptive sparse mask 改造**：`plan-video-masks` 不再因 tiny/multi-shot/multi-instance 等问题直接不产 mask；mask 脚本会尽量生成全长稀疏诊断 mask，并用 `mask_quality_tier` / `usable_for_vace` 控制是否进入 VACE。
+9. **fixed-first 路由改造**：full background replacement 的 production 默认路线改为 `deterministic_foreground_background_composite`；`vace_bg_replace_composite_first_frame_mv2v` 变成 fallback，`guided_composite_refine_vace` 只负责修边/融合，`vace_full_generative` 只保留给必须生成的任务。
 
-当前只证明了一条 talking-head background replacement 可通过 composite-first-frame route 成功。下一步不是大规模跑批，而是用脚本化 route 小批量验证同 route 是否可复现，并继续做 capability map：哪些编辑类型可以生产、哪些只能作为实验、哪些应自动拒绝。
+当前只证明了一条 talking-head background replacement 可通过 composite-first-frame route 成功；下一轮要优先验证 deterministic fixed composite 是否能更稳定、更便宜地产出同类目标。接下来不是大规模跑批，而是用 fixed-first route 小批量验证：哪些任务能确定性完成，哪些需要 VACE 修边，哪些必须交给生成模型，哪些应自动拒绝。
 
 参考：
 
@@ -126,6 +142,7 @@ PLAN_RUN: /data02/usr/wangqihao/Demo/test/cvr_clean_main/runs/omni_stable_all_ca
 branch: codex/vace-pipeline-hardening
 最近已推送参考 HEAD: 8e827ab Support composite first-frame VACE smoke
 后续新增: adaptive_repair_v1 mask 诊断生成与 VACE preflight 硬门控
+本轮新增: fixed-first visual route, deterministic foreground/background composite helper, Omni route-selection prompt
 ```
 
 服务器执行前必须先 `git fetch` / `git pull --ff-only`，并确认：
@@ -137,6 +154,7 @@ git rev-parse --short HEAD
 
 如果没有包含 `98e0070` 之后的 background route 降级修复，不要继续跑 background VACE。
 如果没有包含 `adaptive_repair_v1`，不要复跑历史失败 mask。
+如果没有包含 fixed-first route，不要把 background replacement 直接交给 VACE。
 
 当前服务器下一次执行应确认：
 
@@ -337,7 +355,7 @@ ffb8a3d Prefer torch GroundingDINO checkpoints
 
 `2d1fc41` 的作用是：`--grounder auto` 遇到 HF 格式 GroundingDINO checkpoint 时自动退到 Florence-2。服务器拉到 `fcbf033` 后已经包含这个 fallback。注意：这不是让 GroundingDINO 变可用，而是避免 `auto` 因错误 checkpoint 格式直接崩溃。
 
-### 4.5 background replacement prompt 冲突修复
+### 4.6 background replacement prompt 冲突修复
 
 `mannul5` 暴露的背景替换失败不是 mask / 帧率 / remux 问题，而是 planner 把 source 背景锁进了 VACE prompt 与 preserve 约束：
 
@@ -376,8 +394,10 @@ A woman with curly red hair and glasses speaks to the camera in a clean blue-whi
 `mannul6` 已证明：即使上述 prompt 修复生效，plain masked VACE 仍然只做蓝色 overlay。因此现在进一步要求：
 
 - `background_replace_policy.plain_masked_vace_production=false`
-- `background_replace_policy.recommended_route=vace_bg_replace_composite_first_frame_mv2v`
-- `route_suitability.production_allowed=false`
+- `background_replace_policy.recommended_route=deterministic_foreground_background_composite`
+- `background_replace_policy.fallback_route=vace_bg_replace_composite_first_frame_mv2v`
+- `background_replace_policy.refine_route=guided_composite_refine_vace`
+- `route_suitability.production_allowed=true` 只表示 deterministic fixed route 可进入生产候选，不表示 plain VACE 可进入生产
 - normal `run_vace_visual_synthetic_smoke.sh` 默认拒绝 full background replacement，除非显式设置 `ALLOW_PLAIN_BACKGROUND_REPLACE=1` 做实验。
 - accepted synthetic pairs 拒绝 `model_route=vace_controlled` 的 full background replacement，除非 generation 明确记录：
   - `background_replace_route=vace_bg_replace_composite_first_frame_mv2v`，或
@@ -410,6 +430,60 @@ python -m unittest discover -s tests -v: 214 OK, 2 skipped, 1 error
 ```
 
 全量测试唯一 error 是本地 `.venv` 缺少 `torch`，失败点在 `tests/test_avigate_official.py`，与 VACE hardening 修改无关。
+
+### 4.7 fixed-first visual route 修复
+
+`mannul8` 之后进一步确认：高质量 mask 只是必要条件，不是充分条件。background replacement 的目标背景如果已经有 16:9 `src_ref` plate，最稳的生产路线不是让 VACE 重新生成整块背景，而是直接固定参考背景，再用 mask 保留前景主体。
+
+当前新增三层视觉路线：
+
+| route | 用途 | 是否默认用 VACE |
+|---|---|---|
+| `deterministic_foreground_background_composite` | talking-head / static-camera 背景替换；固定 `src_ref` plate，保留原前景 | 否 |
+| `deterministic_masked_reference_paste` | 图标、平面物体、静态区域、简单参考图贴合 | 否 |
+| `guided_composite_refine_vace` | deterministic 结构正确但边缘/融合/阴影需要小范围修复 | 是，但只给小 repair mask |
+| `vace_full_generative` | object removal / hidden-content inpaint / 复杂非刚性替换 | 是 |
+
+这次新增了脚本：
+
+```text
+scripts/build_deterministic_masked_composite.py
+```
+
+它按 VACE mask 语义复用现有 mask：
+
+```text
+mask white = 背景 / 可替换区域 -> 使用固定 src_ref plate
+mask black = 前景 / 保留区域 -> 使用原 reference foreground
+```
+
+输出内容包括：
+
+```text
+target_with_ref_audio.mp4
+metadata/deterministic_composite_metrics.json
+metadata/deterministic_composite_command.json
+review_inputs/src_ref_plate.png
+review_inputs/alpha_contact.jpg
+review_inputs/composite_target_contact.jpg
+metadata/post_vace_or_composite_verdict.json
+```
+
+`run_vace_visual_synthetic_smoke.sh` 现在遇到 `background_replace_route=deterministic_foreground_background_composite` 会直接调用这个脚本并跳过 Wan/VACE。review bundle 不再要求 VACE log，但必须要求 deterministic composite metadata、alpha contact、composite target contact 和 semantic verdict。
+
+Omni 侧也做了 prompt 调整：plan 生成时会提醒模型优先判断能否 deterministic composite / masked reference paste，并把 VACE 留给 seam repair、harmonization、occlusion/inpaint 或必须生成的内容。最终执行仍由本地 route policy 兜底，避免 planner 偶然把可固定任务送去 full generative VACE。
+
+新的 accepted-pair 语义是：
+
+```text
+generation_route=deterministic_foreground_background_composite
+requires_vace=false
+duration_gate.passed=true
+semantic_gate.passed=true
+review_bundle_complete=true
+```
+
+这条路线的意义是把“能确定的视觉变化”从生成模型里拿出来。它不会解决所有编辑类型，但会让 background replacement 这类可固定任务更便宜、更稳定，也更适合批量生产。
 
 ## 5. 当前遇到的问题
 
@@ -647,7 +721,45 @@ adaptive mask v1 解决的是“不要过早放弃诊断”，不是一次性解
 3. 给多场景 clip 做 scene-span segmentation，而不是整段硬传播。
 4. 正确接入本地 GroundingDINO `.pth` 或其它 open-vocabulary detector 作为 Florence-2 fallback。
 
-### 5.5 GroundingDINO 当前不可用
+### 5.5 mannul9 adaptive mask 诊断结果
+
+`/Users/Admin/Desktop/mannul9` 是第一批 adaptive mask-only 诊断包。它的结论不是“又失败了”，而是 mask 阶段已经开始产出可审查证据：
+
+```text
+10 条 mask plan
+1 条 excellent / usable_for_vace=true
+9 条 diagnostic_generated / usable_for_vace=false
+```
+
+通过项：
+
+| plan | edit | mask query | tier | 结论 |
+|---|---|---|---|---|
+| ef8f2818 | background -> futuristic laboratory | woman | excellent | 可进入 fixed-first 背景替换路线；优先 deterministic composite，不要直接跑 VACE |
+
+失败项按原因分层：
+
+| 类型 | 样本 | 现象 | 下一步 |
+|---|---|---|---|
+| 小目标但有局部检测 | 23ab74e5 cup, 6bc2cc4b cup | coverage 约 0.26%-0.44%，nonempty 约 58%-75% | 不进整段 VACE；后续尝试 high-res/tiled detector + visible-span clip |
+| 动画小局部 | 2babdf1c robe | coverage 0.95%，nonempty 83%，接近但未过 | 可作为 visible-span / local recolor 诊断候选，不进 full VACE |
+| 结构性衣物 | 2d9c7b5a jacket | protected overlap=1.0，且 black jacket 本身是 try-on 级别 | 继续拒绝，不用普通 VACE 救 |
+| 衣物与保护物重叠 | 8e8069c9 blouse | nonempty 2%，protected overlap 0.9865 | 需要更准 clothing/person parsing；当前不进 VACE |
+| 多场景/短暂主体 | aab85616, c708d4d5, e6d4f1fc | nonempty / temporal stability 约 25% | 不该整段跑；应裁 visible span 后再评估 |
+| 多实例/不成立 removal | ebd86ec9 chair | almost empty，多实例/场景语义不稳定 | 保留拒绝样本 |
+
+这批结果说明下一层 mask 优化方向应该是：
+
+```text
+full-length sparse mask 继续保留用于诊断；
+但如果 visible span 本身足够长，就生成 span-level edit candidate；
+对 span 内重新计算 nonempty / stability / coverage；
+只有 span-level gate 通过，才进入 deterministic/paste/VACE route。
+```
+
+这能避免一个典型误判：目标只在后 25% 帧出现时，整段 `nonempty_frame_ratio` 必然失败；但把 clip 裁到可见区间后，它可能变成可用样本。也就是说，下一步不应降低整段 gate，而应新增 `visible_span_reroute`。
+
+### 5.6 GroundingDINO 当前不可用
 
 当前服务器没有官方格式 GroundingDINO `.pth` checkpoint。因此：
 
@@ -662,7 +774,7 @@ adaptive mask v1 解决的是“不要过早放弃诊断”，不是一次性解
 --grounder florence2
 ```
 
-### 5.6 复杂编辑路线暂时不应该继续烧 VACE
+### 5.7 复杂编辑路线暂时不应该继续烧 VACE
 
 这些任务已经明确不适合当前默认 VACE route：
 
@@ -673,7 +785,7 @@ adaptive mask v1 解决的是“不要过早放弃诊断”，不是一次性解
 - 多主体或多镜头背景替换
 - Qwen-Image 生成的 1:1 方形背景参考图用于 16:9 background change
 
-### 5.7 capability map 新结论
+### 5.8 capability map 新结论
 
 最新 capability map 的意义不是“又失败了一轮”，而是把当前默认 VACE route 的主要瓶颈定位清楚了：
 
@@ -695,10 +807,11 @@ adaptive mask v1 解决的是“不要过早放弃诊断”，不是一次性解
 
 短期目标不是直接生成上千条视觉样本，而是先找到 2-3 个可重复的高产类别。当前最有希望的是：
 
-1. composite-first-frame talking-head background replacement。
+1. fixed deterministic talking-head background replacement。
 2. deterministic audio synthetic。
 3. 更干净 source clips 上的 existing object / large attribute edit。
 4. 静态或近静态视频中的局部颜色 / 材质变化。
+5. visible-span reroute：对 sparse mask 中可见区间足够长的片段，裁成短 clip 后重新 gate。
 
 当前不建议继续在这批 35 条 plan 里反复调阈值。更应该把新筛选规则前移到 clip/plan 阶段：
 
@@ -713,7 +826,7 @@ adaptive mask v1 解决的是“不要过早放弃诊断”，不是一次性解
 
 ### 6.1 服务器下一步执行方向
 
-先不要扩大跑批，也不要再跑 plain masked background replacement。服务器下一步应拉取最新 `codex/vace-pipeline-hardening`，先复跑 adaptive mask 诊断任务；如果出现新的 `usable_for_vace=true` 样本，再使用脚本化 `vace_bg_replace_composite_first_frame_mv2v` 或其它合适 route 做小批量 VACE。
+先不要扩大跑批，也不要再跑 plain masked background replacement。服务器下一步应拉取最新 `codex/vace-pipeline-hardening`，先复跑 adaptive mask 诊断任务；如果出现新的 `usable_for_vace=true` 样本，先让 route policy 选择 deterministic / paste / guided refine / full VACE，不要默认把它送进 Wan/VACE。
 
 第一优先级：adaptive mask 诊断复跑：
 
@@ -722,13 +835,31 @@ adaptive mask v1 解决的是“不要过早放弃诊断”，不是一次性解
 目标: 观察 adaptive_repair_v1 是否能产出更完整的 visible_spans / diagnostic mask / usable_for_vace=true 候选。
 ```
 
-第二优先级：继续验证 composite-first-frame route：
+第二优先级：visible-span reroute：
+
+```text
+输入: mannul9 这类 diagnostic_generated manifest
+目标: 对 visible_spans 中足够长的区间裁短 clip，重新计算 span 内 mask gate
+规则: 不降低整段阈值；只允许 span-level gate 通过的片段进入 deterministic/paste/VACE route
+优先样本: aab85616/c708d4d5/e6d4f1fc 的 background span，23ab74e5/6bc2cc4b 的 cup span
+```
+
+第三优先级：验证 fixed deterministic background composite：
+
+```text
+plan: ef8f2818 或其它单主体全程可见 talking-head
+task: background -> futuristic laboratory / clean target background
+当前状态: helper 已实现，smoke script 会在 deterministic route 下跳过 Wan/VACE
+下一步: 先跑 deterministic_foreground_background_composite，并把结果与 mannul8 VACE candidate 并列 review
+```
+
+第四优先级：继续验证 composite-first-frame / guided refine route：
 
 ```text
 plan: ef8f2818
 task: woman background -> futuristic laboratory
 当前状态: mannul8 已用脚本化 route 复现成功
-下一步: 不再重复同一条，改找 2-3 条单主体全程可见 talking-head clip 做同 route smoke
+下一步: 只在 deterministic composite 边缘/融合不够时，用 seam/repair mask 做 guided VACE；不要整块背景交给 VACE
 ```
 
 执行前必须：
@@ -753,16 +884,16 @@ git rev-parse --short HEAD
 python -m unittest tests.test_scripts tests.test_composed_data -v
 ```
 
-如果测试通过，再重新生成 ef8f2818 或其它单场景 talking-head background_replace 的 smoke。不要复用 mannul5/mannul6 的旧 plan，也不要复用旧 review bundle。
+如果测试通过，再重新生成 ef8f2818 或其它单场景 talking-head background_replace 的 deterministic smoke。不要复用 mannul5/mannul6 的旧 plan，也不要复用旧 review bundle。
 
 建议服务器先做这一条最小闭环：
 
 ```text
 1. 拉最新 HEAD。
 2. 确认 ef8f2818 的 v3 mask、selected src_ref_image、prompt、policy 都存在。
-3. 直接跑 run_vace_visual_synthetic_smoke.sh。
-4. 检查 review bundle 是否包含 composite_frame0、composite src_video/mask contact、raw target、target、duration_metrics、post_vace_verdict。
-5. 如果 semantic gate 通过，再把该样本标记为 composite-first-frame 可复现。
+3. 直接跑 run_vace_visual_synthetic_smoke.sh，让脚本按 `background_replace_route` 决定是否跳过 Wan/VACE。
+4. 如果是 deterministic route，检查 review bundle 是否包含 `src_ref_plate.png`、`alpha_contact.jpg`、`composite_target_contact.jpg`、`deterministic_composite_metrics.json`、`post_vace_or_composite_verdict.json`。
+5. 如果 semantic gate 通过，再把该样本标记为 deterministic background composite 可生产候选。
 ```
 
 新 plan 必须人工/脚本确认：
@@ -774,7 +905,16 @@ preserve_regions 不含 window / door / room / wall / background
 VACE prompt 是最终状态描述，不是 “in a sunlit room with lab background”
 ```
 
-只有这些都通过，也不要直接走 plain VACE。background replacement 必须生成 composite first frame：
+只有这些都通过，也不要直接走 plain VACE。background replacement 默认先做 deterministic fixed composite：
+
+```text
+background plate = selected src_ref_image resize/crop 到视频尺寸
+foreground = reference 中 mask 黑区
+background = fixed plate 中 mask 白区
+VACE = 不调用
+```
+
+如果 deterministic 结构正确但边缘需要修复，再生成 composite first frame / guided refine VACE：
 
 ```text
 frame0 = same woman foreground + target futuristic lab background composite
@@ -783,10 +923,11 @@ frames 1..N src_video = original woman foreground + gray 127 background
 frames 1..N src_mask = foreground black preserve, background white generate
 ```
 
-然后 VACE generation metadata 必须记录：
+然后 generation metadata 必须记录：
 
 ```text
-background_replace_route=vace_bg_replace_composite_first_frame_mv2v
+background_replace_route=deterministic_foreground_background_composite
+requires_vace=false
 duration_metrics.duration_gate.passed=true
 ```
 
@@ -827,6 +968,7 @@ failure_reason
 - 不要复用 mannul5 的旧 plan 或旧 bundle。
 - 不要把 blue overlay / original room retained 的背景样本标成成功。
 - 不要再用普通 `run_vace_visual_synthetic_smoke.sh` 默认路线跑 full background replacement；它现在应被 preflight 拒绝。
+- 不要在背景可固定时调用 VACE 重新生成整块背景。
 
 ## 7. 当前判断
 
@@ -848,10 +990,13 @@ failure_reason
 
 1. background replacement prompt 冲突已经修复，但 plain masked VACE 仍然失败。
 2. full background replacement 已从 plain masked VACE production route 降级。
-3. `mannul7/mannul8` 已经证明 `vace_bg_replace_composite_first_frame_mv2v` 能解决 blue overlay，并且脚本化 route 能复现。
-4. 在现有 35 个 plan 和历史失败样本里继续生成 adaptive diagnostic mask，寻找新的 `usable_for_vace=true` 候选。
-5. 如果 Florence-2 + SAM2.1 对真实视频仍然全失败，切换到更简单的 synthetic route：
+3. fixed-first route 已经落地：background replacement 默认用 deterministic foreground/background composite，VACE 只作为 fallback/refine/full-generative route。
+4. `mannul7/mannul8` 已经证明 `vace_bg_replace_composite_first_frame_mv2v` 能解决 blue overlay，并且脚本化 route 能复现；但它现在不是第一优先级。
+5. 在现有 35 个 plan 和历史失败样本里继续生成 adaptive diagnostic mask，寻找新的 `usable_for_vace=true` 候选。
+6. 如果 Florence-2 + SAM2.1 对真实视频仍然全失败，切换到更简单的 synthetic route：
    - deterministic audio route
+   - deterministic fixed background composite
+   - deterministic masked reference paste
    - existing large object / robot / vehicle attribute edit
    - animation / static-like video local color edit
-6. 等 mask route 有稳定通过样本，再恢复非背景替换类 VACE smoke。
+7. 等 mask route 有稳定通过样本，再按 route selector 恢复非背景替换类 VACE smoke。

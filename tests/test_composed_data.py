@@ -4762,12 +4762,25 @@ class ComposedDataTests(unittest.TestCase):
             self.assertFalse(any("lighting" in lock.lower() for lock in plan["visual_edit_risk"]["locks"]))
             self.assertFalse(any("layout" in lock.lower() for lock in plan["visual_edit_risk"]["locks"]))
             self.assertFalse(any("window" in lock.lower() or "door" in lock.lower() for lock in plan["visual_edit_risk"]["locks"]))
-            self.assertFalse(plan["route_suitability"]["production_allowed"])
+            self.assertTrue(plan["route_suitability"]["production_allowed"])
             self.assertFalse(plan["route_suitability"]["plain_masked_vace_production"])
-            self.assertEqual("vace_bg_replace_composite_first_frame_mv2v", plan["route_suitability"]["recommended_route"])
-            self.assertEqual("vace_bg_replace_composite_first_frame_mv2v", plan["background_replace_policy"]["recommended_route"])
+            self.assertEqual("deterministic_foreground_background_composite", plan["route_suitability"]["recommended_route"])
+            self.assertEqual("guided_composite_refine_vace", plan["route_suitability"]["refine_route"])
+            self.assertEqual("vace_bg_replace_composite_first_frame_mv2v", plan["route_suitability"]["fallback_route"])
+            self.assertEqual("omni_planner_plus_local_policy", plan["route_suitability"]["route_decision_source"])
+            self.assertEqual("deterministic_foreground_background_composite", plan["background_replace_policy"]["recommended_route"])
+            self.assertEqual("guided_composite_refine_vace", plan["background_replace_policy"]["refine_route"])
             self.assertFalse(plan["background_replace_policy"]["plain_masked_vace_production"])
-            self.assertTrue(plan["background_replace_policy"]["requires_composite_first_frame"])
+            self.assertFalse(plan["background_replace_policy"]["requires_composite_first_frame"])
+            self.assertTrue(plan["background_replace_policy"]["deterministic_composite_production"])
+            self.assertEqual(
+                [
+                    "deterministic_foreground_background_composite",
+                    "guided_composite_refine_vace",
+                    "vace_bg_replace_composite_first_frame_mv2v",
+                ],
+                plan["route_execution_order"],
+            )
             self.assertIn("target_prompt_rewritten_for_background_replace", plan["planner"]["repaired_fields"])
             self.assertIn("visual_edit_risk_locks_rewritten_for_background_replace", plan["planner"]["repaired_fields"])
             self.assertIn("preserve_regions_rewritten_for_background_replace", plan["planner"]["repaired_fields"])
