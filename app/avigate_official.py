@@ -21,7 +21,7 @@ RUNTIME_CACHE_VERSION = 1
 _RUNTIME_CACHE: dict[tuple[str, str], "AvigateRuntime"] = {}
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class AvigateRuntimeConfig:
     model_dir: str
     checkpoint_path: str
@@ -46,7 +46,7 @@ class AvigateRuntimeConfig:
     cache_dir: str | None = None
 
 
-@dataclass(slots=True)
+@dataclass
 class AvigateRuntime:
     config: AvigateRuntimeConfig
     model: Any

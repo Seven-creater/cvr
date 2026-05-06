@@ -107,7 +107,7 @@ def _materialize_video_url(raw_url: str) -> str:
     return f"data:{mime_type};base64,{content}"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class RetrievalHints:
     query_text_override: str | None
     audio_mode: str = "on"
@@ -143,7 +143,7 @@ class RetrievalHints:
         return payload
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class T2VQueryUnderstanding:
     retrieval_text: str
     summary: str
@@ -189,7 +189,7 @@ class T2VQueryUnderstanding:
         }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class VideoDescription:
     summary: str
     main_events: list[str]
@@ -223,7 +223,7 @@ class VideoDescription:
         }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class T2VRerankResult:
     ordered_video_ids: list[str]
     top_choice_video_id: str
@@ -255,7 +255,7 @@ class T2VRerankResult:
         }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class V2TRerankResult:
     ordered_text_ids: list[str]
     top_choice_text_id: str

@@ -10,7 +10,7 @@ def parse_topk_values(raw: str) -> list[int]:
     return ks
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class TextRow:
     text_id: str
     video_id: str
@@ -21,7 +21,7 @@ class TextRow:
         return cls(text_id=str(row["text_id"]), video_id=str(row["video_id"]), text=str(row["text"]))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class VideoRow:
     video_id: str
     video_path: str
@@ -36,7 +36,7 @@ class VideoRow:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class RetrievalHit:
     rank: int
     item_id: str

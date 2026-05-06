@@ -443,7 +443,10 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual([30, 70, 90], [item["frame_idx"] for item in anchors])
 
     def test_adaptive_sparse_mask_records_visible_spans(self) -> None:
-        import numpy as np
+        try:
+            import numpy as np
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"numpy unavailable: {exc}")
 
         masks = {
             2: np.ones((2, 2), dtype="uint8"),

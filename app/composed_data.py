@@ -823,7 +823,7 @@ FINAL_ACCEPT_BUCKET_TARGETS = {
 }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class RawAsset:
     asset_id: str
     dataset: str
@@ -847,7 +847,7 @@ class RawAsset:
         }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class ClipManifestRecord:
     clip_id: str
     source_asset_id: str | None
