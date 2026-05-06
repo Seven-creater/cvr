@@ -5858,8 +5858,18 @@ class ComposedDataTests(unittest.TestCase):
                 mask_manifest_path=root / "pairs" / "video_mask_manifest.jsonl",
             )
 
-            self.assertEqual(0, summary["mask_plan_count"])
+            mask_plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["mask_plan_count"])
             self.assertEqual(1, summary["skipped_reasons"]["low_contrast_dark_clothing_color_edit"])
+            self.assertEqual("low_contrast_dark_clothing_color_edit", mask_plans[0]["maskability_issue"])
+            self.assertTrue(mask_plans[0]["generate_diagnostic_mask"])
+            self.assertFalse(mask_plans[0]["usable_for_vace_default"])
+            self.assertEqual("adaptive_repair_v1", mask_plans[0]["mask_generation_strategy"])
 
     def test_plan_video_masks_skips_multi_subject_background_edit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5895,8 +5905,17 @@ class ComposedDataTests(unittest.TestCase):
                 mask_manifest_path=root / "pairs" / "video_mask_manifest.jsonl",
             )
 
-            self.assertEqual(0, summary["mask_plan_count"])
+            mask_plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["mask_plan_count"])
             self.assertEqual(1, summary["skipped_reasons"]["multi_subject_background_mask_route_unsupported"])
+            self.assertEqual("multi_subject_background_mask_route_unsupported", mask_plans[0]["maskability_issue"])
+            self.assertTrue(mask_plans[0]["generate_diagnostic_mask"])
+            self.assertFalse(mask_plans[0]["usable_for_vace_default"])
 
     def test_plan_video_masks_skips_tiny_fullframe_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5927,8 +5946,17 @@ class ComposedDataTests(unittest.TestCase):
                 mask_manifest_path=root / "pairs" / "video_mask_manifest.jsonl",
             )
 
-            self.assertEqual(0, summary["mask_plan_count"])
+            mask_plans = [
+                json.loads(line)
+                for line in Path(summary["output_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            self.assertEqual(1, summary["mask_plan_count"])
             self.assertEqual(1, summary["skipped_reasons"]["small_object_too_tiny_for_fullframe_vace"])
+            self.assertEqual("small_object_too_tiny_for_fullframe_vace", mask_plans[0]["maskability_issue"])
+            self.assertTrue(mask_plans[0]["generate_diagnostic_mask"])
+            self.assertFalse(mask_plans[0]["usable_for_vace_default"])
 
     def test_plan_src_ref_images_requires_references_for_object_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -600,6 +600,19 @@ if mask_manifest_path:
     mask_polarity = str(mask_manifest_row.get("mask_polarity", "")).strip()
     if mask_polarity != VIDEO_MASK_POLARITY:
         raise SystemExit(f"mask manifest row has invalid mask_polarity for plan_id {plan_id}: {mask_polarity!r}")
+    mask_generation_strategy = str(mask_manifest_row.get("mask_generation_strategy", "")).strip()
+    if mask_generation_strategy != "adaptive_repair_v1":
+        raise SystemExit(
+            f"mask manifest row has stale/missing mask_generation_strategy for plan_id {plan_id}: "
+            f"{mask_generation_strategy!r}"
+        )
+    if mask_manifest_row.get("usable_for_vace") is False:
+        raise SystemExit(f"mask manifest row is diagnostic-only and not usable for VACE for plan_id {plan_id}")
+    mask_quality_tier = str(mask_manifest_row.get("mask_quality_tier", "")).strip()
+    if mask_quality_tier in {"diagnostic_only", "failed"}:
+        raise SystemExit(
+            f"mask manifest row has non-VACE mask_quality_tier for plan_id {plan_id}: {mask_quality_tier!r}"
+        )
     manifest_mask_query = str(mask_manifest_row.get("mask_query", "")).strip()
     manifest_mask_mode = str(mask_manifest_row.get("mask_mode", "")).strip()
     expected_query = expected_mask_query(plan, str(plan.get("mask_query", "")).strip() or manifest_mask_query)

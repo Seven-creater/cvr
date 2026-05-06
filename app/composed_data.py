@@ -2822,7 +2822,6 @@ def plan_video_masks(
         maskability_issue = _video_maskability_issue(edit_plan, mask_query=mask_query, mask_mode=mask_mode)
         if maskability_issue:
             skipped_reasons[maskability_issue] += 1
-            continue
         mask_query_candidates = _video_mask_query_candidates_for_plan(edit_plan, mask_query)
         safe_id = _safe_id(plan_id)
         mask_video = mask_dir / f"{safe_id}_mask.mp4"
@@ -2848,6 +2847,10 @@ def plan_video_masks(
                 "wrapper": "Grounded-SAM-2",
             },
             "mask_gate": _video_mask_gate_defaults(mask_mode=mask_mode, mask_query=mask_query, plan=edit_plan),
+            "mask_generation_strategy": "adaptive_repair_v1",
+            "generate_diagnostic_mask": bool(maskability_issue),
+            "maskability_issue": maskability_issue,
+            "usable_for_vace_default": not bool(maskability_issue),
             "status": "planned",
         }
         mask_plans.append(mask_record)
@@ -2861,6 +2864,10 @@ def plan_video_masks(
                 "mask_mode": mask_mode,
                 "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
                 "mask_polarity": VIDEO_MASK_POLARITY,
+                "mask_generation_strategy": "adaptive_repair_v1",
+                "generate_diagnostic_mask": bool(maskability_issue),
+                "maskability_issue": maskability_issue,
+                "usable_for_vace_default": not bool(maskability_issue),
                 "status": "planned",
             }
         )

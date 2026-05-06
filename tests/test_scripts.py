@@ -4,7 +4,14 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from scripts.generate_grounded_sam2_video_masks import _find_grounding_dino_checkpoint, _mask_gate_errors
+from scripts.generate_grounded_sam2_video_masks import (
+    _find_grounding_dino_checkpoint,
+    _mask_gate_errors,
+    _mask_quality_tier,
+    _sample_detection_frame_indices,
+    _select_anchor_detections,
+    _visible_spans_from_masks,
+)
 
 
 class ScriptTests(unittest.TestCase):
@@ -185,6 +192,10 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("mask_polarity", script)
         self.assertIn("mask manifest row has stale/missing mask_semantics_version", script)
         self.assertIn("mask manifest query does not match current plan", script)
+        self.assertIn("mask_generation_strategy", script)
+        self.assertIn("adaptive_repair_v1", script)
+        self.assertIn("diagnostic-only and not usable for VACE", script)
+        self.assertIn("mask_quality_tier", script)
         self.assertIn("background inverse mask appears to edit the subject", script)
         self.assertIn("low_contrast_dark_clothing_color_edit", script)
         self.assertIn("multi_subject_background_mask_route_unsupported", script)
@@ -290,6 +301,20 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("protected_overlap_queries", helper)
         self.assertIn("protected_overlap_ratio_max", helper)
         self.assertIn("min_protected_detections", helper)
+        self.assertIn("adaptive_repair_v1", helper)
+        self.assertIn("sparse_full_length", helper)
+        self.assertIn("visible_spans", helper)
+        self.assertIn("detector_cascade", helper)
+        self.assertIn("detection_attempts", helper)
+        self.assertIn("anchor_frame_indices", helper)
+        self.assertIn("prompt_type", helper)
+        self.assertIn("mask_quality_tier", helper)
+        self.assertIn("usable_for_vace", helper)
+        self.assertIn("usable_for_vace_default", helper)
+        self.assertIn("tier=`{row.get('mask_quality_tier')}`", helper)
+        self.assertIn("visible_spans=`{len(row.get('visible_spans') or [])}`", helper)
+        self.assertIn("_write_all_black_mask_video", helper)
+        self.assertIn("_sample_detection_frame_indices", helper)
 
     def test_grounding_dino_checkpoint_rejects_huggingface_bin(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -394,6 +419,70 @@ class ScriptTests(unittest.TestCase):
 
         self.assertTrue(any("protected_detection_count" in error for error in errors))
 
+    def test_adaptive_mask_sampling_uses_dense_frame_candidates(self) -> None:
+        sampled = _sample_detection_frame_indices(101, max_samples=13)
+
+        self.assertIn(0, sampled)
+        self.assertIn(25, sampled)
+        self.assertIn(50, sampled)
+        self.assertIn(75, sampled)
+        self.assertIn(100, sampled)
+        self.assertGreater(len(sampled), 5)
+
+    def test_adaptive_mask_selects_multiple_anchor_frames(self) -> None:
+        anchors = _select_anchor_detections(
+            [
+                {"frame_idx": 10, "score": 0.2},
+                {"frame_idx": 30, "score": 0.9},
+                {"frame_idx": 70, "score": 0.7},
+                {"frame_idx": 90, "score": 0.6},
+            ],
+            max_anchors=3,
+        )
+
+        self.assertEqual([30, 70, 90], [item["frame_idx"] for item in anchors])
+
+    def test_adaptive_sparse_mask_records_visible_spans(self) -> None:
+        import numpy as np
+
+        masks = {
+            2: np.ones((2, 2), dtype="uint8"),
+            3: np.ones((2, 2), dtype="uint8"),
+            7: np.ones((2, 2), dtype="uint8"),
+        }
+
+        self.assertEqual(
+            [
+                {"start_frame": 2, "end_frame": 3, "frame_count": 2, "coverage_avg": 1.0},
+                {"start_frame": 7, "end_frame": 7, "frame_count": 1, "coverage_avg": 1.0},
+            ],
+            _visible_spans_from_masks(masks, 10),
+        )
+
+    def test_adaptive_mask_quality_tier_keeps_diagnostics_out_of_vace(self) -> None:
+        self.assertEqual(
+            "diagnostic_only",
+            _mask_quality_tier(
+                ["temporal_stability 0.2500 < min 0.7500"],
+                {
+                    "mask_coverage_ratio_avg": 0.2,
+                    "mask_nonempty_frame_ratio": 0.25,
+                    "mask_temporal_stability": 0.25,
+                },
+            ),
+        )
+        self.assertEqual(
+            "excellent",
+            _mask_quality_tier(
+                [],
+                {
+                    "mask_coverage_ratio_avg": 0.5,
+                    "mask_nonempty_frame_ratio": 1.0,
+                    "mask_temporal_stability": 0.95,
+                },
+            ),
+        )
+
     def test_vace_smoke_script_lints_clothing_prompt_conflicts(self) -> None:
         script = Path("scripts/run_vace_visual_synthetic_smoke.sh").read_text(encoding="utf-8")
 
@@ -438,7 +527,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("AutoModelForCausalLM.from_pretrained", script)
         helper = Path("scripts/generate_grounded_sam2_video_masks.py").read_text(encoding="utf-8")
         self.assertIn("_sample_keyframe_indices", helper)
-        self.assertIn("mask gate failed", helper)
+        self.assertIn("failed_gate", helper)
         self.assertIn("mask_nonempty_frame_ratio", helper)
 
     def test_manual_review_bundle_script_calls_review_bundle_command(self) -> None:

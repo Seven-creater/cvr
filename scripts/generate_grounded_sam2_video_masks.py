@@ -11,6 +11,11 @@ from typing import Any
 
 VIDEO_MASK_SEMANTICS_VERSION = 3
 VIDEO_MASK_POLARITY = "white_generate_black_preserve"
+MASK_GENERATION_STRATEGY = "adaptive_repair_v1"
+MASK_QUALITY_EXCELLENT = "excellent"
+MASK_QUALITY_USABLE = "usable_for_vace"
+MASK_QUALITY_DIAGNOSTIC = "diagnostic_only"
+MASK_QUALITY_FAILED = "failed"
 
 
 def _normalized_phrase(value: str) -> str:
@@ -193,6 +198,163 @@ def _sample_keyframe_indices(frame_count: int) -> list[int]:
         return []
     raw = [0, frame_count // 4, frame_count // 2, (frame_count * 3) // 4, frame_count - 1]
     return sorted({max(0, min(frame_count - 1, idx)) for idx in raw})
+
+
+def _sample_detection_frame_indices(frame_count: int, *, max_samples: int = 13) -> list[int]:
+    if frame_count <= 0:
+        return []
+    if frame_count <= max_samples:
+        return list(range(frame_count))
+    anchors = set(_sample_keyframe_indices(frame_count))
+    sample_count = max(2, max_samples)
+    for pos in range(sample_count):
+        idx = round(pos * (frame_count - 1) / (sample_count - 1))
+        anchors.add(max(0, min(frame_count - 1, idx)))
+    return sorted(anchors)
+
+
+def _select_anchor_detections(
+    detections: list[dict[str, Any]],
+    *,
+    max_anchors: int = 3,
+) -> list[dict[str, Any]]:
+    by_frame: dict[int, dict[str, Any]] = {}
+    for detection in detections:
+        frame_idx = int(detection.get("frame_idx", 0) or 0)
+        previous = by_frame.get(frame_idx)
+        if previous is None or float(detection.get("score", 0.0) or 0.0) > float(previous.get("score", 0.0) or 0.0):
+            by_frame[frame_idx] = detection
+    ranked = sorted(by_frame.values(), key=lambda item: float(item.get("score", 0.0) or 0.0), reverse=True)
+    selected = ranked[: max(1, max_anchors)]
+    return sorted(selected, key=lambda item: int(item.get("frame_idx", 0) or 0))
+
+
+def _visible_spans_from_masks(masks_by_frame: dict[int, Any], frame_count: int) -> list[dict[str, Any]]:
+    import numpy as np
+
+    spans: list[dict[str, Any]] = []
+    active_start: int | None = None
+    coverages: list[float] = []
+    for idx in range(frame_count):
+        mask = masks_by_frame.get(idx)
+        coverage = float(np.asarray(mask).astype(bool).mean()) if mask is not None else 0.0
+        if coverage > 0.0:
+            if active_start is None:
+                active_start = idx
+                coverages = []
+            coverages.append(coverage)
+        elif active_start is not None:
+            spans.append(
+                {
+                    "start_frame": active_start,
+                    "end_frame": idx - 1,
+                    "frame_count": idx - active_start,
+                    "coverage_avg": sum(coverages) / len(coverages) if coverages else 0.0,
+                }
+            )
+            active_start = None
+            coverages = []
+    if active_start is not None:
+        spans.append(
+            {
+                "start_frame": active_start,
+                "end_frame": frame_count - 1,
+                "frame_count": frame_count - active_start,
+                "coverage_avg": sum(coverages) / len(coverages) if coverages else 0.0,
+            }
+        )
+    return spans
+
+
+def _mask_quality_tier(gate_errors: list[str], metrics: dict[str, Any]) -> str:
+    nonempty = float(metrics.get("mask_nonempty_frame_ratio", 0.0) or 0.0)
+    stability = float(metrics.get("mask_temporal_stability", 0.0) or 0.0)
+    avg_coverage = float(metrics.get("mask_coverage_ratio_avg", 0.0) or 0.0)
+    if nonempty <= 0.0 or avg_coverage <= 0.0:
+        return MASK_QUALITY_FAILED
+    if not gate_errors:
+        if nonempty >= 0.98 and stability >= 0.90:
+            return MASK_QUALITY_EXCELLENT
+        return MASK_QUALITY_USABLE
+    return MASK_QUALITY_DIAGNOSTIC
+
+
+def _append_adaptive_provenance(
+    metrics: dict[str, Any],
+    *,
+    gate_errors: list[str] | None = None,
+    detection_attempts: list[dict[str, Any]] | None = None,
+    anchor_frame_indices: list[int] | None = None,
+    prompt_type: str = "box",
+    repair_rounds: int = 0,
+) -> dict[str, Any]:
+    errors = list(gate_errors or [])
+    quality_tier = _mask_quality_tier(errors, metrics)
+    metrics["mask_generation_strategy"] = MASK_GENERATION_STRATEGY
+    metrics["detector_cascade"] = metrics.get("detector_cascade", [])
+    metrics["detection_attempts"] = detection_attempts or metrics.get("detection_attempts", [])
+    metrics["anchor_frame_indices"] = anchor_frame_indices or metrics.get("anchor_frame_indices", [])
+    metrics["prompt_type"] = prompt_type
+    metrics["reinit_count"] = max(0, len(metrics["anchor_frame_indices"]) - 1)
+    metrics["repair_rounds"] = repair_rounds
+    metrics["visible_spans"] = metrics.get("visible_spans", [])
+    metrics["sparse_full_length"] = bool(float(metrics.get("mask_nonempty_frame_ratio", 0.0) or 0.0) < 0.98)
+    metrics["mask_quality_tier"] = quality_tier
+    metrics["usable_for_vace"] = quality_tier in {MASK_QUALITY_EXCELLENT, MASK_QUALITY_USABLE}
+    metrics["failure_reasons"] = errors
+    return metrics
+
+
+def _write_all_black_mask_video(reference_video: Path, output_mask_video: Path) -> dict[str, Any]:
+    import cv2
+    import numpy as np
+
+    with tempfile.TemporaryDirectory(prefix="black_sparse_mask_") as tmp:
+        tmp_dir = Path(tmp)
+        frame_dir = tmp_dir / "frames"
+        mask_dir = tmp_dir / "masks"
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        _extract_frames(reference_video, frame_dir)
+        frame_paths = sorted(frame_dir.glob("*.jpg"))
+        if not frame_paths:
+            raise RuntimeError(f"no frames extracted from {reference_video}")
+        shape = None
+        for idx, frame_path in enumerate(frame_paths):
+            frame = cv2.imread(str(frame_path))
+            if frame is None:
+                raise RuntimeError(f"cannot read extracted frame: {frame_path}")
+            shape = frame.shape[:2]
+            cv2.imwrite(str(mask_dir / f"{idx:05d}.png"), np.zeros(shape, dtype="uint8"))
+        fps = _ffprobe_fps(reference_video)
+        _encode_mask_video(mask_dir, output_mask_video, fps)
+        metrics = {
+            "frame_count": len(frame_paths),
+            "fps": fps,
+            "reference_frame_count": len(frame_paths),
+            "reference_fps": fps,
+            "mask_coverage_ratio_min": 0.0,
+            "mask_coverage_ratio_avg": 0.0,
+            "mask_coverage_ratio_max": 0.0,
+            "mask_temporal_stability": 1.0,
+            "mask_nonempty_frame_ratio": 0.0,
+            "visible_span_ratio": 0.0,
+            "visible_spans": [],
+            "sampled_frame_indices": _sample_detection_frame_indices(len(frame_paths)),
+            "detected_keyframe_index": None,
+            "detected_keyframe_box_coverage": 0.0,
+            "box_count": 0,
+            "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
+            "mask_polarity": VIDEO_MASK_POLARITY,
+            "generator_commit": _git_head_short(),
+            "device": "",
+        }
+        return _append_adaptive_provenance(
+            metrics,
+            gate_errors=["no detector produced a usable mask; emitted all-black diagnostic mask"],
+            detection_attempts=[],
+            anchor_frame_indices=[],
+            prompt_type="none",
+        )
 
 
 def _mask_gate_errors(mask_gate: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
@@ -412,8 +574,9 @@ def _run_grounded_sam2(
             str(grounding_dino_checkpoint),
             device=device,
         )
-        sampled_frame_indices = _sample_keyframe_indices(len(frame_paths))
-        best_detection: dict[str, Any] | None = None
+        sampled_frame_indices = _sample_detection_frame_indices(len(frame_paths))
+        detections: list[dict[str, Any]] = []
+        detection_attempts: list[dict[str, Any]] = []
         for frame_idx in sampled_frame_indices:
             frame_path = frame_paths[frame_idx]
             image_source, image = load_image(str(frame_path))
@@ -426,6 +589,9 @@ def _run_grounded_sam2(
                 device=device,
             )
             if boxes is None or len(boxes) == 0:
+                detection_attempts.append(
+                    {"frame_idx": frame_idx, "query": mask_query, "status": "not_detected", "detector": "groundingdino"}
+                )
                 continue
             h, w = image_source.shape[:2]
             boxes_np = boxes.detach().cpu().numpy()
@@ -442,29 +608,49 @@ def _run_grounded_sam2(
             logits_np = logits.detach().cpu().numpy() if hasattr(logits, "detach") else np.array(logits)
             confidence = float(logits_np.max()) if logits_np.size else 0.0
             score = confidence - abs(min(coverage, 1.0) - 0.12)
-            if best_detection is None or score > float(best_detection["score"]):
-                best_detection = {
+            detection = {
+                "frame_idx": frame_idx,
+                "boxes_xyxy": boxes_xyxy,
+                "phrases": [str(item) for item in phrases],
+                "score": score,
+                "box_coverage": coverage,
+                "confidence": confidence,
+                "box_count": int(len(boxes_xyxy)),
+            }
+            detections.append(detection)
+            detection_attempts.append(
+                {
                     "frame_idx": frame_idx,
-                    "boxes_xyxy": boxes_xyxy,
-                    "phrases": [str(item) for item in phrases],
-                    "score": score,
+                    "query": mask_query,
+                    "status": "detected",
+                    "detector": "groundingdino",
+                    "box_count": int(len(boxes_xyxy)),
                     "box_coverage": coverage,
+                    "confidence": confidence,
+                    "score": score,
+                    "phrases": [str(item) for item in phrases],
                 }
-        if best_detection is None:
+            )
+        if not detections:
             raise RuntimeError(f"GroundingDINO found no box for query in sampled frames: {mask_query}")
+        anchor_detections = _select_anchor_detections(detections, max_anchors=3)
+        best_detection = max(anchor_detections, key=lambda item: float(item.get("score", 0.0) or 0.0))
         boxes_xyxy = best_detection["boxes_xyxy"]
         keyframe_idx = int(best_detection["frame_idx"])
 
         predictor = build_sam2_video_predictor(sam2_config, str(sam2_checkpoint), device=device)
         inference_state = predictor.init_state(video_path=str(frame_dir))
         predictor.reset_state(inference_state)
-        for object_id, box in enumerate(boxes_xyxy[:3], start=1):
-            predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=keyframe_idx,
-                obj_id=object_id,
-                box=box,
-            )
+        object_id = 1
+        for anchor in anchor_detections:
+            for box in anchor["boxes_xyxy"][:3]:
+                predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=int(anchor["frame_idx"]),
+                    obj_id=object_id,
+                    box=box,
+                )
+                object_id += 1
 
         raw_frame_masks: dict[int, np.ndarray] = {}
         frame_masks: dict[int, np.ndarray] = {}
@@ -571,13 +757,19 @@ def _run_grounded_sam2(
             "mask_temporal_stability": sum(ious) / len(ious) if ious else 1.0,
             "mask_nonempty_frame_ratio": nonempty_count / len(coverages) if coverages else 0.0,
             "visible_span_ratio": nonempty_count / len(coverages) if coverages else 0.0,
-            "reinit_count": 0,
+            "visible_spans": _visible_spans_from_masks(frame_masks, len(frame_paths)),
+            "reinit_count": max(0, len(anchor_detections) - 1),
             "sampled_frame_indices": sampled_frame_indices,
             "detected_phrases": best_detection["phrases"],
             "detected_keyframe_index": keyframe_idx,
             "detected_keyframe_box_coverage": best_detection["box_coverage"],
             "box_count": int(len(boxes_xyxy)),
             "device": device,
+            "grounder": "groundingdino",
+            "detector_cascade": ["groundingdino"],
+            "detection_attempts": detection_attempts,
+            "anchor_frame_indices": [int(item["frame_idx"]) for item in anchor_detections],
+            "prompt_type": "box",
             "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
             "mask_polarity": VIDEO_MASK_POLARITY,
             "generator_commit": _git_head_short(),
@@ -593,7 +785,12 @@ def _run_grounded_sam2(
         if protected_overlap_details:
             metrics["protected_overlap"] = protected_overlap_details
             metrics["protected_overlap_ratio_max"] = protected_overlap_max if protected_overlap_max is not None else 0.0
-        return metrics
+        return _append_adaptive_provenance(
+            metrics,
+            detection_attempts=detection_attempts,
+            anchor_frame_indices=[int(item["frame_idx"]) for item in anchor_detections],
+            prompt_type="box",
+        )
 
 
 def _florence_boxes(
@@ -689,8 +886,9 @@ def _run_florence_sam2(
         if not frame_paths:
             raise RuntimeError(f"no frames extracted from {reference_video}")
 
-        sampled_frame_indices = _sample_keyframe_indices(len(frame_paths))
-        best_detection: dict[str, Any] | None = None
+        sampled_frame_indices = _sample_detection_frame_indices(len(frame_paths))
+        detections: list[dict[str, Any]] = []
+        detection_attempts: list[dict[str, Any]] = []
         for frame_idx in sampled_frame_indices:
             try:
                 boxes_xyxy, labels = _florence_boxes_with_model(
@@ -701,6 +899,9 @@ def _run_florence_sam2(
                     device=device,
                 )
             except RuntimeError:
+                detection_attempts.append(
+                    {"frame_idx": frame_idx, "query": mask_query, "status": "not_detected", "detector": "florence2"}
+                )
                 continue
             frame = cv2.imread(str(frame_paths[frame_idx]))
             if frame is None:
@@ -712,29 +913,47 @@ def _run_florence_sam2(
             box_areas = np.maximum(0, clipped[:, 2] - clipped[:, 0]) * np.maximum(0, clipped[:, 3] - clipped[:, 1])
             coverage = float(box_areas[:3].sum() / max(float(w * h), 1.0))
             score = -abs(min(coverage, 1.0) - 0.12) + min(len(boxes_xyxy), 3) * 0.05
-            if best_detection is None or score > float(best_detection["score"]):
-                best_detection = {
+            detection = {
+                "frame_idx": frame_idx,
+                "boxes_xyxy": boxes_xyxy,
+                "labels": labels,
+                "score": score,
+                "box_coverage": coverage,
+                "box_count": int(len(boxes_xyxy)),
+            }
+            detections.append(detection)
+            detection_attempts.append(
+                {
                     "frame_idx": frame_idx,
-                    "boxes_xyxy": boxes_xyxy,
-                    "labels": labels,
-                    "score": score,
+                    "query": mask_query,
+                    "status": "detected",
+                    "detector": "florence2",
+                    "box_count": int(len(boxes_xyxy)),
                     "box_coverage": coverage,
+                    "score": score,
+                    "labels": labels,
                 }
-        if best_detection is None:
+            )
+        if not detections:
             raise RuntimeError(f"Florence-2 found no box for query in sampled frames: {mask_query}")
+        anchor_detections = _select_anchor_detections(detections, max_anchors=3)
+        best_detection = max(anchor_detections, key=lambda item: float(item.get("score", 0.0) or 0.0))
         boxes_xyxy = best_detection["boxes_xyxy"]
         labels = best_detection["labels"]
         keyframe_idx = int(best_detection["frame_idx"])
         predictor = build_sam2_video_predictor(sam2_config, str(sam2_checkpoint), device=device)
         inference_state = predictor.init_state(video_path=str(frame_dir))
         predictor.reset_state(inference_state)
-        for object_id, box in enumerate(boxes_xyxy[:3], start=1):
-            predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=keyframe_idx,
-                obj_id=object_id,
-                box=box,
-            )
+        object_id = 1
+        for anchor in anchor_detections:
+            for box in anchor["boxes_xyxy"][:3]:
+                predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=int(anchor["frame_idx"]),
+                    obj_id=object_id,
+                    box=box,
+                )
+                object_id += 1
 
         raw_frame_masks: dict[int, np.ndarray] = {}
         frame_masks: dict[int, np.ndarray] = {}
@@ -825,7 +1044,8 @@ def _run_florence_sam2(
             "mask_temporal_stability": sum(ious) / len(ious) if ious else 1.0,
             "mask_nonempty_frame_ratio": nonempty_count / len(coverages) if coverages else 0.0,
             "visible_span_ratio": nonempty_count / len(coverages) if coverages else 0.0,
-            "reinit_count": 0,
+            "visible_spans": _visible_spans_from_masks(frame_masks, len(frame_paths)),
+            "reinit_count": max(0, len(anchor_detections) - 1),
             "sampled_frame_indices": sampled_frame_indices,
             "detected_phrases": labels,
             "detected_keyframe_index": keyframe_idx,
@@ -833,6 +1053,10 @@ def _run_florence_sam2(
             "box_count": int(len(boxes_xyxy)),
             "device": device,
             "grounder": "florence2",
+            "detector_cascade": ["florence2"],
+            "detection_attempts": detection_attempts,
+            "anchor_frame_indices": [int(item["frame_idx"]) for item in anchor_detections],
+            "prompt_type": "box",
             "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
             "mask_polarity": VIDEO_MASK_POLARITY,
             "generator_commit": _git_head_short(),
@@ -848,7 +1072,12 @@ def _run_florence_sam2(
         if protected_overlap_details:
             metrics["protected_overlap"] = protected_overlap_details
             metrics["protected_overlap_ratio_max"] = protected_overlap_max if protected_overlap_max is not None else 0.0
-        return metrics
+        return _append_adaptive_provenance(
+            metrics,
+            detection_attempts=detection_attempts,
+            anchor_frame_indices=[int(item["frame_idx"]) for item in anchor_detections],
+            prompt_type="box",
+        )
 
 
 def _mask_query_candidates(plan: dict[str, Any]) -> list[str]:
@@ -929,6 +1158,7 @@ def main() -> None:
         plan_id = str(plan.get("plan_id", "")).strip()
         row = manifest_by_plan.get(plan_id, {"plan_id": plan_id})
         attempts: list[dict[str, Any]] = []
+        candidate_videos_to_cleanup: list[Path] = []
         try:
             reference_video = _resolve_video(root, str(plan.get("reference_video", "")))
             mask_video = Path(str(plan.get("mask_video") or row.get("mask_video", "")))
@@ -937,6 +1167,9 @@ def main() -> None:
             mask_gate = plan.get("mask_gate") if isinstance(plan.get("mask_gate"), dict) else {}
             metrics: dict[str, Any] | None = None
             selected_query = ""
+            selected_candidate_video: Path | None = None
+            selected_gate_errors: list[str] = []
+            selected_status = "failed"
             for attempt_index, candidate_query in enumerate(_mask_query_candidates(plan), start=1):
                 candidate_video = _candidate_mask_video_path(mask_video, attempt_index)
                 try:
@@ -974,25 +1207,48 @@ def main() -> None:
                             mask_gate=mask_gate,
                         )
                     gate_errors = _mask_gate_errors(mask_gate, candidate_metrics)
+                    candidate_metrics = _append_adaptive_provenance(
+                        candidate_metrics,
+                        gate_errors=gate_errors,
+                        detection_attempts=candidate_metrics.get("detection_attempts", []),
+                        anchor_frame_indices=candidate_metrics.get("anchor_frame_indices", []),
+                        prompt_type=str(candidate_metrics.get("prompt_type", "box") or "box"),
+                    )
                     attempts.append(
                         {
                             "mask_query": candidate_query,
                             "status": "generated" if not gate_errors else "failed_gate",
                             "gate_errors": gate_errors,
                             "mask_metrics": candidate_metrics,
+                            "candidate_mask_video": str(candidate_video),
+                            "mask_quality_tier": candidate_metrics.get("mask_quality_tier"),
+                            "usable_for_vace": bool(candidate_metrics.get("usable_for_vace")),
                         }
                     )
-                    if gate_errors:
-                        if candidate_video.exists():
-                            candidate_video.unlink()
-                        continue
-                    mask_video.parent.mkdir(parents=True, exist_ok=True)
-                    if mask_video.exists():
-                        mask_video.unlink()
-                    shutil.move(str(candidate_video), str(mask_video))
-                    metrics = candidate_metrics
-                    selected_query = candidate_query
-                    break
+                    candidate_videos_to_cleanup.append(candidate_video)
+                    if metrics is None:
+                        metrics = candidate_metrics
+                        selected_query = candidate_query
+                        selected_candidate_video = candidate_video
+                        selected_gate_errors = gate_errors
+                        selected_status = "generated" if not gate_errors else "diagnostic_generated"
+                    else:
+                        previous_tier = str(metrics.get("mask_quality_tier", MASK_QUALITY_FAILED))
+                        current_tier = str(candidate_metrics.get("mask_quality_tier", MASK_QUALITY_FAILED))
+                        rank = {
+                            MASK_QUALITY_EXCELLENT: 4,
+                            MASK_QUALITY_USABLE: 3,
+                            MASK_QUALITY_DIAGNOSTIC: 2,
+                            MASK_QUALITY_FAILED: 1,
+                        }
+                        if rank.get(current_tier, 0) > rank.get(previous_tier, 0):
+                            metrics = candidate_metrics
+                            selected_query = candidate_query
+                            selected_candidate_video = candidate_video
+                            selected_gate_errors = gate_errors
+                            selected_status = "generated" if not gate_errors else "diagnostic_generated"
+                    if not gate_errors:
+                        break
                 except Exception as attempt_exc:
                     if candidate_video.exists():
                         candidate_video.unlink()
@@ -1004,9 +1260,34 @@ def main() -> None:
                         }
                     )
             if metrics is None:
-                last = attempts[-1] if attempts else {"error": "no mask query candidates"}
-                reason = last.get("error") or "mask gate failed: " + "; ".join(last.get("gate_errors", []))
-                raise RuntimeError(str(reason))
+                mask_video.parent.mkdir(parents=True, exist_ok=True)
+                if mask_video.exists():
+                    mask_video.unlink()
+                metrics = _write_all_black_mask_video(reference_video, mask_video)
+                selected_query = str(plan.get("mask_query", "")).strip()
+                selected_gate_errors = list(metrics.get("failure_reasons", []))
+                selected_status = "diagnostic_generated"
+            else:
+                if selected_candidate_video is None:
+                    raise RuntimeError("selected mask candidate is missing")
+                mask_video.parent.mkdir(parents=True, exist_ok=True)
+                if mask_video.exists():
+                    mask_video.unlink()
+                shutil.move(str(selected_candidate_video), str(mask_video))
+                for candidate_video in candidate_videos_to_cleanup:
+                    if candidate_video != selected_candidate_video and candidate_video.exists():
+                        candidate_video.unlink()
+            if not attempts and selected_status == "diagnostic_generated":
+                attempts.append(
+                    {
+                        "mask_query": selected_query,
+                        "status": "diagnostic_all_black",
+                        "gate_errors": selected_gate_errors,
+                        "mask_metrics": metrics,
+                        "mask_quality_tier": metrics.get("mask_quality_tier"),
+                        "usable_for_vace": False,
+                    }
+                )
             target_instance_description = str(plan.get("target_instance_description", "")).strip()
             mask_target_instance_alignment = {}
             if target_instance_description:
@@ -1016,12 +1297,31 @@ def main() -> None:
                     "reason": "target_instance_description requires external Omni/contact-sheet alignment review",
                     "target_instance_description": target_instance_description,
                 }
+            default_usable_for_vace = plan.get("usable_for_vace_default", row.get("usable_for_vace_default", True)) is not False
+            maskability_issue = str(plan.get("maskability_issue") or row.get("maskability_issue") or "").strip()
+            final_usable_for_vace = bool(metrics.get("usable_for_vace")) and not selected_gate_errors and default_usable_for_vace
+            if not default_usable_for_vace:
+                selected_status = "diagnostic_generated"
             row.update(
                 {
                     "mask_video": str(mask_video),
-                    "status": "generated",
+                    "status": selected_status,
                     "mask_metrics": metrics,
-                    "mask_gate_result": {"passed": True, "errors": []},
+                    "mask_gate_result": {"passed": not selected_gate_errors, "errors": selected_gate_errors},
+                    "mask_quality_tier": metrics.get("mask_quality_tier", MASK_QUALITY_FAILED),
+                    "usable_for_vace": final_usable_for_vace,
+                    "failure_reasons": selected_gate_errors,
+                    "maskability_issue": maskability_issue,
+                    "usable_for_vace_default": default_usable_for_vace,
+                    "sparse_full_length": bool(metrics.get("sparse_full_length", False)),
+                    "visible_spans": metrics.get("visible_spans", []),
+                    "mask_generation_strategy": MASK_GENERATION_STRATEGY,
+                    "detector_cascade": metrics.get("detector_cascade", []),
+                    "detection_attempts": metrics.get("detection_attempts", []),
+                    "anchor_frame_indices": metrics.get("anchor_frame_indices", []),
+                    "prompt_type": metrics.get("prompt_type", ""),
+                    "reinit_count": metrics.get("reinit_count", 0),
+                    "repair_rounds": metrics.get("repair_rounds", 0),
                     "mask_query": selected_query,
                     "mask_query_candidates": _mask_query_candidates(plan),
                     "mask_attempts": attempts,
@@ -1038,19 +1338,60 @@ def main() -> None:
             if mask_target_instance_alignment:
                 row["mask_target_instance_alignment"] = mask_target_instance_alignment
         except Exception as exc:  # pragma: no cover - integration path
-            row.update(
-                {
-                    "status": "failed",
-                    "failure_reason": f"{type(exc).__name__}: {exc}",
-                    "mask_query": str(plan.get("mask_query", "")).strip(),
-                    "mask_query_candidates": _mask_query_candidates(plan),
-                    "mask_attempts": attempts,
-                    "mask_mode": str(plan.get("mask_mode", "")).strip(),
-                    "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
-                    "mask_polarity": VIDEO_MASK_POLARITY,
-                    "generator_commit": _git_head_short(),
-                }
-            )
+            try:
+                reference_video = _resolve_video(root, str(plan.get("reference_video", "")))
+                mask_video = Path(str(plan.get("mask_video") or row.get("mask_video", "")))
+                if not mask_video.is_absolute():
+                    mask_video = Path(args.mask_manifest_path).resolve().parent / mask_video
+                if reference_video.exists():
+                    diagnostic_metrics = _write_all_black_mask_video(reference_video, mask_video)
+                    row.update(
+                        {
+                            "mask_video": str(mask_video),
+                            "status": "diagnostic_generated",
+                            "failure_reason": f"{type(exc).__name__}: {exc}",
+                            "failure_reasons": [f"{type(exc).__name__}: {exc}"],
+                            "mask_metrics": diagnostic_metrics,
+                            "mask_gate_result": {"passed": False, "errors": diagnostic_metrics.get("failure_reasons", [])},
+                            "mask_quality_tier": MASK_QUALITY_FAILED,
+                            "usable_for_vace": False,
+                            "sparse_full_length": True,
+                            "visible_spans": [],
+                            "mask_generation_strategy": MASK_GENERATION_STRATEGY,
+                            "detector_cascade": diagnostic_metrics.get("detector_cascade", []),
+                            "detection_attempts": diagnostic_metrics.get("detection_attempts", []),
+                            "anchor_frame_indices": [],
+                            "prompt_type": "none",
+                            "reinit_count": 0,
+                            "repair_rounds": 0,
+                            "mask_query": str(plan.get("mask_query", "")).strip(),
+                            "mask_query_candidates": _mask_query_candidates(plan),
+                            "mask_attempts": attempts,
+                            "mask_mode": str(plan.get("mask_mode", "")).strip(),
+                            "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
+                            "mask_polarity": VIDEO_MASK_POLARITY,
+                            "generator_commit": _git_head_short(),
+                        }
+                    )
+                else:
+                    raise FileNotFoundError(reference_video)
+            except Exception:
+                row.update(
+                    {
+                        "status": "failed",
+                        "failure_reason": f"{type(exc).__name__}: {exc}",
+                        "mask_query": str(plan.get("mask_query", "")).strip(),
+                        "mask_query_candidates": _mask_query_candidates(plan),
+                        "mask_attempts": attempts,
+                        "mask_mode": str(plan.get("mask_mode", "")).strip(),
+                        "mask_semantics_version": VIDEO_MASK_SEMANTICS_VERSION,
+                        "mask_polarity": VIDEO_MASK_POLARITY,
+                        "mask_generation_strategy": MASK_GENERATION_STRATEGY,
+                        "mask_quality_tier": MASK_QUALITY_FAILED,
+                        "usable_for_vace": False,
+                        "generator_commit": _git_head_short(),
+                    }
+                )
         output_records.append(row)
         report_rows.append(
             {
@@ -1059,6 +1400,11 @@ def main() -> None:
                 "status": row.get("status"),
                 "mask_video": row.get("mask_video"),
                 "failure_reason": row.get("failure_reason", ""),
+                "failure_reasons": row.get("failure_reasons", []),
+                "mask_quality_tier": row.get("mask_quality_tier", ""),
+                "usable_for_vace": row.get("usable_for_vace", False),
+                "visible_spans": row.get("visible_spans", []),
+                "reinit_count": row.get("reinit_count", 0),
                 "mask_metrics": row.get("mask_metrics", {}),
             }
         )
@@ -1067,9 +1413,16 @@ def main() -> None:
     if args.report_path:
         report = ["# Grounded-SAM-2 Mask Report", ""]
         for row in report_rows:
+            reasons = row.get("failure_reasons")
+            if isinstance(reasons, list) and reasons:
+                reason_text = "; ".join(str(item) for item in reasons)
+            else:
+                reason_text = str(row.get("failure_reason", ""))
             report.append(
                 f"- `{row['plan_id']}` query=`{row.get('mask_query')}` status=`{row.get('status')}` "
-                f"mask=`{row.get('mask_video')}` reason=`{row.get('failure_reason', '')}`"
+                f"tier=`{row.get('mask_quality_tier')}` usable_for_vace=`{row.get('usable_for_vace')}` "
+                f"visible_spans=`{len(row.get('visible_spans') or [])}` reinit_count=`{row.get('reinit_count')}` "
+                f"mask=`{row.get('mask_video')}` reason=`{reason_text}`"
             )
         Path(args.report_path).write_text("\n".join(report) + "\n", encoding="utf-8")
     print(json.dumps({"mask_count": len(output_records), "output_manifest_path": args.output_manifest_path}, ensure_ascii=False, indent=2))
