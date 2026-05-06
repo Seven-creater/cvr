@@ -9034,6 +9034,18 @@ def _video_edit_route_suitability(
         }
 
     if difference_type == "scene":
+        if _reference_has_multi_shot_mask_risk(reference_annotation):
+            return {
+                "allow_generation": False,
+                "reason": "vace_background_edit_multi_scene_reference",
+                "priority": "C",
+            }
+        if _reference_has_multiple_foreground_subjects(reference_annotation):
+            return {
+                "allow_generation": False,
+                "reason": "vace_background_edit_multi_subject_reference",
+                "priority": "C",
+            }
         if not any(marker in combined_text for marker in VACE_BACKGROUND_STYLE_MARKERS):
             return {
                 "allow_generation": False,
@@ -9804,6 +9816,9 @@ def _video_edit_reference_understanding(annotation: dict[str, Any]) -> dict[str,
     object_names = list(_normalize_object_counts(annotation.get("object_counts", {})).keys())[:6]
     summary = str(annotation.get("summary", "")).strip()
     scene = str(annotation.get("scene", "")).strip()
+    stable_clip_selection = (
+        annotation.get("stable_clip_selection") if isinstance(annotation.get("stable_clip_selection"), dict) else {}
+    )
     editable_attributes: list[dict[str, Any]] = []
     text = _normalized_phrase(" ".join([summary, scene, " ".join(subjects), " ".join(object_names)]))
     if any(marker in text for marker in ("robot", "robotic", "action figure")):
@@ -9836,6 +9851,21 @@ def _video_edit_reference_understanding(annotation: dict[str, Any]) -> dict[str,
     return {
         "main_subjects": subjects or object_names,
         "stable_scene": scene or summary,
+        "camera_motion": str(
+            annotation.get("camera_motion")
+            or stable_clip_selection.get("camera_motion")
+            or "unknown"
+        ).strip()
+        or "unknown",
+        "stability_score": _score_float(
+            stable_clip_selection.get("stability_score", annotation.get("stability_score", 0.5))
+        ),
+        "recommended_for_vace": _boolish(
+            stable_clip_selection.get("recommended_for_vace", annotation.get("recommended_for_vace", True))
+        ),
+        "stable_clip_reason": str(
+            stable_clip_selection.get("reason") or annotation.get("stable_clip_reason") or ""
+        ).strip(),
         "visible_text": visible_text,
         "actions": actions,
         "editable_attributes": editable_attributes,

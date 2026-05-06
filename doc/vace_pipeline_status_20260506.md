@@ -31,6 +31,7 @@ src_video + src_mask + optional src_ref_images + target prompt -> VACE target
 3. **background replacement prompt 修复**：planner 不再把 source 背景词和 preserve locks 带进 VACE prompt，避免 “换成 lab” 和 “保留 sunlit room/window/door/layout/lighting” 互相打架。
 4. **background replacement route 降级**：full background replacement 不再允许作为 plain masked VACE production route；默认推荐切到 `vace_bg_replace_composite_first_frame_mv2v`，否则保留为 experiment-only。
 5. **composite-first-frame 初步验证**：`mannul7` 的 9/9 review bundle 完整，语义门通过；但 duration gate 元数据必须修正后才能作为正式 accepted 样本。
+6. **background plan 前移拒绝**：`plan_video_edits` 现在会在规划阶段直接拒绝多场景和多主体的 background scene edit，避免这类样本继续走到 mask 阶段白跑。
 
 当前只证明了一条 talking-head background replacement 可通过 composite-first-frame route 成功。下一步不是大规模跑批，而是修正 duration gate 与 accepted-pair metadata，然后小批量验证同 route 是否可复现。
 
@@ -442,6 +443,15 @@ generation.duration_metrics.duration_gate.passed=true
 - laptop/tablet 且屏幕有文字
 - 多主体或多镜头背景替换
 - Qwen-Image 生成的 1:1 方形背景参考图用于 16:9 background change
+
+### 5.6 capability map 新结论
+
+最新 capability map 的意义不是“又失败了一轮”，而是把当前默认 VACE route 的主要瓶颈定位清楚了：
+
+- 当前最大瓶颈不是 VACE 推理本身，而是 source clip suitability。
+- 多场景 / 主体只在后半段短暂出现的 clip，会让 Florence-2 + SAM2.1 只能在约 25% 帧上检测到目标，因此天然过不了 `nonempty_frame_ratio >= 0.9` 和 `temporal_stability >= 0.75`。
+- 这类问题对 full background replacement 最致命，所以现在已经把 background scene edit 的多场景 / 多主体参考前移到 `plan_video_edits` 拒绝，而不是等到 `plan_video_masks` 再失败。
+- 其他类别暂时还保留在 maskability gate 探索，因为我们还不想过早把所有非 background 类型都一刀切掉。
 
 ## 6. 当前推荐下一步
 

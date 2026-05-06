@@ -5064,6 +5064,102 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(0, summary["plan_count"])
             self.assertEqual(1, summary["skipped_reasons"]["plan_lint_ambiguous_multi_instance_mask_query"])
 
+    def test_plan_video_edits_rejects_multi_scene_background_reference_before_mask_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "bg_ref.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "bg_ref",
+                        "output_path": "clips/bg_ref.mp4",
+                        "summary": "a man speaks across multiple scenes in different locations",
+                        "subjects": ["man"],
+                        "object_counts": {"man": 1},
+                        "actions": ["speaking"],
+                        "scene": "indoor room",
+                        "stable_scene": "multiple scenes across different locations",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "bg_lab",
+                        "reference_video": "clips/bg_ref.mp4",
+                        "edit_text": "change the background to a futuristic laboratory",
+                        "difference": {
+                            "type": "scene",
+                            "from": "original room background",
+                            "to": "futuristic laboratory background",
+                        },
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["vace_background_edit_multi_scene_reference"])
+
+    def test_plan_video_edits_rejects_multi_subject_background_reference_before_mask_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            (root / "clips" / "bg_ref.mp4").write_bytes(b"video")
+            annotations_path = root / "captions" / "annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "bg_ref",
+                        "output_path": "clips/bg_ref.mp4",
+                        "summary": "two speakers stand side by side in a studio",
+                        "subjects": ["man with beard", "woman with glasses"],
+                        "object_counts": {"man": 1, "woman": 1},
+                        "actions": ["speaking"],
+                        "scene": "studio wall",
+                        "stable_scene": "studio wall",
+                    }
+                ],
+            )
+            candidates_path = root / "pairs" / "candidates.jsonl"
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "proposal_id": "bg_lab",
+                        "reference_video": "clips/bg_ref.mp4",
+                        "edit_text": "change the background to a futuristic laboratory",
+                        "difference": {
+                            "type": "scene",
+                            "from": "studio background",
+                            "to": "futuristic laboratory background",
+                        },
+                    }
+                ],
+            )
+
+            summary = plan_video_edits(
+                root=root,
+                pair_candidates_path=candidates_path,
+                clip_annotations_path=annotations_path,
+                max_plans=5,
+            )
+
+            self.assertEqual(0, summary["plan_count"])
+            self.assertEqual(1, summary["skipped_reasons"]["vace_background_edit_multi_subject_reference"])
+
     def test_video_edit_plan_lint_rejects_replacement_prompt_source_state_conflict(self) -> None:
         lint = _video_edit_plan_lint(
             source_prompt="A flutist is sitting on a chair on stage.",
