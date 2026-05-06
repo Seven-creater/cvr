@@ -19,6 +19,8 @@ CONCURRENCY=${CONCURRENCY:-1}
 MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-10}
 MAX_PROPOSALS=${MAX_PROPOSALS:-40}
 ANNOTATION_MAX_PASSES=${ANNOTATION_MAX_PASSES:-3}
+ANNOTATION_PASS_TIMEOUT_SECONDS=${ANNOTATION_PASS_TIMEOUT_SECONDS:-900}
+PROPOSE_TIMEOUT_SECONDS=${PROPOSE_TIMEOUT_SECONDS:-900}
 START_STAGE=${START_STAGE:-plan}
 ALLOW_PARTIAL_ANNOTATIONS=${ALLOW_PARTIAL_ANNOTATIONS:-0}
 MODEL_STAGE=${MODEL_STAGE:-instruct}
@@ -41,6 +43,8 @@ Options:
   --max-accepted-pairs N
   --max-proposals N
   --annotation-max-passes N
+  --annotation-pass-timeout-seconds N
+  --propose-timeout-seconds N
   --start-stage plan|extract|annotate|propose|validate|review
   --allow-partial-annotations
   --model-stage VALUE
@@ -94,6 +98,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --annotation-max-passes)
       ANNOTATION_MAX_PASSES="$2"
+      shift 2
+      ;;
+    --annotation-pass-timeout-seconds)
+      ANNOTATION_PASS_TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
+    --propose-timeout-seconds)
+      PROPOSE_TIMEOUT_SECONDS="$2"
       shift 2
       ;;
     --start-stage)
@@ -204,6 +216,28 @@ print(len(seen))
 PY
 }
 
+run_with_timeout() {
+  local label="$1"
+  local timeout_seconds="$2"
+  shift 2
+  "$@" &
+  local child_pid=$!
+  local elapsed=0
+  while kill -0 "$child_pid" 2>/dev/null; do
+    if [ "$elapsed" -ge "$timeout_seconds" ]; then
+      echo "[omni-detective] ERROR: $label timed out after ${timeout_seconds}s; killing child pid=$child_pid" >&2
+      kill "$child_pid" 2>/dev/null || true
+      sleep 2
+      kill -9 "$child_pid" 2>/dev/null || true
+      wait "$child_pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+  wait "$child_pid"
+}
+
 GPU_COUNT=$(count_gpu_ids "$GPU_IDS")
 if (( GPU_COUNT > MAX_GPUS )); then
   echo "[resource-policy] refusing to run with GPU_COUNT=$GPU_COUNT > MAX_GPUS=$MAX_GPUS" >&2
@@ -234,7 +268,7 @@ echo "[omni-detective] model=$MODEL"
 echo "[resource-policy] one Omni model per run; do not keep Captioner/Instruct/Thinking loaded together"
 echo "[resource-policy] model_stage=$MODEL_STAGE gpu_ids=${GPU_IDS:-unset} gpu_count=$GPU_COUNT max_gpus=$MAX_GPUS"
 echo "[omni-detective] start_stage=$START_STAGE"
-echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS annotation_max_passes=$ANNOTATION_MAX_PASSES allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
+echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS annotation_max_passes=$ANNOTATION_MAX_PASSES annotation_pass_timeout_seconds=$ANNOTATION_PASS_TIMEOUT_SECONDS propose_timeout_seconds=$PROPOSE_TIMEOUT_SECONDS allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
 curl -fsS "$BASE_URL/models"
 echo
 
@@ -280,6 +314,7 @@ if stage_enabled "annotate"; then
     while [ "$ANNOTATION_PASS" -le "$ANNOTATION_MAX_PASSES" ]; do
       echo "[omni-detective] annotation pass $ANNOTATION_PASS/$ANNOTATION_MAX_PASSES target_clips=$ANNOTATION_TARGET_COUNT $(date)"
       set +e
+      run_with_timeout "detective-annotate-clips pass $ANNOTATION_PASS" "$ANNOTATION_PASS_TIMEOUT_SECONDS" \
       python -m app.composed_data detective-annotate-clips \
         --root "$ROOT" \
         --clips-manifest-path "$RUN_ROOT/extracted_event_clips.jsonl" \
@@ -295,6 +330,10 @@ if stage_enabled "annotate"; then
       ANNOTATION_DONE_COUNT=$(jsonl_unique_clip_count "$RUN_ROOT/detective_annotations.jsonl")
       ANNOTATION_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/detective_annotations.jsonl")
       echo "[omni-detective] annotation pass $ANNOTATION_PASS exit=$ANNOTATION_STATUS unique_done=$ANNOTATION_DONE_COUNT/$ANNOTATION_TARGET_COUNT rows=$ANNOTATION_ROW_COUNT"
+      if [ "$ANNOTATION_STATUS" -eq 124 ]; then
+        echo "[omni-detective] annotation pass timed out; report this status immediately instead of waiting" >&2
+        exit 124
+      fi
       if [ "$ANNOTATION_DONE_COUNT" -ge "$ANNOTATION_TARGET_COUNT" ]; then
         break
       fi
@@ -322,6 +361,8 @@ if [ "$ANNOTATION_DONE_COUNT" -lt "$ANNOTATION_TARGET_COUNT" ] && [ "$ALLOW_PART
 fi
 
 if stage_enabled "propose"; then
+  set +e
+  run_with_timeout "propose-group-pairs" "$PROPOSE_TIMEOUT_SECONDS" \
   python -m app.composed_data propose-group-pairs \
     --root "$ROOT" \
     --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
@@ -335,6 +376,15 @@ if stage_enabled "propose"; then
     --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
     --max-proposals "$MAX_PROPOSALS" \
     --overwrite
+  PROPOSE_STATUS=$?
+  set -e
+  PROPOSAL_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/judged_pair_proposals.jsonl")
+  ACCEPTED_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/accepted_pairs.jsonl")
+  echo "[omni-detective] propose exit=$PROPOSE_STATUS judged_rows=$PROPOSAL_ROW_COUNT accepted_rows=$ACCEPTED_ROW_COUNT"
+  if [ "$PROPOSE_STATUS" -ne 0 ]; then
+    echo "[omni-detective] propose failed or timed out; report this status immediately instead of waiting" >&2
+    exit "$PROPOSE_STATUS"
+  fi
 
   echo "[omni-detective] group proposal and judge done $(date)"
 else
