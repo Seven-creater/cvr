@@ -69,7 +69,7 @@ nohup bash scripts/run_omni_detective_pilot.sh \
 
 If annotation stops partway through, rerun the same command with the same
 `RUN_ROOT`. `detective_annotations.jsonl` is treated as a resume cache, and the
-script now retries annotation passes until the annotated row count matches
+script now retries annotation passes until the unique `clip_id` count matches
 `extracted_event_clips.jsonl` or `--annotation-max-passes` is exhausted.
 
 If planning and extraction are already done, resume directly from a later

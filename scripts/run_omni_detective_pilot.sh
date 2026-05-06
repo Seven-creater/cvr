@@ -20,6 +20,7 @@ MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-10}
 MAX_PROPOSALS=${MAX_PROPOSALS:-40}
 ANNOTATION_MAX_PASSES=${ANNOTATION_MAX_PASSES:-3}
 START_STAGE=${START_STAGE:-plan}
+ALLOW_PARTIAL_ANNOTATIONS=${ALLOW_PARTIAL_ANNOTATIONS:-0}
 MODEL_STAGE=${MODEL_STAGE:-instruct}
 GPU_IDS=${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-}}
 MAX_GPUS=${MAX_GPUS:-6}
@@ -41,6 +42,7 @@ Options:
   --max-proposals N
   --annotation-max-passes N
   --start-stage plan|extract|annotate|propose|validate|review
+  --allow-partial-annotations
   --model-stage VALUE
   --gpu-ids IDS
   --max-gpus N
@@ -97,6 +99,10 @@ while [[ $# -gt 0 ]]; do
     --start-stage)
       START_STAGE="$2"
       shift 2
+      ;;
+    --allow-partial-annotations)
+      ALLOW_PARTIAL_ANNOTATIONS=1
+      shift
       ;;
     --model-stage)
       MODEL_STAGE="$2"
@@ -164,6 +170,40 @@ require_file() {
   fi
 }
 
+jsonl_row_count() {
+  local path="$1"
+  if [ ! -f "$path" ]; then
+    echo 0
+    return
+  fi
+  grep -cve '^[[:space:]]*$' "$path" || true
+}
+
+jsonl_unique_clip_count() {
+  local path="$1"
+  if [ ! -f "$path" ]; then
+    echo 0
+    return
+  fi
+  python - "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+seen = set()
+for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    if not line.strip():
+        continue
+    try:
+        clip_id = str(json.loads(line).get("clip_id", "")).strip()
+    except json.JSONDecodeError:
+        continue
+    if clip_id:
+        seen.add(clip_id)
+print(len(seen))
+PY
+}
+
 GPU_COUNT=$(count_gpu_ids "$GPU_IDS")
 if (( GPU_COUNT > MAX_GPUS )); then
   echo "[resource-policy] refusing to run with GPU_COUNT=$GPU_COUNT > MAX_GPUS=$MAX_GPUS" >&2
@@ -194,7 +234,7 @@ echo "[omni-detective] model=$MODEL"
 echo "[resource-policy] one Omni model per run; do not keep Captioner/Instruct/Thinking loaded together"
 echo "[resource-policy] model_stage=$MODEL_STAGE gpu_ids=${GPU_IDS:-unset} gpu_count=$GPU_COUNT max_gpus=$MAX_GPUS"
 echo "[omni-detective] start_stage=$START_STAGE"
-echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS annotation_max_passes=$ANNOTATION_MAX_PASSES"
+echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS annotation_max_passes=$ANNOTATION_MAX_PASSES allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
 curl -fsS "$BASE_URL/models"
 echo
 
@@ -230,13 +270,11 @@ else
 fi
 
 if stage_enabled "annotate"; then
-  ANNOTATION_TARGET_COUNT=$(grep -cve '^[[:space:]]*$' "$RUN_ROOT/extracted_event_clips.jsonl" || true)
-  ANNOTATION_DONE_COUNT=0
-  if [ -f "$RUN_ROOT/detective_annotations.jsonl" ]; then
-    ANNOTATION_DONE_COUNT=$(grep -cve '^[[:space:]]*$' "$RUN_ROOT/detective_annotations.jsonl" || true)
-  fi
+  ANNOTATION_TARGET_COUNT=$(jsonl_row_count "$RUN_ROOT/extracted_event_clips.jsonl")
+  ANNOTATION_DONE_COUNT=$(jsonl_unique_clip_count "$RUN_ROOT/detective_annotations.jsonl")
+  ANNOTATION_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/detective_annotations.jsonl")
   if [ "$ANNOTATION_DONE_COUNT" -ge "$ANNOTATION_TARGET_COUNT" ]; then
-    echo "[omni-detective] annotation already complete done=$ANNOTATION_DONE_COUNT/$ANNOTATION_TARGET_COUNT"
+    echo "[omni-detective] annotation already complete unique_done=$ANNOTATION_DONE_COUNT/$ANNOTATION_TARGET_COUNT rows=$ANNOTATION_ROW_COUNT"
   else
     ANNOTATION_PASS=1
     while [ "$ANNOTATION_PASS" -le "$ANNOTATION_MAX_PASSES" ]; do
@@ -254,11 +292,9 @@ if stage_enabled "annotate"; then
         --overwrite
       ANNOTATION_STATUS=$?
       set -e
-      ANNOTATION_DONE_COUNT=0
-      if [ -f "$RUN_ROOT/detective_annotations.jsonl" ]; then
-        ANNOTATION_DONE_COUNT=$(grep -cve '^[[:space:]]*$' "$RUN_ROOT/detective_annotations.jsonl" || true)
-      fi
-      echo "[omni-detective] annotation pass $ANNOTATION_PASS exit=$ANNOTATION_STATUS done=$ANNOTATION_DONE_COUNT/$ANNOTATION_TARGET_COUNT"
+      ANNOTATION_DONE_COUNT=$(jsonl_unique_clip_count "$RUN_ROOT/detective_annotations.jsonl")
+      ANNOTATION_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/detective_annotations.jsonl")
+      echo "[omni-detective] annotation pass $ANNOTATION_PASS exit=$ANNOTATION_STATUS unique_done=$ANNOTATION_DONE_COUNT/$ANNOTATION_TARGET_COUNT rows=$ANNOTATION_ROW_COUNT"
       if [ "$ANNOTATION_DONE_COUNT" -ge "$ANNOTATION_TARGET_COUNT" ]; then
         break
       fi
@@ -274,6 +310,15 @@ if stage_enabled "annotate"; then
 else
   require_file "$RUN_ROOT/detective_annotations.jsonl" "detective annotations"
   echo "[omni-detective] skip annotation start_stage=$START_STAGE"
+fi
+
+ANNOTATION_TARGET_COUNT=$(jsonl_row_count "$RUN_ROOT/extracted_event_clips.jsonl")
+ANNOTATION_DONE_COUNT=$(jsonl_unique_clip_count "$RUN_ROOT/detective_annotations.jsonl")
+ANNOTATION_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/detective_annotations.jsonl")
+echo "[omni-detective] annotation coverage unique_done=$ANNOTATION_DONE_COUNT/$ANNOTATION_TARGET_COUNT rows=$ANNOTATION_ROW_COUNT"
+if [ "$ANNOTATION_DONE_COUNT" -lt "$ANNOTATION_TARGET_COUNT" ] && [ "$ALLOW_PARTIAL_ANNOTATIONS" != "1" ]; then
+  echo "[omni-detective] annotation incomplete by unique clip_id count; rerun with --start-stage annotate before propose, or pass --allow-partial-annotations for diagnostics" >&2
+  exit 3
 fi
 
 if stage_enabled "propose"; then
