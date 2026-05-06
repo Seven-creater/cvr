@@ -95,7 +95,15 @@ MIN_VIDEO_MASK_TEMPORAL_STABILITY = 0.75
 MIN_VIDEO_MASK_NONEMPTY_FRAME_RATIO = 0.90
 MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE = 0.995
 VISUAL_DIFFERENCE_TYPES = {"object_count", "object_presence", "attribute", "action", "scene", "visible_text"}
-SYNTHETIC_VISUAL_ROUTES = {"vace_controlled", "ltx2_retake", "tokenflow_style"}
+VACE_BG_REPLACE_COMPOSITE_ROUTE = "vace_bg_replace_composite_first_frame_mv2v"
+DETERMINISTIC_BG_COMPOSITE_ROUTE = "deterministic_foreground_background_composite"
+SYNTHETIC_VISUAL_ROUTES = {
+    "vace_controlled",
+    "ltx2_retake",
+    "tokenflow_style",
+    VACE_BG_REPLACE_COMPOSITE_ROUTE,
+    DETERMINISTIC_BG_COMPOSITE_ROUTE,
+}
 SYNTHETIC_AUDIO_ROUTES = {"deterministic_overlay", "foleycrafter_temporal", "frieren_benchmark", "audio_deterministic"}
 VACE_ATTRIBUTE_MARKERS = {
     "attribute",
@@ -403,13 +411,21 @@ VACE_BACKGROUND_REPLACE_REGION_DENY_MARKERS = {
     "window",
 }
 VACE_BACKGROUND_REPLACE_LOCK_DENY_PATTERNS = {
+    "door",
     "do not change lighting",
     "do not change layout",
+    "original background",
+    "original room",
     "preserve lighting",
     "preserve lighting exactly",
     "preserve layout",
     "preserve layout exactly",
     "preserve source background",
+    "room",
+    "source background",
+    "sunlit room",
+    "wall",
+    "window",
 }
 VACE_BACKGROUND_REPLACE_NEGATIVE_PROMPT = (
     "do not change the subject identity, face, hair, glasses, pose, body position, mouth motion, "
@@ -2266,6 +2282,16 @@ def plan_video_edits(
             if repaired_preserve_regions != planned_preserve_regions:
                 planned_preserve_regions = repaired_preserve_regions
                 prompt_repairs.append("preserve_regions_rewritten_for_background_replace")
+            suitability = dict(suitability)
+            suitability.update(
+                {
+                    "production_allowed": False,
+                    "plain_masked_vace_production": False,
+                    "recommended_route": VACE_BG_REPLACE_COMPOSITE_ROUTE,
+                    "reason": "background_replace_requires_composite_first_frame",
+                    "priority": "experimental",
+                }
+            )
         if prompt_repairs:
             planner_metadata = dict(planner_metadata)
             repaired_fields = list(planner_metadata.get("repaired_fields", []))
@@ -2311,6 +2337,7 @@ def plan_video_edits(
             preserve_regions = _filter_background_replace_preserve_regions(preserve_regions)
         if planned_preserve_regions:
             preserve_regions = planned_preserve_regions
+        background_replace_policy = _background_replace_route_policy() if background_replace_plan else {}
         mask_plan_name = "grounded_sam2_video_mask" if route == "vace_controlled" else (
             "none" if route == "audio_deterministic" else "local_roi"
         )
@@ -2357,6 +2384,7 @@ def plan_video_edits(
             "route_suitability": suitability,
             "plan_lint": plan_lint,
             "visual_edit_risk": risk,
+            "background_replace_policy": background_replace_policy,
             "planning_mode": planning_mode,
             "exploration_family": str(candidate.get("exploration_family", "")).strip(),
             "exploration_goal": str(candidate.get("exploration_goal", "")).strip(),
@@ -8126,6 +8154,9 @@ def _synthetic_edit_record_issues(
     ):
         issues.append("visual synthetic edits must record generation.postprocess.audio_copied_from_reference=true")
     if difference_type in VISUAL_DIFFERENCE_TYPES and not is_audio_route:
+        plain_background_issue = _plain_background_replacement_vace_issue(record, generation)
+        if plain_background_issue:
+            issues.append(plain_background_issue)
         src_ref_requirements = (
             generation.get("src_ref_requirements", {}) if isinstance(generation.get("src_ref_requirements"), dict) else {}
         )
@@ -10028,13 +10059,22 @@ def _is_background_replace_edit(
 
 def _is_background_replace_lock_denied(value: str) -> bool:
     key = _normalized_phrase(value)
-    if "do not preserve source background" in key:
-        return False
     if "preserve" in key and ("lighting" in key or "layout" in key):
         return True
     if "do not change" in key and ("lighting" in key or "layout" in key):
         return True
     return any(pattern in key for pattern in VACE_BACKGROUND_REPLACE_LOCK_DENY_PATTERNS)
+
+
+def _background_replace_route_policy() -> dict[str, Any]:
+    return {
+        "plain_masked_vace_production": False,
+        "plain_masked_vace_allowed_for": ["background_restyle", "soft_repaint", "low_structural_delta"],
+        "recommended_route": VACE_BG_REPLACE_COMPOSITE_ROUTE,
+        "fallback_route": DETERMINISTIC_BG_COMPOSITE_ROUTE,
+        "requires_composite_first_frame": True,
+        "reason": "full background replacement preserved the source room layout under plain masked VACE; require a composite first-frame anchor before production",
+    }
 
 
 def _background_replace_target_background(difference: dict[str, Any], edit_text: str = "", edit_token: str = "") -> str:
@@ -10129,11 +10169,26 @@ def _background_replace_risk_locks(risk: dict[str, Any] | None) -> dict[str, Any
         "preserve foreground identity and face",
         "preserve foreground pose, speaking motion, and timing",
         "preserve camera framing",
-        "do not preserve source background layout or lighting",
     ):
         if lock not in locks:
             locks.append(lock)
     updated["locks"] = locks
+    updated["background_replace_locks"] = {
+        "foreground": {
+            "preserve_identity": True,
+            "preserve_face": True,
+            "preserve_pose": True,
+            "preserve_mouth_motion": True,
+            "preserve_timing": True,
+            "preserve_camera_framing": True,
+        },
+        "background": {
+            "preserve_source_background": False,
+            "preserve_source_layout": False,
+            "preserve_source_lighting": False,
+            "preserve_windows_doors_walls": False,
+        },
+    }
     return updated
 
 
@@ -11348,6 +11403,38 @@ def _is_audio_synthetic_route(route: str) -> bool:
     return route in SYNTHETIC_AUDIO_ROUTES
 
 
+def _background_replace_actual_route(generation: dict[str, Any]) -> str:
+    explicit = str(generation.get("background_replace_route", "")).strip()
+    if explicit:
+        return explicit
+    policy = generation.get("background_replace_policy")
+    if isinstance(policy, dict):
+        actual = str(policy.get("actual_route", "")).strip()
+        if actual:
+            return actual
+    return ""
+
+
+def _plain_background_replacement_vace_issue(record: dict[str, Any], generation: dict[str, Any]) -> str:
+    route = _synthetic_generation_route(generation)
+    if route != "vace_controlled":
+        return ""
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    edit_text = str(record.get("edit_text", "")).strip()
+    if not _is_background_replace_edit(
+        difference,
+        edit_text,
+        edit_region=str(generation.get("edit_region", "") or record.get("edit_region", "")).strip(),
+        mask_query=str(generation.get("mask_query", "") or record.get("mask_query", "")).strip(),
+        target_prompt=str(generation.get("target_prompt", "") or record.get("target_prompt", "")).strip(),
+    ):
+        return ""
+    actual_route = _background_replace_actual_route(generation)
+    if actual_route in {VACE_BG_REPLACE_COMPOSITE_ROUTE, DETERMINISTIC_BG_COMPOSITE_ROUTE}:
+        return ""
+    return "full background replacement requires composite-first-frame or deterministic composite route; plain masked VACE is experiment-only"
+
+
 def _known_pair_generation_issues(record: dict[str, Any]) -> list[str]:
     source_type = str(record.get("source_type", "")).strip() or "natural"
     if source_type not in ALLOWED_SOURCE_TYPES:
@@ -11405,6 +11492,9 @@ def _known_pair_generation_issues(record: dict[str, Any]) -> list[str]:
         issues.append("structural clothing edit requires try-on route instead of vace_controlled")
     difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
     edit_text = str(record.get("edit_text", "")).strip()
+    plain_background_issue = _plain_background_replacement_vace_issue(record, generation)
+    if plain_background_issue:
+        issues.append(plain_background_issue)
     source_object = _video_edit_source_object(difference, edit_text)
     if route == "vace_controlled" and _is_existing_object_replacement(difference, edit_text):
         if _target_prompt_conflicts_with_replacement_source_state(

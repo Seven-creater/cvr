@@ -20,13 +20,14 @@ src_video + src_mask + optional src_ref_images + target prompt -> VACE target
 
 其中 `src_mask` 白区是生成区域，黑区是保留区域；`src_video` 的编辑区域需要置灰为 127；prompt 应描述目标视频，而不是写操作指令。
 
-截至 `fcbf033 Repair background replacement prompt conflicts`，当前已经完成三类关键修复：
+截至 `fcbf033 Repair background replacement prompt conflicts` 之后，又根据 `mannul6` 复跑结果确认：即使 prompt / mask / src_ref / frame 对齐全部正确，plain masked VACE 对 talking-head full background replacement 仍然只产生 blue overlay / style wash，不是真正的空间背景重构。因此当前已经完成四类关键修复：
 
 1. **输入契约修复**：VACE 输入强制 exact-frame，`reference/src_video/src_mask` 对齐到 `81f@16fps`，避免 5 秒输入生成 9 秒 target。
 2. **诚实验收修复**：duration gate、mask provenance gate、semantic gate、review bundle completeness gate 已经能拦住假阳性。
 3. **background replacement prompt 修复**：planner 不再把 source 背景词和 preserve locks 带进 VACE prompt，避免 “换成 lab” 和 “保留 sunlit room/window/door/layout/lighting” 互相打架。
+4. **background replacement route 降级**：full background replacement 不再允许作为 plain masked VACE production route；默认推荐切到 `vace_bg_replace_composite_first_frame_mv2v`，否则保留为 experiment-only。
 
-当前还没有证明 VACE 能稳定产出可收样本。下一步不是扩大跑批，而是服务器拉到 `fcbf033` 后，先复跑 **1 条** background smoke，验证新 prompt 是否能从 “蓝色 overlay” 变成真正的背景替换。
+当前还没有证明 VACE 能稳定产出可收样本。下一步不是扩大跑批，而是实现并验证 composite-first-frame background route。
 
 参考：
 
@@ -57,7 +58,7 @@ PLAN_RUN: /data02/usr/wangqihao/Demo/test/cvr_clean_main/runs/omni_stable_all_ca
 
 ```text
 branch: codex/vace-pipeline-hardening
-远端 HEAD: fcbf033 Repair background replacement prompt conflicts
+远端 HEAD: 仍需以最新 codex/vace-pipeline-hardening 为准
 状态: 本地与 origin/codex/vace-pipeline-hardening 已同步
 ```
 
@@ -65,10 +66,10 @@ branch: codex/vace-pipeline-hardening
 
 ```text
 git rev-parse --short HEAD
-fcbf033
+最新短 SHA
 ```
 
-如果不是 `fcbf033` 或更新提交，不要继续跑 VACE。
+如果没有包含 `fcbf033` 之后的 background route 降级修复，不要继续跑 background VACE。
 
 ## 3. 数据与 plan 进展
 
@@ -232,14 +233,28 @@ A woman with curly red hair and glasses speaks to the camera in a clean blue-whi
 
 旧 plan 或旧 review bundle 只要仍包含 `sunlit room/window/door/layout/lighting` 这类 source 背景锁，就必须被 plan lint / smoke preflight 拒绝，不能进入 VACE。
 
+`mannul6` 已证明：即使上述 prompt 修复生效，plain masked VACE 仍然只做蓝色 overlay。因此现在进一步要求：
+
+- `background_replace_policy.plain_masked_vace_production=false`
+- `background_replace_policy.recommended_route=vace_bg_replace_composite_first_frame_mv2v`
+- `route_suitability.production_allowed=false`
+- normal `run_vace_visual_synthetic_smoke.sh` 默认拒绝 full background replacement，除非显式设置 `ALLOW_PLAIN_BACKGROUND_REPLACE=1` 做实验。
+- accepted synthetic pairs 拒绝 `model_route=vace_controlled` 的 full background replacement，除非 generation 明确记录：
+  - `background_replace_route=vace_bg_replace_composite_first_frame_mv2v`，或
+  - `background_replace_route=deterministic_foreground_background_composite`
+
+这会阻止服务器继续把同类 blue overlay 当成可收样本。
+
 这次修复落在：
 
 - `app/composed_data.py`
   - 新增 background replacement 判定与 deterministic repair。
   - 重写 target prompt、preserve tokens、preserve regions、negative prompt、risk locks。
   - plan lint 拒绝 source 背景词和 layout/lighting preserve lock。
+  - 给 background replacement 写入 route policy，并在 accepted-pair gate 拒绝 plain masked VACE。
 - `scripts/run_vace_visual_synthetic_smoke.sh`
   - 对旧 plan 增加 smoke preflight lint，防止复用冲突 plan。
+  - 默认禁止 full background replacement 继续走 plain masked VACE。
 - `tests/test_composed_data.py`
   - 增加 background prompt 冲突回归测试。
 - `tests/test_scripts.py`
@@ -250,7 +265,7 @@ A woman with curly red hair and glasses speaks to the camera in a clean blue-whi
 ```text
 git diff --check: OK
 bash -n scripts/run_vace_visual_synthetic_smoke.sh: OK
-python -m unittest tests.test_scripts tests.test_composed_data -v: 180 OK, 2 skipped
+python -m unittest tests.test_scripts tests.test_composed_data -v: 181 OK, 2 skipped
 python -m unittest discover -s tests -v: 214 OK, 2 skipped, 1 error
 ```
 
@@ -376,12 +391,12 @@ subject_preserved_but_edit_failed
 
 ### 6.1 服务器下一步执行方向
 
-先不要扩大跑批。服务器只做一条 smoke 验证：
+先不要扩大跑批，也不要再跑 plain masked background replacement。服务器下一步应实现/验证 composite-first-frame route：
 
 ```text
 plan: ef8f2818
 task: woman background -> futuristic laboratory
-目的: 验证 fcbf033 的 prompt/preserve 修复是否解决 mannul5 的 blue overlay / original room retained 问题
+目的: 验证 composite-first-frame 是否能解决 mannul5/mannul6 的 blue overlay / original room retained 问题
 ```
 
 执行前必须：
@@ -405,7 +420,7 @@ fcbf033
 python -m unittest tests.test_scripts tests.test_composed_data -v
 ```
 
-如果测试通过，再重新生成 ef8f2818 的 plan。不要复用 mannul5 的旧 plan，也不要复用旧 review bundle。
+如果测试通过，再重新生成 ef8f2818 的 plan。不要复用 mannul5/mannul6 的旧 plan，也不要复用旧 review bundle。
 
 新 plan 必须人工/脚本确认：
 
@@ -416,7 +431,22 @@ preserve_regions 不含 window / door / room / wall / background
 VACE prompt 是最终状态描述，不是 “in a sunlit room with lab background”
 ```
 
-只有这些都通过，再走 mask / src_ref / preflight / VACE，且只跑 1 条 smoke。
+只有这些都通过，也不要直接走 plain VACE。下一步应先生成 composite first frame：
+
+```text
+frame0 = same woman foreground + target futuristic lab background composite
+frame0 mask = all black / retain full composite first frame
+frames 1..N src_video = original woman foreground + gray 127 background
+frames 1..N src_mask = foreground black preserve, background white generate
+```
+
+然后 VACE generation metadata 必须记录：
+
+```text
+background_replace_route=vace_bg_replace_composite_first_frame_mv2v
+```
+
+否则 accepted-pair gate 会拒绝。
 
 ### 6.2 mask smoke 验收字段
 
@@ -452,6 +482,7 @@ failure_reason
 - 不要在 mask 全失败时跑 VACE。
 - 不要复用 mannul5 的旧 plan 或旧 bundle。
 - 不要把 blue overlay / original room retained 的背景样本标成成功。
+- 不要再用普通 `run_vace_visual_synthetic_smoke.sh` 默认路线跑 full background replacement；它现在应被 preflight 拒绝。
 
 ## 7. 当前判断
 
@@ -471,11 +502,12 @@ failure_reason
 
 现在这些问题大部分已经被 gate 拦截。下一步的关键不是继续盲跑 VACE，而是：
 
-1. 先用 `fcbf033` 重新生成 ef8f2818 plan，验证 background replacement prompt 冲突是否消失。
-2. 如果 prompt 已修复但 VACE 仍然只做蓝色 overlay，则把 background replacement 降级为 high-risk experiment，下一步考虑 composite first-frame fallback。
-3. 在现有 35 个 plan 里继续寻找能稳定生成 mask 的少数样本。
-4. 如果 Florence-2 + SAM2.1 对真实视频仍然全失败，切换到更简单的 synthetic route：
+1. background replacement prompt 冲突已经修复，但 plain masked VACE 仍然失败。
+2. full background replacement 已从 plain masked VACE production route 降级。
+3. 下一步只验证 `vace_bg_replace_composite_first_frame_mv2v`；如果它仍然只做 overlay，则把 full background replacement 整体移出 production candidates。
+4. 在现有 35 个 plan 里继续寻找能稳定生成 mask 的少数样本。
+5. 如果 Florence-2 + SAM2.1 对真实视频仍然全失败，切换到更简单的 synthetic route：
    - deterministic audio route
    - existing large object / robot / vehicle attribute edit
    - animation / static-like video local color edit
-5. 等 mask route 有稳定通过样本，再恢复 VACE smoke。
+6. 等 mask route 有稳定通过样本，再恢复非背景替换类 VACE smoke。

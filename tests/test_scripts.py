@@ -196,6 +196,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("blue tint, blue overlay, or style wash", script)
         self.assertIn("target_prompt_contains_source_background", script)
         self.assertIn("background_replace_contains_source_layout_or_lighting_lock", script)
+        self.assertIn("background_replace_plain_masked_vace_disabled", script)
+        self.assertIn("ALLOW_PLAIN_BACKGROUND_REPLACE", script)
         self.assertIn("object_replacement", script)
         self.assertIn("raw_target_contact.jpg", script)
         self.assertIn("target_contact.jpg", script)

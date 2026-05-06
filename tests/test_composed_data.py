@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import unittest
@@ -4758,7 +4759,17 @@ class ComposedDataTests(unittest.TestCase):
             self.assertNotIn("window", plan["negative_prompt"].lower())
             self.assertNotIn("door", plan["negative_prompt"].lower())
             self.assertFalse(any("layout exactly" in lock.lower() for lock in plan["visual_edit_risk"]["locks"]))
+            self.assertFalse(any("lighting" in lock.lower() for lock in plan["visual_edit_risk"]["locks"]))
+            self.assertFalse(any("layout" in lock.lower() for lock in plan["visual_edit_risk"]["locks"]))
+            self.assertFalse(any("window" in lock.lower() or "door" in lock.lower() for lock in plan["visual_edit_risk"]["locks"]))
+            self.assertFalse(plan["route_suitability"]["production_allowed"])
+            self.assertFalse(plan["route_suitability"]["plain_masked_vace_production"])
+            self.assertEqual("vace_bg_replace_composite_first_frame_mv2v", plan["route_suitability"]["recommended_route"])
+            self.assertEqual("vace_bg_replace_composite_first_frame_mv2v", plan["background_replace_policy"]["recommended_route"])
+            self.assertFalse(plan["background_replace_policy"]["plain_masked_vace_production"])
+            self.assertTrue(plan["background_replace_policy"]["requires_composite_first_frame"])
             self.assertIn("target_prompt_rewritten_for_background_replace", plan["planner"]["repaired_fields"])
+            self.assertIn("visual_edit_risk_locks_rewritten_for_background_replace", plan["planner"]["repaired_fields"])
             self.assertIn("preserve_regions_rewritten_for_background_replace", plan["planner"]["repaired_fields"])
             self.assertTrue(plan["plan_lint"]["passed"])
 
@@ -7011,6 +7022,69 @@ class ComposedDataTests(unittest.TestCase):
                 )
 
             self.assertTrue(any("try-on route" in issue for issue in issues))
+
+    def test_synthetic_visual_rejects_plain_background_replacement_vace_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in ("ref.mp4", "target.mp4", "src_video.mp4", "src_mask.mp4"):
+                (root / name).write_bytes(name.encode("utf-8"))
+
+            record = {
+                "source_type": "synthetic_edit",
+                "reference_video": "ref.mp4",
+                "target_video": "target.mp4",
+                "edit_text": "change the background to a futuristic laboratory",
+                "difference": {"type": "scene", "from": "sunlit room background", "to": "futuristic laboratory background"},
+                "quality": {"visual_near_duplicate_score": 0.90},
+                "source_context": {"relation": "synthetic_from_reference"},
+                "generation": {
+                    "model": "wan-vace",
+                    "source_video": "ref.mp4",
+                    "model_route": "vace_controlled",
+                    "prompt": "A woman speaks in a futuristic laboratory.",
+                    "source_prompt": "A woman speaks in a sunlit room.",
+                    "target_prompt": "A woman speaks in a clean futuristic laboratory interior.",
+                    "edit_region": "background",
+                    "mask_query": "woman",
+                    "preserve_tokens": ["woman", "face", "camera framing"],
+                    "src_video_for_vace": "src_video.mp4",
+                    "src_mask": "src_mask.mp4",
+                    "mask_semantics_version": 3,
+                    "mask_polarity": "white_generate_black_preserve",
+                    "mask_metrics": {"mask_coverage_ratio_avg": 0.55},
+                    "review_inputs_dir": ".",
+                    "duration_metrics": {"duration_gate": {"passed": True}},
+                    "post_vace_verdict": {"semantic_gate_required": True, "semantic_gate_passed": True},
+                    "postprocess": {"audio_copied_from_reference": True, "raw_generated_video": "target.mp4"},
+                },
+            }
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={"duration_seconds": 5.0, "has_audio": True, "has_video": True},
+            ):
+                issues = _pair_record_acceptance_issues(
+                    root=root,
+                    record=record,
+                    reference_annotation={"object_counts": {"woman": 1}},
+                    target_annotation={"object_counts": {"woman": 1}},
+                )
+
+            self.assertTrue(any("plain masked VACE is experiment-only" in issue for issue in issues))
+
+            composite_record = copy.deepcopy(record)
+            composite_record["generation"]["background_replace_route"] = "vace_bg_replace_composite_first_frame_mv2v"
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={"duration_seconds": 5.0, "has_audio": True, "has_video": True},
+            ):
+                composite_issues = _pair_record_acceptance_issues(
+                    root=root,
+                    record=composite_record,
+                    reference_annotation={"object_counts": {"woman": 1}},
+                    target_annotation={"object_counts": {"woman": 1}},
+                )
+
+            self.assertFalse(any("plain masked VACE is experiment-only" in issue for issue in composite_issues))
 
     def test_post_vace_semantic_verdict_passes_strict_black_jacket_annotation(self) -> None:
         record = {

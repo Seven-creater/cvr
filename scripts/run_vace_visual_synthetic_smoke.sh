@@ -263,6 +263,34 @@ def multiple_foreground_subjects(plan):
         if marker in stable_scene
     ) >= 2
 
+def is_background_replace_plan(plan):
+    difference = plan.get("difference", {}) if isinstance(plan.get("difference"), dict) else {}
+    if str(difference.get("type", "")).strip() not in {"scene", "background"}:
+        return False
+    combined = normalize_phrase(
+        " ".join(
+            [
+                str(plan.get("edit_text", "")),
+                str(plan.get("edit_region", "")),
+                str(plan.get("mask_query", "")),
+                str(plan.get("target_prompt", "")),
+                str(difference.get("from", "")),
+                str(difference.get("to", "")),
+            ]
+        )
+    )
+    return "background" in combined and any(
+        marker in combined
+        for marker in (
+            "background to",
+            "change background",
+            "change the background",
+            "replace background",
+            "replace the background",
+            "futuristic laboratory",
+        )
+    )
+
 def foreground_mask_query_from_annotation(annotation):
     candidates = []
     if isinstance(annotation, dict):
@@ -466,6 +494,13 @@ def visual_prompt_errors(plan):
     )
     if "replace" in edit_text and support_contact and not target_instance_safe:
         errors.append("object_replacement_breaks_support_contact")
+    if is_background_replace_plan(plan):
+        policy = plan.get("background_replace_policy", {}) if isinstance(plan.get("background_replace_policy"), dict) else {}
+        if os.environ.get("ALLOW_PLAIN_BACKGROUND_REPLACE", "0").strip() != "1":
+            errors.append(
+                "background_replace_plain_masked_vace_disabled:"
+                + str(policy.get("recommended_route", "vace_bg_replace_composite_first_frame_mv2v"))
+            )
     if str(difference.get("type", "")).strip() in {"scene", "background"} and "background" in " ".join([
         edit_text,
         normalize_phrase(difference.get("from", "")),
