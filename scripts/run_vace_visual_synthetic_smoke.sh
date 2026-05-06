@@ -1155,6 +1155,8 @@ def semantic_requirements_for_family(family: str) -> list:
     if family == "background":
         return [
             "target must clearly show the requested background semantics",
+            "source background elements such as the original room, windows, doors, walls, or brick wall must not remain visible",
+            "a blue tint, blue overlay, or style wash over the original background is not enough",
             "foreground subject identity, face, action, important objects, audio, and duration must remain aligned",
         ]
     if family == "object_replacement":

@@ -351,6 +351,38 @@ VACE_DARK_COLOR_MARKERS = {"black", "dark", "navy", "deep navy", "deep navy blue
 VACE_BACKGROUND_MAX_SUBJECT_OVERLAP_RATIO = 0.20
 VACE_BACKGROUND_MIN_FOREGROUND_SUBJECT_COVERAGE_RATIO = 0.04
 VACE_BACKGROUND_MAX_FOREGROUND_SUBJECT_COVERAGE_RATIO = 0.70
+VACE_BACKGROUND_ORIGINAL_SCENE_MARKERS = {
+    "brick wall",
+    "curtain",
+    "desk",
+    "door",
+    "indoor room",
+    "kitchen",
+    "living room",
+    "office",
+    "same room",
+    "stage",
+    "studio",
+    "sunlit room",
+    "window",
+}
+VACE_BACKGROUND_OVERLAY_FAILURE_MARKERS = {
+    "blue filter",
+    "blue haze",
+    "blue overlay",
+    "blue tint",
+    "blue tinted",
+    "blue wash",
+    "color cast",
+    "overlay",
+    "semi transparent",
+    "transparent overlay",
+}
+VACE_BACKGROUND_TARGET_SYNONYMS = {
+    "laboratory": {"laboratory", "lab"},
+    "lab": {"laboratory", "lab"},
+    "futuristic": {"futuristic", "sci fi", "science fiction", "high tech", "hi tech"},
+}
 VACE_SEMANTIC_PRESERVE_OBJECT_MARKERS = {
     "beard",
     "face",
@@ -7683,6 +7715,11 @@ def _semantic_missing_preserve_markers(text: str, preserve_tokens: list[str]) ->
     ]
 
 
+def _append_unique(values: list[str], value: str) -> None:
+    if value and value not in values:
+        values.append(value)
+
+
 def _post_vace_semantic_family(record: dict[str, Any], post_vace_verdict: dict[str, Any]) -> str:
     explicit = _normalized_phrase(str(post_vace_verdict.get("semantic_gate_family", "")))
     if explicit:
@@ -7739,11 +7776,99 @@ def _background_semantic_errors(record: dict[str, Any], target_annotation: dict[
         drop_tokens={"background", "room", "scene", "original"},
     )
     errors: list[str] = []
-    if target_markers and not all(marker in target_text for marker in target_markers):
-        errors.append("target_annotation_missing_target_background")
+    missing_target_background = target_markers and not all(
+        _background_marker_is_present(target_text, marker) for marker in target_markers
+    )
+    source_markers = _background_source_markers(record)
+    retained_source_markers = [
+        marker
+        for marker in source_markers
+        if _text_mentions_phrase(target_text, marker)
+    ]
+    overlay_only = _background_overlay_failure(target_text) and (missing_target_background or bool(retained_source_markers))
+    if missing_target_background:
+        _append_unique(errors, "target_annotation_missing_target_background")
+        _append_unique(errors, "target_background_missing")
+    if retained_source_markers:
+        _append_unique(errors, "original_background_retained")
+        for marker in retained_source_markers[:4]:
+            _append_unique(errors, f"target_annotation_retains_source_background:{marker}")
+        if any(marker in {"sunlit room", "indoor room", "same room", "window", "door"} for marker in retained_source_markers):
+            _append_unique(errors, "background_not_replaced_original_room_still_visible")
+    if overlay_only:
+        _append_unique(errors, "futuristic_lab_only_blue_overlay")
     for marker in _semantic_missing_preserve_markers(target_text, _normalize_list(generation.get("preserve_tokens", []))):
-        errors.append(f"target_annotation_missing_preserved_object:{marker}")
+        _append_unique(errors, f"target_annotation_missing_preserved_object:{marker}")
+    if not any(error.startswith("target_annotation_missing_preserved_object:") for error in errors) and (
+        missing_target_background or retained_source_markers or overlay_only
+    ):
+        _append_unique(errors, "subject_preserved_but_edit_failed")
     return errors
+
+
+def _background_marker_is_present(target_text: str, marker: str) -> bool:
+    marker_key = _normalized_phrase(marker)
+    candidates = VACE_BACKGROUND_TARGET_SYNONYMS.get(marker_key, {marker_key})
+    for candidate in candidates:
+        if _background_marker_is_negated(target_text, candidate):
+            return False
+    return any(_text_mentions_phrase(target_text, candidate) for candidate in candidates)
+
+
+def _background_marker_is_negated(target_text: str, marker: str) -> bool:
+    marker_key = _normalized_phrase(marker)
+    if not marker_key:
+        return False
+    if any(
+        phrase in target_text
+        for phrase in (
+            f"no {marker_key}",
+            f"not {marker_key}",
+            f"without {marker_key}",
+            f"missing {marker_key}",
+            f"lacks {marker_key}",
+            f"lack {marker_key}",
+        )
+    ):
+        return True
+    tokens = target_text.split()
+    marker_tokens = marker_key.split()
+    negators = {"no", "not", "without", "missing", "lacks", "lack"}
+    for index, token in enumerate(tokens):
+        if token not in negators:
+            continue
+        window = tokens[index + 1 : index + 6]
+        for start in range(0, max(len(window) - len(marker_tokens) + 1, 0)):
+            if window[start : start + len(marker_tokens)] == marker_tokens:
+                return True
+    return False
+
+
+def _background_source_markers(record: dict[str, Any]) -> list[str]:
+    generation = record.get("generation", {}) if isinstance(record.get("generation"), dict) else {}
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    raw_planner_output = (
+        generation.get("raw_planner_output", {}) if isinstance(generation.get("raw_planner_output"), dict) else {}
+    )
+    chunks = [
+        str(difference.get("from", "")),
+        str(record.get("reference_caption", "")),
+        str(record.get("source_prompt", "")),
+        str(generation.get("source_prompt", "")),
+        str(raw_planner_output.get("source_prompt", "")),
+    ]
+    chunks.extend(_normalize_list(generation.get("preserve_regions", [])))
+    chunks.extend(_normalize_list(raw_planner_output.get("preserve_regions", [])))
+    source_text = _normalized_phrase(" ".join(chunks))
+    markers: list[str] = []
+    for marker in sorted(VACE_BACKGROUND_ORIGINAL_SCENE_MARKERS, key=len, reverse=True):
+        if _text_mentions_phrase(source_text, marker):
+            _append_unique(markers, _normalized_phrase(marker))
+    return markers
+
+
+def _background_overlay_failure(target_text: str) -> bool:
+    return any(_text_mentions_phrase(target_text, marker) for marker in VACE_BACKGROUND_OVERLAY_FAILURE_MARKERS)
 
 
 def _object_edit_semantic_errors(

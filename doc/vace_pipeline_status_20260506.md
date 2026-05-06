@@ -240,7 +240,7 @@ preflight_report.json: passed=true
 
 这说明 VACE 输入链路、exact-frame 策略、mask、src_ref、音频 remux 基本正常。
 
-但这条样本还不能标为 accepted，原因是后处理脚本在生成 `duration_metrics.json` / `post_vace_verdict.json` 之前崩溃：
+但这条样本不能标为 accepted。第一层原因是后处理脚本在生成 `duration_metrics.json` / `post_vace_verdict.json` 之前崩溃：
 
 ```text
 TypeError: Python 3.8 does not support list[str] runtime annotations
@@ -258,11 +258,24 @@ def semantic_requirements_for_family(family: str) -> list[str]:
 def semantic_requirements_for_family(family: str) -> list:
 ```
 
-本地已修复并通过测试，但该 commit 尚未推送到 GitHub。视觉上是否成功仍需要人工查看 `*_with_ref_audio.mp4`：
+本地已修复并通过测试。随后检查 `/Users/Admin/Desktop/mannul5` 的 review bundle，视觉结论是：
 
-- 背景是否真变成 futuristic laboratory。
-- woman 身份、脸、动作是否保留。
-- 是否有糊脸、换人、边缘蓝化、背景无变化等问题。
+- reference/src_video/mask 极性正确，白区是背景，黑区保留 woman。
+- target 不是真正的 futuristic laboratory；原来的 room/window/door 仍可见。
+- VACE 只生成了蓝色科幻 overlay / tint，背景语义没有被替换。
+- woman 基本保留，但这属于 `subject_preserved_but_edit_failed`。
+
+因此 `mannul5` 必须归档为 `failed_semantic_gate`，错误标签应包含：
+
+```text
+target_background_missing
+original_background_retained
+background_not_replaced_original_room_still_visible
+futuristic_lab_only_blue_overlay
+subject_preserved_but_edit_failed
+```
+
+不要把这条样本写入 `accepted_synthetic_pairs.jsonl`。
 
 ### 5.3 GroundingDINO 当前不可用
 

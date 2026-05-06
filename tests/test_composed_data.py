@@ -7040,6 +7040,78 @@ class ComposedDataTests(unittest.TestCase):
         self.assertIn("target_annotation_missing_target_background", verdict["semantic_gate_errors"])
         self.assertIn("target_annotation_missing_preserved_object:ukulele", verdict["semantic_gate_errors"])
 
+    def test_post_vace_semantic_verdict_rejects_background_overlay_and_original_room(self) -> None:
+        record = {
+            "edit_text": "change the background to a futuristic laboratory",
+            "difference": {"type": "scene", "from": "original background", "to": "futuristic laboratory background"},
+            "reference_caption": "A woman with curly red hair and glasses speaks in a sunlit room.",
+            "generation": {
+                "exploration_family": "background_change",
+                "source_prompt": "A woman with curly red hair and glasses speaks to the camera in a sunlit room.",
+                "preserve_tokens": ["woman", "curly red hair", "glasses", "speaking"],
+                "preserve_regions": ["window", "door"],
+                "post_vace_verdict": {
+                    "semantic_gate_required": True,
+                    "semantic_gate_passed": False,
+                },
+            },
+        }
+
+        updated = _apply_post_vace_semantic_verdict(
+            record,
+            target_annotation={
+                "summary": (
+                    "The same woman with curly red hair and glasses speaks in the original sunlit room; "
+                    "the window and door are still visible under a blue overlay, with no futuristic laboratory present."
+                ),
+                "subjects": ["woman"],
+                "actions": ["speaking"],
+                "object_counts": {"glasses": 1, "window": 1, "door": 1},
+            },
+        )
+
+        verdict = updated["generation"]["post_vace_verdict"]
+        self.assertFalse(verdict["semantic_gate_passed"])
+        self.assertEqual("failed_semantic_gate", verdict["stage"])
+        self.assertIn("target_background_missing", verdict["semantic_gate_errors"])
+        self.assertIn("original_background_retained", verdict["semantic_gate_errors"])
+        self.assertIn("background_not_replaced_original_room_still_visible", verdict["semantic_gate_errors"])
+        self.assertIn("futuristic_lab_only_blue_overlay", verdict["semantic_gate_errors"])
+        self.assertIn("subject_preserved_but_edit_failed", verdict["semantic_gate_errors"])
+
+    def test_post_vace_semantic_verdict_passes_background_lab_when_source_room_removed(self) -> None:
+        record = {
+            "edit_text": "change the background to a futuristic laboratory",
+            "difference": {"type": "scene", "from": "sunlit room background", "to": "futuristic laboratory background"},
+            "generation": {
+                "exploration_family": "background_change",
+                "source_prompt": "A woman with curly red hair and glasses speaks to the camera in a sunlit room.",
+                "preserve_tokens": ["woman", "glasses", "speaking"],
+                "post_vace_verdict": {
+                    "semantic_gate_required": True,
+                    "semantic_gate_passed": False,
+                },
+            },
+        }
+
+        updated = _apply_post_vace_semantic_verdict(
+            record,
+            target_annotation={
+                "summary": (
+                    "A woman with curly red hair and glasses speaks in front of a futuristic lab with benches, "
+                    "glass equipment, and high tech wall panels."
+                ),
+                "scene": "futuristic laboratory",
+                "subjects": ["woman"],
+                "actions": ["speaking"],
+                "object_counts": {"glasses": 1, "lab bench": 1},
+            },
+        )
+
+        verdict = updated["generation"]["post_vace_verdict"]
+        self.assertTrue(verdict["semantic_gate_passed"])
+        self.assertEqual("passed_semantic_gate", verdict["stage"])
+
     def test_validate_pilot_dataset_builds_gallery_from_targets_and_negatives(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

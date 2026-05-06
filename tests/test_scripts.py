@@ -192,6 +192,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("src_video_contact.jpg", script)
         self.assertIn("post_vace_verdict.json", script)
         self.assertIn("semantic_gate_family", script)
+        self.assertIn("original room, windows, doors, walls, or brick wall must not remain visible", script)
+        self.assertIn("blue tint, blue overlay, or style wash", script)
         self.assertIn("object_replacement", script)
         self.assertIn("raw_target_contact.jpg", script)
         self.assertIn("target_contact.jpg", script)
