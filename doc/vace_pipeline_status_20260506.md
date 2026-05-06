@@ -191,7 +191,16 @@ ffb8a3d Prefer torch GroundingDINO checkpoints
 
 ### 5.1 Florence-2 + SAM2.1 mask 质量不稳定
 
-56f56b1 下 4 个候选全部 mask gate 失败：
+最新 mask smoke 中 4 个候选只有 1 个通过 mask gate：
+
+| plan | edit | status | 关键指标 / 原因 |
+|---|---|---|---|
+| ef8f2818 | woman background -> futuristic lab | mask passed | avg coverage 0.5207, temporal stability 0.9969, nonempty 1.0, foreground subject coverage 0.4793 |
+| 8e8069c9 | blouse -> red blouse | failed | temporal stability 0.2476, nonempty 0.2533, ukulele protected overlap 0.99 |
+| aab85616 | man background -> futuristic lab | failed | avg coverage 0.1819, temporal stability 0.2492, foreground nonempty 0.2511 |
+| 2babdf1c | robe red -> blue | failed | avg coverage 0.0023, temporal stability 0.1444, nonempty 0.16 |
+
+56f56b1 下曾经 4 个候选全部 mask gate 失败：
 
 | 类别 | 失败表现 |
 |---|---|
@@ -216,7 +225,46 @@ coverage 极低或空帧
 - 衣物变成 vest/polo/暗色上衣，而不是目标衣物。
 - target 变成 near-duplicate 或主体漂移。
 
-### 5.2 GroundingDINO 当前不可用
+### 5.2 ef8f2818 VACE smoke 状态
+
+`ef8f2818` 在补齐 16:9 futuristic laboratory background src_ref 后已经启动过一次 VACE smoke。结果：
+
+```text
+VACE 推理: 成功
+raw target: 5.063s, 81 frames @ 16fps
+audio-remux target: 5.109s
+reference_for_vace: 5.086s
+duration drift: 0.023s
+preflight_report.json: passed=true
+```
+
+这说明 VACE 输入链路、exact-frame 策略、mask、src_ref、音频 remux 基本正常。
+
+但这条样本还不能标为 accepted，原因是后处理脚本在生成 `duration_metrics.json` / `post_vace_verdict.json` 之前崩溃：
+
+```text
+TypeError: Python 3.8 does not support list[str] runtime annotations
+```
+
+根因是 `scripts/run_vace_visual_synthetic_smoke.sh` 的内联 Python 里有：
+
+```python
+def semantic_requirements_for_family(family: str) -> list[str]:
+```
+
+服务器系统 `python3` 是 3.8，不支持这种写法。修复方式是改成：
+
+```python
+def semantic_requirements_for_family(family: str) -> list:
+```
+
+本地已修复并通过测试，但该 commit 尚未推送到 GitHub。视觉上是否成功仍需要人工查看 `*_with_ref_audio.mp4`：
+
+- 背景是否真变成 futuristic laboratory。
+- woman 身份、脸、动作是否保留。
+- 是否有糊脸、换人、边缘蓝化、背景无变化等问题。
+
+### 5.3 GroundingDINO 当前不可用
 
 当前服务器没有官方格式 GroundingDINO `.pth` checkpoint。因此：
 
@@ -231,7 +279,7 @@ coverage 极低或空帧
 --grounder florence2
 ```
 
-### 5.3 复杂编辑路线暂时不应该继续烧 VACE
+### 5.4 复杂编辑路线暂时不应该继续烧 VACE
 
 这些任务已经明确不适合当前默认 VACE route：
 
@@ -321,4 +369,3 @@ failure_reason
    - existing large object / robot / vehicle attribute edit
    - animation / static-like video local color edit
 3. 等 mask route 有稳定通过样本，再恢复 VACE smoke。
-
