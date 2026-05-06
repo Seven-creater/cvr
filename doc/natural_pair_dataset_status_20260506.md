@@ -5,7 +5,9 @@
 The main dataset route is now natural video pair construction:
 
 ```text
-source videos -> event clips -> Omni-Detective annotations -> group pairs -> judge -> video verification -> accepted_pairs.jsonl
+source videos -> event clips -> Omni-Detective annotations
+-> local candidate mining -> Omni edit_text/judge -> selective video verification
+-> accepted_pairs.jsonl
 ```
 
 Synthetic video editing remains available for controlled experiments, but it is no longer the default route for large-scale dataset production. The VACE route exposed too many quality bottlenecks: mask quality, target video drift, and weak semantic control even when masks were good.
@@ -14,6 +16,8 @@ Synthetic video editing remains available for controlled experiments, but it is 
 
 - `natural_pair` is the production default. `synthetic_edit` is a supplement only.
 - `run_omni_detective_pilot.sh` now exposes `--concurrency`, `--max-accepted-pairs`, `--max-proposals`, `--annotation-max-passes`, stage timeouts, and `--start-stage`, and writes a manual review bundle after accepted pairs are produced.
+- A new local `mine-pair-candidates` stage now runs before Omni proposal/judge. It reads `detective_annotations.jsonl` and `clip_groups.jsonl`, writes `mined_pair_candidates.jsonl`, and emits `candidate_mining_report.md` without calling Omni or reading video frames.
+- `propose-group-pairs` can now consume `--mined-candidates-path`, so Omni is used as observer/editor/judge on shortlisted candidates rather than as the full pair searcher.
 - Pair priority now favors audio/video fusion signals first: `audio_event`, `speech`, `visible_text`, then object/action/attribute/scene.
 - Natural pair gates now record explicit failure buckets:
   - `bad_imperative_edit_text`
@@ -57,6 +61,15 @@ caps local pair comparisons, and removes video near-duplicate probing from
 candidate construction. Near-duplicate/video checks should happen only after
 cheap annotation gates and Omni judge have narrowed the candidate set.
 
+`9fdc522+` changes the method more substantially: candidate construction is no
+longer hidden inside propose. The pipeline now mines candidates locally first,
+with explicit difference-type counts, source-relation counts, and risk flags
+such as `multi_delta`, `too_broad_scene`, `ocr_template_risk`,
+`visible_text_fragment_edit`, `speech_unbacked`, and `audio_too_similar`.
+This matches the Omni-Captioner-style division of labor better: Omni annotates
+clips and judges shortlisted evidence, while cheap local code does the bulk
+pair search and reports whether the candidate pool itself is healthy.
+
 ## Mannul Boundary Table
 
 | Pair | Example edit | Route decision | Main reason |
@@ -97,8 +110,10 @@ nohup bash scripts/run_omni_detective_pilot.sh \
   --concurrency 1 \
   --max-accepted-pairs 20 \
   --max-proposals 120 \
+  --max-mined-candidates 240 \
   --annotation-max-passes 5 \
   --annotation-pass-timeout-seconds 900 \
+  --mine-candidates-timeout-seconds 120 \
   --propose-timeout-seconds 600 \
   --pair-request-timeout-seconds 90 \
   --model-stage instruct \
@@ -122,8 +137,10 @@ nohup bash scripts/run_omni_detective_pilot.sh \
   --concurrency 1 \
   --max-accepted-pairs 20 \
   --max-proposals 120 \
+  --max-mined-candidates 240 \
   --annotation-max-passes 5 \
   --annotation-pass-timeout-seconds 900 \
+  --mine-candidates-timeout-seconds 120 \
   --propose-timeout-seconds 600 \
   --pair-request-timeout-seconds 90 \
   --start-stage annotate \
@@ -131,10 +148,33 @@ nohup bash scripts/run_omni_detective_pilot.sh \
   > "$RUN_ROOT/logs/omni_detective_resume.log" 2>&1 &
 ```
 
+For the first diagnosis after pulling this commit, it is reasonable to stop
+after local mining and inspect candidate health before spending Omni judge
+time:
+
+```bash
+bash scripts/run_omni_detective_pilot.sh \
+  --root "$ROOT" \
+  --run-root "$RUN_ROOT" \
+  --model "$MODEL" \
+  --base-url "$BASE_URL" \
+  --max-mined-candidates 240 \
+  --max-proposals 0 \
+  --mine-candidates-timeout-seconds 120 \
+  --start-stage mine-candidates \
+  --model-stage instruct
+```
+
+This should produce `mined_pair_candidates.jsonl` and
+`candidate_mining_report.md` quickly. If it cannot produce candidates, the
+problem is candidate pool quality rather than Omni proposal latency.
+
 Report back:
 
 - `git rev-parse --short HEAD`
 - test summary
+- `mined_pair_candidates.jsonl` count
+- `candidate_mining_report.md` top difference/risk counts
 - `accepted_pairs.jsonl` count
 - `pilot_review.md`
 - top rejection buckets from `judged_pair_proposals.jsonl`

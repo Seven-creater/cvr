@@ -30,6 +30,9 @@ DEFAULT_ACCEPTED_PAIRS_NAME = "accepted_pairs.jsonl"
 DEFAULT_SYNTHETIC_JUDGED_PAIRS_NAME = "judged_synthetic_pair_proposals.jsonl"
 DEFAULT_SYNTHETIC_ACCEPTED_PAIRS_NAME = "accepted_synthetic_pairs.jsonl"
 DEFAULT_SYNTHETIC_PILOT_REVIEW_NAME = "synthetic_pilot_review.md"
+DEFAULT_MINED_PAIR_CANDIDATES_NAME = "mined_pair_candidates.jsonl"
+DEFAULT_CANDIDATE_MINING_REPORT_NAME = "candidate_mining_report.md"
+DEFAULT_MAX_MINED_PAIR_CANDIDATES = 240
 DEFAULT_VIDEO_EDIT_PLAN_NAME = "video_edit_plan.jsonl"
 DEFAULT_VIDEO_EDIT_PLANNER_CACHE_NAME = "video_edit_planner_cache.jsonl"
 DEFAULT_VIDEO_MASK_PLAN_NAME = "video_mask_plan.jsonl"
@@ -1580,11 +1583,389 @@ def propose_pairs(
     }
 
 
+def mine_pair_candidates(
+    *,
+    root: str | Path,
+    clip_annotations_path: str | Path,
+    clip_groups_path: str | Path,
+    output_path: str | Path | None = None,
+    report_path: str | Path | None = None,
+    max_candidates: int = DEFAULT_MAX_MINED_PAIR_CANDIDATES,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    annotations_path = Path(clip_annotations_path)
+    groups_path = Path(clip_groups_path)
+    output = Path(output_path) if output_path else layout["pairs"] / DEFAULT_MINED_PAIR_CANDIDATES_NAME
+    report = Path(report_path) if report_path else layout["reports"] / DEFAULT_CANDIDATE_MINING_REPORT_NAME
+    annotations = list(_load_jsonl(annotations_path))
+    groups = list(_load_jsonl(groups_path))
+    if not annotations:
+        raise ValueError("clip annotations are empty")
+    if not groups:
+        raise ValueError("clip groups are empty")
+
+    annotations_by_id: dict[str, dict[str, Any]] = {}
+    duplicate_annotation_count = 0
+    for item in annotations:
+        clip_id = str(item.get("clip_id", "")).strip()
+        if not clip_id:
+            continue
+        if clip_id in annotations_by_id:
+            duplicate_annotation_count += 1
+        annotations_by_id[clip_id] = item
+
+    candidate_by_id: dict[str, dict[str, Any]] = {}
+    skipped_groups: Counter[str] = Counter()
+    group_candidate_counts: Counter[str] = Counter()
+    usable_annotations = [
+        item
+        for item in annotations_by_id.values()
+        if not bool(item.get("fallback_used")) and _annotation_has_signal(item)
+    ]
+
+    for group in groups:
+        group_metadata = {
+            "group_id": str(group.get("group_id", "")).strip(),
+            "group_reason": str(group.get("group_reason", "")).strip(),
+        }
+        candidate_clip_ids = [str(value).strip() for value in group.get("candidate_clip_ids", []) if str(value).strip()]
+        group_annotations = [
+            annotations_by_id[clip_id]
+            for clip_id in candidate_clip_ids
+            if clip_id in annotations_by_id
+            and not bool(annotations_by_id[clip_id].get("fallback_used"))
+            and _annotation_has_signal(annotations_by_id[clip_id])
+        ]
+        if len(group_annotations) < 4:
+            skipped_groups["too_few_usable_annotations"] += 1
+            continue
+        group_candidates = _build_pair_candidates(root=layout["root"], annotations=group_annotations)
+        group_candidate_counts[group_metadata["group_id"] or "unknown"] += len(group_candidates)
+        for candidate in group_candidates:
+            mined = _mined_pair_candidate_record(candidate, group_metadata=group_metadata)
+            existing = candidate_by_id.get(mined["candidate_id"])
+            if existing is None or _score_float(mined["scores"].get("local_candidate_score")) > _score_float(
+                existing.get("scores", {}).get("local_candidate_score")
+            ):
+                candidate_by_id[mined["candidate_id"]] = mined
+
+    if len(candidate_by_id) < max_candidates and len(usable_annotations) >= 4:
+        global_metadata = {
+            "group_id": "global_same_context_backfill",
+            "group_reason": "backfill from all same-source or same-dataset annotations after grouped mining",
+        }
+        for candidate in _build_pair_candidates(root=layout["root"], annotations=usable_annotations):
+            mined = _mined_pair_candidate_record(candidate, group_metadata=global_metadata)
+            candidate_by_id.setdefault(mined["candidate_id"], mined)
+
+    mined_records = sorted(
+        candidate_by_id.values(),
+        key=lambda item: (
+            -_score_float(item.get("scores", {}).get("local_candidate_score")),
+            str(item.get("candidate_id", "")),
+        ),
+    )[: max(0, max_candidates)]
+    _write_jsonl(output, mined_records)
+    report.write_text(
+        _build_candidate_mining_report(
+            output_path=output,
+            annotations_count=len(annotations),
+            unique_annotation_count=len(annotations_by_id),
+            duplicate_annotation_count=duplicate_annotation_count,
+            group_count=len(groups),
+            skipped_groups=skipped_groups,
+            group_candidate_counts=group_candidate_counts,
+            candidates=mined_records,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "clip_annotations_path": str(annotations_path),
+        "clip_groups_path": str(groups_path),
+        "output_path": str(output),
+        "report_path": str(report),
+        "annotation_count": len(annotations),
+        "unique_annotation_count": len(annotations_by_id),
+        "duplicate_annotation_count": duplicate_annotation_count,
+        "group_count": len(groups),
+        "candidate_count": len(mined_records),
+        "risk_flag_counts": dict(_candidate_risk_flag_counts(mined_records)),
+        "difference_type_counts": dict(Counter(str(item.get("difference", {}).get("type", "")) for item in mined_records)),
+        "source_relation_counts": dict(
+            Counter(str(item.get("source_context", {}).get("relation", "")) for item in mined_records)
+        ),
+        "skipped_groups": dict(skipped_groups),
+    }
+
+
+def _mined_pair_candidate_record(
+    candidate: dict[str, Any],
+    *,
+    group_metadata: dict[str, str],
+) -> dict[str, Any]:
+    reference_annotation = candidate["reference_annotation"]
+    target_annotation = candidate["target_annotation"]
+    difference = dict(candidate["primary_difference"])
+    quality = dict(candidate["quality"])
+    risk_flags = _candidate_risk_flags(candidate)
+    scores = {
+        "same_context_score": _score_float(quality.get("same_context_score")),
+        "difference_strength_score": _score_float(quality.get("difference_strength_score")),
+        "single_delta_score": round(max(0.0, 1.0 - max(0, len(candidate.get("changed_difference_types", [])) - 1) * 0.2), 3),
+        "target_uniqueness_score": _score_float(quality.get("target_uniqueness_score")),
+        "edit_match_score": _score_float(quality.get("edit_match_score")),
+        "semantic_context_score": _score_float(quality.get("semantic_context_score")),
+        "local_candidate_score": _score_float(candidate.get("composite_score")),
+    }
+    return {
+        "candidate_id": candidate["proposal_id"],
+        "proposal_id": candidate["proposal_id"],
+        "reference_clip_id": str(reference_annotation.get("clip_id", "")).strip(),
+        "target_clip_id": str(target_annotation.get("clip_id", "")).strip(),
+        "reference_video": str(reference_annotation.get("output_path", "")).strip(),
+        "target_video": str(target_annotation.get("output_path", "")).strip(),
+        "difference": difference,
+        "changed_difference_types": list(candidate.get("changed_difference_types", [])),
+        "modalities": _infer_pair_modalities(reference_annotation, target_annotation, difference["type"]),
+        "source_context": dict(candidate.get("source_context", {})),
+        "scores": scores,
+        "quality": quality,
+        "evidence": dict(candidate.get("difference_evidence", {})),
+        "risk_flags": risk_flags,
+        "group_id": group_metadata.get("group_id", ""),
+        "group_reason": group_metadata.get("group_reason", ""),
+        "hard_negative_clip_ids": [
+            str(annotation.get("clip_id", "")).strip()
+            for annotation in candidate.get("hard_negative_annotations", [])
+            if str(annotation.get("clip_id", "")).strip()
+        ],
+        "hard_negative_paths": list(candidate.get("hard_negative_paths", [])),
+    }
+
+
+def _candidate_risk_flags(candidate: dict[str, Any]) -> list[str]:
+    difference = candidate.get("primary_difference", {})
+    difference_type = str(difference.get("type", "")).strip()
+    quality = candidate.get("quality", {}) if isinstance(candidate.get("quality"), dict) else {}
+    source_context = candidate.get("source_context", {}) if isinstance(candidate.get("source_context"), dict) else {}
+    risk_flags: list[str] = []
+    changed_types = list(candidate.get("changed_difference_types", []))
+    if len(changed_types) > 1:
+        risk_flags.append("multi_delta")
+    if _score_float(quality.get("difference_strength_score")) < MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE:
+        risk_flags.append("weak_difference_strength")
+    if difference_type == "scene":
+        if _score_float(quality.get("same_context_score")) < 0.75 or str(source_context.get("relation", "")) in {
+            "same_dataset",
+            "unknown",
+            "cross_dataset",
+        }:
+            risk_flags.append("too_broad_scene")
+    if difference_type == "visible_text":
+        if _visible_text_fragment_edit(difference):
+            risk_flags.append("visible_text_fragment_edit")
+        if _score_float(quality.get("target_uniqueness_score")) < MIN_ACCEPT_TARGET_UNIQUENESS_SCORE:
+            risk_flags.append("ocr_template_risk")
+    if difference_type == "speech" and _score_float(quality.get("speech_transcript_backed")) < 1.0:
+        risk_flags.append("speech_unbacked")
+    if difference_type == "audio_event" and _difference_values_are_too_similar(
+        str(difference.get("from", "")),
+        str(difference.get("to", "")),
+    ):
+        risk_flags.append("audio_too_similar")
+    if difference_type in VISUAL_DIFFERENCE_TYPES:
+        observable = _observable_difference_gate(
+            reference_annotation=candidate["reference_annotation"],
+            target_annotation=candidate["target_annotation"],
+            difference=difference,
+            visual_near_duplicate_score=None,
+        )
+        if not bool(observable.get("passed")):
+            risk_flags.append("too_similar_without_observable_delta")
+    return _dedupe_strings(risk_flags)
+
+
+def _candidate_risk_flag_counts(candidates: list[dict[str, Any]]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for candidate in candidates:
+        flags = candidate.get("risk_flags", [])
+        if isinstance(flags, list) and flags:
+            counts.update(str(item) for item in flags)
+        else:
+            counts["none"] += 1
+    return counts
+
+
+def _build_candidate_mining_report(
+    *,
+    output_path: Path,
+    annotations_count: int,
+    unique_annotation_count: int,
+    duplicate_annotation_count: int,
+    group_count: int,
+    skipped_groups: Counter[str],
+    group_candidate_counts: Counter[str],
+    candidates: list[dict[str, Any]],
+) -> str:
+    difference_counts = Counter(str(item.get("difference", {}).get("type", "")) for item in candidates)
+    relation_counts = Counter(str(item.get("source_context", {}).get("relation", "")) for item in candidates)
+    risk_counts = _candidate_risk_flag_counts(candidates)
+    lines = [
+        "# Candidate Mining Report",
+        "",
+        f"- Output: `{output_path}`",
+        f"- Annotation rows: `{annotations_count}`",
+        f"- Unique annotations: `{unique_annotation_count}`",
+        f"- Duplicate annotation rows: `{duplicate_annotation_count}`",
+        f"- Clip groups: `{group_count}`",
+        f"- Mined candidates: `{len(candidates)}`",
+        "",
+        "## Difference Type Counts",
+    ]
+    for key, value in sorted(difference_counts.items()):
+        lines.append(f"- `{key or 'unknown'}`: `{value}`")
+    if not difference_counts:
+        lines.append("- none")
+    lines.extend(["", "## Source Relation Counts"])
+    for key, value in sorted(relation_counts.items()):
+        lines.append(f"- `{key or 'unknown'}`: `{value}`")
+    if not relation_counts:
+        lines.append("- none")
+    lines.extend(["", "## Risk Flag Counts"])
+    for key, value in sorted(risk_counts.items()):
+        lines.append(f"- `{key}`: `{value}`")
+    if not risk_counts:
+        lines.append("- none")
+    lines.extend(["", "## Skipped Groups"])
+    for key, value in sorted(skipped_groups.items()):
+        lines.append(f"- `{key}`: `{value}`")
+    if not skipped_groups:
+        lines.append("- none")
+    lines.extend(["", "## Top Groups"])
+    for key, value in group_candidate_counts.most_common(10):
+        lines.append(f"- `{key}`: `{value}`")
+    if not group_candidate_counts:
+        lines.append("- none")
+    lines.extend(["", "## Top Candidates"])
+    for candidate in candidates[:20]:
+        difference = candidate.get("difference", {})
+        scores = candidate.get("scores", {})
+        flags = candidate.get("risk_flags", [])
+        lines.append(
+            "- "
+            f"`{candidate.get('candidate_id')}` "
+            f"`{difference.get('type', 'unknown')}` "
+            f"`{difference.get('from', '')}` -> `{difference.get('to', '')}` "
+            f"score=`{scores.get('local_candidate_score', 0.0)}` "
+            f"risks=`{','.join(flags) if flags else 'none'}`"
+        )
+    if not candidates:
+        lines.append("- none")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _candidate_from_mined_record(
+    mined: dict[str, Any],
+    *,
+    annotations_by_id: dict[str, dict[str, Any]],
+    annotations: list[dict[str, Any]],
+    root: Path,
+) -> dict[str, Any] | None:
+    reference_clip_id = str(mined.get("reference_clip_id", "")).strip()
+    target_clip_id = str(mined.get("target_clip_id", "")).strip()
+    if not reference_clip_id or not target_clip_id:
+        return None
+    reference_annotation = annotations_by_id.get(reference_clip_id)
+    target_annotation = annotations_by_id.get(target_clip_id)
+    if reference_annotation is None or target_annotation is None:
+        return None
+    difference = mined.get("difference", {})
+    if not isinstance(difference, dict) or not str(difference.get("type", "")).strip():
+        detected = _detect_primary_difference(reference_annotation, target_annotation)
+        if detected is None:
+            return None
+        changed_types = list(detected.pop("changed_types"))
+        difference = detected
+    else:
+        difference = dict(difference)
+        changed_types = [
+            str(item).strip()
+            for item in mined.get("changed_difference_types", [])
+            if str(item).strip()
+        ] or [str(difference.get("type", "")).strip()]
+
+    hard_negative_annotations = [
+        annotations_by_id[clip_id]
+        for clip_id in [str(item).strip() for item in mined.get("hard_negative_clip_ids", []) if str(item).strip()]
+        if clip_id in annotations_by_id and clip_id not in {reference_clip_id, target_clip_id}
+    ]
+    if len(hard_negative_annotations) < 2:
+        hard_negative_annotations = _select_hard_negative_annotations(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            annotations=annotations,
+            primary_difference=difference,
+        )
+    if len(hard_negative_annotations) < 2:
+        return None
+
+    quality = dict(mined.get("quality", {})) if isinstance(mined.get("quality"), dict) else {}
+    scores = mined.get("scores", {}) if isinstance(mined.get("scores"), dict) else {}
+    for source_key, target_key in (
+        ("same_context_score", "same_context_score"),
+        ("semantic_context_score", "semantic_context_score"),
+        ("edit_match_score", "edit_match_score"),
+        ("target_uniqueness_score", "target_uniqueness_score"),
+        ("difference_strength_score", "difference_strength_score"),
+    ):
+        if target_key not in quality and source_key in scores:
+            quality[target_key] = _score_float(scores.get(source_key))
+    quality.setdefault("difference_type", str(difference.get("type", "")).strip())
+    source_context = mined.get("source_context", {}) if isinstance(mined.get("source_context"), dict) else {}
+    if not source_context:
+        source_context = _source_context(reference_annotation, target_annotation)
+
+    reference_path = _display_path(root, _resolve_under_root(root, reference_annotation["output_path"]))
+    target_path = _display_path(root, _resolve_under_root(root, target_annotation["output_path"]))
+    hard_negative_paths = [
+        _display_path(root, _resolve_under_root(root, annotation["output_path"])) for annotation in hard_negative_annotations[:3]
+    ]
+    return {
+        "proposal_id": str(mined.get("proposal_id") or mined.get("candidate_id") or _build_proposal_id(reference_path, target_path)),
+        "reference_annotation": _sanitize_annotation_for_output(reference_annotation, root),
+        "target_annotation": _sanitize_annotation_for_output(target_annotation, root),
+        "primary_difference": difference,
+        "changed_difference_types": changed_types,
+        "quality": quality,
+        "composite_score": _score_float(scores.get("local_candidate_score"))
+        or _candidate_composite_score(quality, source_context),
+        "source_context": dict(source_context),
+        "difference_evidence": dict(mined.get("evidence", {}))
+        if isinstance(mined.get("evidence"), dict)
+        else _difference_evidence_from_annotations(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            primary_difference=difference,
+        ),
+        "hard_negative_annotations": [
+            _sanitize_annotation_for_output(annotation, root) for annotation in hard_negative_annotations[:3]
+        ],
+        "hard_negative_paths": hard_negative_paths,
+        "mined_candidate": {
+            "candidate_id": mined.get("candidate_id", ""),
+            "risk_flags": list(mined.get("risk_flags", [])) if isinstance(mined.get("risk_flags"), list) else [],
+            "scores": dict(scores),
+        },
+    }
+
+
 def propose_group_pairs(
     *,
     root: str | Path,
     clip_annotations_path: str | Path,
     clip_groups_path: str | Path,
+    mined_candidates_path: str | Path | None = None,
     base_url: str,
     api_key: str,
     model: str,
@@ -1599,8 +1980,10 @@ def propose_group_pairs(
     layout = ensure_layout(root)
     annotations_path = Path(clip_annotations_path)
     groups_path = Path(clip_groups_path)
+    mined_path = Path(mined_candidates_path) if mined_candidates_path else None
     print(
-        f"[propose-group-pairs] load inputs annotations_path={annotations_path} groups_path={groups_path}",
+        "[propose-group-pairs] load inputs "
+        f"annotations_path={annotations_path} groups_path={groups_path} mined_candidates_path={mined_path or ''}",
         file=sys.stderr,
         flush=True,
     )
@@ -1659,30 +2042,67 @@ def propose_group_pairs(
         _write_jsonl(output, output_records)
         _write_jsonl(accepted_output, current_accepted)
 
-    for group_index, group in enumerate(groups, start=1):
-        group_metadata = {
-            "group_id": str(group.get("group_id", "")).strip(),
-            "group_reason": str(group.get("group_reason", "")).strip(),
-        }
-        candidate_clip_ids = [str(value).strip() for value in group.get("candidate_clip_ids", []) if str(value).strip()]
-        group_annotations = [
-            annotations_by_id[clip_id]
-            for clip_id in candidate_clip_ids
-            if clip_id in annotations_by_id and not bool(annotations_by_id[clip_id].get("fallback_used"))
-        ]
+    if mined_path is not None:
+        mined_records = list(_load_jsonl(mined_path))
         print(
-            "[propose-group-pairs] group "
-            f"{group_index}/{len(groups)} group_id={group_metadata['group_id']} "
-            f"candidate_clip_ids={len(candidate_clip_ids)} usable_annotations={len(group_annotations)}",
+            f"[propose-group-pairs] loaded mined candidates rows={len(mined_records)}",
             file=sys.stderr,
             flush=True,
         )
-        if len(group_annotations) < 4:
-            continue
-        candidates = _build_pair_candidates(root=layout["root"], annotations=group_annotations)
+        mined_candidates = [
+            candidate
+            for candidate in (
+                _candidate_from_mined_record(
+                    record,
+                    annotations_by_id=annotations_by_id,
+                    annotations=list(annotations_by_id.values()),
+                    root=layout["root"],
+                )
+                for record in mined_records
+            )
+            if candidate is not None
+        ]
+        candidate_batches = [
+            (
+                1,
+                1,
+                {
+                    "group_id": "mined_pair_candidates",
+                    "group_reason": f"local candidate mining from {mined_path}",
+                },
+                mined_candidates,
+                list(annotations_by_id.values()),
+            )
+        ]
+    else:
+        candidate_batches = []
+        for group_index, group in enumerate(groups, start=1):
+            group_metadata = {
+                "group_id": str(group.get("group_id", "")).strip(),
+                "group_reason": str(group.get("group_reason", "")).strip(),
+            }
+            candidate_clip_ids = [str(value).strip() for value in group.get("candidate_clip_ids", []) if str(value).strip()]
+            group_annotations = [
+                annotations_by_id[clip_id]
+                for clip_id in candidate_clip_ids
+                if clip_id in annotations_by_id and not bool(annotations_by_id[clip_id].get("fallback_used"))
+            ]
+            print(
+                "[propose-group-pairs] group "
+                f"{group_index}/{len(groups)} group_id={group_metadata['group_id']} "
+                f"candidate_clip_ids={len(candidate_clip_ids)} usable_annotations={len(group_annotations)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if len(group_annotations) < 4:
+                continue
+            candidates = _build_pair_candidates(root=layout["root"], annotations=group_annotations)
+            candidate_batches.append((group_index, len(groups), group_metadata, candidates, group_annotations))
+
+    for group_index, group_total, group_metadata, candidates, group_annotations in candidate_batches:
         print(
             "[propose-group-pairs] group "
-            f"{group_index}/{len(groups)} built_candidates={len(candidates)} total_candidate_count={candidate_count + len(candidates)}",
+            f"{group_index}/{group_total} built_candidates={len(candidates)} total_candidate_count={candidate_count + len(candidates)}",
             file=sys.stderr,
             flush=True,
         )
@@ -1985,6 +2405,7 @@ def propose_group_pairs(
         "clip_groups_path": str(groups_path),
         "output_path": str(output),
         "accepted_output_path": str(accepted_output),
+        "mined_candidates_path": str(mined_path) if mined_path else "",
         "group_count": len(groups),
         "annotation_count": len(annotations),
         "unique_annotation_count": len(annotations_by_id),
@@ -12147,6 +12568,14 @@ def build_parser() -> argparse.ArgumentParser:
     detective_annotate_parser.add_argument("--concurrency", type=int, default=1)
     detective_annotate_parser.add_argument("--overwrite", action="store_true")
 
+    mine_pair_candidates_parser = subparsers.add_parser("mine-pair-candidates")
+    mine_pair_candidates_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    mine_pair_candidates_parser.add_argument("--clip-annotations-path", required=True)
+    mine_pair_candidates_parser.add_argument("--clip-groups-path", required=True)
+    mine_pair_candidates_parser.add_argument("--output-path")
+    mine_pair_candidates_parser.add_argument("--report-path")
+    mine_pair_candidates_parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_MINED_PAIR_CANDIDATES)
+
     propose_pairs_parser = subparsers.add_parser("propose-pairs")
     propose_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
     propose_pairs_parser.add_argument("--clip-annotations-path", required=True)
@@ -12162,6 +12591,7 @@ def build_parser() -> argparse.ArgumentParser:
     propose_group_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
     propose_group_pairs_parser.add_argument("--clip-annotations-path", required=True)
     propose_group_pairs_parser.add_argument("--clip-groups-path", required=True)
+    propose_group_pairs_parser.add_argument("--mined-candidates-path")
     propose_group_pairs_parser.add_argument("--output-path")
     propose_group_pairs_parser.add_argument("--accepted-output-path")
     propose_group_pairs_parser.add_argument("--raw-index-path")
@@ -12345,6 +12775,18 @@ def main() -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
+    if args.command == "mine-pair-candidates":
+        result = mine_pair_candidates(
+            root=args.root,
+            clip_annotations_path=args.clip_annotations_path,
+            clip_groups_path=args.clip_groups_path,
+            output_path=args.output_path,
+            report_path=args.report_path,
+            max_candidates=args.max_candidates,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
     if args.command == "propose-pairs":
         result = propose_pairs(
             root=args.root,
@@ -12366,6 +12808,7 @@ def main() -> None:
             root=args.root,
             clip_annotations_path=args.clip_annotations_path,
             clip_groups_path=args.clip_groups_path,
+            mined_candidates_path=args.mined_candidates_path,
             output_path=args.output_path,
             accepted_output_path=args.accepted_output_path,
             raw_index_path=args.raw_index_path,

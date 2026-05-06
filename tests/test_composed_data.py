@@ -54,6 +54,7 @@ from app.composed_data import (
     extract_clips,
     index_raw_sources,
     main as composed_data_main,
+    mine_pair_candidates,
     plan_audio_edits,
     plan_detective_event_clips,
     plan_stable_omni_clips,
@@ -1572,6 +1573,209 @@ class ComposedDataTests(unittest.TestCase):
             self.assertGreaterEqual(len(candidates), 1)
             self.assertNotIn("visual_near_duplicate_score", candidates[0]["quality"])
 
+    def test_mine_pair_candidates_writes_local_candidate_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "captions" / "detective_annotations.jsonl"
+            annotations = []
+            for clip_id, count, action in (
+                ("clip_ref", 1, "resting"),
+                ("clip_target", 2, "resting"),
+                ("clip_neg1", 1, "stretching"),
+                ("clip_neg2", 1, "sitting"),
+            ):
+                annotations.append(
+                    {
+                        "clip_id": clip_id,
+                        "output_path": f"clips/{clip_id}.mp4",
+                        "source_asset_id": "source_cat",
+                        "source_path": "raw/cats.mp4",
+                        "source_clip": {"start_seconds": 0.0, "end_seconds": 8.0},
+                        "summary": f"{count} orange cat {action} on a sofa",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": count},
+                        "actions": [action],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "modalities": ["visual", "audio"],
+                        "fallback_used": False,
+                    }
+                )
+            self._write_jsonl(annotations_path, annotations)
+            groups_path = root / "metadata" / "clip_groups.jsonl"
+            self._write_jsonl(
+                groups_path,
+                [
+                    {
+                        "group_id": "group_cat_room",
+                        "group_reason": "same_source_video",
+                        "candidate_clip_ids": ["clip_ref", "clip_target", "clip_neg1", "clip_neg2"],
+                    }
+                ],
+            )
+
+            summary = mine_pair_candidates(
+                root=root,
+                clip_annotations_path=annotations_path,
+                clip_groups_path=groups_path,
+                output_path=root / "pairs" / "mined_pair_candidates.jsonl",
+                report_path=root / "reports" / "candidate_mining_report.md",
+                max_candidates=20,
+            )
+
+            records = [
+                json.loads(line)
+                for line in (root / "pairs" / "mined_pair_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertGreaterEqual(summary["candidate_count"], 1)
+            self.assertGreaterEqual(len(records), 1)
+            self.assertIn("candidate_id", records[0])
+            self.assertIn("reference_clip_id", records[0])
+            self.assertIn("target_clip_id", records[0])
+            self.assertIn("single_delta_score", records[0]["scores"])
+            self.assertTrue((root / "reports" / "candidate_mining_report.md").exists())
+            self.assertIn("Candidate Mining Report", (root / "reports" / "candidate_mining_report.md").read_text(encoding="utf-8"))
+
+    def test_propose_group_pairs_uses_mined_candidates_without_rebuilding_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("clip_ref.mp4", "clip_target.mp4", "clip_neg1.mp4", "clip_neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+            annotations_path = root / "captions" / "detective_annotations.jsonl"
+            annotations = []
+            for clip_id, output_path, count in (
+                ("clip_ref", "clips/clip_ref.mp4", 1),
+                ("clip_target", "clips/clip_target.mp4", 2),
+                ("clip_neg1", "clips/clip_neg1.mp4", 1),
+                ("clip_neg2", "clips/clip_neg2.mp4", 1),
+            ):
+                annotations.append(
+                    {
+                        "clip_id": clip_id,
+                        "output_path": output_path,
+                        "source_asset_id": "source_cat",
+                        "source_path": "raw/cats.mp4",
+                        "summary": f"{count} orange cat resting on a sofa",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": count},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "modalities": ["visual", "audio"],
+                        "fallback_used": False,
+                    }
+                )
+            self._write_jsonl(annotations_path, annotations)
+            groups_path = root / "metadata" / "clip_groups.jsonl"
+            self._write_jsonl(
+                groups_path,
+                [
+                    {
+                        "group_id": "group_cat_room",
+                        "group_reason": "same_source_video",
+                        "candidate_clip_ids": ["clip_ref", "clip_target", "clip_neg1", "clip_neg2"],
+                    }
+                ],
+            )
+            mined_path = root / "pairs" / "mined_pair_candidates.jsonl"
+            mine_pair_candidates(
+                root=root,
+                clip_annotations_path=annotations_path,
+                clip_groups_path=groups_path,
+                output_path=mined_path,
+                report_path=root / "reports" / "candidate_mining_report.md",
+                max_candidates=10,
+            )
+
+            with mock.patch("app.composed_data._build_pair_candidates", side_effect=AssertionError), mock.patch(
+                "app.composed_data.OpenAIComposedDataClient"
+            ) as client_cls:
+                client_cls.return_value.propose_pair.return_value = (
+                    {
+                        "edit_text": "change the number of cat from 1 to 2",
+                        "modalities": ["visual", "audio"],
+                        "reference_caption": "one orange cat resting on a sofa",
+                        "target_caption": "two orange cats resting on a sofa",
+                        "difference": {
+                            "type": "object_count",
+                            "from": "1 cat",
+                            "to": "2 cat",
+                            "description": "the count of cat changes from 1 to 2",
+                        },
+                        "proposal_reason": "mined object_count candidate",
+                    },
+                    {"provider": "mock"},
+                )
+                client_cls.return_value.judge_pair.return_value = (
+                    {
+                        "reference_satisfies_edit": False,
+                        "target_satisfies_edit": True,
+                        "single_main_difference": True,
+                        "same_context_score": 0.82,
+                        "edit_match_score": 0.91,
+                        "target_uniqueness_score": 0.86,
+                        "audio_required": False,
+                        "hard_negative_quality": "good",
+                        "accept": True,
+                        "reject_reason": "",
+                    },
+                    {"provider": "mock-judge"},
+                )
+                client_cls.return_value.verify_pair_difference.return_value = (
+                    {
+                        "caption_delta": {
+                            "caption_equivalent": False,
+                            "has_concrete_difference": True,
+                            "difference_matches_edit": True,
+                            "concrete_differences": ["one cat becomes two cats"],
+                            "reason": "cat count changes",
+                        },
+                        "edit_projection": {
+                            "projected_target_caption": "two orange cats resting on a sofa",
+                            "target_matches_projection": True,
+                            "score": 0.92,
+                            "missing_requirements": [],
+                            "reason": "projection matches",
+                        },
+                        "edit_necessity": {
+                            "edit_needed": True,
+                            "reference_satisfies_edit": False,
+                            "target_satisfies_edit": True,
+                            "score": 0.9,
+                            "reason": "reference only has one cat",
+                        },
+                    },
+                    {"provider": "mock-verification"},
+                )
+
+                summary = propose_group_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    clip_groups_path=groups_path,
+                    mined_candidates_path=mined_path,
+                    output_path=root / "pairs" / "judged_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    max_proposals=1,
+                )
+
+            self.assertEqual(str(mined_path), summary["mined_candidates_path"])
+            self.assertEqual(1, summary["proposal_count"])
+            client_cls.return_value.propose_pair.assert_called_once()
+
     def test_propose_group_pairs_rejects_caption_equivalent_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1746,6 +1950,8 @@ class ComposedDataTests(unittest.TestCase):
             "/tmp/annotations.jsonl",
             "--clip-groups-path",
             "/tmp/groups.jsonl",
+            "--mined-candidates-path",
+            "/tmp/mined.jsonl",
             "--base-url",
             "http://127.0.0.1:8093/v1",
             "--api-key",
@@ -1768,6 +1974,7 @@ class ComposedDataTests(unittest.TestCase):
         self.assertEqual(7, propose_mock.call_args.kwargs["max_accepted_pairs"])
         self.assertEqual(11, propose_mock.call_args.kwargs["max_proposals"])
         self.assertEqual(66.0, propose_mock.call_args.kwargs["timeout_seconds"])
+        self.assertEqual("/tmp/mined.jsonl", propose_mock.call_args.kwargs["mined_candidates_path"])
 
     def test_compose_reject_reason_includes_threshold_failures(self) -> None:
         judge = {

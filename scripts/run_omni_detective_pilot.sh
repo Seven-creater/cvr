@@ -18,8 +18,10 @@ SEGMENT_SECONDS=${SEGMENT_SECONDS:-8}
 CONCURRENCY=${CONCURRENCY:-1}
 MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-10}
 MAX_PROPOSALS=${MAX_PROPOSALS:-40}
+MAX_MINED_CANDIDATES=${MAX_MINED_CANDIDATES:-240}
 ANNOTATION_MAX_PASSES=${ANNOTATION_MAX_PASSES:-3}
 ANNOTATION_PASS_TIMEOUT_SECONDS=${ANNOTATION_PASS_TIMEOUT_SECONDS:-900}
+MINE_CANDIDATES_TIMEOUT_SECONDS=${MINE_CANDIDATES_TIMEOUT_SECONDS:-120}
 PROPOSE_TIMEOUT_SECONDS=${PROPOSE_TIMEOUT_SECONDS:-900}
 PAIR_REQUEST_TIMEOUT_SECONDS=${PAIR_REQUEST_TIMEOUT_SECONDS:-90}
 START_STAGE=${START_STAGE:-plan}
@@ -43,11 +45,13 @@ Options:
   --concurrency N
   --max-accepted-pairs N
   --max-proposals N
+  --max-mined-candidates N
   --annotation-max-passes N
   --annotation-pass-timeout-seconds N
+  --mine-candidates-timeout-seconds N
   --propose-timeout-seconds N
   --pair-request-timeout-seconds N
-  --start-stage plan|extract|annotate|propose|validate|review
+  --start-stage plan|extract|annotate|mine-candidates|propose|validate|review
   --allow-partial-annotations
   --model-stage VALUE
   --gpu-ids IDS
@@ -98,12 +102,20 @@ while [[ $# -gt 0 ]]; do
       MAX_PROPOSALS="$2"
       shift 2
       ;;
+    --max-mined-candidates)
+      MAX_MINED_CANDIDATES="$2"
+      shift 2
+      ;;
     --annotation-max-passes)
       ANNOTATION_MAX_PASSES="$2"
       shift 2
       ;;
     --annotation-pass-timeout-seconds)
       ANNOTATION_PASS_TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
+    --mine-candidates-timeout-seconds)
+      MINE_CANDIDATES_TIMEOUT_SECONDS="$2"
       shift 2
       ;;
     --propose-timeout-seconds)
@@ -164,9 +176,10 @@ stage_rank() {
     plan) echo 1 ;;
     extract) echo 2 ;;
     annotate) echo 3 ;;
-    propose) echo 4 ;;
-    validate) echo 5 ;;
-    review) echo 6 ;;
+    mine-candidates) echo 4 ;;
+    propose) echo 5 ;;
+    validate) echo 6 ;;
+    review) echo 7 ;;
     *)
       echo "[omni-detective] unsupported start stage: $1" >&2
       exit 2
@@ -274,9 +287,13 @@ echo "[omni-detective] model=$MODEL"
 echo "[resource-policy] one Omni model per run; do not keep Captioner/Instruct/Thinking loaded together"
 echo "[resource-policy] model_stage=$MODEL_STAGE gpu_ids=${GPU_IDS:-unset} gpu_count=$GPU_COUNT max_gpus=$MAX_GPUS"
 echo "[omni-detective] start_stage=$START_STAGE"
-echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS annotation_max_passes=$ANNOTATION_MAX_PASSES annotation_pass_timeout_seconds=$ANNOTATION_PASS_TIMEOUT_SECONDS propose_timeout_seconds=$PROPOSE_TIMEOUT_SECONDS pair_request_timeout_seconds=$PAIR_REQUEST_TIMEOUT_SECONDS allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
-curl -fsS "$BASE_URL/models"
-echo
+echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS max_mined_candidates=$MAX_MINED_CANDIDATES annotation_max_passes=$ANNOTATION_MAX_PASSES annotation_pass_timeout_seconds=$ANNOTATION_PASS_TIMEOUT_SECONDS mine_candidates_timeout_seconds=$MINE_CANDIDATES_TIMEOUT_SECONDS propose_timeout_seconds=$PROPOSE_TIMEOUT_SECONDS pair_request_timeout_seconds=$PAIR_REQUEST_TIMEOUT_SECONDS allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
+if stage_enabled "annotate" || { stage_enabled "propose" && [ "$MAX_PROPOSALS" != "0" ]; }; then
+  curl -fsS "$BASE_URL/models"
+  echo
+else
+  echo "[omni-detective] skip Omni model probe; current stage selection does not need model calls"
+fi
 
 if stage_enabled "plan"; then
   python -m app.composed_data plan-detective-clips \
@@ -366,6 +383,41 @@ if [ "$ANNOTATION_DONE_COUNT" -lt "$ANNOTATION_TARGET_COUNT" ] && [ "$ALLOW_PART
   exit 3
 fi
 
+run_mine_candidates() {
+  set +e
+  run_with_timeout "mine-pair-candidates" "$MINE_CANDIDATES_TIMEOUT_SECONDS" \
+  python -m app.composed_data mine-pair-candidates \
+    --root "$ROOT" \
+    --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
+    --clip-groups-path "$RUN_ROOT/clip_groups.jsonl" \
+    --output-path "$RUN_ROOT/mined_pair_candidates.jsonl" \
+    --report-path "$RUN_ROOT/candidate_mining_report.md" \
+    --max-candidates "$MAX_MINED_CANDIDATES"
+  MINE_STATUS=$?
+  set -e
+  MINED_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/mined_pair_candidates.jsonl")
+  echo "[omni-detective] mine-candidates exit=$MINE_STATUS mined_rows=$MINED_ROW_COUNT"
+  if [ "$MINE_STATUS" -ne 0 ]; then
+    echo "[omni-detective] mine-candidates failed or timed out; report this status immediately instead of waiting" >&2
+    exit "$MINE_STATUS"
+  fi
+}
+
+if stage_enabled "mine-candidates"; then
+  run_mine_candidates
+  echo "[omni-detective] candidate mining done $(date)"
+else
+  if [ "$START_STAGE" = "propose" ] && [ ! -s "$RUN_ROOT/mined_pair_candidates.jsonl" ]; then
+    echo "[omni-detective] mined candidates missing for start_stage=propose; running local mine-candidates prerequisite"
+    run_mine_candidates
+  elif stage_enabled "propose"; then
+    require_file "$RUN_ROOT/mined_pair_candidates.jsonl" "mined pair candidates"
+    echo "[omni-detective] skip candidate mining start_stage=$START_STAGE"
+  else
+    echo "[omni-detective] skip candidate mining start_stage=$START_STAGE"
+  fi
+fi
+
 if stage_enabled "propose"; then
   set +e
   run_with_timeout "propose-group-pairs" "$PROPOSE_TIMEOUT_SECONDS" \
@@ -373,6 +425,7 @@ if stage_enabled "propose"; then
     --root "$ROOT" \
     --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
     --clip-groups-path "$RUN_ROOT/clip_groups.jsonl" \
+    --mined-candidates-path "$RUN_ROOT/mined_pair_candidates.jsonl" \
     --output-path "$RUN_ROOT/judged_pair_proposals.jsonl" \
     --accepted-output-path "$RUN_ROOT/accepted_pairs.jsonl" \
     --base-url "$BASE_URL" \
@@ -405,6 +458,17 @@ if stage_enabled "validate"; then
       --pilot-jsonl-path "$RUN_ROOT/accepted_pairs.jsonl" \
       --gallery-output-path "$RUN_ROOT/gallery.jsonl" \
       --report-output-path "$RUN_ROOT/pilot_review.md"
+    if [ -s "$RUN_ROOT/candidate_mining_report.md" ] && ! grep -q '^## Candidate Funnel$' "$RUN_ROOT/pilot_review.md"; then
+      {
+        echo
+        echo "## Candidate Funnel"
+        echo
+        echo "- mined_pair_candidates: \`$(jsonl_row_count "$RUN_ROOT/mined_pair_candidates.jsonl")\`"
+        echo "- candidate_mining_report: \`$RUN_ROOT/candidate_mining_report.md\`"
+        echo
+        sed -n '1,80p' "$RUN_ROOT/candidate_mining_report.md"
+      } >> "$RUN_ROOT/pilot_review.md"
+    fi
   else
     echo "[omni-detective] no accepted pairs; skip validate-pilot"
   fi
@@ -431,6 +495,8 @@ ls -lh "$RUN_ROOT/clip_plan_detective.jsonl" || true
 ls -lh "$RUN_ROOT/clip_groups.jsonl" || true
 ls -lh "$RUN_ROOT/extracted_event_clips.jsonl" || true
 ls -lh "$RUN_ROOT/detective_annotations.jsonl" || true
+ls -lh "$RUN_ROOT/mined_pair_candidates.jsonl" || true
+ls -lh "$RUN_ROOT/candidate_mining_report.md" || true
 ls -lh "$RUN_ROOT/judged_pair_proposals.jsonl" || true
 ls -lh "$RUN_ROOT/accepted_pairs.jsonl" || true
 ls -lh "$RUN_ROOT/gallery.jsonl" || true
