@@ -1140,7 +1140,7 @@ def semantic_family(pair: dict) -> str:
         return "object_replacement"
     return ""
 
-def semantic_requirements_for_family(family: str) -> list[str]:
+def semantic_requirements_for_family(family: str) -> list:
     if family == "black_jacket":
         return [
             "target must show an open black long-sleeved jacket",
