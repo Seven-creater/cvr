@@ -20,6 +20,14 @@ src_video + src_mask + optional src_ref_images + target prompt -> VACE target
 
 其中 `src_mask` 白区是生成区域，黑区是保留区域；`src_video` 的编辑区域需要置灰为 127；prompt 应描述目标视频，而不是写操作指令。
 
+截至 `fcbf033 Repair background replacement prompt conflicts`，当前已经完成三类关键修复：
+
+1. **输入契约修复**：VACE 输入强制 exact-frame，`reference/src_video/src_mask` 对齐到 `81f@16fps`，避免 5 秒输入生成 9 秒 target。
+2. **诚实验收修复**：duration gate、mask provenance gate、semantic gate、review bundle completeness gate 已经能拦住假阳性。
+3. **background replacement prompt 修复**：planner 不再把 source 背景词和 preserve locks 带进 VACE prompt，避免 “换成 lab” 和 “保留 sunlit room/window/door/layout/lighting” 互相打架。
+
+当前还没有证明 VACE 能稳定产出可收样本。下一步不是扩大跑批，而是服务器拉到 `fcbf033` 后，先复跑 **1 条** background smoke，验证新 prompt 是否能从 “蓝色 overlay” 变成真正的背景替换。
+
 参考：
 
 - VACE User Guide: https://github.com/ali-vilab/VACE/blob/main/UserGuide.md
@@ -49,11 +57,18 @@ PLAN_RUN: /data02/usr/wangqihao/Demo/test/cvr_clean_main/runs/omni_stable_all_ca
 
 ```text
 branch: codex/vace-pipeline-hardening
-本地 HEAD: 持续在 codex/vace-pipeline-hardening 上追加 hardening commit
-状态: 本地可能 ahead origin；服务器执行前必须先 git fetch / pull 最新可见远端
+远端 HEAD: fcbf033 Repair background replacement prompt conflicts
+状态: 本地与 origin/codex/vace-pipeline-hardening 已同步
 ```
 
-如果本机 DNS/SSH 暂时无法解析 GitHub，最新本地 commit 可能尚未推送。服务器 AI 不应根据旧 commit 结论继续跑实验，必须先确认远端 HEAD。
+服务器执行前必须先 `git fetch` / `git pull --ff-only`，并确认：
+
+```text
+git rev-parse --short HEAD
+fcbf033
+```
+
+如果不是 `fcbf033` 或更新提交，不要继续跑 VACE。
 
 ## 3. 数据与 plan 进展
 
@@ -176,15 +191,10 @@ checkpoint["model"]
 
 ```text
 ffb8a3d Prefer torch GroundingDINO checkpoints
-```
-
-本地未推送修复：
-
-```text
 2d1fc41 Fallback from HF GroundingDINO checkpoints
 ```
 
-`2d1fc41` 的作用是：`--grounder auto` 遇到 HF 格式 GroundingDINO checkpoint 时自动退到 Florence-2。服务器执行前需要确认远端是否已经包含这个 commit；如果没有，仍应显式使用 `--grounder florence2`。
+`2d1fc41` 的作用是：`--grounder auto` 遇到 HF 格式 GroundingDINO checkpoint 时自动退到 Florence-2。服务器拉到 `fcbf033` 后已经包含这个 fallback。注意：这不是让 GroundingDINO 变可用，而是避免 `auto` 因错误 checkpoint 格式直接崩溃。
 
 ### 4.5 background replacement prompt 冲突修复
 
@@ -221,6 +231,30 @@ A woman with curly red hair and glasses speaks to the camera in a clean blue-whi
 ```
 
 旧 plan 或旧 review bundle 只要仍包含 `sunlit room/window/door/layout/lighting` 这类 source 背景锁，就必须被 plan lint / smoke preflight 拒绝，不能进入 VACE。
+
+这次修复落在：
+
+- `app/composed_data.py`
+  - 新增 background replacement 判定与 deterministic repair。
+  - 重写 target prompt、preserve tokens、preserve regions、negative prompt、risk locks。
+  - plan lint 拒绝 source 背景词和 layout/lighting preserve lock。
+- `scripts/run_vace_visual_synthetic_smoke.sh`
+  - 对旧 plan 增加 smoke preflight lint，防止复用冲突 plan。
+- `tests/test_composed_data.py`
+  - 增加 background prompt 冲突回归测试。
+- `tests/test_scripts.py`
+  - 确认 smoke script 包含 background prompt 冲突拦截。
+
+本地验证结果：
+
+```text
+git diff --check: OK
+bash -n scripts/run_vace_visual_synthetic_smoke.sh: OK
+python -m unittest tests.test_scripts tests.test_composed_data -v: 180 OK, 2 skipped
+python -m unittest discover -s tests -v: 214 OK, 2 skipped, 1 error
+```
+
+全量测试唯一 error 是本地 `.venv` 缺少 `torch`，失败点在 `tests/test_avigate_official.py`，与 VACE hardening 修改无关。
 
 ## 5. 当前遇到的问题
 
@@ -318,10 +352,10 @@ subject_preserved_but_edit_failed
 
 ```text
 --grounder groundingdino 不能用
---grounder auto 在 ffb8a3d 上仍可能碰到 HF checkpoint 格式问题
+--grounder auto 在 fcbf033 上会遇到 HF checkpoint 格式时 fallback 到 Florence-2
 ```
 
-在 `2d1fc41` 推送前，服务器应显式使用：
+如果服务器没有拉到 `fcbf033`，仍应显式使用：
 
 ```text
 --grounder florence2
@@ -340,25 +374,49 @@ subject_preserved_but_edit_failed
 
 ## 6. 当前推荐下一步
 
-### 6.1 服务器今晚应执行的方向
+### 6.1 服务器下一步执行方向
 
-不要跑 VACE，只重跑 mask smoke。
-
-如果服务器只能拉到 `ffb8a3d`：
+先不要扩大跑批。服务器只做一条 smoke 验证：
 
 ```text
-显式使用 --grounder florence2
-不要使用 --grounder auto
-不要使用 --grounder groundingdino
+plan: ef8f2818
+task: woman background -> futuristic laboratory
+目的: 验证 fcbf033 的 prompt/preserve 修复是否解决 mannul5 的 blue overlay / original room retained 问题
 ```
 
-如果之后本地 `2d1fc41` 成功推送到 GitHub，服务器再拉最新后可以恢复：
+执行前必须：
 
 ```text
---grounder auto
+git fetch origin
+git checkout codex/vace-pipeline-hardening
+git pull --ff-only origin codex/vace-pipeline-hardening
+git rev-parse --short HEAD
 ```
 
-因为那时 auto 会自动识别 HF checkpoint 并退到 Florence-2。
+期望 HEAD：
+
+```text
+fcbf033
+```
+
+然后跑：
+
+```text
+python -m unittest tests.test_scripts tests.test_composed_data -v
+```
+
+如果测试通过，再重新生成 ef8f2818 的 plan。不要复用 mannul5 的旧 plan，也不要复用旧 review bundle。
+
+新 plan 必须人工/脚本确认：
+
+```text
+target_prompt 不含 sunlit room / window / door / original room / source background
+preserve_tokens 不含 sunlit room / lighting / layout / room / window / door
+preserve_regions 不含 window / door / room / wall / background
+VACE prompt 是最终状态描述，不是 “in a sunlit room with lab background”
+```
+
+只有这些都通过，再走 mask / src_ref / preflight / VACE，且只跑 1 条 smoke。
 
 ### 6.2 mask smoke 验收字段
 
@@ -392,6 +450,8 @@ failure_reason
 - 不要继续跑 chair/stool。
 - 不要给 GroundingDINO 下载或硬塞 HF checkpoint。
 - 不要在 mask 全失败时跑 VACE。
+- 不要复用 mannul5 的旧 plan 或旧 bundle。
+- 不要把 blue overlay / original room retained 的背景样本标成成功。
 
 ## 7. 当前判断
 
@@ -411,9 +471,11 @@ failure_reason
 
 现在这些问题大部分已经被 gate 拦截。下一步的关键不是继续盲跑 VACE，而是：
 
-1. 在现有 35 个 plan 里找到能稳定生成 mask 的少数样本。
-2. 如果 Florence-2 + SAM2.1 对真实视频仍然全失败，切换到更简单的 synthetic route：
+1. 先用 `fcbf033` 重新生成 ef8f2818 plan，验证 background replacement prompt 冲突是否消失。
+2. 如果 prompt 已修复但 VACE 仍然只做蓝色 overlay，则把 background replacement 降级为 high-risk experiment，下一步考虑 composite first-frame fallback。
+3. 在现有 35 个 plan 里继续寻找能稳定生成 mask 的少数样本。
+4. 如果 Florence-2 + SAM2.1 对真实视频仍然全失败，切换到更简单的 synthetic route：
    - deterministic audio route
    - existing large object / robot / vehicle attribute edit
    - animation / static-like video local color edit
-3. 等 mask route 有稳定通过样本，再恢复 VACE smoke。
+5. 等 mask route 有稳定通过样本，再恢复 VACE smoke。
