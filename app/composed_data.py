@@ -44,6 +44,7 @@ VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"
 ALLOWED_MODALITIES = {"visual", "audio"}
 ALLOWED_SOURCE_TYPES = {"natural", "synthetic_edit"}
 MAX_PAIR_CANDIDATES = 40
+MAX_PAIR_LOCAL_COMPARISONS = 240
 MIN_PAIR_CONTEXT_SCORE = 0.03
 MAX_PAIR_CHANGED_TYPES = 5
 MIN_PAIR_EDIT_MATCH_SCORE = 0.15
@@ -1598,12 +1599,22 @@ def propose_group_pairs(
     layout = ensure_layout(root)
     annotations_path = Path(clip_annotations_path)
     groups_path = Path(clip_groups_path)
+    print(
+        f"[propose-group-pairs] load inputs annotations_path={annotations_path} groups_path={groups_path}",
+        file=sys.stderr,
+        flush=True,
+    )
     annotations = list(_load_jsonl(annotations_path))
     groups = list(_load_jsonl(groups_path))
     if not annotations:
         raise ValueError("clip annotations are empty")
     if not groups:
         raise ValueError("clip groups are empty")
+    print(
+        f"[propose-group-pairs] loaded annotations={len(annotations)} groups={len(groups)}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     output = Path(output_path) if output_path else layout["pairs"] / "judged_pair_proposals.jsonl"
     accepted_output = Path(accepted_output_path) if accepted_output_path else layout["pairs"] / DEFAULT_ACCEPTED_PAIRS_NAME
@@ -1614,7 +1625,9 @@ def propose_group_pairs(
         _write_jsonl(output, [])
     if not accepted_output.exists():
         _write_jsonl(accepted_output, [])
+    print("[propose-group-pairs] load raw asset index", file=sys.stderr, flush=True)
     raw_index = _load_raw_asset_index(Path(raw_index_path) if raw_index_path else layout["metadata"] / DEFAULT_RAW_INDEX_NAME)
+    print(f"[propose-group-pairs] raw asset index loaded rows={len(raw_index)}", file=sys.stderr, flush=True)
     annotations_by_id: dict[str, dict[str, Any]] = {}
     duplicate_annotation_count = 0
     for item in annotations:
@@ -1646,7 +1659,7 @@ def propose_group_pairs(
         _write_jsonl(output, output_records)
         _write_jsonl(accepted_output, current_accepted)
 
-    for group in groups:
+    for group_index, group in enumerate(groups, start=1):
         group_metadata = {
             "group_id": str(group.get("group_id", "")).strip(),
             "group_reason": str(group.get("group_reason", "")).strip(),
@@ -1657,9 +1670,22 @@ def propose_group_pairs(
             for clip_id in candidate_clip_ids
             if clip_id in annotations_by_id and not bool(annotations_by_id[clip_id].get("fallback_used"))
         ]
+        print(
+            "[propose-group-pairs] group "
+            f"{group_index}/{len(groups)} group_id={group_metadata['group_id']} "
+            f"candidate_clip_ids={len(candidate_clip_ids)} usable_annotations={len(group_annotations)}",
+            file=sys.stderr,
+            flush=True,
+        )
         if len(group_annotations) < 4:
             continue
         candidates = _build_pair_candidates(root=layout["root"], annotations=group_annotations)
+        print(
+            "[propose-group-pairs] group "
+            f"{group_index}/{len(groups)} built_candidates={len(candidates)} total_candidate_count={candidate_count + len(candidates)}",
+            file=sys.stderr,
+            flush=True,
+        )
         candidate_count += len(candidates)
         for candidate in candidates:
             if max_proposals is not None and len(output_records) >= max_proposals:
@@ -4693,16 +4719,50 @@ def _validate_pilot_record(root: Path, record: dict[str, Any], line_number: int)
 
 def _build_pair_candidates(*, root: Path, annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     eligible = [annotation for annotation in annotations if _annotation_has_signal(annotation)]
+    eligible.sort(key=lambda annotation: (-_annotation_pairing_signal_score(annotation), str(annotation.get("clip_id", ""))))
     candidates: list[dict[str, Any]] = []
+    comparison_count = 0
     for left_index, left in enumerate(eligible):
         for right in eligible[left_index + 1 :]:
-            forward = _score_ordered_pair(root=root, reference_annotation=left, target_annotation=right, annotations=eligible)
-            backward = _score_ordered_pair(root=root, reference_annotation=right, target_annotation=left, annotations=eligible)
+            if comparison_count >= MAX_PAIR_LOCAL_COMPARISONS:
+                break
+            comparison_count += 1
+            forward = _score_ordered_pair(
+                root=root,
+                reference_annotation=left,
+                target_annotation=right,
+                annotations=eligible,
+                compute_visual_near_duplicate=False,
+            )
+            backward = _score_ordered_pair(
+                root=root,
+                reference_annotation=right,
+                target_annotation=left,
+                annotations=eligible,
+                compute_visual_near_duplicate=False,
+            )
             chosen = _select_better_pair(forward, backward)
             if chosen is not None:
                 candidates.append(chosen)
+        if comparison_count >= MAX_PAIR_LOCAL_COMPARISONS:
+            break
     candidates.sort(key=lambda item: (-item["composite_score"], item["proposal_id"]))
     return _select_diverse_pair_candidates(candidates, max_candidates=MAX_PAIR_CANDIDATES)
+
+
+def _annotation_pairing_signal_score(annotation: dict[str, Any]) -> float:
+    score = 0.0
+    if _non_speech_audio_terms(annotation):
+        score += 5.0
+    if _speech_texts_from_annotation(annotation):
+        score += 4.0
+    if _visible_text_values(annotation):
+        score += 4.0
+    score += min(3.0, len(_normalize_object_counts(annotation.get("object_counts", {}))) * 0.5)
+    score += min(2.0, len(_action_terms_from_annotation(annotation)) * 0.4)
+    score += min(2.0, len(_normalize_list(annotation.get("attributes", []))) * 0.25)
+    score += min(1.0, len(_normalize_list(annotation.get("storyline", []))) * 0.2)
+    return score
 
 
 def _select_diverse_pair_candidates(
@@ -5974,6 +6034,8 @@ def _carry_local_gate_quality(target_quality: dict[str, Any], source_quality: di
         "too_similar_without_observable_delta",
         "too_broad_or_loose_pair",
         "ocr_template_risk",
+        "audio_event_too_similar",
+        "visible_text_fragment_edit",
         "competing_difference_passed",
         "audio_event_independent_evidence_passed",
         "synthetic_context_override",
@@ -6022,6 +6084,7 @@ def _score_ordered_pair(
     reference_annotation: dict[str, Any],
     target_annotation: dict[str, Any],
     annotations: list[dict[str, Any]],
+    compute_visual_near_duplicate: bool = False,
 ) -> dict[str, Any] | None:
     if reference_annotation["clip_id"] == target_annotation["clip_id"]:
         return None
@@ -6071,10 +6134,12 @@ def _score_ordered_pair(
         annotations=annotations,
         primary_difference=primary_difference,
     )
-    visual_near_duplicate_score = _visual_near_duplicate_score(
-        _resolve_under_root(root, reference_annotation["output_path"]),
-        _resolve_under_root(root, target_annotation["output_path"]),
-    )
+    visual_near_duplicate_score = None
+    if compute_visual_near_duplicate:
+        visual_near_duplicate_score = _visual_near_duplicate_score(
+            _resolve_under_root(root, reference_annotation["output_path"]),
+            _resolve_under_root(root, target_annotation["output_path"]),
+        )
     hard_negative_paths = [
         _display_path(root, _resolve_under_root(root, annotation["output_path"])) for annotation in hard_negative_annotations[:3]
     ]
@@ -12296,6 +12361,7 @@ def main() -> None:
         return
 
     if args.command == "propose-group-pairs":
+        print("[propose-group-pairs] cli enter", file=sys.stderr, flush=True)
         result = propose_group_pairs(
             root=args.root,
             clip_annotations_path=args.clip_annotations_path,

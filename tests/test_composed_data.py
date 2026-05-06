@@ -1533,6 +1533,45 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(records[0]["raw_verification_output"]["skipped"])
             client_cls.return_value.verify_pair_difference.assert_not_called()
 
+    def test_build_pair_candidates_skips_expensive_visual_near_duplicate_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations = []
+            for clip_id, count in (
+                ("clip_ref", 1),
+                ("clip_target", 2),
+                ("clip_neg1", 1),
+                ("clip_neg2", 1),
+            ):
+                annotations.append(
+                    {
+                        "clip_id": clip_id,
+                        "output_path": f"clips/{clip_id}.mp4",
+                        "source_asset_id": "source_cat",
+                        "start_seconds": 0.0,
+                        "end_seconds": 8.0,
+                        "summary": f"{count} orange cat resting on a sofa",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": count},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "modalities": ["visual", "audio"],
+                        "fallback_used": False,
+                    }
+                )
+
+            with mock.patch("app.composed_data._visual_near_duplicate_score", side_effect=AssertionError):
+                candidates = _build_pair_candidates(root=root, annotations=annotations)
+
+            self.assertGreaterEqual(len(candidates), 1)
+            self.assertNotIn("visual_near_duplicate_score", candidates[0]["quality"])
+
     def test_propose_group_pairs_rejects_caption_equivalent_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

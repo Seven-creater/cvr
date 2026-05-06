@@ -50,6 +50,13 @@ logs, use a shorter pair-request timeout, and skip expensive video verification
 for candidates already rejected by judge/local precheck. Rejected rows should now
 be persisted quickly instead of leaving 0-byte proposal files.
 
+`2a923e5` then showed the process could still time out before the first proposal
+heartbeat. That means the stall was earlier, inside local group/candidate
+construction. The latest fix moves heartbeats to CLI/function/group entry,
+caps local pair comparisons, and removes video near-duplicate probing from
+candidate construction. Near-duplicate/video checks should happen only after
+cheap annotation gates and Omni judge have narrowed the candidate set.
+
 ## Mannul Boundary Table
 
 | Pair | Example edit | Route decision | Main reason |
