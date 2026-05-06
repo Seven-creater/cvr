@@ -1588,6 +1588,7 @@ def propose_group_pairs(
     overwrite: bool = False,
     timeout_seconds: float = 180.0,
     max_accepted_pairs: int = 10,
+    max_proposals: int | None = None,
 ) -> dict[str, Any]:
     layout = ensure_layout(root)
     annotations_path = Path(clip_annotations_path)
@@ -1601,9 +1602,23 @@ def propose_group_pairs(
 
     output = Path(output_path) if output_path else layout["pairs"] / "judged_pair_proposals.jsonl"
     accepted_output = Path(accepted_output_path) if accepted_output_path else layout["pairs"] / DEFAULT_ACCEPTED_PAIRS_NAME
-    existing_records = {} if overwrite else _load_records_by_key(output, "proposal_id")
+    # Long pair proposal runs are model-call heavy. Preserve already written
+    # proposal rows as a resume cache even when callers pass --overwrite.
+    existing_records = _load_records_by_key(output, "proposal_id")
+    if not output.exists():
+        _write_jsonl(output, [])
+    if not accepted_output.exists():
+        _write_jsonl(accepted_output, [])
     raw_index = _load_raw_asset_index(Path(raw_index_path) if raw_index_path else layout["metadata"] / DEFAULT_RAW_INDEX_NAME)
-    annotations_by_id = {str(item.get("clip_id", "")).strip(): item for item in annotations if str(item.get("clip_id", "")).strip()}
+    annotations_by_id: dict[str, dict[str, Any]] = {}
+    duplicate_annotation_count = 0
+    for item in annotations:
+        clip_id = str(item.get("clip_id", "")).strip()
+        if not clip_id:
+            continue
+        if clip_id in annotations_by_id:
+            duplicate_annotation_count += 1
+        annotations_by_id[clip_id] = item
     client = OpenAIComposedDataClient(
         base_url=base_url,
         api_key=api_key,
@@ -1621,6 +1636,11 @@ def propose_group_pairs(
     accepted_total_count = 0
     seen_proposal_ids: set[str] = set()
 
+    def persist_progress() -> None:
+        current_accepted = _select_final_accepted_records(output_records, max_accepted_pairs=max_accepted_pairs)
+        _write_jsonl(output, output_records)
+        _write_jsonl(accepted_output, current_accepted)
+
     for group in groups:
         group_metadata = {
             "group_id": str(group.get("group_id", "")).strip(),
@@ -1637,6 +1657,8 @@ def propose_group_pairs(
         candidates = _build_pair_candidates(root=layout["root"], annotations=group_annotations)
         candidate_count += len(candidates)
         for candidate in candidates:
+            if max_proposals is not None and len(output_records) >= max_proposals:
+                break
             proposal_id = candidate["proposal_id"]
             if proposal_id in seen_proposal_ids:
                 continue
@@ -1885,6 +1907,9 @@ def propose_group_pairs(
             else:
                 rejected_count += 1
             output_records.append(record)
+            persist_progress()
+        if max_proposals is not None and len(output_records) >= max_proposals:
+            break
 
     accepted_records = _select_final_accepted_records(output_records, max_accepted_pairs=max_accepted_pairs)
     _write_jsonl(output, output_records)
@@ -1896,6 +1921,9 @@ def propose_group_pairs(
         "output_path": str(output),
         "accepted_output_path": str(accepted_output),
         "group_count": len(groups),
+        "annotation_count": len(annotations),
+        "unique_annotation_count": len(annotations_by_id),
+        "duplicate_annotation_count": duplicate_annotation_count,
         "candidate_count": candidate_count,
         "proposal_count": len(output_records),
         "accepted_count": len(accepted_records),
@@ -11972,6 +12000,7 @@ def build_parser() -> argparse.ArgumentParser:
     propose_group_pairs_parser.add_argument("--model", required=True)
     propose_group_pairs_parser.add_argument("--timeout-seconds", type=float, default=180.0)
     propose_group_pairs_parser.add_argument("--max-accepted-pairs", type=int, default=10)
+    propose_group_pairs_parser.add_argument("--max-proposals", type=int)
     propose_group_pairs_parser.add_argument("--overwrite", action="store_true")
 
     plan_video_edits_parser = subparsers.add_parser("plan-video-edits")
@@ -12174,6 +12203,7 @@ def main() -> None:
             model=args.model,
             timeout_seconds=args.timeout_seconds,
             max_accepted_pairs=args.max_accepted_pairs,
+            max_proposals=args.max_proposals,
             overwrite=args.overwrite,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))

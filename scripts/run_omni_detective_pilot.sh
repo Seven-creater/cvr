@@ -17,6 +17,7 @@ MAX_SOURCE_VIDEOS=${MAX_SOURCE_VIDEOS:-80}
 SEGMENT_SECONDS=${SEGMENT_SECONDS:-8}
 CONCURRENCY=${CONCURRENCY:-1}
 MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-10}
+MAX_PROPOSALS=${MAX_PROPOSALS:-40}
 ANNOTATION_MAX_PASSES=${ANNOTATION_MAX_PASSES:-3}
 START_STAGE=${START_STAGE:-plan}
 MODEL_STAGE=${MODEL_STAGE:-instruct}
@@ -37,6 +38,7 @@ Options:
   --segment-seconds N
   --concurrency N
   --max-accepted-pairs N
+  --max-proposals N
   --annotation-max-passes N
   --start-stage plan|extract|annotate|propose|validate|review
   --model-stage VALUE
@@ -82,6 +84,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --max-accepted-pairs)
       MAX_ACCEPTED_PAIRS="$2"
+      shift 2
+      ;;
+    --max-proposals)
+      MAX_PROPOSALS="$2"
       shift 2
       ;;
     --annotation-max-passes)
@@ -188,7 +194,7 @@ echo "[omni-detective] model=$MODEL"
 echo "[resource-policy] one Omni model per run; do not keep Captioner/Instruct/Thinking loaded together"
 echo "[resource-policy] model_stage=$MODEL_STAGE gpu_ids=${GPU_IDS:-unset} gpu_count=$GPU_COUNT max_gpus=$MAX_GPUS"
 echo "[omni-detective] start_stage=$START_STAGE"
-echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS annotation_max_passes=$ANNOTATION_MAX_PASSES"
+echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS annotation_max_passes=$ANNOTATION_MAX_PASSES"
 curl -fsS "$BASE_URL/models"
 echo
 
@@ -282,6 +288,7 @@ if stage_enabled "propose"; then
     --model "$MODEL" \
     --timeout-seconds 300 \
     --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
+    --max-proposals "$MAX_PROPOSALS" \
     --overwrite
 
   echo "[omni-detective] group proposal and judge done $(date)"

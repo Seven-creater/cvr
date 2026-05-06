@@ -13,7 +13,7 @@ Synthetic video editing remains available for controlled experiments, but it is 
 ## What Changed
 
 - `natural_pair` is the production default. `synthetic_edit` is a supplement only.
-- `run_omni_detective_pilot.sh` now exposes `--concurrency`, `--max-accepted-pairs`, `--annotation-max-passes`, and `--start-stage`, and writes a manual review bundle after accepted pairs are produced.
+- `run_omni_detective_pilot.sh` now exposes `--concurrency`, `--max-accepted-pairs`, `--max-proposals`, `--annotation-max-passes`, and `--start-stage`, and writes a manual review bundle after accepted pairs are produced.
 - Pair priority now favors audio/video fusion signals first: `audio_event`, `speech`, `visible_text`, then object/action/attribute/scene.
 - Natural pair gates now record explicit failure buckets:
   - `bad_imperative_edit_text`
@@ -61,6 +61,7 @@ nohup bash scripts/run_omni_detective_pilot.sh \
   --segment-seconds 8 \
   --concurrency 1 \
   --max-accepted-pairs 20 \
+  --max-proposals 40 \
   --annotation-max-passes 5 \
   --model-stage instruct \
   > "$RUN_ROOT/logs/omni_detective_pair.log" 2>&1 &
@@ -82,6 +83,7 @@ nohup bash scripts/run_omni_detective_pilot.sh \
   --base-url "$BASE_URL" \
   --concurrency 1 \
   --max-accepted-pairs 20 \
+  --max-proposals 40 \
   --annotation-max-passes 5 \
   --start-stage annotate \
   --model-stage instruct \
