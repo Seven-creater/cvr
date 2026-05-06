@@ -13,7 +13,7 @@ Synthetic video editing remains available for controlled experiments, but it is 
 ## What Changed
 
 - `natural_pair` is the production default. `synthetic_edit` is a supplement only.
-- `run_omni_detective_pilot.sh` now exposes `--concurrency` and `--max-accepted-pairs`, and writes a manual review bundle after accepted pairs are produced.
+- `run_omni_detective_pilot.sh` now exposes `--concurrency`, `--max-accepted-pairs`, `--annotation-max-passes`, and `--start-stage`, and writes a manual review bundle after accepted pairs are produced.
 - Pair priority now favors audio/video fusion signals first: `audio_event`, `speech`, `visible_text`, then object/action/attribute/scene.
 - Natural pair gates now record explicit failure buckets:
   - `bad_imperative_edit_text`
@@ -70,6 +70,23 @@ If annotation stops partway through, rerun the same command with the same
 `RUN_ROOT`. `detective_annotations.jsonl` is treated as a resume cache, and the
 script now retries annotation passes until the annotated row count matches
 `extracted_event_clips.jsonl` or `--annotation-max-passes` is exhausted.
+
+If planning and extraction are already done, resume directly from a later
+stage. For example:
+
+```bash
+nohup bash scripts/run_omni_detective_pilot.sh \
+  --root "$ROOT" \
+  --run-root "$RUN_ROOT" \
+  --model "$MODEL" \
+  --base-url "$BASE_URL" \
+  --concurrency 1 \
+  --max-accepted-pairs 20 \
+  --annotation-max-passes 5 \
+  --start-stage annotate \
+  --model-stage instruct \
+  > "$RUN_ROOT/logs/omni_detective_resume.log" 2>&1 &
+```
 
 Report back:
 
