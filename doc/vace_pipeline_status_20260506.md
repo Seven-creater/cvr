@@ -22,7 +22,7 @@ src_video + src_mask + optional src_ref_images + target prompt -> VACE target
 
 截至 `fcbf033 Repair background replacement prompt conflicts` 之后，又根据 `mannul6` 复跑结果确认：即使 prompt / mask / src_ref / frame 对齐全部正确，plain masked VACE 对 talking-head full background replacement 仍然只产生 blue overlay / style wash，不是真正的空间背景重构。随后 `98e0070 Disable plain background replacement VACE route` 禁用了 full background replacement 的 plain masked production route，并要求切到 composite-first-frame。
 
-最新 `mannul7` 结果证明：`vace_bg_replace_composite_first_frame_mv2v` 能把同一 woman 前景保留下来，并真实生成 futuristic laboratory 背景，而不是蓝色叠加。这是第一条 background replacement route 层面的正向 smoke。不过当前还不能直接收进 accepted synthetic pairs，因为 `duration_metrics.json` 错把 target 与 15 秒原始 reference 比较，而不是与实际 VACE 输入段 / composite source 比较。下一步必须先修 duration gate 参照，再扩 2-3 条同 route smoke。
+最新 `mannul7` 结果证明：`vace_bg_replace_composite_first_frame_mv2v` 能把同一 woman 前景保留下来，并真实生成 futuristic laboratory 背景，而不是蓝色叠加。这是第一条 background replacement route 层面的正向 smoke。随后 duration gate 参照已修正为实际 VACE 输入段 / composite source，不再拿 15 秒原始 reference 与 5 秒 target 比较；当前下一步是把这条 route 做成可重复脚本能力，并扩 2-3 条同 route smoke。
 
 当前已经完成五类关键修复：
 
@@ -30,10 +30,11 @@ src_video + src_mask + optional src_ref_images + target prompt -> VACE target
 2. **诚实验收修复**：duration gate、mask provenance gate、semantic gate、review bundle completeness gate 已经能拦住假阳性。
 3. **background replacement prompt 修复**：planner 不再把 source 背景词和 preserve locks 带进 VACE prompt，避免 “换成 lab” 和 “保留 sunlit room/window/door/layout/lighting” 互相打架。
 4. **background replacement route 降级**：full background replacement 不再允许作为 plain masked VACE production route；默认推荐切到 `vace_bg_replace_composite_first_frame_mv2v`，否则保留为 experiment-only。
-5. **composite-first-frame 初步验证**：`mannul7` 的 9/9 review bundle 完整，语义门通过；但 duration gate 元数据必须修正后才能作为正式 accepted 样本。
+5. **composite-first-frame 初步验证**：`mannul7` 的 9/9 review bundle 完整，语义门通过；duration gate 已按实际 VACE 输入段修正，允许作为 accepted 候选继续复核。
 6. **background plan 前移拒绝**：`plan_video_edits` 现在会在规划阶段直接拒绝多场景和多主体的 background scene edit，避免这类样本继续走到 mask 阶段白跑。
+7. **composite-first-frame 脚本化**：`run_vace_visual_synthetic_smoke.sh` 现在能根据 `background_replace_policy.recommended_route=vace_bg_replace_composite_first_frame_mv2v` 自动构造 `composite_frame0`、composite `src_video`、composite `src_mask` 和对应 contact sheet，不再依赖服务器手工拼接。
 
-当前只证明了一条 talking-head background replacement 可通过 composite-first-frame route 成功。下一步不是大规模跑批，而是修正 duration gate 与 accepted-pair metadata，然后小批量验证同 route 是否可复现。
+当前只证明了一条 talking-head background replacement 可通过 composite-first-frame route 成功。下一步不是大规模跑批，而是用脚本化 route 小批量验证同 route 是否可复现，并继续做 capability map：哪些编辑类型可以生产、哪些只能作为实验、哪些应自动拒绝。
 
 参考：
 
@@ -397,10 +398,17 @@ bundle 9/9 项齐全：
 - 原始 room / window / wall 结构消失，不再是 `mannul5` / `mannul6` 那种 blue overlay。
 - foreground woman 的红卷发、眼镜、姿态和说话动作基本保留。
 
-但 `duration_metrics.json` 当前有一个重要 bug：它把约 3 秒 target 与约 15 秒原始 reference 比较，导致 `duration_drift_seconds=11.961`。正确做法应该比较同一 VACE 输入段：
+早期 `duration_metrics.json` 有一个重要 bug：它把约 3 秒 target 与约 15 秒原始 reference 比较，导致 `duration_drift_seconds=11.961`。正确做法是比较同一 VACE 输入段：
 
 ```text
 reference_for_vace / composite src_video / src_mask / raw target / remux target
+```
+
+当前服务器复核结果已经修正为：
+
+```text
+duration drift = 0
+duration_gate.passed = true
 ```
 
 因此当前验收策略是：
@@ -416,7 +424,14 @@ reference_for_vace / composite src_video / src_mask / raw target / remux target
 generation.duration_metrics.duration_gate.passed=true
 ```
 
-这会防止类似 `mannul7` 的“语义成功但元数据参照错误”的样本直接进入 accepted pairs。
+这会防止类似早期 `mannul7` 的“语义成功但元数据参照错误”的样本直接进入 accepted pairs。
+
+最新脚本化要求：
+
+- `run_vace_visual_synthetic_smoke.sh` 直接支持 `vace_bg_replace_composite_first_frame_mv2v`。
+- composite route 必须有 `src_mask` 和至少 1 张 selected `src_ref_image`。
+- review bundle 必须写入 `composite_frame0.png`、`composite_src_video_contact.jpg`、`composite_src_mask_contact.jpg`。
+- frame 0 使用 `composite_frame0 + all-black mask` 作为目标空间 anchor；后续帧继续使用原前景 + 灰色背景 + 白色背景 mask。
 
 ### 5.4 GroundingDINO 当前不可用
 
@@ -457,20 +472,9 @@ generation.duration_metrics.duration_gate.passed=true
 
 ### 6.1 服务器下一步执行方向
 
-先不要扩大跑批，也不要再跑 plain masked background replacement。服务器下一步应把 `mannul7` 的后处理元数据修正为可验收格式，然后只做 2-3 条 composite-first-frame 小批量复现。
+先不要扩大跑批，也不要再跑 plain masked background replacement。服务器下一步应拉取最新 `codex/vace-pipeline-hardening`，使用脚本化 `vace_bg_replace_composite_first_frame_mv2v` 路线做 2-3 条小批量复现。
 
-第一优先级：
-
-```text
-修正 duration_metrics：
-reference_for_vace / composite src_video / src_mask / raw target / remux target 必须比较同一 VACE 输入段
-写入 generation.duration_metrics.duration_gate.passed=true
-不要用原始 15 秒 reference 与 3 秒 target 比
-```
-
-只有这个修正完成后，`mannul7` 才能作为 accepted synthetic pair 的候选。
-
-第二优先级：继续验证 composite-first-frame route：
+第一优先级：继续验证 composite-first-frame route：
 
 ```text
 plan: ef8f2818
@@ -491,7 +495,7 @@ git rev-parse --short HEAD
 
 ```text
 98e0070
-以及后续 duration gate 强制验收修复
+以及后续 composite-first-frame smoke 脚本化修复
 ```
 
 然后跑：
@@ -500,7 +504,7 @@ git rev-parse --short HEAD
 python -m unittest tests.test_scripts tests.test_composed_data -v
 ```
 
-如果测试通过，再重新生成 ef8f2818 的 plan。不要复用 mannul5/mannul6 的旧 plan，也不要复用旧 review bundle。
+如果测试通过，再重新生成 ef8f2818 或其它单场景 talking-head background_replace 的 smoke。不要复用 mannul5/mannul6 的旧 plan，也不要复用旧 review bundle。
 
 新 plan 必须人工/脚本确认：
 
@@ -585,7 +589,7 @@ failure_reason
 
 1. background replacement prompt 冲突已经修复，但 plain masked VACE 仍然失败。
 2. full background replacement 已从 plain masked VACE production route 降级。
-3. `mannul7` 已经证明 `vace_bg_replace_composite_first_frame_mv2v` 能解决 blue overlay；现在要修 duration gate 元数据并做 2-3 条复现。
+3. `mannul7` 已经证明 `vace_bg_replace_composite_first_frame_mv2v` 能解决 blue overlay；现在要用脚本化 route 做 2-3 条复现。
 4. 在现有 35 个 plan 里继续寻找能稳定生成 mask 的少数样本。
 5. 如果 Florence-2 + SAM2.1 对真实视频仍然全失败，切换到更简单的 synthetic route：
    - deterministic audio route

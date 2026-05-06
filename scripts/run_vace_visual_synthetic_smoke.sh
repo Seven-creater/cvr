@@ -145,6 +145,7 @@ from pathlib import Path
 
 VIDEO_MASK_SEMANTICS_VERSION = 3
 VIDEO_MASK_POLARITY = "white_generate_black_preserve"
+VACE_BG_REPLACE_COMPOSITE_ROUTE = "vace_bg_replace_composite_first_frame_mv2v"
 VACE_DARK_COLOR_MARKERS = {"black", "dark", "navy", "deep navy", "deep navy blue", "charcoal"}
 
 data_root = Path(sys.argv[1])
@@ -496,7 +497,12 @@ def visual_prompt_errors(plan):
         errors.append("object_replacement_breaks_support_contact")
     if is_background_replace_plan(plan):
         policy = plan.get("background_replace_policy", {}) if isinstance(plan.get("background_replace_policy"), dict) else {}
-        if os.environ.get("ALLOW_PLAIN_BACKGROUND_REPLACE", "0").strip() != "1":
+        background_route = normalize_phrase(
+            plan.get("background_replace_route", "")
+            or policy.get("recommended_route", "")
+        )
+        composite_route = normalize_phrase(VACE_BG_REPLACE_COMPOSITE_ROUTE)
+        if background_route != composite_route and os.environ.get("ALLOW_PLAIN_BACKGROUND_REPLACE", "0").strip() != "1":
             errors.append(
                 "background_replace_plain_masked_vace_disabled:"
                 + str(policy.get("recommended_route", "vace_bg_replace_composite_first_frame_mv2v"))
@@ -714,6 +720,11 @@ known_pair = {
         "mask_target_instance_alignment": mask_manifest_row.get("mask_target_instance_alignment", {}),
         "exploration_family": str(plan.get("exploration_family", "")).strip(),
         "video_edit_plan_id": plan_id,
+        "background_replace_route": str(
+            plan.get("background_replace_route")
+            or (plan.get("background_replace_policy") or {}).get("recommended_route", "")
+        ).strip(),
+        "background_replace_policy": plan.get("background_replace_policy", {}),
         "review_inputs_dir": str(out_root / "review_inputs"),
         "postprocess": {
             "audio_copied_from_reference": True,
@@ -754,6 +765,10 @@ env_values = {
     "SRC_MASK_ORIGINAL": src_mask_original,
     "SRC_REF_IMAGES": ",".join(src_ref_images),
     "SRC_REF_REQUIRED": "1" if (plan.get("src_ref_requirements") or {}).get("required") else "0",
+    "BACKGROUND_REPLACE_ROUTE": str(
+        plan.get("background_replace_route")
+        or (plan.get("background_replace_policy") or {}).get("recommended_route", "")
+    ).strip(),
     "PROMPT": prompt,
     "KNOWN_PAIRS": str(out_root / "pairs" / "synthetic_visual_candidate_pairs.jsonl"),
     "TARGET_MANIFEST": str(out_root / "metadata" / "synthetic_visual_target_manifest.jsonl"),
@@ -868,6 +883,136 @@ if [[ -n "${SRC_REF_IMAGES:-}" ]]; then
     idx=$((idx + 1))
     cp "$image_path" "$OUT_ROOT/review_inputs/src_ref_images/$(printf '%03d' "$idx")_$(basename "$image_path")" || true
   done
+fi
+
+COMPOSITE_ROUTE="vace_bg_replace_composite_first_frame_mv2v"
+if [[ "${BACKGROUND_REPLACE_ROUTE:-}" == "$COMPOSITE_ROUTE" ]]; then
+  if [[ -z "${SRC_MASK:-}" ]]; then
+    echo "[vace-smoke] composite-first-frame requires src_mask" >&2
+    exit 1
+  fi
+  if [[ -z "${SRC_REF_IMAGES:-}" ]]; then
+    echo "[vace-smoke] composite-first-frame requires at least one src_ref_image" >&2
+    exit 1
+  fi
+  IFS=',' read -r -a SRC_REF_IMAGE_ARRAY <<< "$SRC_REF_IMAGES"
+  PRIMARY_SRC_REF_IMAGE="${SRC_REF_IMAGE_ARRAY[0]}"
+  if [[ ! -s "$PRIMARY_SRC_REF_IMAGE" ]]; then
+    echo "[vace-smoke] composite-first-frame missing primary src_ref_image: $PRIMARY_SRC_REF_IMAGE" >&2
+    exit 1
+  fi
+
+  WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
+  HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$REFERENCE_VIDEO" | head -1)
+  COMPOSITE_TMP="$OUT_ROOT/metadata/composite_first_frame"
+  mkdir -p "$COMPOSITE_TMP"
+
+  REFERENCE_FRAME0="$COMPOSITE_TMP/reference_frame0.png"
+  MASK_FRAME0="$COMPOSITE_TMP/mask_frame0.png"
+  PERSON_MASK_FRAME0="$COMPOSITE_TMP/person_mask_frame0.png"
+  BACKGROUND_FRAME0="$COMPOSITE_TMP/background_frame0.png"
+  BLACK_FRAME0="$COMPOSITE_TMP/black_frame0.png"
+  COMPOSITE_FRAME0="$OUT_ROOT/review_inputs/composite_frame0.png"
+
+  ffmpeg -y -i "$REFERENCE_VIDEO" -frames:v 1 "$REFERENCE_FRAME0" \
+    > "$OUT_ROOT/logs/composite_reference_frame0.log" 2>&1 || {
+      echo "[vace-smoke] failed to extract reference frame0 for composite route" >&2
+      tail -80 "$OUT_ROOT/logs/composite_reference_frame0.log" >&2 || true
+      exit 1
+    }
+  ffmpeg -y -i "$SRC_MASK" -vf "format=gray" -frames:v 1 "$MASK_FRAME0" \
+    > "$OUT_ROOT/logs/composite_mask_frame0.log" 2>&1 || {
+      echo "[vace-smoke] failed to extract mask frame0 for composite route" >&2
+      tail -80 "$OUT_ROOT/logs/composite_mask_frame0.log" >&2 || true
+      exit 1
+    }
+  ffmpeg -y -i "$PRIMARY_SRC_REF_IMAGE" \
+    -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
+    -frames:v 1 "$BACKGROUND_FRAME0" > "$OUT_ROOT/logs/composite_background_frame0.log" 2>&1 || {
+      echo "[vace-smoke] failed to prepare background frame0 from src_ref_image" >&2
+      tail -80 "$OUT_ROOT/logs/composite_background_frame0.log" >&2 || true
+      exit 1
+    }
+  ffmpeg -y -i "$MASK_FRAME0" -vf "format=gray,negate" -frames:v 1 "$PERSON_MASK_FRAME0" \
+    > "$OUT_ROOT/logs/composite_person_mask_frame0.log" 2>&1 || {
+      echo "[vace-smoke] failed to invert mask frame0 for composite route" >&2
+      tail -80 "$OUT_ROOT/logs/composite_person_mask_frame0.log" >&2 || true
+      exit 1
+    }
+  ffmpeg -y -f lavfi -i "color=c=black:s=${WIDTH}x${HEIGHT}:r=${VACE_SOURCE_FPS}" -frames:v 1 "$BLACK_FRAME0" \
+    > "$OUT_ROOT/logs/composite_black_frame0.log" 2>&1 || {
+      echo "[vace-smoke] failed to create black frame0 for composite route" >&2
+      tail -80 "$OUT_ROOT/logs/composite_black_frame0.log" >&2 || true
+      exit 1
+    }
+  ffmpeg -y -i "$REFERENCE_FRAME0" -i "$BACKGROUND_FRAME0" -i "$PERSON_MASK_FRAME0" \
+    -filter_complex "[0:v][2:v]alphamerge[fg];[1:v][fg]overlay=format=auto[out]" \
+    -map "[out]" -frames:v 1 "$COMPOSITE_FRAME0" > "$OUT_ROOT/logs/composite_frame0.log" 2>&1 || {
+      echo "[vace-smoke] failed to build composite frame0" >&2
+      tail -80 "$OUT_ROOT/logs/composite_frame0.log" >&2 || true
+      exit 1
+    }
+
+  SRC_VIDEO_HEAD="$COMPOSITE_TMP/src_video_head.mp4"
+  SRC_VIDEO_TAIL="$COMPOSITE_TMP/src_video_tail.mp4"
+  SRC_VIDEO_CONCAT="$COMPOSITE_TMP/src_video_concat.txt"
+  SRC_VIDEO_COMPOSITE="$COMPOSITE_TMP/src_video_for_vace_composite.mp4"
+  ffmpeg -y -loop 1 -framerate "$VACE_SOURCE_FPS" -i "$COMPOSITE_FRAME0" -frames:v 1 -an \
+    -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p "$SRC_VIDEO_HEAD" \
+    > "$OUT_ROOT/logs/composite_src_video_head.log" 2>&1 || {
+      echo "[vace-smoke] failed to create composite src_video head" >&2
+      tail -80 "$OUT_ROOT/logs/composite_src_video_head.log" >&2 || true
+      exit 1
+    }
+  ffmpeg -y -i "$SRC_VIDEO_FOR_VACE" -vf "trim=start_frame=1,setpts=N/${VACE_SOURCE_FPS}/TB" -an \
+    -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p "$SRC_VIDEO_TAIL" \
+    > "$OUT_ROOT/logs/composite_src_video_tail.log" 2>&1 || {
+      echo "[vace-smoke] failed to create composite src_video tail" >&2
+      tail -80 "$OUT_ROOT/logs/composite_src_video_tail.log" >&2 || true
+      exit 1
+    }
+  printf "file '%s'\nfile '%s'\n" "$SRC_VIDEO_HEAD" "$SRC_VIDEO_TAIL" > "$SRC_VIDEO_CONCAT"
+  ffmpeg -y -f concat -safe 0 -i "$SRC_VIDEO_CONCAT" \
+    -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p "$SRC_VIDEO_COMPOSITE" \
+    > "$OUT_ROOT/logs/composite_src_video_concat.log" 2>&1 || {
+      echo "[vace-smoke] failed to concat composite src_video" >&2
+      tail -80 "$OUT_ROOT/logs/composite_src_video_concat.log" >&2 || true
+      exit 1
+    }
+  mv "$SRC_VIDEO_COMPOSITE" "$SRC_VIDEO_FOR_VACE"
+
+  SRC_MASK_HEAD="$COMPOSITE_TMP/src_mask_head.mp4"
+  SRC_MASK_TAIL="$COMPOSITE_TMP/src_mask_tail.mp4"
+  SRC_MASK_CONCAT="$COMPOSITE_TMP/src_mask_concat.txt"
+  SRC_MASK_COMPOSITE="$COMPOSITE_TMP/src_mask_for_vace_composite.mp4"
+  ffmpeg -y -loop 1 -framerate "$VACE_SOURCE_FPS" -i "$BLACK_FRAME0" -frames:v 1 -an \
+    -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p "$SRC_MASK_HEAD" \
+    > "$OUT_ROOT/logs/composite_src_mask_head.log" 2>&1 || {
+      echo "[vace-smoke] failed to create composite src_mask head" >&2
+      tail -80 "$OUT_ROOT/logs/composite_src_mask_head.log" >&2 || true
+      exit 1
+    }
+  ffmpeg -y -i "$SRC_MASK" -vf "trim=start_frame=1,setpts=N/${VACE_SOURCE_FPS}/TB" -an \
+    -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p "$SRC_MASK_TAIL" \
+    > "$OUT_ROOT/logs/composite_src_mask_tail.log" 2>&1 || {
+      echo "[vace-smoke] failed to create composite src_mask tail" >&2
+      tail -80 "$OUT_ROOT/logs/composite_src_mask_tail.log" >&2 || true
+      exit 1
+    }
+  printf "file '%s'\nfile '%s'\n" "$SRC_MASK_HEAD" "$SRC_MASK_TAIL" > "$SRC_MASK_CONCAT"
+  ffmpeg -y -f concat -safe 0 -i "$SRC_MASK_CONCAT" \
+    -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p "$SRC_MASK_COMPOSITE" \
+    > "$OUT_ROOT/logs/composite_src_mask_concat.log" 2>&1 || {
+      echo "[vace-smoke] failed to concat composite src_mask" >&2
+      tail -80 "$OUT_ROOT/logs/composite_src_mask_concat.log" >&2 || true
+      exit 1
+    }
+  mv "$SRC_MASK_COMPOSITE" "$SRC_MASK"
+
+  ffmpeg -y -i "$SRC_VIDEO_FOR_VACE" -vf "fps=1,scale=240:-1,tile=5x1" -frames:v 1 \
+    "$OUT_ROOT/review_inputs/composite_src_video_contact.jpg" > "$OUT_ROOT/logs/contact_composite_src_video.log" 2>&1 || true
+  ffmpeg -y -i "$SRC_MASK" -vf "fps=1,scale=240:-1,tile=5x1" -frames:v 1 \
+    "$OUT_ROOT/review_inputs/composite_src_mask_contact.jpg" > "$OUT_ROOT/logs/contact_composite_src_mask.log" 2>&1 || true
 fi
 
 python3 - "$OUT_ROOT" "$REFERENCE_VIDEO" "$SRC_VIDEO_FOR_VACE" "${SRC_MASK:-}" "$SRC_REF_IMAGES" "$SRC_REF_REQUIRED" "$VACE_INPUT_DURATION_DRIFT_MAX" "$FRAME_NUM" "$VACE_SOURCE_FPS" <<'PY'
