@@ -1430,6 +1430,109 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(1, len(judged_records))
             self.assertTrue((root / "pairs" / "accepted_pairs.jsonl").exists())
 
+    def test_propose_group_pairs_skips_video_verification_after_precheck_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("clip_ref.mp4", "clip_target.mp4", "clip_neg1.mp4", "clip_neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+            annotations_path = root / "captions" / "detective_annotations.jsonl"
+            annotations = []
+            for clip_id, output_path, count in (
+                ("clip_ref", "clips/clip_ref.mp4", 1),
+                ("clip_target", "clips/clip_target.mp4", 2),
+                ("clip_neg1", "clips/clip_neg1.mp4", 1),
+                ("clip_neg2", "clips/clip_neg2.mp4", 1),
+            ):
+                annotations.append(
+                    {
+                        "clip_id": clip_id,
+                        "output_path": output_path,
+                        "summary": f"{count} orange cat resting on a sofa",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": count},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "on_screen_text": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "modalities": ["visual", "audio"],
+                        "fallback_used": False,
+                    }
+                )
+            self._write_jsonl(annotations_path, annotations)
+            groups_path = root / "metadata" / "clip_groups.jsonl"
+            self._write_jsonl(
+                groups_path,
+                [
+                    {
+                        "group_id": "group_cat_room",
+                        "dataset": "daily_omni",
+                        "group_reason": "same_source_video",
+                        "source_clip_ids": ["source_cat"],
+                        "candidate_clip_ids": ["clip_ref", "clip_target", "clip_neg1", "clip_neg2"],
+                        "group_tags": ["cat", "sofa"],
+                    }
+                ],
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.propose_pair.return_value = (
+                    {
+                        "edit_text": "change one orange cat into two orange cats",
+                        "modalities": ["visual"],
+                        "reference_caption": "one orange cat resting on a sofa",
+                        "target_caption": "two orange cats resting on a sofa",
+                        "difference": {
+                            "type": "object_count",
+                            "from": "one cat",
+                            "to": "two cats",
+                            "description": "cat count changes",
+                        },
+                        "proposal_reason": "same sofa scene",
+                    },
+                    {"provider": "mock"},
+                )
+                client_cls.return_value.judge_pair.return_value = (
+                    {
+                        "reference_satisfies_edit": False,
+                        "target_satisfies_edit": False,
+                        "single_main_difference": True,
+                        "same_context_score": 0.9,
+                        "edit_match_score": 0.9,
+                        "target_uniqueness_score": 0.9,
+                        "audio_required": False,
+                        "hard_negative_quality": "good",
+                        "accept": False,
+                        "reject_reason": "target does not satisfy the edit",
+                    },
+                    {"provider": "mock-judge"},
+                )
+                summary = propose_group_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    clip_groups_path=groups_path,
+                    output_path=root / "pairs" / "judged_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    max_proposals=1,
+                )
+
+            records = [
+                json.loads(line)
+                for line in (root / "pairs" / "judged_pair_proposals.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["proposal_count"])
+            self.assertEqual(1, len(records))
+            self.assertTrue(records[0]["verification_skipped_before_video"])
+            self.assertTrue(records[0]["raw_verification_output"]["skipped"])
+            client_cls.return_value.verify_pair_difference.assert_not_called()
+
     def test_propose_group_pairs_rejects_caption_equivalent_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1614,6 +1717,8 @@ class ComposedDataTests(unittest.TestCase):
             "7",
             "--max-proposals",
             "11",
+            "--timeout-seconds",
+            "66",
         ]
         with mock.patch("sys.argv", argv), mock.patch("builtins.print"), mock.patch(
             "app.composed_data.propose_group_pairs",
@@ -1623,6 +1728,7 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertEqual(7, propose_mock.call_args.kwargs["max_accepted_pairs"])
         self.assertEqual(11, propose_mock.call_args.kwargs["max_proposals"])
+        self.assertEqual(66.0, propose_mock.call_args.kwargs["timeout_seconds"])
 
     def test_compose_reject_reason_includes_threshold_failures(self) -> None:
         judge = {

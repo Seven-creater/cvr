@@ -42,6 +42,14 @@ not to be simple fragments of the source text. The next smoke should increase
 `--max-proposals` after pulling the new commit, because the previous 40
 proposals produced too few diverse accepted pairs.
 
+`c434c13` exposed one more operational issue: with a larger `--max-proposals`,
+the first proposal can spend too long inside the three Omni calls
+`propose -> judge -> video verification`, so the outer stage timeout can kill
+the job before any row is written. The fix is to write per-proposal heartbeat
+logs, use a shorter pair-request timeout, and skip expensive video verification
+for candidates already rejected by judge/local precheck. Rejected rows should now
+be persisted quickly instead of leaving 0-byte proposal files.
+
 ## Mannul Boundary Table
 
 | Pair | Example edit | Route decision | Main reason |
@@ -85,6 +93,7 @@ nohup bash scripts/run_omni_detective_pilot.sh \
   --annotation-max-passes 5 \
   --annotation-pass-timeout-seconds 900 \
   --propose-timeout-seconds 600 \
+  --pair-request-timeout-seconds 90 \
   --model-stage instruct \
   > "$RUN_ROOT/logs/omni_detective_pair.log" 2>&1 &
 ```
@@ -109,6 +118,7 @@ nohup bash scripts/run_omni_detective_pilot.sh \
   --annotation-max-passes 5 \
   --annotation-pass-timeout-seconds 900 \
   --propose-timeout-seconds 600 \
+  --pair-request-timeout-seconds 90 \
   --start-stage annotate \
   --model-stage instruct \
   > "$RUN_ROOT/logs/omni_detective_resume.log" 2>&1 &

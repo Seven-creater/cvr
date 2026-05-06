@@ -21,6 +21,7 @@ MAX_PROPOSALS=${MAX_PROPOSALS:-40}
 ANNOTATION_MAX_PASSES=${ANNOTATION_MAX_PASSES:-3}
 ANNOTATION_PASS_TIMEOUT_SECONDS=${ANNOTATION_PASS_TIMEOUT_SECONDS:-900}
 PROPOSE_TIMEOUT_SECONDS=${PROPOSE_TIMEOUT_SECONDS:-900}
+PAIR_REQUEST_TIMEOUT_SECONDS=${PAIR_REQUEST_TIMEOUT_SECONDS:-90}
 START_STAGE=${START_STAGE:-plan}
 ALLOW_PARTIAL_ANNOTATIONS=${ALLOW_PARTIAL_ANNOTATIONS:-0}
 MODEL_STAGE=${MODEL_STAGE:-instruct}
@@ -45,6 +46,7 @@ Options:
   --annotation-max-passes N
   --annotation-pass-timeout-seconds N
   --propose-timeout-seconds N
+  --pair-request-timeout-seconds N
   --start-stage plan|extract|annotate|propose|validate|review
   --allow-partial-annotations
   --model-stage VALUE
@@ -106,6 +108,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --propose-timeout-seconds)
       PROPOSE_TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
+    --pair-request-timeout-seconds)
+      PAIR_REQUEST_TIMEOUT_SECONDS="$2"
       shift 2
       ;;
     --start-stage)
@@ -268,7 +274,7 @@ echo "[omni-detective] model=$MODEL"
 echo "[resource-policy] one Omni model per run; do not keep Captioner/Instruct/Thinking loaded together"
 echo "[resource-policy] model_stage=$MODEL_STAGE gpu_ids=${GPU_IDS:-unset} gpu_count=$GPU_COUNT max_gpus=$MAX_GPUS"
 echo "[omni-detective] start_stage=$START_STAGE"
-echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS annotation_max_passes=$ANNOTATION_MAX_PASSES annotation_pass_timeout_seconds=$ANNOTATION_PASS_TIMEOUT_SECONDS propose_timeout_seconds=$PROPOSE_TIMEOUT_SECONDS allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
+echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS annotation_max_passes=$ANNOTATION_MAX_PASSES annotation_pass_timeout_seconds=$ANNOTATION_PASS_TIMEOUT_SECONDS propose_timeout_seconds=$PROPOSE_TIMEOUT_SECONDS pair_request_timeout_seconds=$PAIR_REQUEST_TIMEOUT_SECONDS allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
 curl -fsS "$BASE_URL/models"
 echo
 
@@ -372,7 +378,7 @@ if stage_enabled "propose"; then
     --base-url "$BASE_URL" \
     --api-key EMPTY \
     --model "$MODEL" \
-    --timeout-seconds 300 \
+    --timeout-seconds "$PAIR_REQUEST_TIMEOUT_SECONDS" \
     --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
     --max-proposals "$MAX_PROPOSALS" \
     --overwrite

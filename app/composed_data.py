@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -1669,6 +1670,13 @@ def propose_group_pairs(
             seen_proposal_ids.add(proposal_id)
             reference_annotation = candidate["reference_annotation"]
             target_annotation = candidate["target_annotation"]
+            print(
+                "[propose-group-pairs] start "
+                f"proposal_index={len(output_records) + 1} group_id={group_metadata['group_id']} "
+                f"proposal_id={proposal_id}",
+                file=sys.stderr,
+                flush=True,
+            )
             if proposal_id in existing_records:
                 record = existing_records[proposal_id]
                 reused_count += 1
@@ -1676,6 +1684,7 @@ def propose_group_pairs(
                 raw_model_output: dict[str, Any] = {}
                 judge_raw_output: dict[str, Any] = {}
                 verification_raw_output: dict[str, Any] = {}
+                verification_skipped_before_video = False
                 try:
                     model_fields, raw_model_output = client.propose_pair(
                         reference_annotation=_annotation_prompt_view(reference_annotation),
@@ -1796,27 +1805,43 @@ def propose_group_pairs(
                     judge_raw_output = {"error": f"{type(exc).__name__}: {exc}"}
                     judge_fallback_used = True
 
-                try:
-                    (
-                        verification,
-                        verification_raw_output,
-                        verification_context_retry_used,
-                    ) = _verify_pair_difference_with_context_retry(
-                        client,
-                        proposal=proposal_view,
-                        reference_annotation=_annotation_prompt_view(reference_annotation),
-                        target_annotation=_annotation_prompt_view(target_annotation),
-                        reference_clip_path=str(_resolve_under_root(layout["root"], reference_annotation["output_path"])),
-                        target_clip_path=str(_resolve_under_root(layout["root"], target_annotation["output_path"])),
-                    )
-                    verification_fallback_used = False
-                except Exception as exc:
-                    verification = _fallback_pair_verification(reason=f"{type(exc).__name__}: {exc}")
-                    verification_raw_output = {"error": f"{type(exc).__name__}: {exc}"}
-                    verification_context_retry_used = False
-                    verification_fallback_used = True
-
                 judge = _finalize_pair_judge(judge)
+                pre_verification_quality = _effective_pair_quality(judge, None, proposal_quality)
+                if not _should_skip_pair_video_verification(judge, pre_verification_quality):
+                    try:
+                        (
+                            verification,
+                            verification_raw_output,
+                            verification_context_retry_used,
+                        ) = _verify_pair_difference_with_context_retry(
+                            client,
+                            proposal=proposal_view,
+                            reference_annotation=_annotation_prompt_view(reference_annotation),
+                            target_annotation=_annotation_prompt_view(target_annotation),
+                            reference_clip_path=str(
+                                _resolve_under_root(layout["root"], reference_annotation["output_path"])
+                            ),
+                            target_clip_path=str(_resolve_under_root(layout["root"], target_annotation["output_path"])),
+                        )
+                        verification_fallback_used = False
+                    except Exception as exc:
+                        verification = _fallback_pair_verification(reason=f"{type(exc).__name__}: {exc}")
+                        verification_raw_output = {"error": f"{type(exc).__name__}: {exc}"}
+                        verification_context_retry_used = False
+                        verification_fallback_used = True
+                else:
+                    skip_reason = _compose_reject_reason(judge, None, pre_verification_quality)
+                    verification = _fallback_pair_verification(
+                        reason=f"pre-verification reject; video verification skipped: {skip_reason}"
+                    )
+                    verification_raw_output = {
+                        "skipped": True,
+                        "stage": "pre_verification_gate",
+                        "reason": skip_reason,
+                    }
+                    verification_context_retry_used = False
+                    verification_fallback_used = False
+                    verification_skipped_before_video = True
                 verification = _finalize_pair_verification(verification)
                 fallback_used = proposal_fallback_used or judge_fallback_used or verification_fallback_used
                 effective_quality = _effective_pair_quality(judge, verification, proposal_quality)
@@ -1868,6 +1893,7 @@ def propose_group_pairs(
                     "raw_judge_output": judge_raw_output,
                     "raw_verification_output": verification_raw_output,
                     "verification_annotation_only_retry_used": verification_context_retry_used,
+                    "verification_skipped_before_video": verification_skipped_before_video,
                 }
                 proposed_count += 1
 
@@ -1912,6 +1938,15 @@ def propose_group_pairs(
                 rejected_count += 1
             output_records.append(record)
             persist_progress()
+            print(
+                "[propose-group-pairs] wrote "
+                f"proposal_count={len(output_records)} accepted_current="
+                f"{len(_select_final_accepted_records(output_records, max_accepted_pairs=max_accepted_pairs))} "
+                f"accepted={bool(record.get('accepted'))} fallback={bool(record.get('fallback_used'))} "
+                f"skipped_video={bool(record.get('verification_skipped_before_video'))}",
+                file=sys.stderr,
+                flush=True,
+            )
         if max_proposals is not None and len(output_records) >= max_proposals:
             break
 
@@ -7703,6 +7738,29 @@ def _judge_accepts(
     if verification is None:
         return bool(judge.get("accept")) and judge_accepted
     return judge_accepted and _verification_accepts(verification)
+
+
+def _should_skip_pair_video_verification(judge: dict[str, Any], quality: dict[str, Any]) -> bool:
+    hard_negative_quality = str(judge.get("hard_negative_quality", "")).strip().lower()
+    if (
+        not bool(judge.get("accept"))
+        or _boolish(judge.get("reference_satisfies_edit"))
+        or not _boolish(judge.get("target_satisfies_edit"))
+        or not _boolish(judge.get("single_main_difference"))
+        or hard_negative_quality not in {"good", "weak"}
+    ):
+        return True
+    if _structured_edit_text_failures(quality):
+        return True
+    if _observable_difference_rejects(quality):
+        return True
+    if _natural_pair_quality_failures(quality):
+        return True
+    if _score_float(quality.get("competing_difference_passed", 1.0)) < 1.0:
+        return True
+    if _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0:
+        return True
+    return False
 
 
 def _visual_near_duplicate_rejects(score: float, difference_type: str) -> bool:
