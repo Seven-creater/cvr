@@ -21,7 +21,11 @@ CONCURRENCY=${CONCURRENCY:-1}
 MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-5}
 MAX_PROPOSALS=${MAX_PROPOSALS:-15}
 ZERO_ACCEPTED_STOP_AFTER=${ZERO_ACCEPTED_STOP_AFTER:-10}
-SELECT_TIMEOUT_SECONDS=${SELECT_TIMEOUT_SECONDS:-240}
+SELECT_TIMEOUT_SECONDS=${SELECT_TIMEOUT_SECONDS:-120}
+SOURCE_SELECTION_TOP_K=${SOURCE_SELECTION_TOP_K:-3}
+SOURCE_SELECTION_SCAN_LIMIT=${SOURCE_SELECTION_SCAN_LIMIT:-500}
+SOURCE_SELECTION_MAX_ELIGIBLE=${SOURCE_SELECTION_MAX_ELIGIBLE:-24}
+OMNI_SOURCE_SELECTION=${OMNI_SOURCE_SELECTION:-0}
 ANNOTATION_TIMEOUT_SECONDS=${ANNOTATION_TIMEOUT_SECONDS:-240}
 PROPOSE_TIMEOUT_SECONDS=${PROPOSE_TIMEOUT_SECONDS:-900}
 PAIR_REQUEST_TIMEOUT_SECONDS=${PAIR_REQUEST_TIMEOUT_SECONDS:-90}
@@ -44,6 +48,10 @@ Options:
   --max-proposals N
   --zero-accepted-stop-after N
   --select-timeout-seconds N
+  --source-selection-top-k N
+  --source-selection-scan-limit N
+  --source-selection-max-eligible N
+  --omni-source-selection
   --annotation-timeout-seconds N
   --propose-timeout-seconds N
   --pair-request-timeout-seconds N
@@ -66,6 +74,10 @@ while [[ $# -gt 0 ]]; do
     --max-proposals) MAX_PROPOSALS="$2"; shift 2 ;;
     --zero-accepted-stop-after) ZERO_ACCEPTED_STOP_AFTER="$2"; shift 2 ;;
     --select-timeout-seconds) SELECT_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --source-selection-top-k) SOURCE_SELECTION_TOP_K="$2"; shift 2 ;;
+    --source-selection-scan-limit) SOURCE_SELECTION_SCAN_LIMIT="$2"; shift 2 ;;
+    --source-selection-max-eligible) SOURCE_SELECTION_MAX_ELIGIBLE="$2"; shift 2 ;;
+    --omni-source-selection) OMNI_SOURCE_SELECTION=1; shift ;;
     --annotation-timeout-seconds) ANNOTATION_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --propose-timeout-seconds) PROPOSE_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --pair-request-timeout-seconds) PAIR_REQUEST_TIMEOUT_SECONDS="$2"; shift 2 ;;
@@ -167,17 +179,29 @@ GALLERY="$RUN_ROOT/gallery.jsonl"
 REVIEW_BUNDLE="$RUN_ROOT/single_source_review_bundle"
 
 if stage_enabled select; then
-  run_with_timeout "select-single-source-video" "$SELECT_TIMEOUT_SECONDS" \
-    python3 -m app.composed_data select-single-source-video \
-      --root "$ROOT" \
-      --source-clips-path "$SOURCE_CLIPS" \
-      --output-path "$SELECTED_SOURCE" \
-      --candidates-output-path "$SOURCE_CANDIDATES" \
-      --selection-annotations-path "$SOURCE_SELECTION_ANNOTATIONS" \
-      --base-url "$BASE_URL" \
-      --api-key EMPTY \
-      --model "$MODEL" \
+  SELECT_CMD=(
+    python3 -m app.composed_data select-single-source-video
+    --root "$ROOT"
+    --source-clips-path "$SOURCE_CLIPS"
+    --output-path "$SELECTED_SOURCE"
+    --candidates-output-path "$SOURCE_CANDIDATES"
+    --selection-annotations-path "$SOURCE_SELECTION_ANNOTATIONS"
+    --top-k "$SOURCE_SELECTION_TOP_K"
+    --max-source-videos-scan "$SOURCE_SELECTION_SCAN_LIMIT"
+    --max-eligible-candidates "$SOURCE_SELECTION_MAX_ELIGIBLE"
+  )
+  if [ "$OMNI_SOURCE_SELECTION" = "1" ]; then
+    SELECT_CMD+=(
+      --base-url "$BASE_URL"
+      --api-key EMPTY
+      --model "$MODEL"
       --timeout-seconds "$SELECT_TIMEOUT_SECONDS"
+    )
+  else
+    echo "[single-source-omni] fast local source selection; Omni source selection disabled (pass --omni-source-selection to enable)"
+  fi
+  run_with_timeout "select-single-source-video" "$SELECT_TIMEOUT_SECONDS" \
+    "${SELECT_CMD[@]}"
 else
   echo "[single-source-omni] skip select start_stage=$START_STAGE"
 fi

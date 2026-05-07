@@ -278,6 +278,49 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(str(raw_video), selected["source_path"])
             self.assertEqual(1, summary["eligible_count"])
 
+    def test_select_single_source_video_can_stop_after_local_eligible_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            source_clips_path = root / "metadata" / "source_clips_all.jsonl"
+            rows = []
+            for index in range(5):
+                video = root / "raw" / "daily_omni" / "video" / f"source_{index}.mp4"
+                video.parent.mkdir(parents=True, exist_ok=True)
+                video.write_bytes(b"raw")
+                rows.append(
+                    {
+                        "clip_id": f"daily_raw_{index}",
+                        "dataset": "daily_omni",
+                        "source_path": str(video),
+                    }
+                )
+            self._write_jsonl(source_clips_path, rows)
+
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={
+                    "duration_seconds": 30.0,
+                    "has_audio": True,
+                    "has_video": True,
+                    "width": 640,
+                    "height": 360,
+                    "fps": 30.0,
+                },
+            ) as probe_mock:
+                summary = select_single_source_video(
+                    root=root,
+                    source_clips_path=source_clips_path,
+                    output_path=root / "metadata" / "selected_source_video.json",
+                    candidates_output_path=root / "metadata" / "selected_source_candidates.jsonl",
+                    max_eligible_candidates=2,
+                    top_k=2,
+                )
+
+            self.assertEqual(2, summary["eligible_count"])
+            self.assertEqual(2, summary["top_k_count"])
+            self.assertEqual(2, probe_mock.call_count)
+
     def test_plan_single_source_clips_splits_30s_into_6_segments_and_15_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

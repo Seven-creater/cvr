@@ -1374,6 +1374,7 @@ def select_single_source_video(
     max_duration_seconds: float = 32.0,
     top_k: int = 8,
     max_source_videos_scan: int = 2000,
+    max_eligible_candidates: int | None = None,
     base_url: str | None = None,
     api_key: str = "EMPTY",
     model: str | None = None,
@@ -1459,6 +1460,8 @@ def select_single_source_video(
         if source_asset_id:
             candidate["source_asset_id"] = source_asset_id
         candidates.append(candidate)
+        if max_eligible_candidates is not None and max_eligible_candidates > 0 and len(candidates) >= max_eligible_candidates:
+            break
 
     candidates.sort(
         key=lambda record: (
@@ -1539,6 +1542,7 @@ def select_single_source_video(
         "probed_count": probed,
         "eligible_count": len(candidates),
         "top_k_count": len(top_candidates),
+        "max_eligible_candidates": max_eligible_candidates,
         "selected_source_clip_id": selected_record["source_clip_id"],
         "selected_source_path": selected_record["source_path"],
         "selection_method": selection_method,
@@ -15056,6 +15060,7 @@ def build_parser() -> argparse.ArgumentParser:
     select_single_source_parser.add_argument("--max-duration-seconds", type=float, default=32.0)
     select_single_source_parser.add_argument("--top-k", type=int, default=8)
     select_single_source_parser.add_argument("--max-source-videos-scan", type=int, default=2000)
+    select_single_source_parser.add_argument("--max-eligible-candidates", type=int)
     select_single_source_parser.add_argument("--base-url")
     select_single_source_parser.add_argument("--api-key", default="EMPTY")
     select_single_source_parser.add_argument("--model")
@@ -15317,6 +15322,7 @@ def main() -> None:
             max_duration_seconds=args.max_duration_seconds,
             top_k=args.top_k,
             max_source_videos_scan=args.max_source_videos_scan,
+            max_eligible_candidates=args.max_eligible_candidates,
             base_url=args.base_url,
             api_key=args.api_key,
             model=args.model,
