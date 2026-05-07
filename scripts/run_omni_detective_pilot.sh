@@ -10,7 +10,7 @@ export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 ROOT=${ROOT:-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval}
 RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/omni_detective_pilot}
-MODEL=${MODEL:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-instruct}
+MODEL=${MODEL:-qwen3-omni}
 BASE_URL=${BASE_URL:-http://127.0.0.1:8093/v1}
 SOURCE_CLIPS=${SOURCE_CLIPS:-$ROOT/metadata/source_clips_all.jsonl}
 MAX_SOURCE_VIDEOS=${MAX_SOURCE_VIDEOS:-80}
@@ -235,6 +235,34 @@ print(len(seen))
 PY
 }
 
+probe_omni_model() {
+  local models_json
+  models_json=$(curl -fsS "$BASE_URL/models")
+  printf '%s\n' "$models_json"
+  BASE_URL="$BASE_URL" OMNI_MODELS_JSON="$models_json" python - "$MODEL" <<'PY'
+import json
+import os
+import sys
+
+wanted = sys.argv[1]
+payload = json.loads(os.environ["OMNI_MODELS_JSON"])
+served = [
+    str(item.get("id", "")).strip()
+    for item in payload.get("data", [])
+    if isinstance(item, dict) and str(item.get("id", "")).strip()
+]
+print("[omni-detective] served_models=" + ",".join(served))
+if wanted not in served:
+    choices = ", ".join(served) if served else "<none>"
+    print(
+        f"[omni-detective] ERROR: model={wanted!r} is not served by {os.environ['BASE_URL']}; "
+        f"use one of: {choices}",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+PY
+}
+
 run_with_timeout() {
   local label="$1"
   local timeout_seconds="$2"
@@ -289,8 +317,7 @@ echo "[resource-policy] model_stage=$MODEL_STAGE gpu_ids=${GPU_IDS:-unset} gpu_c
 echo "[omni-detective] start_stage=$START_STAGE"
 echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS max_mined_candidates=$MAX_MINED_CANDIDATES annotation_max_passes=$ANNOTATION_MAX_PASSES annotation_pass_timeout_seconds=$ANNOTATION_PASS_TIMEOUT_SECONDS mine_candidates_timeout_seconds=$MINE_CANDIDATES_TIMEOUT_SECONDS propose_timeout_seconds=$PROPOSE_TIMEOUT_SECONDS pair_request_timeout_seconds=$PAIR_REQUEST_TIMEOUT_SECONDS allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
 if stage_enabled "annotate" || { stage_enabled "propose" && [ "$MAX_PROPOSALS" != "0" ]; }; then
-  curl -fsS "$BASE_URL/models"
-  echo
+  probe_omni_model
 else
   echo "[omni-detective] skip Omni model probe; current stage selection does not need model calls"
 fi
