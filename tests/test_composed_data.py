@@ -1890,6 +1890,192 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(1, summary["proposal_count"])
             client_cls.return_value.propose_pair.assert_called_once()
 
+    def test_propose_group_pairs_retargets_secondary_audio_mined_candidate_to_subject_attribute(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("clip_ref.mp4", "clip_target.mp4", "clip_neg1.mp4", "clip_neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+            annotations_path = root / "captions" / "detective_annotations.jsonl"
+            annotations = [
+                {
+                    "clip_id": "clip_ref",
+                    "output_path": "clips/clip_ref.mp4",
+                    "dataset": "presentations",
+                    "source_path": "raw/woman_speaker.mp4",
+                    "summary": "A woman with red hair, glasses, earrings, and a necklace speaks in a studio.",
+                    "subjects": ["woman"],
+                    "object_counts": {"woman": 1},
+                    "actions": ["speaking"],
+                    "scene": "studio podium",
+                    "attributes": ["red hair", "glasses", "earrings", "necklace"],
+                    "on_screen_text": [],
+                    "visible_text": [],
+                    "speech": [],
+                    "audio_events": ["mouse click"],
+                    "modalities": ["visual", "audio"],
+                    "fallback_used": False,
+                },
+                {
+                    "clip_id": "clip_target",
+                    "output_path": "clips/clip_target.mp4",
+                    "dataset": "presentations",
+                    "source_path": "raw/man_speaker.mp4",
+                    "summary": "A man with a beard and black shirt speaks in a studio.",
+                    "subjects": ["man"],
+                    "object_counts": {"man": 1},
+                    "actions": ["speaking"],
+                    "scene": "studio podium",
+                    "attributes": ["beard", "black shirt"],
+                    "on_screen_text": [],
+                    "visible_text": [],
+                    "speech": [],
+                    "audio_events": ["ambient music"],
+                    "modalities": ["visual", "audio"],
+                    "fallback_used": False,
+                },
+                {
+                    "clip_id": "clip_neg1",
+                    "output_path": "clips/clip_neg1.mp4",
+                    "dataset": "presentations",
+                    "source_path": "raw/neg1.mp4",
+                    "summary": "A woman with red hair speaks in a studio.",
+                    "subjects": ["woman"],
+                    "object_counts": {"woman": 1},
+                    "actions": ["speaking"],
+                    "scene": "studio podium",
+                    "attributes": ["red hair", "glasses"],
+                    "audio_events": ["mouse click"],
+                    "modalities": ["visual", "audio"],
+                    "fallback_used": False,
+                },
+                {
+                    "clip_id": "clip_neg2",
+                    "output_path": "clips/clip_neg2.mp4",
+                    "dataset": "presentations",
+                    "source_path": "raw/neg2.mp4",
+                    "summary": "A man in a brown shirt speaks in a studio.",
+                    "subjects": ["man"],
+                    "object_counts": {"man": 1},
+                    "actions": ["speaking"],
+                    "scene": "studio podium",
+                    "attributes": ["brown shirt", "beard"],
+                    "audio_events": ["ambient music"],
+                    "modalities": ["visual", "audio"],
+                    "fallback_used": False,
+                },
+            ]
+            self._write_jsonl(annotations_path, annotations)
+            groups_path = root / "metadata" / "clip_groups.jsonl"
+            self._write_jsonl(groups_path, [{"group_id": "group_presenters", "candidate_clip_ids": ["clip_ref", "clip_target", "clip_neg1", "clip_neg2"]}])
+            mined_path = root / "pairs" / "mined_pair_candidates.jsonl"
+            self._write_jsonl(
+                mined_path,
+                [
+                    {
+                        "candidate_id": "audio_secondary_candidate",
+                        "reference_clip_id": "clip_ref",
+                        "target_clip_id": "clip_target",
+                        "difference": {"type": "audio_event", "from": "mouse click", "to": "ambient music"},
+                        "changed_difference_types": ["audio_event"],
+                        "source_context": {
+                            "relation": "same_template_cluster",
+                            "score": 0.72,
+                            "template_compatibility_score": 0.82,
+                            "template_route": "cross_video_audio_nonspeech",
+                        },
+                        "scores": {
+                            "same_context_score": 0.72,
+                            "edit_match_score": 0.78,
+                            "target_uniqueness_score": 0.82,
+                            "difference_strength_score": 0.80,
+                            "local_candidate_score": 0.80,
+                        },
+                        "quality": {
+                            "same_context_score": 0.72,
+                            "edit_match_score": 0.78,
+                            "target_uniqueness_score": 0.82,
+                            "difference_strength_score": 0.80,
+                            "difference_type": "audio_event",
+                        },
+                        "hard_negative_clip_ids": ["clip_neg1", "clip_neg2"],
+                    }
+                ],
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.propose_pair.return_value = (
+                    {
+                        "edit_text": "change the speaker from red hair, glasses, earrings, necklace to beard, black shirt",
+                        "modalities": ["visual"],
+                        "reference_caption": "A woman with red hair and glasses speaks in a studio.",
+                        "target_caption": "A bearded man in a black shirt speaks in a studio.",
+                        "difference": {
+                            "type": "attribute",
+                            "from": "speaker with woman, red hair, glasses, earrings",
+                            "to": "speaker with man, black shirt, beard",
+                        },
+                        "proposal_reason": "dominant subject signature changes",
+                    },
+                    {"provider": "mock"},
+                )
+                client_cls.return_value.judge_pair.return_value = (
+                    {
+                        "reference_satisfies_edit": False,
+                        "target_satisfies_edit": True,
+                        "single_main_difference": True,
+                        "same_context_score": 0.72,
+                        "edit_match_score": 0.86,
+                        "target_uniqueness_score": 0.82,
+                        "audio_required": False,
+                        "hard_negative_quality": "good",
+                        "accept": True,
+                        "reject_reason": "",
+                    },
+                    {"provider": "mock-judge"},
+                )
+                client_cls.return_value.verify_pair_difference.return_value = (
+                    {
+                        "caption_delta": {
+                            "caption_equivalent": False,
+                            "has_concrete_difference": True,
+                            "difference_matches_edit": True,
+                            "concrete_differences": ["woman speaker changes to bearded man speaker"],
+                        },
+                        "edit_projection": {
+                            "target_matches_projection": True,
+                            "score": 0.8,
+                            "missing_requirements": [],
+                        },
+                        "edit_necessity": {
+                            "edit_needed": True,
+                            "reference_satisfies_edit": False,
+                            "target_satisfies_edit": True,
+                            "score": 0.8,
+                        },
+                    },
+                    {"provider": "mock-verification"},
+                )
+
+                propose_group_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    clip_groups_path=groups_path,
+                    mined_candidates_path=mined_path,
+                    output_path=root / "pairs" / "judged_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    max_proposals=1,
+                    acceptance_profile="exploration",
+                )
+
+            heuristic_pair = client_cls.return_value.propose_pair.call_args.kwargs["heuristic_pair"]
+            self.assertEqual("attribute", heuristic_pair["primary_difference"]["type"])
+            self.assertTrue(heuristic_pair["primary_difference"]["from"].startswith("speaker with "))
+            self.assertEqual(1.0, heuristic_pair["heuristic_quality"]["retargeted_from_audio_secondary"])
+
     def test_propose_group_pairs_rejects_caption_equivalent_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3032,6 +3218,46 @@ class ComposedDataTests(unittest.TestCase):
         )
 
         self.assertEqual("add a man", repaired["edit_text"])
+
+    def test_repair_pair_model_fields_retargets_secondary_audio_to_speaker_signature(self) -> None:
+        repaired = _repair_pair_model_fields(
+            model_fields={
+                "edit_text": "replace mouse click with ambient music",
+                "modalities": ["audio"],
+                "reference_caption": "A woman with red hair, glasses, earrings, and a necklace speaks in a studio.",
+                "target_caption": "A bearded man in a black shirt speaks in a studio.",
+                "difference": {"type": "audio_event", "from": "mouse click", "to": "ambient music"},
+                "proposal_reason": "model focused on audio",
+            },
+            reference_annotation={
+                "summary": "A woman with red hair, glasses, earrings, and a necklace speaks in a studio.",
+                "subjects": ["woman"],
+                "object_counts": {"woman": 1},
+                "actions": ["speaking"],
+                "scene": "studio podium",
+                "attributes": ["red hair", "glasses", "earrings", "necklace"],
+                "audio_events": ["mouse click"],
+            },
+            target_annotation={
+                "summary": "A bearded man in a black shirt speaks in a studio.",
+                "subjects": ["man"],
+                "object_counts": {"man": 1},
+                "actions": ["speaking"],
+                "scene": "studio podium",
+                "attributes": ["beard", "black shirt"],
+                "audio_events": ["ambient music"],
+            },
+            source_context={
+                "relation": "same_template_cluster",
+                "score": 0.72,
+                "template_compatibility_score": 0.82,
+            },
+        )
+
+        self.assertEqual("attribute", repaired["difference"]["type"])
+        self.assertTrue(repaired["difference"]["from"].startswith("speaker with "))
+        self.assertTrue(repaired["edit_text"].startswith("change the speaker from "))
+        self.assertEqual("audio_event", repaired["retargeted_from_difference_type"])
 
     def test_edit_text_quality_rejects_caption_like_target_copy(self) -> None:
         caption = "A man in a white shirt stands at a desk in a bright room and speaks to the camera."

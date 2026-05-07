@@ -2507,7 +2507,67 @@ def _build_cross_video_template_candidate(
                     _normalize_list(quality.get("exploration_warnings", []))
                     + list(audio_decision.get("failure_flags", []))
                 )
-        composite_score = _candidate_composite_score(quality, source_context)
+            if not audio_decision["audio_primary_allowed"] and audio_decision.get("dominant_type") in DOMINANT_VISUAL_DIFFERENCE_TYPES:
+                retargeted_difference_type = str(audio_decision.get("dominant_type", "")).strip()
+                retargeted_difference = _dominant_visual_difference_from_annotations(
+                    reference_annotation,
+                    target_annotation,
+                    difference_type=retargeted_difference_type,
+                )
+                if retargeted_difference is None or retargeted_difference.get("type") != retargeted_difference_type:
+                    continue
+                changed_types = list(retargeted_difference.pop("changed_types"))
+                difference = retargeted_difference
+                difference_type = retargeted_difference_type
+                route_name = f"{route_name}_retargeted_{difference_type}"
+                quality["difference_type"] = difference_type
+                quality["retargeted_from_audio_secondary"] = 1.0
+                quality["retargeted_from_difference_type"] = "audio_event"
+                quality["edit_match_score"] = round(
+                    _edit_match_score(
+                        same_context_score=same_context_score,
+                        primary_difference_type=difference_type,
+                        changed_types=changed_types,
+                    ),
+                    3,
+                )
+                quality["difference_strength_score"] = round(
+                    _difference_strength_score(
+                        reference_annotation=reference_annotation,
+                        target_annotation=target_annotation,
+                        primary_difference=difference,
+                        changed_types=changed_types,
+                    ),
+                    3,
+                )
+                quality["exploration_warnings"] = _dedupe_strings(
+                    _normalize_list(quality.get("exploration_warnings", []))
+                    + ["retargeted_from_audio_secondary"]
+                )
+                difference_strength_score = _score_float(quality.get("difference_strength_score"))
+            else:
+                changed_types = [difference_type]
+        else:
+            changed_types = [difference_type]
+        source_context_for_candidate = {
+            **source_context,
+            "template_route": route_name,
+            "subject_signature_bundle": {"reference": subject_reference, "target": subject_target},
+            "object_signature_bundle": {"reference": object_reference, "target": object_target},
+            "scene_signature_bundle": {"reference": scene_reference, "target": scene_target},
+        }
+        dominant_delta_decision = _dominant_delta_decision(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            difference=difference,
+            quality=quality,
+            source_context=source_context_for_candidate,
+        )
+        quality["dominant_delta_type"] = dominant_delta_decision["dominant_type"]
+        quality["audio_primary_allowed"] = 1.0 if dominant_delta_decision["audio_primary_allowed"] else 0.0
+        quality["visual_competing_delta_score"] = dominant_delta_decision["visual_competing_delta_score"]
+        quality["dominant_delta_decision"] = dominant_delta_decision
+        composite_score = _candidate_composite_score(quality, source_context_for_candidate)
         reference_path = _display_path(root, _resolve_under_root(root, reference_annotation["output_path"]))
         target_path = _display_path(root, _resolve_under_root(root, target_annotation["output_path"]))
         hard_negative_paths = [
@@ -2519,29 +2579,11 @@ def _build_cross_video_template_candidate(
             "reference_annotation": _sanitize_annotation_for_output(reference_annotation, root),
             "target_annotation": _sanitize_annotation_for_output(target_annotation, root),
             "primary_difference": difference,
-            "changed_difference_types": [difference_type],
+            "changed_difference_types": changed_types,
             "quality": quality,
             "composite_score": composite_score,
-            "source_context": {
-                **source_context,
-                "template_route": route_name,
-                "subject_signature_bundle": {"reference": subject_reference, "target": subject_target},
-                "object_signature_bundle": {"reference": object_reference, "target": object_target},
-                "scene_signature_bundle": {"reference": scene_reference, "target": scene_target},
-            },
-            "dominant_delta_decision": _dominant_delta_decision(
-                reference_annotation=reference_annotation,
-                target_annotation=target_annotation,
-                difference=difference,
-                quality=quality,
-                source_context={
-                    **source_context,
-                    "template_route": route_name,
-                    "subject_signature_bundle": {"reference": subject_reference, "target": subject_target},
-                    "object_signature_bundle": {"reference": object_reference, "target": object_target},
-                    "scene_signature_bundle": {"reference": scene_reference, "target": scene_target},
-                },
-            ),
+            "source_context": source_context_for_candidate,
+            "dominant_delta_decision": dominant_delta_decision,
             "difference_evidence": _difference_evidence_from_annotations(
                 reference_annotation=reference_annotation,
                 target_annotation=target_annotation,
@@ -2717,7 +2759,7 @@ def _candidate_from_mined_record(
     hard_negative_paths = [
         _display_path(root, _resolve_under_root(root, annotation["output_path"])) for annotation in hard_negative_annotations[:3]
     ]
-    return {
+    candidate = {
         "proposal_id": str(mined.get("proposal_id") or mined.get("candidate_id") or _build_proposal_id(reference_path, target_path)),
         "reference_annotation": _sanitize_annotation_for_output(reference_annotation, root),
         "target_annotation": _sanitize_annotation_for_output(target_annotation, root),
@@ -2727,9 +2769,7 @@ def _candidate_from_mined_record(
         "composite_score": _score_float(scores.get("local_candidate_score"))
         or _candidate_composite_score(quality, source_context),
         "source_context": dict(source_context),
-        "dominant_delta_decision": dict(mined.get("dominant_delta_decision", dominant_delta_decision))
-        if isinstance(mined.get("dominant_delta_decision", dominant_delta_decision), dict)
-        else dominant_delta_decision,
+        "dominant_delta_decision": dominant_delta_decision,
         "difference_evidence": dict(mined.get("evidence", {}))
         if isinstance(mined.get("evidence"), dict)
         else _difference_evidence_from_annotations(
@@ -2747,6 +2787,7 @@ def _candidate_from_mined_record(
             "scores": dict(scores),
         },
     }
+    return _retarget_audio_secondary_candidate_to_dominant_visual(candidate)
 
 
 def propose_group_pairs(
@@ -2955,6 +2996,7 @@ def propose_group_pairs(
                     model_fields=model_fields,
                     reference_annotation=reference_annotation,
                     target_annotation=target_annotation,
+                    source_context=candidate["source_context"],
                 )
                 direction_corrected = False
                 oriented_candidate, model_fields, direction_corrected = _maybe_reorient_candidate_for_model_fields(
@@ -6132,13 +6174,12 @@ def _retarget_pair_candidate(candidate: dict[str, Any], difference_type: str) ->
     if candidate["primary_difference"]["type"] == difference_type:
         return candidate
 
-    priority_order = (difference_type,) + tuple(item for item in PAIR_PRIORITY if item != difference_type)
     reference_annotation = candidate["reference_annotation"]
     target_annotation = candidate["target_annotation"]
-    primary_difference = _detect_primary_difference(
+    primary_difference = _dominant_visual_difference_from_annotations(
         reference_annotation,
         target_annotation,
-        priority_order=priority_order,
+        difference_type=difference_type,
     )
     if primary_difference is None or primary_difference["type"] != difference_type:
         return None
@@ -6154,6 +6195,7 @@ def _retarget_pair_candidate(candidate: dict[str, Any], difference_type: str) ->
         return None
 
     retargeted = dict(candidate)
+    source_context = dict(candidate.get("source_context", {}))
     retargeted["primary_difference"] = primary_difference
     retargeted["changed_difference_types"] = list(changed_types)
     quality = dict(candidate["quality"])
@@ -6181,13 +6223,101 @@ def _retarget_pair_candidate(candidate: dict[str, Any], difference_type: str) ->
             target_annotation,
         )
         quality["has_audio_modality"] = 1.0
+    dominant_delta_decision = _dominant_delta_decision(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        difference=primary_difference,
+        quality=quality,
+        source_context=source_context,
+    )
+    quality["dominant_delta_type"] = dominant_delta_decision["dominant_type"]
+    quality["audio_primary_allowed"] = 1.0 if dominant_delta_decision["audio_primary_allowed"] else 0.0
+    quality["visual_competing_delta_score"] = dominant_delta_decision["visual_competing_delta_score"]
+    quality["dominant_delta_decision"] = dominant_delta_decision
     retargeted["quality"] = quality
-    retargeted["composite_score"] = _candidate_composite_score(quality, candidate["source_context"])
+    retargeted["source_context"] = source_context
+    retargeted["dominant_delta_decision"] = dominant_delta_decision
+    retargeted["composite_score"] = _candidate_composite_score(quality, source_context)
     retargeted["difference_evidence"] = _difference_evidence_from_annotations(
         reference_annotation=reference_annotation,
         target_annotation=target_annotation,
         primary_difference=primary_difference,
     )
+    return retargeted
+
+
+def _dominant_visual_difference_from_annotations(
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    *,
+    difference_type: str,
+) -> dict[str, Any] | None:
+    if difference_type == "attribute" and _is_talking_head_template(reference_annotation) and _is_talking_head_template(target_annotation):
+        reference_signature = _annotation_subject_signature_bundle(reference_annotation)
+        target_signature = _annotation_subject_signature_bundle(target_annotation)
+        if reference_signature and target_signature and reference_signature != target_signature:
+            return {
+                "type": "attribute",
+                "from": f"speaker with {', '.join(reference_signature[:4])}",
+                "to": f"speaker with {', '.join(target_signature[:4])}",
+                "description": "the speaker's visual signature changes while the presentation template stays similar",
+                "changed_types": ["attribute"],
+            }
+
+    priority_order = (difference_type,) + tuple(item for item in PAIR_PRIORITY if item != difference_type)
+    return _detect_primary_difference(
+        reference_annotation,
+        target_annotation,
+        priority_order=priority_order,
+    )
+
+
+def _retarget_audio_secondary_candidate_to_dominant_visual(candidate: dict[str, Any]) -> dict[str, Any] | None:
+    difference = candidate.get("primary_difference", {})
+    if not isinstance(difference, dict) or str(difference.get("type", "")).strip() != "audio_event":
+        return candidate
+
+    quality = dict(candidate.get("quality", {})) if isinstance(candidate.get("quality"), dict) else {}
+    source_context = dict(candidate.get("source_context", {})) if isinstance(candidate.get("source_context"), dict) else {}
+    decision = candidate.get("dominant_delta_decision") if isinstance(candidate.get("dominant_delta_decision"), dict) else {}
+    if not decision:
+        decision = _dominant_delta_decision(
+            reference_annotation=candidate["reference_annotation"],
+            target_annotation=candidate["target_annotation"],
+            difference=difference,
+            quality=quality,
+            source_context=source_context,
+        )
+    if bool(decision.get("audio_primary_allowed")):
+        return candidate
+
+    dominant_type = str(decision.get("dominant_type", "")).strip()
+    if dominant_type not in DOMINANT_VISUAL_DIFFERENCE_TYPES:
+        return None
+
+    retargeted = _retarget_pair_candidate(candidate, dominant_type)
+    if retargeted is None:
+        return None
+
+    retargeted_quality = dict(retargeted.get("quality", {}))
+    retargeted_quality["retargeted_from_audio_secondary"] = 1.0
+    retargeted_quality["retargeted_from_difference_type"] = "audio_event"
+    retargeted_quality["exploration_warnings"] = _dedupe_strings(
+        _normalize_list(retargeted_quality.get("exploration_warnings", []))
+        + ["retargeted_from_audio_secondary"]
+        + list(decision.get("failure_flags", []))
+    )
+    retargeted_source_context = dict(retargeted.get("source_context", {}))
+    retargeted_source_context["retargeted_from_difference_type"] = "audio_event"
+    retargeted_source_context["retarget_reason"] = str(decision.get("reason", "")).strip()
+    retargeted["quality"] = retargeted_quality
+    retargeted["source_context"] = retargeted_source_context
+    retargeted["composite_score"] = _candidate_composite_score(retargeted_quality, retargeted_source_context)
+
+    mined_candidate = dict(retargeted.get("mined_candidate", {})) if isinstance(retargeted.get("mined_candidate"), dict) else {}
+    if mined_candidate:
+        mined_candidate["retargeted_from_difference_type"] = "audio_event"
+        retargeted["mined_candidate"] = mined_candidate
     return retargeted
 
 
@@ -6333,15 +6463,75 @@ def _visible_text_fragment_edit(difference: dict[str, Any]) -> bool:
     )
 
 
+def _retarget_audio_secondary_model_fields(
+    *,
+    model_fields: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    source_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    difference = model_fields.get("difference", {})
+    if not isinstance(difference, dict) or str(difference.get("type", "")).strip() != "audio_event":
+        return model_fields
+
+    source_context = source_context if isinstance(source_context, dict) else {}
+    quality_seed = {
+        "same_context_score": _score_float(source_context.get("score")) or _same_context_score(reference_annotation, target_annotation),
+        "template_compatibility_score": _score_float(source_context.get("template_compatibility_score")),
+    }
+    decision = _dominant_delta_decision(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        difference=difference,
+        quality=quality_seed,
+        source_context=source_context,
+    )
+    if decision["audio_primary_allowed"]:
+        return model_fields
+
+    dominant_type = str(decision.get("dominant_type", "")).strip()
+    if dominant_type not in DOMINANT_VISUAL_DIFFERENCE_TYPES:
+        return model_fields
+
+    detected = _dominant_visual_difference_from_annotations(
+        reference_annotation,
+        target_annotation,
+        difference_type=dominant_type,
+    )
+    if detected is None or detected.get("type") != dominant_type:
+        return model_fields
+
+    changed_types = list(detected.pop("changed_types"))
+    repaired = dict(model_fields)
+    repaired["difference"] = detected
+    repaired["modalities"] = _infer_pair_modalities(reference_annotation, target_annotation, dominant_type)
+    repaired["edit_text"] = _build_fallback_edit_text(detected)
+    reason = str(repaired.get("proposal_reason", "")).strip()
+    repaired["proposal_reason"] = (
+        f"{reason} retargeted from secondary audio_event to dominant {dominant_type} "
+        "because stronger visual deltas define the pair"
+    ).strip()
+    repaired["retargeted_from_difference_type"] = "audio_event"
+    repaired["retargeted_changed_difference_types"] = changed_types
+    return repaired
+
+
 def _repair_pair_model_fields(
     *,
     model_fields: dict[str, Any],
     reference_annotation: dict[str, Any],
     target_annotation: dict[str, Any],
+    source_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     repaired = dict(model_fields)
     if str(repaired.get("difference", {}).get("type", "")).strip() == "audio_event":
         repaired = _normalize_audio_event_model_fields(repaired)
+        repaired = _retarget_audio_secondary_model_fields(
+            model_fields=repaired,
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            source_context=source_context,
+        )
     current_quality = _edit_text_quality_payload(
         edit_text=str(repaired.get("edit_text", "")),
         difference=repaired.get("difference", {}),
