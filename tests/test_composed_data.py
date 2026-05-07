@@ -86,6 +86,46 @@ class ComposedDataTests(unittest.TestCase):
             for record in records:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def _single_source_final_accept_payload(self, *, score: float = 0.92) -> tuple[dict[str, object], dict[str, str]]:
+        return (
+            {
+                "accept": True,
+                "confidence": score,
+                "quality_score": score,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "observable_delta": True,
+                "single_primary_delta": True,
+                "text_or_ocr_driven": False,
+                "segment_wide": True,
+                "edit_text_accurate": True,
+                "main_reject_reason": "",
+                "evidence": ["final verifier confirms the target visibly satisfies the edit"],
+                "recommended_edit_text": "",
+            },
+            {"raw": "final_accept"},
+        )
+
+    def _single_source_final_reject_payload(self, reason: str, *, score: float = 0.30) -> tuple[dict[str, object], dict[str, str]]:
+        return (
+            {
+                "accept": False,
+                "confidence": score,
+                "quality_score": score,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": False,
+                "observable_delta": False,
+                "single_primary_delta": False,
+                "text_or_ocr_driven": False,
+                "segment_wide": False,
+                "edit_text_accurate": False,
+                "main_reject_reason": reason,
+                "evidence": ["final verifier rejects the pair"],
+                "recommended_edit_text": "",
+            },
+            {"raw": "final_reject"},
+        )
+
     def test_ensure_layout_creates_expected_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = ensure_layout(temp_dir)
@@ -626,6 +666,7 @@ class ComposedDataTests(unittest.TestCase):
                 },
                 {"raw": "ok"},
             )
+            client.verify_single_source_pair_final.return_value = self._single_source_final_accept_payload(score=0.91)
 
             with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
                 summary = propose_single_source_pairs(
@@ -660,6 +701,90 @@ class ComposedDataTests(unittest.TestCase):
             self.assertNotIn("change attribute from dark blue blouse to dark blue shirt", ranked[0]["edit_text"])
             self.assertEqual([], ranked[0]["single_source_pair_acceptance_issues"])
             self.assertEqual("add_pip_demo", ranked[0]["single_source_delta_family"])
+            self.assertTrue(ranked[0]["final_omni_accept"])
+            self.assertGreaterEqual(ranked[0]["final_omni_verification"]["quality_score"], 0.60)
+
+    def test_propose_single_source_pairs_rejects_low_final_omni_score(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode("utf-8"))
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {"clip_id": "seg_1", "output_path": "clips/seg_1.mp4", "dataset": "daily_omni", "summary": "speaker only"},
+                    {"clip_id": "seg_2", "output_path": "clips/seg_2.mp4", "dataset": "daily_omni", "summary": "speaker with product overlay"},
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "candidate_1",
+                        "proposal_id": _build_proposal_id("clips/seg_1.mp4", "clips/seg_2.mp4"),
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_single_source_pair.return_value = (
+                {
+                    "edit_text": "add a static product image overlay on the left",
+                    "modalities": ["visual"],
+                    "reference_caption": "speaker only",
+                    "target_caption": "speaker with a static product image overlay",
+                    "difference": {"type": "object_presence", "from": "no product overlay", "to": "static product image overlay", "description": "a product image appears beside the speaker"},
+                    "dominant_delta": {"type": "object_presence", "from": "no product overlay", "to": "static product image overlay", "reason": "the overlay is the visible change"},
+                    "reference_state": {"main_speaker": "woman", "inset_subjects": [], "product_overlay": "", "composition": "speaker only", "internal_transitions": []},
+                    "target_state": {"main_speaker": "woman", "inset_subjects": [], "product_overlay": "static product image", "composition": "speaker with product overlay", "internal_transitions": []},
+                    "delta_temporal_extent": {"reference": "none", "target": "overlay throughout", "target_coverage": 0.9, "evidence": "overlay persists"},
+                    "subject_roles": {"main_speaker": "woman", "inset_subjects": [], "product_overlay": "static product image"},
+                    "is_segment_wide_delta": True,
+                    "discarded_deltas": [],
+                    "evidence": ["target has a stable product overlay"],
+                    "confidence": 0.9,
+                    "accept": True,
+                    "reject_reason": "",
+                },
+                {"raw": "ok"},
+            )
+            client.verify_single_source_pair_final.return_value = self._single_source_final_accept_payload(score=0.50)
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked_single_source_pairs.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    max_accepted_pairs=5,
+                    acceptance_profile="exploration",
+                )
+
+            ranked = [
+                json.loads(line)
+                for line in (root / "pairs" / "ranked_single_source_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            accepted = [
+                json.loads(line)
+                for line in (root / "pairs" / "accepted_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertFalse(ranked[0]["accepted"])
+            self.assertFalse(ranked[0]["final_omni_accept"])
+            self.assertIn("final_omni_quality_score_below_threshold", "; ".join(ranked[0]["single_source_pair_acceptance_issues"]))
+            self.assertEqual([], accepted)
 
     def test_propose_single_source_pairs_rejects_transient_or_overclaimed_edits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -745,6 +870,10 @@ class ComposedDataTests(unittest.TestCase):
                 },
                 {"raw": "ok"},
             )
+            client.verify_single_source_pair_final.return_value = self._single_source_final_reject_payload(
+                "the edit overclaims a product close-up while the speaker remains visible",
+                score=0.25,
+            )
             with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
                 propose_single_source_pairs(
                     root=root,
@@ -771,6 +900,7 @@ class ComposedDataTests(unittest.TestCase):
             ]
             self.assertFalse(ranked[0]["accepted"])
             self.assertIn("composition_label_mismatch", "; ".join(ranked[0]["single_source_pair_acceptance_issues"]))
+            self.assertIn("final_omni_reject", "; ".join(ranked[0]["single_source_pair_acceptance_issues"]))
             self.assertEqual("add a static product image overlay on the left", ranked[0]["recommended_edit_text"])
             self.assertEqual([], accepted)
 
@@ -851,6 +981,10 @@ class ComposedDataTests(unittest.TestCase):
             client.propose_single_source_pair.side_effect = [
                 product_overlay_payload("brow-lift roller"),
                 product_overlay_payload("smooth line pen"),
+            ]
+            client.verify_single_source_pair_final.side_effect = [
+                self._single_source_final_accept_payload(score=0.90),
+                self._single_source_final_accept_payload(score=0.88),
             ]
             with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
                 propose_single_source_pairs(
@@ -956,6 +1090,7 @@ class ComposedDataTests(unittest.TestCase):
                 },
                 {"raw": "ok"},
             )
+            client.verify_single_source_pair_final.return_value = self._single_source_final_accept_payload(score=0.95)
             with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
                 propose_single_source_pairs(
                     root=root,
@@ -983,6 +1118,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertFalse(ranked[0]["accepted"])
             self.assertIn("text_driven_product_overlay_change", "; ".join(ranked[0]["single_source_pair_acceptance_issues"]))
             self.assertEqual([], accepted)
+            client.verify_single_source_pair_final.assert_not_called()
 
     def test_plan_stable_omni_clips_uses_cache_and_enforces_window_length(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -9214,8 +9350,12 @@ class ComposedDataTests(unittest.TestCase):
             pair_description = bundle / "pair_review" / "accepted" / "001_object_presence" / "description.md"
             self.assertTrue(pair_description.exists())
             self.assertTrue((bundle / "pair_review" / "accepted" / "001_object_presence" / "contact_sheet.jpg").exists())
+            self.assertTrue((bundle / "pair_review" / "accepted" / "001_object_presence" / "local_gate_report.json").exists())
+            self.assertTrue((bundle / "pair_review" / "accepted" / "001_object_presence" / "final_omni_verification.json").exists())
+            self.assertTrue((bundle / "pair_review" / "accepted" / "001_object_presence" / "final_reason.md").exists())
             description_text = pair_description.read_text(encoding="utf-8")
             self.assertIn("issue_tags", description_text)
+            self.assertIn("Final Omni Verification", description_text)
             self.assertIn("Contact Sheet", description_text)
             self.assertIn("Reference Segment Description", description_text)
             self.assertIn("Target Segment Description", description_text)

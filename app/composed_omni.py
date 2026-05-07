@@ -108,6 +108,22 @@ REQUIRED_SINGLE_SOURCE_PAIR_FIELDS = (
     "reject_reason",
 )
 
+REQUIRED_SINGLE_SOURCE_FINAL_VERIFICATION_FIELDS = (
+    "accept",
+    "confidence",
+    "quality_score",
+    "reference_satisfies_edit",
+    "target_satisfies_edit",
+    "observable_delta",
+    "single_primary_delta",
+    "text_or_ocr_driven",
+    "segment_wide",
+    "edit_text_accurate",
+    "main_reject_reason",
+    "evidence",
+    "recommended_edit_text",
+)
+
 REQUIRED_VIDEO_EDIT_PLAN_FIELDS = (
     "should_generate",
     "source_prompt",
@@ -493,6 +509,36 @@ def _single_source_pair_system_prompt() -> str:
     )
 
 
+def _single_source_final_verification_system_prompt() -> str:
+    return (
+        "You are the final strict verifier for a single-source composed video retrieval pair. "
+        "The candidate has already passed an initial pair-comparison step and local gates; your job is to decide whether it should enter human review as an accepted sample. "
+        "Use the attached reference and target videos as primary evidence. Use captions, dominant_delta, and local_gate_report only as supporting evidence. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"accept": boolean, "confidence": number, "quality_score": number, '
+        '"reference_satisfies_edit": boolean, "target_satisfies_edit": boolean, '
+        '"observable_delta": boolean, "single_primary_delta": boolean, '
+        '"text_or_ocr_driven": boolean, "segment_wide": boolean, '
+        '"edit_text_accurate": boolean, "main_reject_reason": string, '
+        '"evidence": [string], "recommended_edit_text": string}. '
+        "Set quality_score from 0.0 to 1.0 for dataset usefulness: 1.0 is a clean, obvious, single-delta pair; "
+        "0.6 is borderline but acceptable for human review; below 0.6 should normally be rejected. "
+        "If accept=false, quality_score must be below 0.6. "
+        "Accept only if the reference does not satisfy the edit, the target clearly satisfies it, "
+        "there is an obvious real difference, the edit_text names the main difference accurately, "
+        "and the difference is stable for most of the target clip. "
+        "Reject if the candidate is driven by subtitles, visible text, title cards, lower-thirds, product-label/OCR wording, or boundary-frame text. "
+        "Reject if reference and target are effectively the same, if the target does not visibly satisfy the edit, "
+        "if the edit_text exaggerates the composition, or if there is a stronger unmentioned difference. "
+        "Specifically reject inaccurate phrases such as 'product close-up', 'full-screen product presentation', or 'speaker replacement' "
+        "unless the actual target video proves that phrase. "
+        "Distinguish the main speaker from picture-in-picture/inset subjects; do not let an inset person count as the main speaker. "
+        "Inspect the beginning, middle, and end of both clips before deciding. "
+        "If any of text_or_ocr_driven=true, observable_delta=false, target_satisfies_edit=false, "
+        "or edit_text_accurate=false, set accept=false and explain main_reject_reason."
+    )
+
+
 def _pair_judge_system_prompt() -> str:
     return (
         "You are a strict judge for composed video retrieval dataset construction. "
@@ -749,6 +795,40 @@ def _build_single_source_pair_user_content(
         {"type": "text", "text": "Reference clip:"},
         {"type": "video_url", "video_url": {"url": reference_clip_path}},
         {"type": "text", "text": "Target clip:"},
+        {"type": "video_url", "video_url": {"url": target_clip_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
+def _build_single_source_final_verification_user_content(
+    *,
+    reference_clip_path: str,
+    target_clip_path: str,
+    model_fields: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    local_gate_report: dict[str, Any],
+    whole_annotation: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    context_text = ""
+    if whole_annotation:
+        context_text = f"Whole source video context JSON:\n{json.dumps(whole_annotation, ensure_ascii=False)}\n"
+    prompt = (
+        "Task: final-check whether this single-source pair should be accepted.\n"
+        "Use the actual videos first. Check the reference and target at approximately 0.2s, 2.5s, and 4.8s, "
+        "plus any other moment needed to verify the edit.\n"
+        f"{context_text}"
+        f"Pair proposal JSON:\n{json.dumps(model_fields, ensure_ascii=False)}\n"
+        f"Local gate report JSON:\n{json.dumps(local_gate_report, ensure_ascii=False)}\n"
+        f"Reference segment annotation JSON:\n{json.dumps(reference_annotation, ensure_ascii=False)}\n"
+        f"Target segment annotation JSON:\n{json.dumps(target_annotation, ensure_ascii=False)}\n"
+        "Answer the required schema exactly. The accept field must be false if the target does not visibly satisfy edit_text, "
+        "if the reference already satisfies edit_text, if the pair is text/OCR-driven, or if the edit_text describes the wrong subject or composition."
+    )
+    return [
+        {"type": "text", "text": "Reference clip for final verification:"},
+        {"type": "video_url", "video_url": {"url": reference_clip_path}},
+        {"type": "text", "text": "Target clip for final verification:"},
         {"type": "video_url", "video_url": {"url": target_clip_path}},
         {"type": "text", "text": prompt},
     ]
@@ -1086,6 +1166,32 @@ class OpenAIComposedDataClient:
         )
         return _normalize_single_source_pair_payload(raw_payload), raw_payload
 
+    def verify_single_source_pair_final(
+        self,
+        *,
+        reference_clip_path: str,
+        target_clip_path: str,
+        model_fields: dict[str, Any],
+        reference_annotation: dict[str, Any],
+        target_annotation: dict[str, Any],
+        local_gate_report: dict[str, Any],
+        whole_annotation: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_single_source_final_verification_user_content(
+                reference_clip_path=reference_clip_path,
+                target_clip_path=target_clip_path,
+                model_fields=model_fields,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                local_gate_report=local_gate_report,
+                whole_annotation=whole_annotation,
+            ),
+            system_prompt=_single_source_final_verification_system_prompt(),
+            max_tokens=900,
+        )
+        return _normalize_single_source_final_verification_payload(raw_payload), raw_payload
+
     def judge_pair(
         self,
         *,
@@ -1378,6 +1484,37 @@ def _normalize_single_source_pair_payload(payload: dict[str, Any]) -> dict[str, 
         raise ValueError("single-source pair evidence is required")
     if not normalized["delta_temporal_extent"]["evidence"]:
         raise ValueError("single-source pair delta_temporal_extent evidence is required")
+    return normalized
+
+
+def _normalize_single_source_final_verification_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_SINGLE_SOURCE_FINAL_VERIFICATION_FIELDS)
+    if missing_fields:
+        raise ValueError(f"single-source final verification missing fields: {missing_fields}")
+
+    accept = _bool_value(payload.get("accept"))
+    quality_score = _score_value(payload.get("quality_score"))
+    if not accept:
+        quality_score = min(quality_score, 0.59)
+    normalized = {
+        "accept": accept,
+        "confidence": _score_value(payload.get("confidence")),
+        "quality_score": quality_score,
+        "reference_satisfies_edit": _bool_value(payload.get("reference_satisfies_edit")),
+        "target_satisfies_edit": _bool_value(payload.get("target_satisfies_edit")),
+        "observable_delta": _bool_value(payload.get("observable_delta")),
+        "single_primary_delta": _bool_value(payload.get("single_primary_delta")),
+        "text_or_ocr_driven": _bool_value(payload.get("text_or_ocr_driven")),
+        "segment_wide": _bool_value(payload.get("segment_wide")),
+        "edit_text_accurate": _bool_value(payload.get("edit_text_accurate")),
+        "main_reject_reason": str(payload.get("main_reject_reason", "")).strip(),
+        "evidence": _detail_list(payload.get("evidence")),
+        "recommended_edit_text": str(payload.get("recommended_edit_text", "")).strip(),
+    }
+    if normalized["accept"] and not normalized["evidence"]:
+        raise ValueError("single-source final verification evidence is required for accept=true")
+    if not normalized["accept"] and not normalized["main_reject_reason"]:
+        raise ValueError("single-source final verification reject reason is required for accept=false")
     return normalized
 
 

@@ -35,6 +35,7 @@ DEFAULT_MINED_PAIR_CANDIDATES_NAME = "mined_pair_candidates.jsonl"
 DEFAULT_CANDIDATE_MINING_REPORT_NAME = "candidate_mining_report.md"
 DEFAULT_MAX_MINED_PAIR_CANDIDATES = 240
 DEFAULT_ZERO_ACCEPTED_STOP_AFTER = 0
+MIN_SINGLE_SOURCE_FINAL_OMNI_QUALITY_SCORE = 0.60
 DEFAULT_SELECTED_SINGLE_SOURCE_NAME = "selected_source_video.json"
 DEFAULT_SINGLE_SOURCE_CANDIDATES_NAME = "selected_source_candidates.jsonl"
 DEFAULT_SINGLE_SOURCE_CLIP_PLAN_NAME = "single_source_clip_plan.jsonl"
@@ -1910,23 +1911,63 @@ def propose_single_source_pairs(
                 reference_annotation=reference_annotation,
                 target_annotation=target_annotation,
             )
-            weak_reason = "; ".join(acceptance_issues)
+            local_gate_report = _single_source_local_gate_report(
+                acceptance_issues=acceptance_issues,
+                fallback_used=fallback_used,
+                difference_type=difference_type,
+                confidence=confidence,
+                acceptance_profile=acceptance_profile,
+                reference_video_exists=reference_path.exists(),
+                target_video_exists=target_path.exists(),
+            )
+            local_hard_rejects = list(local_gate_report.get("hard_reject", []))
             model_accepted = (
                 bool(model_fields.get("accept"))
-                and confidence >= _profile_threshold(acceptance_profile, "edit_match_score")
-                and difference_type not in FINAL_DISABLED_DIFFERENCE_TYPES
-                and not weak_reason
+                and bool(local_gate_report.get("passed"))
                 and not fallback_used
             )
-            accepted = model_accepted
+            raw_final_omni_output: dict[str, Any] = {}
+            if model_accepted:
+                try:
+                    final_omni_verification, raw_final_omni_output = client.verify_single_source_pair_final(
+                        reference_clip_path=str(reference_path),
+                        target_clip_path=str(target_path),
+                        model_fields=model_fields,
+                        reference_annotation=_annotation_prompt_view(reference_annotation),
+                        target_annotation=_annotation_prompt_view(target_annotation),
+                        local_gate_report=local_gate_report,
+                        whole_annotation=_single_source_whole_prompt_view(whole_annotation) if whole_annotation else None,
+                    )
+                except Exception as exc:
+                    final_omni_verification = _single_source_skipped_final_verification(
+                        f"final_omni_verification_error: {type(exc).__name__}: {exc}"
+                    )
+                    raw_final_omni_output = {"error": f"{type(exc).__name__}: {exc}"}
+            else:
+                skip_reason = "initial_pair_model_rejected"
+                if local_hard_rejects:
+                    skip_reason = "; ".join(local_hard_rejects)
+                elif not bool(model_fields.get("accept")):
+                    skip_reason = str(model_fields.get("reject_reason", "")).strip() or skip_reason
+                final_omni_verification = _single_source_skipped_final_verification(skip_reason)
+            final_issues = _single_source_final_verification_issues(
+                final_omni_verification,
+                acceptance_profile=acceptance_profile,
+            )
+            local_review_required = list(local_gate_report.get("review_required", []))
+            blocking_issues = _dedupe_strings(
+                local_hard_rejects + (local_review_required if final_issues else []) + final_issues
+            )
+            final_omni_accept = bool(model_accepted and not final_issues and _boolish(final_omni_verification.get("accept")))
+            accepted = bool(final_omni_accept and not blocking_issues)
             reject_reason = str(model_fields.get("reject_reason", "")).strip()
             if not accepted:
-                reject_reason = "; ".join([item for item in (reject_reason, weak_reason) if item]).strip()
+                reject_reason = "; ".join([item for item in [reject_reason, *blocking_issues] if item]).strip()
                 reject_reason = reject_reason or "single-source pair model rejected"
             judge = {
                 "reference_satisfies_edit": False,
-                "target_satisfies_edit": bool(model_fields.get("accept")) and not weak_reason,
-                "single_main_difference": bool(model_fields.get("accept")) and not weak_reason,
+                "target_satisfies_edit": accepted,
+                "single_main_difference": accepted,
                 "same_context_score": quality["same_context_score"],
                 "edit_match_score": quality["edit_match_score"],
                 "target_uniqueness_score": quality["target_uniqueness_score"],
@@ -1972,9 +2013,14 @@ def propose_single_source_pairs(
                 "pair_video_evidence": list(model_fields.get("evidence", [])),
                 "confidence": confidence,
                 "model_accepted": model_accepted,
+                "final_omni_accept": final_omni_accept,
+                "final_accept_source": "local_gate_and_final_omni",
+                "local_gate_report": local_gate_report,
+                "final_omni_verification": final_omni_verification,
                 "single_source_delta_family": _single_source_delta_family_from_fields(model_fields),
-                "single_source_pair_acceptance_issues": acceptance_issues,
-                "recommended_edit_text": _single_source_recommended_edit_text(model_fields),
+                "single_source_pair_acceptance_issues": blocking_issues,
+                "recommended_edit_text": str(final_omni_verification.get("recommended_edit_text", "")).strip()
+                or _single_source_recommended_edit_text(model_fields),
                 "hard_negatives": hard_negative_paths,
                 "quality": quality,
                 "heuristic_quality": dict(candidate.get("quality", {})) if isinstance(candidate.get("quality"), dict) else {},
@@ -2001,6 +2047,7 @@ def propose_single_source_pairs(
                 "accepted": accepted,
                 "fallback_used": fallback_used,
                 "raw_model_output": raw_model_output,
+                "raw_final_omni_output": raw_final_omni_output,
                 "single_source_pair": True,
             }
         if bool(record.get("fallback_used")):
@@ -5784,6 +5831,22 @@ def _build_single_source_pair_review_items(
                     missing_videos.append(str(resolved))
         (item_dir / "edit_text.txt").write_text(str(record.get("edit_text", "")).strip() + "\n", encoding="utf-8")
         (item_dir / "metadata.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        local_gate_report = record.get("local_gate_report") if isinstance(record.get("local_gate_report"), dict) else {}
+        final_omni_verification = (
+            record.get("final_omni_verification") if isinstance(record.get("final_omni_verification"), dict) else {}
+        )
+        (item_dir / "local_gate_report.json").write_text(
+            json.dumps(local_gate_report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (item_dir / "final_omni_verification.json").write_text(
+            json.dumps(final_omni_verification, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (item_dir / "final_reason.md").write_text(
+            _single_source_final_reason_markdown(record),
+            encoding="utf-8",
+        )
         reference_annotation = annotation_lookup.get(str(record.get("reference_clip_id", "")).strip(), {})
         target_annotation = annotation_lookup.get(str(record.get("target_clip_id", "")).strip(), {})
         contact_sheet_path = _write_single_source_pair_contact_sheet(
@@ -5810,6 +5873,32 @@ def _build_single_source_pair_review_items(
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
+
+
+def _single_source_final_reason_markdown(record: dict[str, Any]) -> str:
+    local_gate_report = record.get("local_gate_report") if isinstance(record.get("local_gate_report"), dict) else {}
+    final_omni = record.get("final_omni_verification") if isinstance(record.get("final_omni_verification"), dict) else {}
+    return "\n".join(
+        [
+            "# Final Pair Decision",
+            "",
+            f"- accepted: `{bool(record.get('accepted'))}`",
+            f"- final_accept_source: `{record.get('final_accept_source', '')}`",
+            f"- final_omni_accept: `{bool(record.get('final_omni_accept'))}`",
+            f"- final_omni_quality_score: `{final_omni.get('quality_score', '')}`",
+            f"- final_omni_confidence: `{final_omni.get('confidence', '')}`",
+            f"- main_reject_reason: {str(final_omni.get('main_reject_reason', '')).strip()}",
+            "",
+            "## Local Gate Report",
+            "",
+            f"```json\n{json.dumps(local_gate_report, ensure_ascii=False, indent=2)}\n```",
+            "",
+            "## Final Omni Verification",
+            "",
+            f"```json\n{json.dumps(final_omni, ensure_ascii=False, indent=2)}\n```",
+            "",
+        ]
+    )
 
 
 def _write_single_source_pair_contact_sheet(
@@ -5890,10 +5979,12 @@ def _single_source_pair_description_markdown(
         f"# Single Source Pair `{record.get('proposal_id', '')}`",
         "",
         f"- accepted: `{bool(record.get('accepted'))}`",
+        f"- final_omni_accept: `{bool(record.get('final_omni_accept'))}`",
         f"- edit_text: {str(record.get('edit_text', '')).strip()}",
         f"- recommended_edit_text: {str(record.get('recommended_edit_text', record.get('edit_text', ''))).strip()}",
         f"- difference: `{json.dumps(difference, ensure_ascii=False)}`",
         f"- confidence: `{record.get('confidence', '')}`",
+        f"- final_omni_quality_score: `{(record.get('final_omni_verification') or {}).get('quality_score', '') if isinstance(record.get('final_omni_verification'), dict) else ''}`",
         f"- issue_tags: `{', '.join(issues) if issues else 'none'}`",
         f"- reject_reason: {str(judge.get('reject_reason', '')).strip()}",
         f"- delta_family: `{record.get('single_source_delta_family', '')}`",
@@ -5914,6 +6005,14 @@ def _single_source_pair_description_markdown(
         "## Subject Roles",
         "",
         f"```json\n{json.dumps(record.get('subject_roles', {}), ensure_ascii=False, indent=2)}\n```",
+        "",
+        "## Local Gate Report",
+        "",
+        f"```json\n{json.dumps(record.get('local_gate_report', {}), ensure_ascii=False, indent=2)}\n```",
+        "",
+        "## Final Omni Verification",
+        "",
+        f"```json\n{json.dumps(record.get('final_omni_verification', {}), ensure_ascii=False, indent=2)}\n```",
         "",
         "## Reference State",
         "",
@@ -7195,11 +7294,43 @@ def _recheck_existing_single_source_pair_record(
         reference_annotation=record.get("reference_annotation", {}) if isinstance(record.get("reference_annotation"), dict) else None,
         target_annotation=record.get("target_annotation", {}) if isinstance(record.get("target_annotation"), dict) else None,
     )
-    record["single_source_pair_acceptance_issues"] = issues
+    local_gate_report = _single_source_local_gate_report(
+        acceptance_issues=issues,
+        fallback_used=bool(record.get("fallback_used")),
+        difference_type=str(difference.get("type", "")).strip(),
+        confidence=_score_float(record.get("confidence")),
+        acceptance_profile=acceptance_profile,
+        reference_video_exists=True,
+        target_video_exists=True,
+    )
+    final_omni_verification = (
+        record.get("final_omni_verification")
+        if isinstance(record.get("final_omni_verification"), dict)
+        else _single_source_skipped_final_verification("final_omni_verification_missing")
+    )
+    final_issues = _single_source_final_verification_issues(
+        final_omni_verification,
+        acceptance_profile=acceptance_profile,
+    )
+    local_review_required = list(local_gate_report.get("review_required", []))
+    blocking_issues = _dedupe_strings(
+        list(local_gate_report.get("hard_reject", [])) + (local_review_required if final_issues else []) + final_issues
+    )
+    record["local_gate_report"] = local_gate_report
+    record["final_omni_verification"] = final_omni_verification
+    record["final_omni_accept"] = bool(
+        _boolish(final_omni_verification.get("accept")) and not final_issues and bool(local_gate_report.get("passed"))
+    )
+    record["final_accept_source"] = "local_gate_and_final_omni"
+    record["single_source_pair_acceptance_issues"] = blocking_issues
     record["recommended_edit_text"] = record.get("recommended_edit_text") or _single_source_recommended_edit_text(model_fields)
     record["single_source_delta_family"] = record.get("single_source_delta_family") or _single_source_delta_family_from_fields(model_fields)
-    record["model_accepted"] = bool(model_fields.get("accept")) and not issues
-    _set_single_source_record_acceptance(record, accepted=record["model_accepted"], extra_issues=issues)
+    record["model_accepted"] = bool(model_fields.get("accept")) and bool(local_gate_report.get("passed"))
+    _set_single_source_record_acceptance(
+        record,
+        accepted=bool(record["model_accepted"] and record["final_omni_accept"] and not blocking_issues),
+        extra_issues=blocking_issues,
+    )
     return record
 
 
@@ -7350,6 +7481,117 @@ def _single_source_pair_acceptance_issues(
         reasons.append(text_driven_issue)
 
     return _dedupe_strings(reasons)
+
+
+def _single_source_local_gate_report(
+    *,
+    acceptance_issues: list[str],
+    fallback_used: bool,
+    difference_type: str,
+    confidence: float,
+    acceptance_profile: str,
+    reference_video_exists: bool,
+    target_video_exists: bool,
+) -> dict[str, Any]:
+    hard_rejects: list[str] = []
+    review_required: list[str] = []
+    threshold = _profile_threshold(acceptance_profile, "edit_match_score")
+
+    if fallback_used:
+        hard_rejects.append("fallback_pair_proposal")
+    if not reference_video_exists:
+        hard_rejects.append("reference_video_missing")
+    if not target_video_exists:
+        hard_rejects.append("target_video_missing")
+    if difference_type in FINAL_DISABLED_DIFFERENCE_TYPES:
+        hard_rejects.append(f"{difference_type} is diagnostic-only for single-source accepted pairs")
+    if confidence < threshold:
+        hard_rejects.append(f"low_pair_video_confidence: {confidence:.2f} < {threshold:.2f}")
+
+    for issue in acceptance_issues:
+        normalized = str(issue).strip()
+        if not normalized:
+            continue
+        if normalized.startswith(
+            (
+                "transient_delta_not_segment_wide",
+                "segment_internal_transition",
+                "composition_label_mismatch",
+                "subject_role_mismatch",
+            )
+        ):
+            review_required.append(normalized)
+        else:
+            hard_rejects.append(normalized)
+
+    hard_rejects = _dedupe_strings(hard_rejects)
+    review_required = _dedupe_strings(review_required)
+    return {
+        "passed": not hard_rejects,
+        "hard_reject": hard_rejects,
+        "review_required": review_required,
+        "all_issues": _dedupe_strings(hard_rejects + review_required),
+        "confidence": round(confidence, 3),
+        "confidence_threshold": threshold,
+        "frame_check_points_seconds": [0.2, 2.5, 4.8],
+    }
+
+
+def _single_source_skipped_final_verification(reason: str) -> dict[str, Any]:
+    return {
+        "accept": False,
+        "confidence": 0.0,
+        "quality_score": 0.0,
+        "reference_satisfies_edit": False,
+        "target_satisfies_edit": False,
+        "observable_delta": False,
+        "single_primary_delta": False,
+        "text_or_ocr_driven": False,
+        "segment_wide": False,
+        "edit_text_accurate": False,
+        "main_reject_reason": reason,
+        "evidence": [],
+        "recommended_edit_text": "",
+        "skipped": True,
+    }
+
+
+def _single_source_final_verification_issues(
+    final_verification: dict[str, Any],
+    *,
+    acceptance_profile: str,
+) -> list[str]:
+    if not isinstance(final_verification, dict) or not final_verification:
+        return ["final_omni_verification_missing"]
+    threshold = _profile_threshold(acceptance_profile, "edit_match_score")
+    issues: list[str] = []
+    confidence = _score_float(final_verification.get("confidence"))
+    quality_score = _score_float(final_verification.get("quality_score"))
+    reason = str(final_verification.get("main_reject_reason", "")).strip()
+    if not _boolish(final_verification.get("accept")):
+        issues.append("final_omni_reject" + (f": {reason}" if reason else ""))
+    if confidence < threshold:
+        issues.append(f"final_omni_low_confidence: {confidence:.2f} < {threshold:.2f}")
+    if quality_score < MIN_SINGLE_SOURCE_FINAL_OMNI_QUALITY_SCORE:
+        issues.append(
+            "final_omni_quality_score_below_threshold: "
+            f"{quality_score:.2f} < {MIN_SINGLE_SOURCE_FINAL_OMNI_QUALITY_SCORE:.2f}"
+        )
+    if _boolish(final_verification.get("reference_satisfies_edit")):
+        issues.append("final_omni_reference_satisfies_edit")
+    if not _boolish(final_verification.get("target_satisfies_edit")):
+        issues.append("final_omni_target_missing_edit")
+    if not _boolish(final_verification.get("observable_delta")):
+        issues.append("final_omni_missing_observable_delta")
+    if not _boolish(final_verification.get("single_primary_delta")):
+        issues.append("final_omni_not_single_primary_delta")
+    if _boolish(final_verification.get("text_or_ocr_driven")):
+        issues.append("final_omni_text_or_ocr_driven")
+    if not _boolish(final_verification.get("segment_wide")):
+        issues.append("final_omni_delta_not_segment_wide")
+    if not _boolish(final_verification.get("edit_text_accurate")):
+        issues.append("final_omni_edit_text_inaccurate")
+    return _dedupe_strings(issues)
 
 
 def _single_source_model_reject_issues(

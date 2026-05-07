@@ -274,6 +274,128 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("main speaker", request_body["messages"][0]["content"])
         self.assertIn("inset", request_body["messages"][0]["content"])
 
+    def test_verify_single_source_pair_final_materializes_videos_and_scores_quality(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "accept": True,
+                                "confidence": 0.82,
+                                "quality_score": 0.64,
+                                "reference_satisfies_edit": False,
+                                "target_satisfies_edit": True,
+                                "observable_delta": True,
+                                "single_primary_delta": True,
+                                "text_or_ocr_driven": False,
+                                "segment_wide": True,
+                                "edit_text_accurate": True,
+                                "main_reject_reason": "",
+                                "evidence": ["target has a stable product overlay; reference does not"],
+                                "recommended_edit_text": "add a static product image overlay on the left",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8093/v1",
+            api_key="EMPTY",
+            model="qwen3-omni",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "reference.mp4"
+            target_path = Path(temp_dir) / "target.mp4"
+            reference_path.write_bytes(b"reference-video")
+            target_path.write_bytes(b"target-video")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.verify_single_source_pair_final(
+                    reference_clip_path=str(reference_path),
+                    target_clip_path=str(target_path),
+                    model_fields={
+                        "edit_text": "add a static product image overlay on the left",
+                        "dominant_delta": {"type": "object_presence", "from": "no overlay", "to": "product overlay"},
+                    },
+                    reference_annotation={"clip_id": "ref", "summary": "speaker only"},
+                    target_annotation={"clip_id": "target", "summary": "speaker with product overlay"},
+                    local_gate_report={"passed": True, "hard_reject": [], "review_required": []},
+                )
+
+        self.assertTrue(normalized["accept"])
+        self.assertEqual(0.64, normalized["quality_score"])
+        self.assertEqual("add a static product image overlay on the left", normalized["recommended_edit_text"])
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        content = request_body["messages"][1]["content"]
+        self.assertEqual("Reference clip for final verification:", content[0]["text"])
+        self.assertTrue(content[1]["video_url"]["url"].startswith("data:video/mp4;base64,"))
+        self.assertEqual("Target clip for final verification:", content[2]["text"])
+        self.assertTrue(content[3]["video_url"]["url"].startswith("data:video/mp4;base64,"))
+        self.assertIn("quality_score", request_body["messages"][0]["content"])
+        self.assertIn("0.6 is borderline", request_body["messages"][0]["content"])
+
+    def test_verify_single_source_pair_final_caps_rejected_quality_score(self) -> None:
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "accept": False,
+                                "confidence": 0.95,
+                                "quality_score": 0.9,
+                                "reference_satisfies_edit": False,
+                                "target_satisfies_edit": True,
+                                "observable_delta": True,
+                                "single_primary_delta": True,
+                                "text_or_ocr_driven": False,
+                                "segment_wide": True,
+                                "edit_text_accurate": True,
+                                "main_reject_reason": "the clips are effectively the same apart from product text",
+                                "evidence": ["only the product image label changes"],
+                                "recommended_edit_text": "change the product image label",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            return _FakeHTTPResponse(response_payload)
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8093/v1",
+            api_key="EMPTY",
+            model="qwen3-omni",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "reference.mp4"
+            target_path = Path(temp_dir) / "target.mp4"
+            reference_path.write_bytes(b"reference-video")
+            target_path.write_bytes(b"target-video")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.verify_single_source_pair_final(
+                    reference_clip_path=str(reference_path),
+                    target_clip_path=str(target_path),
+                    model_fields={"edit_text": "change the product image label"},
+                    reference_annotation={"clip_id": "ref", "summary": "speaker with product image"},
+                    target_annotation={"clip_id": "target", "summary": "speaker with similar product image"},
+                    local_gate_report={"passed": True, "hard_reject": [], "review_required": []},
+                )
+
+        self.assertFalse(normalized["accept"])
+        self.assertEqual(0.59, normalized["quality_score"])
+
     def test_plan_video_edit_materializes_reference_video_and_normalizes_plan(self) -> None:
         request_holder: dict[str, object] = {}
         response_payload = {
