@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -1375,11 +1376,16 @@ def select_single_source_video(
     top_k: int = 8,
     max_source_videos_scan: int = 2000,
     max_eligible_candidates: int | None = None,
+    selection_mode: str = "local_score",
+    random_seed: int | None = None,
     base_url: str | None = None,
     api_key: str = "EMPTY",
     model: str | None = None,
     timeout_seconds: float = 180.0,
 ) -> dict[str, Any]:
+    selection_mode = str(selection_mode).strip() or "local_score"
+    if selection_mode not in {"local_score", "random", "first"}:
+        raise ValueError("selection_mode must be local_score, random, or first")
     layout = ensure_layout(root)
     source_rows = list(_load_jsonl(Path(source_clips_path)))
     if not source_rows:
@@ -1463,16 +1469,20 @@ def select_single_source_video(
         if max_eligible_candidates is not None and max_eligible_candidates > 0 and len(candidates) >= max_eligible_candidates:
             break
 
-    candidates.sort(
-        key=lambda record: (
-            -_score_float(record.get("local_selection_score")),
-            abs(float(record.get("duration_seconds") or 0.0) - 30.0),
-            str(record.get("source_clip_id", "")),
+    ordered_candidates = list(candidates)
+    if selection_mode == "random":
+        random.Random(random_seed).shuffle(ordered_candidates)
+    elif selection_mode == "local_score":
+        ordered_candidates.sort(
+            key=lambda record: (
+                -_score_float(record.get("local_selection_score")),
+                abs(float(record.get("duration_seconds") or 0.0) - 30.0),
+                str(record.get("source_clip_id", "")),
+            )
         )
-    )
-    top_candidates = candidates[: max(1, top_k)]
+    top_candidates = ordered_candidates[: max(1, top_k)]
     selection_annotations: list[dict[str, Any]] = []
-    selection_method = "local_probe"
+    selection_method = f"{selection_mode}_local_probe"
     selected = top_candidates[0] if top_candidates else None
     if top_candidates and base_url and model:
         client = OpenAIComposedDataClient(
@@ -1520,6 +1530,8 @@ def select_single_source_video(
     selected_record = dict(selected)
     selected_record["selection_method"] = selection_method
     selected_record["selection_top_k"] = len(top_candidates)
+    selected_record["selection_mode"] = selection_mode
+    selected_record["random_seed"] = random_seed
     selected_record["selection_constraints"] = {
         "dataset": dataset,
         "min_duration_seconds": min_duration_seconds,
@@ -1543,6 +1555,8 @@ def select_single_source_video(
         "eligible_count": len(candidates),
         "top_k_count": len(top_candidates),
         "max_eligible_candidates": max_eligible_candidates,
+        "selection_mode": selection_mode,
+        "random_seed": random_seed,
         "selected_source_clip_id": selected_record["source_clip_id"],
         "selected_source_path": selected_record["source_path"],
         "selection_method": selection_method,
@@ -15061,6 +15075,8 @@ def build_parser() -> argparse.ArgumentParser:
     select_single_source_parser.add_argument("--top-k", type=int, default=8)
     select_single_source_parser.add_argument("--max-source-videos-scan", type=int, default=2000)
     select_single_source_parser.add_argument("--max-eligible-candidates", type=int)
+    select_single_source_parser.add_argument("--selection-mode", choices=("local_score", "random", "first"), default="local_score")
+    select_single_source_parser.add_argument("--random-seed", type=int)
     select_single_source_parser.add_argument("--base-url")
     select_single_source_parser.add_argument("--api-key", default="EMPTY")
     select_single_source_parser.add_argument("--model")
@@ -15323,6 +15339,8 @@ def main() -> None:
             top_k=args.top_k,
             max_source_videos_scan=args.max_source_videos_scan,
             max_eligible_candidates=args.max_eligible_candidates,
+            selection_mode=args.selection_mode,
+            random_seed=args.random_seed,
             base_url=args.base_url,
             api_key=args.api_key,
             model=args.model,

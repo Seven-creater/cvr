@@ -22,7 +22,9 @@ MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-5}
 MAX_PROPOSALS=${MAX_PROPOSALS:-15}
 ZERO_ACCEPTED_STOP_AFTER=${ZERO_ACCEPTED_STOP_AFTER:-10}
 SELECT_TIMEOUT_SECONDS=${SELECT_TIMEOUT_SECONDS:-120}
-SOURCE_SELECTION_TOP_K=${SOURCE_SELECTION_TOP_K:-3}
+SOURCE_SELECTION_MODE=${SOURCE_SELECTION_MODE:-random}
+SOURCE_SELECTION_RANDOM_SEED=${SOURCE_SELECTION_RANDOM_SEED:-}
+SOURCE_SELECTION_TOP_K=${SOURCE_SELECTION_TOP_K:-1}
 SOURCE_SELECTION_SCAN_LIMIT=${SOURCE_SELECTION_SCAN_LIMIT:-500}
 SOURCE_SELECTION_MAX_ELIGIBLE=${SOURCE_SELECTION_MAX_ELIGIBLE:-24}
 OMNI_SOURCE_SELECTION=${OMNI_SOURCE_SELECTION:-0}
@@ -48,6 +50,8 @@ Options:
   --max-proposals N
   --zero-accepted-stop-after N
   --select-timeout-seconds N
+  --source-selection-mode random|first|local_score
+  --source-selection-random-seed N
   --source-selection-top-k N
   --source-selection-scan-limit N
   --source-selection-max-eligible N
@@ -74,6 +78,8 @@ while [[ $# -gt 0 ]]; do
     --max-proposals) MAX_PROPOSALS="$2"; shift 2 ;;
     --zero-accepted-stop-after) ZERO_ACCEPTED_STOP_AFTER="$2"; shift 2 ;;
     --select-timeout-seconds) SELECT_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --source-selection-mode) SOURCE_SELECTION_MODE="$2"; shift 2 ;;
+    --source-selection-random-seed) SOURCE_SELECTION_RANDOM_SEED="$2"; shift 2 ;;
     --source-selection-top-k) SOURCE_SELECTION_TOP_K="$2"; shift 2 ;;
     --source-selection-scan-limit) SOURCE_SELECTION_SCAN_LIMIT="$2"; shift 2 ;;
     --source-selection-max-eligible) SOURCE_SELECTION_MAX_ELIGIBLE="$2"; shift 2 ;;
@@ -189,7 +195,11 @@ if stage_enabled select; then
     --top-k "$SOURCE_SELECTION_TOP_K"
     --max-source-videos-scan "$SOURCE_SELECTION_SCAN_LIMIT"
     --max-eligible-candidates "$SOURCE_SELECTION_MAX_ELIGIBLE"
+    --selection-mode "$SOURCE_SELECTION_MODE"
   )
+  if [ -n "$SOURCE_SELECTION_RANDOM_SEED" ]; then
+    SELECT_CMD+=(--random-seed "$SOURCE_SELECTION_RANDOM_SEED")
+  fi
   if [ "$OMNI_SOURCE_SELECTION" = "1" ]; then
     SELECT_CMD+=(
       --base-url "$BASE_URL"
@@ -198,7 +208,7 @@ if stage_enabled select; then
       --timeout-seconds "$SELECT_TIMEOUT_SECONDS"
     )
   else
-    echo "[single-source-omni] fast local source selection; Omni source selection disabled (pass --omni-source-selection to enable)"
+    echo "[single-source-omni] fast local source selection mode=$SOURCE_SELECTION_MODE; Omni source selection disabled (pass --omni-source-selection to enable)"
   fi
   run_with_timeout "select-single-source-video" "$SELECT_TIMEOUT_SECONDS" \
     "${SELECT_CMD[@]}"

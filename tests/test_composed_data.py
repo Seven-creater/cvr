@@ -321,6 +321,61 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(2, summary["top_k_count"])
             self.assertEqual(2, probe_mock.call_count)
 
+    def test_select_single_source_video_random_mode_is_seeded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            source_clips_path = root / "metadata" / "source_clips_all.jsonl"
+            rows = []
+            for index in range(4):
+                video = root / "raw" / "daily_omni" / "video" / f"source_{index}.mp4"
+                video.parent.mkdir(parents=True, exist_ok=True)
+                video.write_bytes(b"raw")
+                rows.append(
+                    {
+                        "clip_id": f"daily_raw_{index}",
+                        "dataset": "daily_omni",
+                        "source_path": str(video),
+                    }
+                )
+            self._write_jsonl(source_clips_path, rows)
+
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={
+                    "duration_seconds": 30.0,
+                    "has_audio": True,
+                    "has_video": True,
+                    "width": 640,
+                    "height": 360,
+                    "fps": 30.0,
+                },
+            ):
+                first = select_single_source_video(
+                    root=root,
+                    source_clips_path=source_clips_path,
+                    output_path=root / "metadata" / "selected_a.json",
+                    candidates_output_path=root / "metadata" / "candidates_a.jsonl",
+                    selection_mode="random",
+                    random_seed=7,
+                    top_k=1,
+                )
+                second = select_single_source_video(
+                    root=root,
+                    source_clips_path=source_clips_path,
+                    output_path=root / "metadata" / "selected_b.json",
+                    candidates_output_path=root / "metadata" / "candidates_b.jsonl",
+                    selection_mode="random",
+                    random_seed=7,
+                    top_k=1,
+                )
+
+            self.assertEqual(first["selected_source_clip_id"], second["selected_source_clip_id"])
+            self.assertEqual("random", first["selection_mode"])
+            selected = json.loads((root / "metadata" / "selected_a.json").read_text(encoding="utf-8"))
+            self.assertEqual("random", selected["selection_mode"])
+            self.assertEqual(7, selected["random_seed"])
+
     def test_plan_single_source_clips_splits_30s_into_6_segments_and_15_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
