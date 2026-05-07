@@ -8026,6 +8026,67 @@ class ComposedDataTests(unittest.TestCase):
 
             self.assertTrue(any("visible_text difference type is disabled" in issue for issue in issues))
 
+    def test_pair_record_acceptance_issues_warns_audio_speech_content_in_exploration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            record = {
+                "reference_video": "ref.mp4",
+                "target_video": "target.mp4",
+                "edit_text": "replace the speech with narration in the audio",
+                "difference": {"type": "audio_event", "from": "speech", "to": "narration"},
+                "quality": {},
+            }
+
+            final_issues = _pair_record_acceptance_issues(
+                root=root,
+                record=copy.deepcopy(record),
+                reference_annotation={"audio_events": ["speech"]},
+                target_annotation={"audio_events": ["narration"]},
+            )
+            exploration_record = copy.deepcopy(record)
+            exploration_issues = _pair_record_acceptance_issues(
+                root=root,
+                record=exploration_record,
+                reference_annotation={"audio_events": ["speech"]},
+                target_annotation={"audio_events": ["narration"]},
+                acceptance_profile="exploration",
+            )
+
+            self.assertTrue(any("speech content edits are disabled" in issue for issue in final_issues))
+            self.assertFalse(any("speech content edits are disabled" in issue for issue in exploration_issues))
+            self.assertTrue(
+                any(
+                    "diagnostic_audio_speech_content" in warning
+                    for warning in exploration_record["quality"].get("exploration_warnings", [])
+                )
+            )
+
+    def test_judge_accepts_exploration_audio_speech_content_reject_as_diagnostic(self) -> None:
+        judge = {
+            "accept": False,
+            "reject_reason": "speech content edits are disabled for final Omni-CVR samples",
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "hard_negative_quality": "good",
+        }
+        quality = {
+            "difference_type": "audio_event",
+            "same_context_score": 0.6,
+            "edit_match_score": 0.7,
+            "target_uniqueness_score": 0.7,
+            "difference_strength_score": 0.7,
+            "non_speech_audio_event_score": 0.6,
+            "intraclip_change_conflict": 0.0,
+            "edit_text_is_imperative": 1.0,
+            "edit_text_quality_score": 0.8,
+        }
+
+        self.assertFalse(_judge_accepts(judge, None, quality))
+        self.assertTrue(_judge_accepts(judge, None, quality, acceptance_profile="exploration"))
+
     def test_synthetic_audio_rejects_visual_drift_and_missing_target_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

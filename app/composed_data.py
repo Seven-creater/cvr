@@ -8259,6 +8259,41 @@ def _speech_content_edit_issues(*, edit_text: str, difference: dict[str, Any]) -
     return deduped
 
 
+def _split_profiled_speech_content_issues(
+    *,
+    edit_text: str,
+    difference: dict[str, Any],
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
+) -> tuple[list[str], list[str]]:
+    issues = _speech_content_edit_issues(edit_text=edit_text, difference=difference)
+    if not _is_exploration_profile(acceptance_profile):
+        return issues, []
+    difference_type = str(difference.get("type", "")).strip()
+    if difference_type != "audio_event":
+        return issues, []
+
+    hard_issues: list[str] = []
+    warning_issues: list[str] = []
+    for issue in issues:
+        if "speech difference type is disabled" in issue or "visible_text difference type is disabled" in issue:
+            hard_issues.append(issue)
+        else:
+            warning_issues.append(issue)
+    return hard_issues, warning_issues
+
+
+def _is_exploration_audio_speech_content_reject(judge: dict[str, Any], quality: dict[str, Any]) -> bool:
+    if str(quality.get("difference_type", "")).strip() != "audio_event":
+        return False
+    reject_reason = str(judge.get("reject_reason", "")).lower()
+    return bool(
+        "speech content edits are disabled" in reject_reason
+        or "speech-only or narration-only" in reject_reason
+        or "speech only" in reject_reason
+        or "narration only" in reject_reason
+    )
+
+
 def _normalize_audio_event_model_fields(model_fields: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(model_fields)
     difference = dict(normalized.get("difference", {}))
@@ -9136,7 +9171,7 @@ def _exploration_judge_accepts(
     hard_negative_quality = str(judge.get("hard_negative_quality", "")).strip().lower()
     if difference_type in FINAL_DISABLED_DIFFERENCE_TYPES:
         return False
-    if not bool(judge.get("accept")):
+    if not bool(judge.get("accept")) and not _is_exploration_audio_speech_content_reject(judge, quality):
         return False
     if _boolish(judge.get("reference_satisfies_edit")) or not _boolish(judge.get("target_satisfies_edit")):
         return False
@@ -9180,7 +9215,12 @@ def _should_skip_pair_video_verification(
     hard_negative_quality = str(judge.get("hard_negative_quality", "")).strip().lower()
     if (
         not bool(judge.get("accept"))
-        or _boolish(judge.get("reference_satisfies_edit"))
+        and not (
+            _is_exploration_profile(acceptance_profile)
+            and _is_exploration_audio_speech_content_reject(judge, quality)
+        )
+    ) or (
+        _boolish(judge.get("reference_satisfies_edit"))
         or not _boolish(judge.get("target_satisfies_edit"))
         or not _boolish(judge.get("single_main_difference"))
         or hard_negative_quality not in {"good", "weak"}
@@ -9794,13 +9834,33 @@ def _pair_record_acceptance_issues(
     ):
         issues.append("the proposed difference appears inside a single clip instead of between reference and target")
     difference = record.get("difference", {})
-    issues.extend(_speech_content_edit_issues(edit_text=str(record.get("edit_text", "")), difference=difference))
+    quality = record.get("quality", {})
+    if not isinstance(quality, dict):
+        quality = {}
+        record["quality"] = quality
+    speech_issues, speech_warnings = _split_profiled_speech_content_issues(
+        edit_text=str(record.get("edit_text", "")),
+        difference=difference,
+        acceptance_profile=acceptance_profile,
+    )
+    issues.extend(speech_issues)
+    if speech_warnings:
+        quality["exploration_warnings"] = _dedupe_strings(
+            _normalize_list(quality.get("exploration_warnings", []))
+            + [f"diagnostic_audio_speech_content: {issue}" for issue in speech_warnings]
+        )
     if str(difference.get("type", "")).strip() == "audio_event":
         from_value = str(difference.get("from", "")).strip()
         to_value = str(difference.get("to", "")).strip()
         if _is_speech_only_audio_phrase(from_value) or _is_speech_only_audio_phrase(to_value):
-            issues.append("audio_event must not use speech-only or narration-only text as the main difference")
-    quality = record.get("quality", {})
+            issue = "audio_event must not use speech-only or narration-only text as the main difference"
+            if _is_exploration_profile(acceptance_profile):
+                quality["exploration_warnings"] = _dedupe_strings(
+                    _normalize_list(quality.get("exploration_warnings", []))
+                    + [f"diagnostic_audio_speech_content: {issue}"]
+                )
+            else:
+                issues.append(issue)
     if isinstance(quality, dict):
         if _is_exploration_profile(acceptance_profile):
             if "edit_text_is_imperative" in quality and _score_float(quality.get("edit_text_is_imperative")) < 1.0:
