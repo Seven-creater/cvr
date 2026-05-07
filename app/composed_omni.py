@@ -96,6 +96,11 @@ REQUIRED_SINGLE_SOURCE_PAIR_FIELDS = (
     "target_caption",
     "difference",
     "dominant_delta",
+    "reference_state",
+    "target_state",
+    "delta_temporal_extent",
+    "subject_roles",
+    "is_segment_wide_delta",
     "discarded_deltas",
     "evidence",
     "confidence",
@@ -455,6 +460,13 @@ def _single_source_pair_system_prompt() -> str:
         '"reference_caption": string, "target_caption": string, '
         '"difference": {"type": string, "from": string, "to": string, "description": string}, '
         '"dominant_delta": {"type": string, "from": string, "to": string, "reason": string}, '
+        '"reference_state": {"main_speaker": string, "inset_subjects": [string], "product_overlay": string, '
+        '"composition": string, "internal_transitions": [string]}, '
+        '"target_state": {"main_speaker": string, "inset_subjects": [string], "product_overlay": string, '
+        '"composition": string, "internal_transitions": [string]}, '
+        '"delta_temporal_extent": {"reference": string, "target": string, "target_coverage": number, "evidence": string}, '
+        '"subject_roles": {"main_speaker": string, "inset_subjects": [string], "product_overlay": string}, '
+        '"is_segment_wide_delta": boolean, '
         '"discarded_deltas": [string], "evidence": [string], "confidence": number, '
         '"accept": boolean, "reject_reason": string}. '
         f"Allowed difference.type values: {difference_types}. "
@@ -464,12 +476,19 @@ def _single_source_pair_system_prompt() -> str:
         "If a product, applicator, hand-held object, product close-up, or picture-in-picture demo is visible in one clip and not the other, "
         "choose object_presence or scene/composition instead of clothing or hair attributes. "
         "Speech and visible text are auxiliary evidence only for this pass; do not use them as the primary edit. "
+        "Distinguish the main speaker from inset-video subjects and product-overlay imagery; never describe an inset man/woman "
+        "as replacing the main speaker. "
+        "Only accept if the dominant delta is stable for most of the target clip; if it appears only briefly or only at the end, "
+        "set is_segment_wide_delta=false and explain the transient timing. "
         "Write edit_text as a short imperative edit that changes the reference into the target, for example: "
         "'add a picture-in-picture demonstration overlay', "
         "'change the shot from face-only speaking to holding a mascara wand', or "
-        "'change the shot from the speaker to a product close-up'. "
+        "'add a static product image overlay on the left'. "
+        "Do not write 'product close-up' unless the speaker mostly disappears and the product dominates the frame. "
+        "Do not write 'full-screen product presentation' unless there is no speaker or overlay layout. "
+        "Do not write 'man speaking' as the primary subject unless it is explicitly an inset video and it persists for most of the clip. "
         "Reject the pair if the only difference is a near-duplicate attribute wording change, unclear clothing/hair wording, "
-        "or multiple equally strong unrelated changes. "
+        "a transient final-moment overlay, an internally changing segment, or multiple equally strong unrelated changes. "
         "When rejecting, still fill the best tentative edit_text and evidence, set accept=false, and explain reject_reason."
     )
 
@@ -1323,6 +1342,10 @@ def _normalize_single_source_pair_payload(payload: dict[str, Any]) -> dict[str, 
     dominant_delta = payload.get("dominant_delta")
     if not isinstance(dominant_delta, dict):
         raise ValueError("single-source pair dominant_delta must be an object")
+    reference_state = _normalize_single_source_state(payload.get("reference_state"))
+    target_state = _normalize_single_source_state(payload.get("target_state"))
+    delta_temporal_extent = _normalize_delta_temporal_extent(payload.get("delta_temporal_extent"))
+    subject_roles = _normalize_single_source_subject_roles(payload.get("subject_roles"))
     normalized = {
         "edit_text": str(payload.get("edit_text", "")).strip(),
         "modalities": modalities,
@@ -1335,6 +1358,11 @@ def _normalize_single_source_pair_payload(payload: dict[str, Any]) -> dict[str, 
             "to": str(dominant_delta.get("to", "")).strip(),
             "reason": str(dominant_delta.get("reason", "")).strip(),
         },
+        "reference_state": reference_state,
+        "target_state": target_state,
+        "delta_temporal_extent": delta_temporal_extent,
+        "subject_roles": subject_roles,
+        "is_segment_wide_delta": _bool_value(payload.get("is_segment_wide_delta")),
         "discarded_deltas": _detail_list(payload.get("discarded_deltas")),
         "evidence": _detail_list(payload.get("evidence")),
         "confidence": _score_value(payload.get("confidence")),
@@ -1348,7 +1376,42 @@ def _normalize_single_source_pair_payload(payload: dict[str, Any]) -> dict[str, 
         raise ValueError("single-source pair dominant_delta type and reason are required")
     if not normalized["evidence"]:
         raise ValueError("single-source pair evidence is required")
+    if not normalized["delta_temporal_extent"]["evidence"]:
+        raise ValueError("single-source pair delta_temporal_extent evidence is required")
     return normalized
+
+
+def _normalize_single_source_state(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("single-source pair state fields must be objects")
+    return {
+        "main_speaker": str(value.get("main_speaker", "")).strip(),
+        "inset_subjects": _detail_list(value.get("inset_subjects")),
+        "product_overlay": str(value.get("product_overlay", "")).strip(),
+        "composition": str(value.get("composition", "")).strip(),
+        "internal_transitions": _detail_list(value.get("internal_transitions")),
+    }
+
+
+def _normalize_delta_temporal_extent(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("single-source pair delta_temporal_extent must be an object")
+    return {
+        "reference": str(value.get("reference", "")).strip(),
+        "target": str(value.get("target", "")).strip(),
+        "target_coverage": _score_value(value.get("target_coverage")),
+        "evidence": str(value.get("evidence", "")).strip(),
+    }
+
+
+def _normalize_single_source_subject_roles(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("single-source pair subject_roles must be an object")
+    return {
+        "main_speaker": str(value.get("main_speaker", "")).strip(),
+        "inset_subjects": _detail_list(value.get("inset_subjects")),
+        "product_overlay": str(value.get("product_overlay", "")).strip(),
+    }
 
 
 def _normalize_pair_judge_payload(payload: dict[str, Any]) -> dict[str, Any]:

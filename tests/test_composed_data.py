@@ -592,6 +592,32 @@ class ComposedDataTests(unittest.TestCase):
                         "to": "picture-in-picture demonstration overlay",
                         "reason": "the overlay is visually obvious while clothing wording is incidental",
                     },
+                    "reference_state": {
+                        "main_speaker": "woman presenter",
+                        "inset_subjects": [],
+                        "product_overlay": "",
+                        "composition": "face-only talking-head shot",
+                        "internal_transitions": [],
+                    },
+                    "target_state": {
+                        "main_speaker": "woman presenter",
+                        "inset_subjects": ["brow treatment demonstrator"],
+                        "product_overlay": "",
+                        "composition": "talking-head shot with picture-in-picture demonstration overlay",
+                        "internal_transitions": [],
+                    },
+                    "delta_temporal_extent": {
+                        "reference": "no overlay throughout the reference clip",
+                        "target": "overlay is visible throughout most of the target clip",
+                        "target_coverage": 0.86,
+                        "evidence": "target frames consistently include the overlay",
+                    },
+                    "subject_roles": {
+                        "main_speaker": "woman presenter",
+                        "inset_subjects": ["brow treatment demonstrator"],
+                        "product_overlay": "",
+                    },
+                    "is_segment_wide_delta": True,
                     "discarded_deltas": ["minor blouse/shirt wording"],
                     "evidence": ["target segment contains a picture-in-picture demo overlay; reference does not"],
                     "confidence": 0.86,
@@ -632,6 +658,227 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(ranked[0]["accepted"])
             self.assertEqual(1, len(accepted))
             self.assertNotIn("change attribute from dark blue blouse to dark blue shirt", ranked[0]["edit_text"])
+            self.assertEqual([], ranked[0]["single_source_pair_acceptance_issues"])
+            self.assertEqual("add_pip_demo", ranked[0]["single_source_delta_family"])
+
+    def test_propose_single_source_pairs_rejects_transient_or_overclaimed_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode("utf-8"))
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {"clip_id": "seg_1", "output_path": "clips/seg_1.mp4", "dataset": "daily_omni", "summary": "speaker only"},
+                    {"clip_id": "seg_2", "output_path": "clips/seg_2.mp4", "dataset": "daily_omni", "summary": "speaker with product overlay"},
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "candidate_1",
+                        "proposal_id": _build_proposal_id("clips/seg_1.mp4", "clips/seg_2.mp4"),
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "object_presence", "from": "speaker", "to": "product close-up"},
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_single_source_pair.return_value = (
+                {
+                    "edit_text": "change the shot from the speaker to a product close-up",
+                    "modalities": ["visual"],
+                    "reference_caption": "the woman speaks to camera",
+                    "target_caption": "the woman speaks with a product image overlay on the left",
+                    "difference": {
+                        "type": "object_presence",
+                        "from": "speaker-only shot",
+                        "to": "speaker with static product image overlay",
+                        "description": "a product image appears beside the speaker",
+                    },
+                    "dominant_delta": {
+                        "type": "object_presence",
+                        "from": "speaker-only shot",
+                        "to": "static product image overlay",
+                        "reason": "the product overlay is visible beside the speaker",
+                    },
+                    "reference_state": {
+                        "main_speaker": "woman presenter",
+                        "inset_subjects": [],
+                        "product_overlay": "",
+                        "composition": "speaker-only talking-head shot",
+                        "internal_transitions": [],
+                    },
+                    "target_state": {
+                        "main_speaker": "woman presenter",
+                        "inset_subjects": [],
+                        "product_overlay": "static product image on the left",
+                        "composition": "speaker remains visible beside a static product image overlay",
+                        "internal_transitions": [],
+                    },
+                    "delta_temporal_extent": {
+                        "reference": "no product overlay",
+                        "target": "product image is visible for the target segment",
+                        "target_coverage": 0.88,
+                        "evidence": "target contains speaker plus product overlay, not a pure product close-up",
+                    },
+                    "subject_roles": {
+                        "main_speaker": "woman presenter",
+                        "inset_subjects": [],
+                        "product_overlay": "static product image on the left",
+                    },
+                    "is_segment_wide_delta": True,
+                    "discarded_deltas": [],
+                    "evidence": ["target still contains the speaker and adds a product image overlay"],
+                    "confidence": 0.88,
+                    "accept": True,
+                    "reject_reason": "",
+                },
+                {"raw": "ok"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked_single_source_pairs.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    max_accepted_pairs=5,
+                    acceptance_profile="exploration",
+                )
+
+            ranked = [
+                json.loads(line)
+                for line in (root / "pairs" / "ranked_single_source_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            accepted = [
+                json.loads(line)
+                for line in (root / "pairs" / "accepted_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertFalse(ranked[0]["accepted"])
+            self.assertIn("composition_label_mismatch", "; ".join(ranked[0]["single_source_pair_acceptance_issues"]))
+            self.assertEqual("add a static product image overlay on the left", ranked[0]["recommended_edit_text"])
+            self.assertEqual([], accepted)
+
+    def test_propose_single_source_pairs_dedupes_same_delta_family(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4", "seg_3.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode("utf-8"))
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {"clip_id": "seg_1", "output_path": "clips/seg_1.mp4", "dataset": "daily_omni", "summary": "speaker only"},
+                    {"clip_id": "seg_2", "output_path": "clips/seg_2.mp4", "dataset": "daily_omni", "summary": "speaker with product image"},
+                    {"clip_id": "seg_3", "output_path": "clips/seg_3.mp4", "dataset": "daily_omni", "summary": "speaker with another product image"},
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "candidate_1",
+                        "proposal_id": _build_proposal_id("clips/seg_1.mp4", "clips/seg_2.mp4"),
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                    },
+                    {
+                        "candidate_id": "candidate_2",
+                        "proposal_id": _build_proposal_id("clips/seg_1.mp4", "clips/seg_3.mp4"),
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_3",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_3.mp4",
+                    },
+                ],
+            )
+
+            def product_overlay_payload(product_name: str) -> tuple[dict[str, object], dict[str, str]]:
+                return (
+                    {
+                        "edit_text": "add a static product image overlay on the left",
+                        "modalities": ["visual"],
+                        "reference_caption": "speaker only",
+                        "target_caption": f"speaker with {product_name} product overlay",
+                        "difference": {
+                            "type": "object_presence",
+                            "from": "no product overlay",
+                            "to": "static product image overlay",
+                            "description": "a static product image appears beside the speaker",
+                        },
+                        "dominant_delta": {
+                            "type": "object_presence",
+                            "from": "no product overlay",
+                            "to": "static product image overlay",
+                            "reason": "the product overlay is the clearest visual change",
+                        },
+                        "reference_state": {"main_speaker": "woman", "inset_subjects": [], "product_overlay": "", "composition": "speaker only", "internal_transitions": []},
+                        "target_state": {"main_speaker": "woman", "inset_subjects": [], "product_overlay": product_name, "composition": "speaker with product overlay", "internal_transitions": []},
+                        "delta_temporal_extent": {"reference": "none", "target": "product overlay throughout", "target_coverage": 0.9, "evidence": "overlay persists"},
+                        "subject_roles": {"main_speaker": "woman", "inset_subjects": [], "product_overlay": product_name},
+                        "is_segment_wide_delta": True,
+                        "discarded_deltas": [],
+                        "evidence": ["target has a stable product overlay"],
+                        "confidence": 0.9,
+                        "accept": True,
+                        "reject_reason": "",
+                    },
+                    {"raw": product_name},
+                )
+
+            client = mock.Mock()
+            client.propose_single_source_pair.side_effect = [
+                product_overlay_payload("brow-lift roller"),
+                product_overlay_payload("smooth line pen"),
+            ]
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked_single_source_pairs.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    max_accepted_pairs=5,
+                    acceptance_profile="exploration",
+                )
+
+            ranked = [
+                json.loads(line)
+                for line in (root / "pairs" / "ranked_single_source_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            accepted = [
+                json.loads(line)
+                for line in (root / "pairs" / "accepted_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, len(accepted))
+            self.assertEqual(1, sum(1 for item in ranked if item["accepted"]))
+            self.assertTrue(any("duplicate_delta_family" in "; ".join(item["single_source_pair_acceptance_issues"]) for item in ranked))
 
     def test_plan_stable_omni_clips_uses_cache_and_enforces_window_length(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -8862,8 +9109,12 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue((bundle / "top_pairs" / "review_items.jsonl").exists())
             pair_description = bundle / "pair_review" / "accepted" / "001_object_presence" / "description.md"
             self.assertTrue(pair_description.exists())
-            self.assertIn("Reference Segment Description", pair_description.read_text(encoding="utf-8"))
-            self.assertIn("Target Segment Description", pair_description.read_text(encoding="utf-8"))
+            self.assertTrue((bundle / "pair_review" / "accepted" / "001_object_presence" / "contact_sheet.jpg").exists())
+            description_text = pair_description.read_text(encoding="utf-8")
+            self.assertIn("issue_tags", description_text)
+            self.assertIn("Contact Sheet", description_text)
+            self.assertIn("Reference Segment Description", description_text)
+            self.assertIn("Target Segment Description", description_text)
 
     def test_build_diagnostic_review_bundle_buckets_major_rejects(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

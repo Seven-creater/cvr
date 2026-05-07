@@ -197,6 +197,32 @@ class ComposedOmniClientTests(unittest.TestCase):
                                     "to": "picture-in-picture overlay",
                                     "reason": "the overlay is the clearest visual difference",
                                 },
+                                "reference_state": {
+                                    "main_speaker": "woman presenter",
+                                    "inset_subjects": [],
+                                    "product_overlay": "",
+                                    "composition": "speaker-only talking-head shot",
+                                    "internal_transitions": [],
+                                },
+                                "target_state": {
+                                    "main_speaker": "woman presenter",
+                                    "inset_subjects": ["brow treatment demonstrator"],
+                                    "product_overlay": "",
+                                    "composition": "talking-head shot with picture-in-picture overlay",
+                                    "internal_transitions": [],
+                                },
+                                "delta_temporal_extent": {
+                                    "reference": "no overlay throughout",
+                                    "target": "overlay appears for most of the target clip",
+                                    "target_coverage": 0.86,
+                                    "evidence": "target frames show the overlay",
+                                },
+                                "subject_roles": {
+                                    "main_speaker": "woman presenter",
+                                    "inset_subjects": ["brow treatment demonstrator"],
+                                    "product_overlay": "",
+                                },
+                                "is_segment_wide_delta": True,
                                 "discarded_deltas": ["minor blouse/shirt wording"],
                                 "evidence": ["target has a picture-in-picture overlay while reference does not"],
                                 "confidence": 0.86,
@@ -235,6 +261,9 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertTrue(normalized["accept"])
         self.assertEqual("object_presence", normalized["difference"]["type"])
         self.assertEqual(["target has a picture-in-picture overlay while reference does not"], normalized["evidence"])
+        self.assertTrue(normalized["is_segment_wide_delta"])
+        self.assertEqual(0.86, normalized["delta_temporal_extent"]["target_coverage"])
+        self.assertEqual(["brow treatment demonstrator"], normalized["subject_roles"]["inset_subjects"])
         request_body = json.loads(request_holder["request"].data.decode("utf-8"))
         content = request_body["messages"][1]["content"]
         self.assertEqual("Reference clip:", content[0]["text"])
@@ -242,6 +271,8 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertEqual("Target clip:", content[2]["text"])
         self.assertTrue(content[3]["video_url"]["url"].startswith("data:video/mp4;base64,"))
         self.assertIn("picture-in-picture", request_body["messages"][0]["content"])
+        self.assertIn("main speaker", request_body["messages"][0]["content"])
+        self.assertIn("inset", request_body["messages"][0]["content"])
 
     def test_plan_video_edit_materializes_reference_video_and_normalizes_plan(self) -> None:
         request_holder: dict[str, object] = {}

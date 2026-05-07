@@ -1858,6 +1858,7 @@ def propose_single_source_pairs(
         )
         if proposal_id in existing_records:
             record = dict(existing_records[proposal_id])
+            record = _recheck_existing_single_source_pair_record(record, acceptance_profile=acceptance_profile)
         else:
             reference_path = _resolve_under_root(layout["root"], reference_video)
             target_path = _resolve_under_root(layout["root"], target_video)
@@ -1902,14 +1903,20 @@ def propose_single_source_pairs(
                 reference_caption=str(model_fields.get("reference_caption", "")),
                 target_caption=str(model_fields.get("target_caption", "")),
             )
-            weak_reason = _single_source_model_reject_reason(model_fields, edit_text_quality)
-            accepted = (
+            acceptance_issues = _single_source_pair_acceptance_issues(
+                model_fields=model_fields,
+                edit_text_quality=edit_text_quality,
+                acceptance_profile=acceptance_profile,
+            )
+            weak_reason = "; ".join(acceptance_issues)
+            model_accepted = (
                 bool(model_fields.get("accept"))
                 and confidence >= _profile_threshold(acceptance_profile, "edit_match_score")
                 and difference_type not in FINAL_DISABLED_DIFFERENCE_TYPES
                 and not weak_reason
                 and not fallback_used
             )
+            accepted = model_accepted
             reject_reason = str(model_fields.get("reject_reason", "")).strip()
             if not accepted:
                 reject_reason = "; ".join([item for item in (reject_reason, weak_reason) if item]).strip()
@@ -1954,9 +1961,18 @@ def propose_single_source_pairs(
                 "target_caption": str(model_fields.get("target_caption", "")).strip(),
                 "difference": difference,
                 "dominant_delta": dict(model_fields.get("dominant_delta", {})),
+                "reference_state": dict(model_fields.get("reference_state", {})) if isinstance(model_fields.get("reference_state"), dict) else {},
+                "target_state": dict(model_fields.get("target_state", {})) if isinstance(model_fields.get("target_state"), dict) else {},
+                "delta_temporal_extent": dict(model_fields.get("delta_temporal_extent", {})) if isinstance(model_fields.get("delta_temporal_extent"), dict) else {},
+                "subject_roles": dict(model_fields.get("subject_roles", {})) if isinstance(model_fields.get("subject_roles"), dict) else {},
+                "is_segment_wide_delta": bool(model_fields.get("is_segment_wide_delta")),
                 "discarded_deltas": list(model_fields.get("discarded_deltas", [])),
                 "pair_video_evidence": list(model_fields.get("evidence", [])),
                 "confidence": confidence,
+                "model_accepted": model_accepted,
+                "single_source_delta_family": _single_source_delta_family_from_fields(model_fields),
+                "single_source_pair_acceptance_issues": acceptance_issues,
+                "recommended_edit_text": _single_source_recommended_edit_text(model_fields),
                 "hard_negatives": hard_negative_paths,
                 "quality": quality,
                 "heuristic_quality": dict(candidate.get("quality", {})) if isinstance(candidate.get("quality"), dict) else {},
@@ -1992,6 +2008,11 @@ def propose_single_source_pairs(
         else:
             rejected_count += 1
         output_records.append(record)
+        _apply_single_source_delta_uniqueness(
+            output_records,
+            max_accepted_pairs=max_accepted_pairs,
+            acceptance_profile=acceptance_profile,
+        )
         persist_progress()
         current_accepted = _select_final_accepted_records(
             output_records,
@@ -2018,6 +2039,16 @@ def propose_single_source_pairs(
             print(f"[propose-single-source-pairs] EARLY_STOP: {early_stop_reason}", file=sys.stderr, flush=True)
             break
 
+    accepted_records = _select_final_accepted_records(
+        output_records,
+        max_accepted_pairs=max_accepted_pairs,
+        acceptance_profile=acceptance_profile,
+    )
+    _apply_single_source_delta_uniqueness(
+        output_records,
+        max_accepted_pairs=max_accepted_pairs,
+        acceptance_profile=acceptance_profile,
+    )
     accepted_records = _select_final_accepted_records(
         output_records,
         max_accepted_pairs=max_accepted_pairs,
@@ -5733,29 +5764,38 @@ def _build_single_source_pair_review_items(
     bucket_counts: Counter[str] = Counter()
     missing_videos: list[str] = []
     for index, record in enumerate(ranked_pairs, start=1):
-        bucket = "accepted" if bool(record.get("accepted")) else "rejected"
+        bucket = "accepted" if bool(record.get("accepted")) else "diagnostic"
         bucket_counts[bucket] += 1
         difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
         item_dir = output_dir / bucket / f"{index:03d}_{_safe_id(str(difference.get('type', 'pair')))}"
         item_dir.mkdir(parents=True, exist_ok=True)
         reference_video = str(record.get("reference_video", "")).strip()
         target_video = str(record.get("target_video", "")).strip()
+        resolved_videos: dict[str, Path] = {}
         if copy_videos:
             for filename, raw_path in (("reference.mp4", reference_video), ("target.mp4", target_video)):
                 resolved = _resolve_under_root(root, raw_path)
                 if resolved.exists():
                     shutil.copy2(resolved, item_dir / filename)
+                    resolved_videos[filename] = resolved
                 else:
                     missing_videos.append(str(resolved))
         (item_dir / "edit_text.txt").write_text(str(record.get("edit_text", "")).strip() + "\n", encoding="utf-8")
         (item_dir / "metadata.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
         reference_annotation = annotation_lookup.get(str(record.get("reference_clip_id", "")).strip(), {})
         target_annotation = annotation_lookup.get(str(record.get("target_clip_id", "")).strip(), {})
+        contact_sheet_path = _write_single_source_pair_contact_sheet(
+            output_path=item_dir / "contact_sheet.jpg",
+            reference_video=resolved_videos.get("reference.mp4") or _resolve_under_root(root, reference_video),
+            target_video=resolved_videos.get("target.mp4") or _resolve_under_root(root, target_video),
+            label=str(record.get("proposal_id", "")),
+        )
         (item_dir / "description.md").write_text(
             _single_source_pair_description_markdown(
                 record=record,
                 reference_annotation=reference_annotation,
                 target_annotation=target_annotation,
+                contact_sheet_path=contact_sheet_path.name if contact_sheet_path else "",
             ),
             encoding="utf-8",
         )
@@ -5770,26 +5810,116 @@ def _build_single_source_pair_review_items(
     return summary
 
 
+def _write_single_source_pair_contact_sheet(
+    *,
+    output_path: Path,
+    reference_video: Path,
+    target_video: Path,
+    label: str,
+) -> Path | None:
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return None
+
+    thumb_w, thumb_h = 170, 96
+    sheet = Image.new("RGB", (thumb_w * 6 + 36, thumb_h + 44), "white")
+    draw = ImageDraw.Draw(sheet)
+    draw.text((4, 4), label[:150], fill=(0, 0, 0))
+    x = 4
+    for side_label, video_path in (("REF", reference_video), ("TGT", target_video)):
+        draw.text((x, 22), side_label, fill=(0, 0, 0))
+        for time_seconds in (0.2, 2.5, 4.8):
+            frame = _read_video_frame_image(video_path, time_seconds=time_seconds, size=(thumb_w, thumb_h))
+            if frame is None:
+                frame = Image.new("RGB", (thumb_w, thumb_h), (245, 245, 245))
+                placeholder = ImageDraw.Draw(frame)
+                placeholder.text((8, 38), "frame unavailable", fill=(80, 80, 80))
+            sheet.paste(frame, (x, 40))
+            draw.text((x, thumb_h + 40), f"{time_seconds:.1f}s", fill=(0, 0, 0))
+            x += thumb_w + 4
+        x += 8
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output_path, quality=90)
+    return output_path
+
+
+def _read_video_frame_image(video_path: Path, *, time_seconds: float, size: tuple[int, int]) -> Any:
+    reader = None
+    try:
+        import imageio.v2 as imageio
+        from PIL import Image
+
+        reader = imageio.get_reader(str(video_path), "ffmpeg")
+        metadata = reader.get_meta_data()
+        fps = float(metadata.get("fps") or 25.0)
+        duration = float(metadata.get("duration") or 5.0)
+        frame_index = max(0, int(min(time_seconds, max(0.0, duration - 0.05)) * fps))
+        try:
+            frame = reader.get_data(frame_index)
+        except Exception:
+            frame = reader.get_data(0)
+        image = Image.fromarray(frame).convert("RGB")
+        image.thumbnail(size)
+        canvas = Image.new("RGB", size, "white")
+        canvas.paste(image, ((size[0] - image.width) // 2, (size[1] - image.height) // 2))
+        return canvas
+    except Exception:
+        return None
+    finally:
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                pass
+
+
 def _single_source_pair_description_markdown(
     *,
     record: dict[str, Any],
     reference_annotation: dict[str, Any],
     target_annotation: dict[str, Any],
+    contact_sheet_path: str = "",
 ) -> str:
     difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
     judge = record.get("judge", {}) if isinstance(record.get("judge"), dict) else {}
+    issues = _normalize_list(record.get("single_source_pair_acceptance_issues", []))
     lines = [
         f"# Single Source Pair `{record.get('proposal_id', '')}`",
         "",
         f"- accepted: `{bool(record.get('accepted'))}`",
         f"- edit_text: {str(record.get('edit_text', '')).strip()}",
+        f"- recommended_edit_text: {str(record.get('recommended_edit_text', record.get('edit_text', ''))).strip()}",
         f"- difference: `{json.dumps(difference, ensure_ascii=False)}`",
         f"- confidence: `{record.get('confidence', '')}`",
+        f"- issue_tags: `{', '.join(issues) if issues else 'none'}`",
         f"- reject_reason: {str(judge.get('reject_reason', '')).strip()}",
+        f"- delta_family: `{record.get('single_source_delta_family', '')}`",
+        "",
+        "## Contact Sheet",
+        "",
+        f"![reference/target frames]({contact_sheet_path})" if contact_sheet_path else "- Contact sheet unavailable.",
         "",
         "## Dominant Delta",
         "",
         f"```json\n{json.dumps(record.get('dominant_delta', record.get('dominant_delta_decision', {})), ensure_ascii=False, indent=2)}\n```",
+        "",
+        "## Temporal Support",
+        "",
+        f"```json\n{json.dumps(record.get('delta_temporal_extent', {}), ensure_ascii=False, indent=2)}\n```",
+        f"- is_segment_wide_delta: `{bool(record.get('is_segment_wide_delta'))}`",
+        "",
+        "## Subject Roles",
+        "",
+        f"```json\n{json.dumps(record.get('subject_roles', {}), ensure_ascii=False, indent=2)}\n```",
+        "",
+        "## Reference State",
+        "",
+        f"```json\n{json.dumps(record.get('reference_state', {}), ensure_ascii=False, indent=2)}\n```",
+        "",
+        "## Target State",
+        "",
+        f"```json\n{json.dumps(record.get('target_state', {}), ensure_ascii=False, indent=2)}\n```",
         "",
         "## Pair Video Evidence",
         "",
@@ -7004,12 +7134,69 @@ def _single_source_rejected_model_fields(*, candidate: dict[str, Any], reason: s
             "to": str(difference.get("to", "")),
             "reason": reason,
         },
+        "reference_state": {"main_speaker": "", "inset_subjects": [], "product_overlay": "", "composition": "", "internal_transitions": []},
+        "target_state": {"main_speaker": "", "inset_subjects": [], "product_overlay": "", "composition": "", "internal_transitions": []},
+        "delta_temporal_extent": {"reference": "", "target": "", "target_coverage": 0.0, "evidence": reason},
+        "subject_roles": {"main_speaker": "", "inset_subjects": [], "product_overlay": ""},
+        "is_segment_wide_delta": False,
         "discarded_deltas": [],
         "evidence": [reason],
         "confidence": 0.0,
         "accept": False,
         "reject_reason": reason,
     }
+
+
+def _recheck_existing_single_source_pair_record(
+    record: dict[str, Any],
+    *,
+    acceptance_profile: str,
+) -> dict[str, Any]:
+    if not bool(record.get("single_source_pair")):
+        return record
+    difference = dict(record.get("difference", {})) if isinstance(record.get("difference"), dict) else {}
+    record_evidence = record.get("evidence", {}) if isinstance(record.get("evidence"), dict) else {}
+    pair_video_evidence = record.get("pair_video_evidence")
+    if not isinstance(pair_video_evidence, list):
+        pair_video_evidence = record_evidence.get("pair_video_comparison", [])
+    if not isinstance(pair_video_evidence, list):
+        pair_video_evidence = []
+    model_fields = {
+        "edit_text": str(record.get("edit_text", "")).strip(),
+        "modalities": list(record.get("modalities", [])) if isinstance(record.get("modalities"), list) else ["visual"],
+        "reference_caption": str(record.get("reference_caption", "")).strip(),
+        "target_caption": str(record.get("target_caption", "")).strip(),
+        "difference": difference,
+        "dominant_delta": dict(record.get("dominant_delta", {})) if isinstance(record.get("dominant_delta"), dict) else {},
+        "reference_state": dict(record.get("reference_state", {})) if isinstance(record.get("reference_state"), dict) else {},
+        "target_state": dict(record.get("target_state", {})) if isinstance(record.get("target_state"), dict) else {},
+        "delta_temporal_extent": dict(record.get("delta_temporal_extent", {})) if isinstance(record.get("delta_temporal_extent"), dict) else {},
+        "subject_roles": dict(record.get("subject_roles", {})) if isinstance(record.get("subject_roles"), dict) else {},
+        "is_segment_wide_delta": bool(record.get("is_segment_wide_delta")),
+        "discarded_deltas": list(record.get("discarded_deltas", [])) if isinstance(record.get("discarded_deltas"), list) else [],
+        "evidence": list(pair_video_evidence),
+        "confidence": _score_float(record.get("confidence")),
+        "accept": bool(record.get("model_accepted", record.get("accepted"))),
+        "reject_reason": str(record.get("judge", {}).get("reject_reason", "")).strip() if isinstance(record.get("judge"), dict) else "",
+    }
+    edit_text_quality = _edit_text_quality_payload(
+        edit_text=str(model_fields.get("edit_text", "")),
+        difference=difference,
+        modalities=list(model_fields.get("modalities", [])),
+        reference_caption=str(model_fields.get("reference_caption", "")),
+        target_caption=str(model_fields.get("target_caption", "")),
+    )
+    issues = _single_source_pair_acceptance_issues(
+        model_fields=model_fields,
+        edit_text_quality=edit_text_quality,
+        acceptance_profile=acceptance_profile,
+    )
+    record["single_source_pair_acceptance_issues"] = issues
+    record["recommended_edit_text"] = record.get("recommended_edit_text") or _single_source_recommended_edit_text(model_fields)
+    record["single_source_delta_family"] = record.get("single_source_delta_family") or _single_source_delta_family_from_fields(model_fields)
+    record["model_accepted"] = bool(model_fields.get("accept")) and not issues
+    _set_single_source_record_acceptance(record, accepted=record["model_accepted"], extra_issues=issues)
+    return record
 
 
 def _single_source_hard_negative_paths(
@@ -7055,6 +7242,7 @@ def _single_source_pair_quality(
     confidence = _score_float(model_fields.get("confidence"))
     difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
     difference_type = str(difference.get("type", "")).strip()
+    extent = model_fields.get("delta_temporal_extent") if isinstance(model_fields.get("delta_temporal_extent"), dict) else {}
     return {
         "same_context_score": max(0.65, _score_float(scores.get("same_context_score", heuristic_quality.get("same_context_score")))),
         "semantic_context_score": _score_float(scores.get("semantic_context_score", heuristic_quality.get("semantic_context_score"))),
@@ -7063,14 +7251,98 @@ def _single_source_pair_quality(
         "difference_strength_score": max(confidence, _score_float(scores.get("difference_strength_score", heuristic_quality.get("difference_strength_score")))),
         "difference_type": difference_type,
         "pair_video_comparison_confidence": confidence,
+        "delta_target_coverage": _score_float(extent.get("target_coverage")),
+        "is_segment_wide_delta": 1.0 if bool(model_fields.get("is_segment_wide_delta")) else 0.0,
         "acceptance_profile": acceptance_profile,
     }
 
 
-def _single_source_model_reject_reason(
+def _single_source_pair_acceptance_issues(
+    *,
     model_fields: dict[str, Any],
     edit_text_quality: dict[str, Any],
-) -> str:
+    acceptance_profile: str,
+) -> list[str]:
+    reasons = _single_source_model_reject_issues(model_fields, edit_text_quality)
+    confidence = _score_float(model_fields.get("confidence"))
+    threshold = _profile_threshold(acceptance_profile, "edit_match_score")
+    if confidence < threshold:
+        reasons.append(f"low_pair_video_confidence: {confidence:.2f} < {threshold:.2f}")
+
+    extent = model_fields.get("delta_temporal_extent") if isinstance(model_fields.get("delta_temporal_extent"), dict) else {}
+    if not extent:
+        reasons.append("missing_delta_temporal_extent")
+    target_coverage = _score_float(extent.get("target_coverage")) if extent else 0.0
+    extent_text = _normalized_phrase(
+        " ".join(
+            str(extent.get(key, ""))
+            for key in ("reference", "target", "evidence")
+        )
+        if extent
+        else ""
+    )
+    if extent and target_coverage <= 0.0:
+        reasons.append("missing_delta_target_coverage")
+    elif 0.0 < target_coverage < 0.55:
+        reasons.append("transient_delta_not_segment_wide")
+    if any(marker in extent_text for marker in ("brief", "briefly", "last moment", "end of clip", "only at the end", "final moment")):
+        reasons.append("transient_delta_not_segment_wide")
+    if not bool(model_fields.get("is_segment_wide_delta")):
+        reasons.append("transient_delta_not_segment_wide")
+
+    reference_state = model_fields.get("reference_state") if isinstance(model_fields.get("reference_state"), dict) else {}
+    target_state = model_fields.get("target_state") if isinstance(model_fields.get("target_state"), dict) else {}
+    internal_transition_text = _normalized_phrase(
+        " ".join(
+            _normalize_list(reference_state.get("internal_transitions", []))
+            + _normalize_list(target_state.get("internal_transitions", []))
+        )
+    )
+    edit_text = str(model_fields.get("edit_text", "")).strip()
+    normalized_edit = _normalized_phrase(edit_text)
+    if internal_transition_text and (
+        not bool(model_fields.get("is_segment_wide_delta"))
+        or any(marker in internal_transition_text for marker in ("appears", "disappears", "then", "followed by", "changes from"))
+    ):
+        reasons.append("segment_internal_transition")
+
+    target_role_text = _normalized_phrase(
+        " ".join(
+            [
+                str(target_state.get("main_speaker", "")),
+                str(target_state.get("product_overlay", "")),
+                str(target_state.get("composition", "")),
+            ]
+            + _normalize_list(target_state.get("inset_subjects", []))
+        )
+    )
+    roles = model_fields.get("subject_roles") if isinstance(model_fields.get("subject_roles"), dict) else {}
+    main_speaker = _normalized_phrase(str(roles.get("main_speaker", target_state.get("main_speaker", ""))))
+    inset_subjects = _normalized_phrase(" ".join(_normalize_list(roles.get("inset_subjects", target_state.get("inset_subjects", [])))))
+    product_overlay = _normalized_phrase(str(roles.get("product_overlay", target_state.get("product_overlay", ""))))
+
+    if "close up" in normalized_edit or "closeup" in normalized_edit:
+        if main_speaker or "speaker" in target_role_text or "woman" in target_role_text:
+            reasons.append("composition_label_mismatch: product close-up claimed while speaker remains visible")
+    if "full screen" in normalized_edit or "fullscreen" in normalized_edit:
+        if product_overlay or "overlay" in target_role_text or main_speaker:
+            reasons.append("composition_label_mismatch: full-screen claimed while speaker or overlay remains visible")
+    if "change the shot from the speaker" in normalized_edit and (main_speaker or "speaker" in target_role_text):
+        reasons.append("composition_label_mismatch: target still contains the speaker")
+    if "man speaking" in normalized_edit and "inset" not in normalized_edit and "picture in picture" not in normalized_edit:
+        if inset_subjects:
+            reasons.append("subject_role_mismatch: inset man described as primary subject")
+    if "woman receiving" in normalized_edit and "inset" not in normalized_edit and "picture in picture" not in normalized_edit:
+        if inset_subjects:
+            reasons.append("subject_role_mismatch: inset woman described as primary subject")
+
+    return _dedupe_strings(reasons)
+
+
+def _single_source_model_reject_issues(
+    model_fields: dict[str, Any],
+    edit_text_quality: dict[str, Any],
+) -> list[str]:
     difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
     difference_type = str(difference.get("type", "")).strip()
     from_value = str(difference.get("from", "")).strip()
@@ -7095,7 +7367,167 @@ def _single_source_model_reject_reason(
             reasons.append("weak_attribute_wording: clothing or hair wording change is not a meaningful single-source edit")
     if _score_float(edit_text_quality.get("score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "edit_text_quality_score"):
         reasons.append("bad_edit_text_quality")
-    return "; ".join(_dedupe_strings(reasons))
+    return _dedupe_strings(reasons)
+
+
+def _single_source_model_reject_reason(
+    model_fields: dict[str, Any],
+    edit_text_quality: dict[str, Any],
+) -> str:
+    return "; ".join(_single_source_model_reject_issues(model_fields, edit_text_quality))
+
+
+def _single_source_recommended_edit_text(model_fields: dict[str, Any]) -> str:
+    edit_text = str(model_fields.get("edit_text", "")).strip()
+    normalized = _normalized_phrase(edit_text)
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    if "product close up" in normalized or "product closeup" in normalized or "close up" in normalized:
+        if "static" in _normalized_phrase(to_value) or "product" in _normalized_phrase(to_value):
+            return "add a static product image overlay on the left"
+        return "change the composition to show a product image overlay beside the speaker"
+    if "full screen" in normalized or "fullscreen" in normalized:
+        return "change the picture-in-picture demonstration to a static product image overlay"
+    if "man speaking" in normalized and "inset" not in normalized and "picture in picture" not in normalized:
+        return edit_text.replace("man speaking", "inset video showing a man speaking")
+    if from_value and to_value and not edit_text:
+        return f"change {from_value} to {to_value}"
+    return edit_text
+
+
+def _single_source_delta_family_from_fields(model_fields: dict[str, Any]) -> str:
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    text = _normalized_phrase(
+        " ".join(
+            [
+                str(model_fields.get("edit_text", "")),
+                str(difference.get("type", "")),
+                str(difference.get("from", "")),
+                str(difference.get("to", "")),
+                str(difference.get("description", "")),
+                str(model_fields.get("dominant_delta", {}).get("from", "")) if isinstance(model_fields.get("dominant_delta"), dict) else "",
+                str(model_fields.get("dominant_delta", {}).get("to", "")) if isinstance(model_fields.get("dominant_delta"), dict) else "",
+            ]
+        )
+    )
+    if any(marker in text for marker in ("picture in picture", "pip", "inset")):
+        if text.startswith("add ") or "no overlay" in text or "no picture in picture" in text:
+            return "add_pip_demo"
+        if "static product" in text or "product image" in text or ("product" in text and "overlay" in text):
+            return "pip_demo_to_product_overlay"
+        if "brow" in text or "eyebrow" in text or "treatment" in text:
+            return "pip_subject_change"
+        if "man" in text:
+            return "add_pip_inset_man"
+        return "pip_overlay_change"
+    if "product" in text or "brow lift" in text or "revlon" in text:
+        if "no product" in text or text.startswith("add "):
+            return "add_product_overlay"
+        if "close up" in text or "closeup" in text:
+            return "product_closeup_claim"
+        return "product_overlay_change"
+    difference_type = str(difference.get("type", "pair")).strip() or "pair"
+    return f"{difference_type}:{_stable_hash(text)[:8]}"
+
+
+def _apply_single_source_delta_uniqueness(
+    records: list[dict[str, Any]],
+    *,
+    max_accepted_pairs: int,
+    acceptance_profile: str,
+) -> None:
+    if not records or not any(bool(record.get("single_source_pair")) for record in records):
+        return
+    cap = min(max_accepted_pairs, 5)
+    uniqueness_issue_prefixes = ("duplicate_delta_family", "single_source_accept_cap_exceeded")
+    eligible: list[dict[str, Any]] = []
+    for record in records:
+        if not bool(record.get("single_source_pair")):
+            continue
+        issues = [
+            str(issue).strip()
+            for issue in record.get("single_source_pair_acceptance_issues", [])
+            if str(issue).strip() and not str(issue).strip().startswith(uniqueness_issue_prefixes)
+        ]
+        record["single_source_pair_acceptance_issues"] = issues
+        base_accepted = bool(record.get("model_accepted", record.get("accepted")))
+        if not base_accepted or issues:
+            _set_single_source_record_acceptance(record, accepted=False, extra_issues=issues)
+            continue
+        family = str(record.get("single_source_delta_family", "")).strip()
+        if not family:
+            family = _single_source_delta_family_from_record(record)
+            record["single_source_delta_family"] = family
+        eligible.append(record)
+
+    selected_ids: set[str] = set()
+    selected_families: set[str] = set()
+    for record in sorted(eligible, key=_accepted_record_sort_key):
+        proposal_id = str(record.get("proposal_id", "")).strip()
+        family = str(record.get("single_source_delta_family", "")).strip()
+        if len(selected_ids) >= cap:
+            _set_single_source_record_acceptance(record, accepted=False, extra_issues=["single_source_accept_cap_exceeded"])
+            continue
+        if family and family in selected_families:
+            _set_single_source_record_acceptance(record, accepted=False, extra_issues=[f"duplicate_delta_family:{family}"])
+            continue
+        selected_ids.add(proposal_id)
+        if family:
+            selected_families.add(family)
+        _set_single_source_record_acceptance(record, accepted=True, extra_issues=[])
+
+
+def _single_source_delta_family_from_record(record: dict[str, Any]) -> str:
+    model_fields = {
+        "edit_text": record.get("edit_text", ""),
+        "difference": record.get("difference", {}),
+        "dominant_delta": record.get("dominant_delta", {}),
+    }
+    return _single_source_delta_family_from_fields(model_fields)
+
+
+def _set_single_source_record_acceptance(
+    record: dict[str, Any],
+    *,
+    accepted: bool,
+    extra_issues: list[str],
+) -> None:
+    issues = _dedupe_strings(
+        [
+            str(issue).strip()
+            for issue in record.get("single_source_pair_acceptance_issues", [])
+            if str(issue).strip()
+        ]
+        + [str(issue).strip() for issue in extra_issues if str(issue).strip()]
+    )
+    record["single_source_pair_acceptance_issues"] = issues
+    record["accepted"] = bool(accepted and not issues)
+    reason = "; ".join(issues)
+    if not record["accepted"] and not reason:
+        reason = "single-source pair rejected"
+    judge = record.get("judge") if isinstance(record.get("judge"), dict) else {}
+    judge["accept"] = record["accepted"]
+    judge["target_satisfies_edit"] = record["accepted"]
+    judge["single_main_difference"] = record["accepted"]
+    judge["reject_reason"] = "" if record["accepted"] else _append_reason(judge.get("reject_reason", ""), reason)
+    record["judge"] = judge
+
+    observable = record.get("observable_difference") if isinstance(record.get("observable_difference"), dict) else {}
+    observable["passed"] = record["accepted"]
+    observable["failure_reason"] = "" if record["accepted"] else _append_reason(observable.get("failure_reason", ""), reason)
+    record["observable_difference"] = observable
+
+    verification = record.get("verification") if isinstance(record.get("verification"), dict) else {}
+    if not record["accepted"]:
+        verification["passed"] = False
+        verification["failures"] = _dedupe_strings(_normalize_list(verification.get("failures", [])) + issues)
+        edit_text_quality_check = verification.get("edit_text_quality_check") if isinstance(verification.get("edit_text_quality_check"), dict) else {}
+        edit_text_quality_check["single_primary_difference"] = False
+        edit_text_quality_check["target_satisfies"] = False
+        edit_text_quality_check["failure_reason"] = _append_reason(edit_text_quality_check.get("failure_reason", ""), reason)
+        verification["edit_text_quality_check"] = edit_text_quality_check
+    record["verification"] = verification
 
 
 def _single_source_pair_verification(
