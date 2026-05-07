@@ -34,6 +34,13 @@ DEFAULT_MINED_PAIR_CANDIDATES_NAME = "mined_pair_candidates.jsonl"
 DEFAULT_CANDIDATE_MINING_REPORT_NAME = "candidate_mining_report.md"
 DEFAULT_MAX_MINED_PAIR_CANDIDATES = 240
 DEFAULT_ZERO_ACCEPTED_STOP_AFTER = 0
+DEFAULT_SELECTED_SINGLE_SOURCE_NAME = "selected_source_video.json"
+DEFAULT_SINGLE_SOURCE_CANDIDATES_NAME = "selected_source_candidates.jsonl"
+DEFAULT_SINGLE_SOURCE_CLIP_PLAN_NAME = "single_source_clip_plan.jsonl"
+DEFAULT_SINGLE_SOURCE_CLIP_GROUPS_NAME = "single_source_clip_groups.jsonl"
+DEFAULT_SINGLE_SOURCE_WHOLE_MANIFEST_NAME = "selected_source_manifest.jsonl"
+DEFAULT_SINGLE_SOURCE_PAIR_CANDIDATES_NAME = "single_source_pair_candidates.jsonl"
+DEFAULT_SINGLE_SOURCE_PAIR_REPORT_NAME = "single_source_pair_report.md"
 DEFAULT_VIDEO_EDIT_PLAN_NAME = "video_edit_plan.jsonl"
 DEFAULT_VIDEO_EDIT_PLANNER_CACHE_NAME = "video_edit_planner_cache.jsonl"
 DEFAULT_VIDEO_MASK_PLAN_NAME = "video_mask_plan.jsonl"
@@ -1352,6 +1359,391 @@ def plan_detective_event_clips(
         "segment_seconds": segment_seconds,
         "min_clip_seconds": min_clip_seconds,
         "max_clip_seconds": max_clip_seconds,
+    }
+
+
+def select_single_source_video(
+    *,
+    root: str | Path,
+    source_clips_path: str | Path,
+    output_path: str | Path | None = None,
+    candidates_output_path: str | Path | None = None,
+    selection_annotations_path: str | Path | None = None,
+    dataset: str = "daily_omni",
+    min_duration_seconds: float = 28.0,
+    max_duration_seconds: float = 32.0,
+    top_k: int = 8,
+    max_source_videos_scan: int = 2000,
+    base_url: str | None = None,
+    api_key: str = "EMPTY",
+    model: str | None = None,
+    timeout_seconds: float = 180.0,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    source_rows = list(_load_jsonl(Path(source_clips_path)))
+    if not source_rows:
+        raise ValueError("source clip manifest is empty")
+    if min_duration_seconds <= 0:
+        raise ValueError("min_duration_seconds must be positive")
+    if max_duration_seconds < min_duration_seconds:
+        raise ValueError("max_duration_seconds must be >= min_duration_seconds")
+
+    output = Path(output_path) if output_path else layout["metadata"] / DEFAULT_SELECTED_SINGLE_SOURCE_NAME
+    candidates_output = (
+        Path(candidates_output_path)
+        if candidates_output_path
+        else layout["metadata"] / DEFAULT_SINGLE_SOURCE_CANDIDATES_NAME
+    )
+    selection_annotations_output = Path(selection_annotations_path) if selection_annotations_path else None
+
+    candidates: list[dict[str, Any]] = []
+    skipped_reasons: Counter[str] = Counter()
+    seen_source_paths: set[str] = set()
+    scanned = 0
+    probed = 0
+    for item in source_rows:
+        if scanned >= max(0, max_source_videos_scan):
+            break
+        scanned += 1
+        source_path = _source_clip_video_path(layout["root"], item)
+        source_key = str(source_path)
+        if not _is_single_source_raw_video_candidate(
+            root=layout["root"],
+            item=item,
+            source_path=source_path,
+            dataset=dataset,
+        ):
+            skipped_reasons["not_daily_omni_raw_video"] += 1
+            continue
+        if source_key in seen_source_paths:
+            skipped_reasons["duplicate_source_path"] += 1
+            continue
+        seen_source_paths.add(source_key)
+        if not source_path.exists():
+            skipped_reasons["missing_source_video"] += 1
+            continue
+        media = probe_media(source_path)
+        probed += 1
+        duration = _source_clip_duration_seconds(item, media)
+        if "error" in media:
+            skipped_reasons["probe_error"] += 1
+            continue
+        if not media.get("has_video"):
+            skipped_reasons["missing_video_stream"] += 1
+            continue
+        if not media.get("has_audio"):
+            skipped_reasons["missing_audio_stream"] += 1
+            continue
+        if duration < min_duration_seconds or duration > max_duration_seconds:
+            skipped_reasons["outside_duration_window"] += 1
+            continue
+
+        source_clip_id = str(item.get("clip_id", "")).strip() or _stable_hash(str(source_path))
+        candidate = {
+            "source_clip_id": source_clip_id,
+            "dataset": str(item.get("dataset", dataset)).strip() or dataset,
+            "source_path": str(source_path),
+            "source_path_display": _display_source_path(layout["root"], str(source_path)),
+            "duration_seconds": round(duration, 3),
+            "media_probe": media,
+            "source_row_ids": list(item.get("source_row_ids", [])),
+            "text_fields": item.get("text_fields", {}),
+            "local_selection_score": _single_source_local_selection_score(item=item, media=media),
+            "selection_notes": [
+                "daily_omni raw video",
+                "28-32s duration",
+                "audio and video streams present",
+            ],
+        }
+        source_asset_id = str(item.get("source_asset_id", "")).strip()
+        if source_asset_id:
+            candidate["source_asset_id"] = source_asset_id
+        candidates.append(candidate)
+
+    candidates.sort(
+        key=lambda record: (
+            -_score_float(record.get("local_selection_score")),
+            abs(float(record.get("duration_seconds") or 0.0) - 30.0),
+            str(record.get("source_clip_id", "")),
+        )
+    )
+    top_candidates = candidates[: max(1, top_k)]
+    selection_annotations: list[dict[str, Any]] = []
+    selection_method = "local_probe"
+    selected = top_candidates[0] if top_candidates else None
+    if top_candidates and base_url and model:
+        client = OpenAIComposedDataClient(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout_seconds=timeout_seconds,
+        )
+        selection_method = "omni_detective_top_k"
+        best_score = -1.0
+        for rank, candidate in enumerate(top_candidates, start=1):
+            source_path = Path(str(candidate["source_path"]))
+            try:
+                normalized, raw_model_output = client.annotate_clip_detective(
+                    clip_path=str(source_path),
+                    tool_observations=_build_toolbox_observations(source_path),
+                )
+                annotation = _single_source_selection_annotation(candidate, normalized, raw_model_output)
+                selection_score = _single_source_omni_selection_score(annotation)
+                annotation["selection_rank_before_omni"] = rank
+                annotation["omni_selection_score"] = selection_score
+                selection_annotations.append(annotation)
+                candidate["omni_selection_score"] = selection_score
+                candidate["omni_summary"] = annotation.get("summary", "")
+                candidate["omni_selection_reasons"] = _single_source_selection_reasons(annotation)
+                if selection_score > best_score:
+                    best_score = selection_score
+                    selected = candidate
+            except Exception as exc:
+                candidate["omni_selection_error"] = f"{type(exc).__name__}: {exc}"
+        top_candidates.sort(
+            key=lambda record: (
+                -_score_float(record.get("omni_selection_score", record.get("local_selection_score"))),
+                -_score_float(record.get("local_selection_score")),
+                str(record.get("source_clip_id", "")),
+            )
+        )
+        selected = top_candidates[0]
+
+    if not selected:
+        raise ValueError(
+            "no eligible single-source daily_omni raw video found; require 28-32s, audio, video, and local file presence"
+        )
+
+    selected_record = dict(selected)
+    selected_record["selection_method"] = selection_method
+    selected_record["selection_top_k"] = len(top_candidates)
+    selected_record["selection_constraints"] = {
+        "dataset": dataset,
+        "min_duration_seconds": min_duration_seconds,
+        "max_duration_seconds": max_duration_seconds,
+        "requires_audio": True,
+        "requires_video": True,
+        "requires_raw_daily_omni_video": True,
+    }
+    _write_jsonl(candidates_output, top_candidates)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(selected_record, ensure_ascii=False, indent=2), encoding="utf-8")
+    if selection_annotations_output is not None:
+        _write_jsonl(selection_annotations_output, selection_annotations)
+    return {
+        "source_clips_path": str(source_clips_path),
+        "output_path": str(output),
+        "candidates_output_path": str(candidates_output),
+        "selection_annotations_path": str(selection_annotations_output or ""),
+        "scanned_count": scanned,
+        "probed_count": probed,
+        "eligible_count": len(candidates),
+        "top_k_count": len(top_candidates),
+        "selected_source_clip_id": selected_record["source_clip_id"],
+        "selected_source_path": selected_record["source_path"],
+        "selection_method": selection_method,
+        "skipped_reasons": dict(skipped_reasons),
+    }
+
+
+def plan_single_source_clips(
+    *,
+    root: str | Path,
+    selected_source_path: str | Path,
+    clip_plan_output_path: str | Path | None = None,
+    clip_groups_output_path: str | Path | None = None,
+    whole_manifest_output_path: str | Path | None = None,
+    segment_seconds: float = 5.0,
+    min_clip_seconds: float = 3.0,
+) -> dict[str, Any]:
+    layout = ensure_layout(root)
+    selected = json.loads(Path(selected_source_path).read_text(encoding="utf-8"))
+    source_path = Path(str(selected.get("source_path", "")).strip())
+    if not source_path.exists():
+        raise FileNotFoundError(f"selected source video not found: {source_path}")
+    media = selected.get("media_probe") if isinstance(selected.get("media_probe"), dict) else probe_media(source_path)
+    duration = float(selected.get("duration_seconds") or media.get("duration_seconds") or 0.0)
+    if duration <= 0:
+        raise ValueError("selected source video duration is unavailable")
+    if segment_seconds <= 0:
+        raise ValueError("segment_seconds must be positive")
+    if min_clip_seconds <= 0:
+        raise ValueError("min_clip_seconds must be positive")
+
+    clip_plan_output = Path(clip_plan_output_path) if clip_plan_output_path else layout["metadata"] / DEFAULT_SINGLE_SOURCE_CLIP_PLAN_NAME
+    clip_groups_output = Path(clip_groups_output_path) if clip_groups_output_path else layout["metadata"] / DEFAULT_SINGLE_SOURCE_CLIP_GROUPS_NAME
+    whole_manifest_output = Path(whole_manifest_output_path) if whole_manifest_output_path else layout["metadata"] / DEFAULT_SINGLE_SOURCE_WHOLE_MANIFEST_NAME
+
+    source_clip_id = str(selected.get("source_clip_id", "")).strip() or _stable_hash(str(source_path))
+    dataset = str(selected.get("dataset", "daily_omni")).strip() or "daily_omni"
+    safe_source_id = _safe_id(source_clip_id)
+    segments = _fixed_single_source_segments(
+        duration_seconds=duration,
+        segment_seconds=segment_seconds,
+        min_clip_seconds=min_clip_seconds,
+    )
+    if len(segments) < 4:
+        raise ValueError(f"single-source pilot needs at least 4 valid segments; planned={len(segments)}")
+
+    plan_records: list[dict[str, Any]] = []
+    candidate_clip_ids: list[str] = []
+    for segment_index, (start_seconds, end_seconds) in enumerate(segments, start=1):
+        clip_id = f"{safe_source_id}__single_{segment_index:03d}"
+        candidate_clip_ids.append(clip_id)
+        plan_records.append(
+            {
+                "clip_id": clip_id,
+                "source_path": str(source_path),
+                "output_path": f"clips/single_source/{safe_source_id}/{clip_id}.mp4",
+                "start_seconds": round(start_seconds, 3),
+                "end_seconds": round(end_seconds, 3),
+                "duration_seconds": round(end_seconds - start_seconds, 3),
+                "role": "single_source_segment",
+                "notes": "fixed 5s single-source Omni pair segment",
+                "dataset": dataset,
+                "source_clip_id": source_clip_id,
+                "group_id": f"single_source_{safe_source_id}",
+                "source_row_ids": list(selected.get("source_row_ids", [])),
+                "text_fields": selected.get("text_fields", {}),
+                "media_probe": media,
+            }
+        )
+
+    group_record = {
+        "group_id": f"single_source_{safe_source_id}",
+        "dataset": dataset,
+        "group_reason": "single_source_video",
+        "source_clip_ids": [source_clip_id],
+        "candidate_clip_ids": candidate_clip_ids,
+        "group_tags": ["single_source", "daily_omni", "fixed_segments"],
+        "source_path": _display_source_path(layout["root"], str(source_path)),
+        "media_probe": media,
+        "segment_seconds": segment_seconds,
+    }
+    whole_record = {
+        "clip_id": f"{safe_source_id}__whole_30s",
+        "source_path": str(source_path),
+        "output_path": str(source_path),
+        "start_seconds": 0.0,
+        "end_seconds": round(duration, 3),
+        "duration_seconds": round(duration, 3),
+        "role": "single_source_whole_video",
+        "notes": "whole 30s source video for global Omni description",
+        "dataset": dataset,
+        "source_clip_id": source_clip_id,
+        "group_id": f"single_source_{safe_source_id}",
+        "source_row_ids": list(selected.get("source_row_ids", [])),
+        "text_fields": selected.get("text_fields", {}),
+        "media_probe": media,
+    }
+    _write_jsonl(clip_plan_output, plan_records)
+    _write_jsonl(clip_groups_output, [group_record])
+    _write_jsonl(whole_manifest_output, [whole_record])
+    return {
+        "selected_source_path": str(selected_source_path),
+        "clip_plan_output_path": str(clip_plan_output),
+        "clip_groups_output_path": str(clip_groups_output),
+        "whole_manifest_output_path": str(whole_manifest_output),
+        "source_clip_id": source_clip_id,
+        "source_path": str(source_path),
+        "segment_count": len(plan_records),
+        "pair_count": len(plan_records) * (len(plan_records) - 1) // 2,
+        "segment_seconds": segment_seconds,
+        "min_clip_seconds": min_clip_seconds,
+    }
+
+
+def mine_single_source_pairs(
+    *,
+    root: str | Path,
+    clip_annotations_path: str | Path,
+    clip_groups_path: str | Path,
+    output_path: str | Path | None = None,
+    report_path: str | Path | None = None,
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
+) -> dict[str, Any]:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
+    layout = ensure_layout(root)
+    annotations_path = Path(clip_annotations_path)
+    groups_path = Path(clip_groups_path)
+    output = Path(output_path) if output_path else layout["pairs"] / DEFAULT_SINGLE_SOURCE_PAIR_CANDIDATES_NAME
+    report = Path(report_path) if report_path else layout["reports"] / DEFAULT_SINGLE_SOURCE_PAIR_REPORT_NAME
+    annotations = list(_load_jsonl(annotations_path))
+    groups = list(_load_jsonl(groups_path))
+    if not annotations:
+        raise ValueError("clip annotations are empty")
+    if not groups:
+        raise ValueError("clip groups are empty")
+
+    annotations_by_id = {str(item.get("clip_id", "")).strip(): item for item in annotations if str(item.get("clip_id", "")).strip()}
+    selected_group = groups[0]
+    candidate_clip_ids = [str(value).strip() for value in selected_group.get("candidate_clip_ids", []) if str(value).strip()]
+    ordered_annotations = [
+        annotations_by_id[clip_id]
+        for clip_id in candidate_clip_ids
+        if clip_id in annotations_by_id and not bool(annotations_by_id[clip_id].get("fallback_used"))
+    ]
+    ordered_annotations.sort(key=lambda item: (_clip_start_seconds(item), str(item.get("clip_id", ""))))
+    if len(ordered_annotations) < 4:
+        raise ValueError(f"single-source pair mining needs at least 4 usable annotations; found={len(ordered_annotations)}")
+
+    mined_records: list[dict[str, Any]] = []
+    fallback_candidate_count = 0
+    for left_index, reference_annotation in enumerate(ordered_annotations):
+        for target_annotation in ordered_annotations[left_index + 1 :]:
+            candidate, fallback_used = _single_source_pair_candidate(
+                root=layout["root"],
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                annotations=ordered_annotations,
+                group_metadata={
+                    "group_id": str(selected_group.get("group_id", "single_source_video")),
+                    "group_reason": "single_source_video",
+                },
+                acceptance_profile=acceptance_profile,
+            )
+            fallback_candidate_count += 1 if fallback_used else 0
+            record = _mined_pair_candidate_record(
+                candidate,
+                group_metadata={
+                    "group_id": str(selected_group.get("group_id", "single_source_video")),
+                    "group_reason": "single_source_video",
+                },
+            )
+            record["candidate_index"] = len(mined_records) + 1
+            record["single_source_pair"] = True
+            record["chronological_pair"] = True
+            record["reference_start_seconds"] = _clip_start_seconds(reference_annotation)
+            record["target_start_seconds"] = _clip_start_seconds(target_annotation)
+            if fallback_used:
+                record["risk_flags"] = _dedupe_strings(list(record.get("risk_flags", [])) + ["fallback_single_source_difference"])
+            if record.get("difference", {}).get("type") in FINAL_DISABLED_DIFFERENCE_TYPES:
+                record["risk_flags"] = _dedupe_strings(list(record.get("risk_flags", [])) + ["diagnostic_only_final_disabled_type"])
+            mined_records.append(record)
+
+    _write_jsonl(output, mined_records)
+    report.write_text(
+        _build_single_source_pair_report(
+            output_path=output,
+            group=selected_group,
+            annotations=ordered_annotations,
+            candidates=mined_records,
+            fallback_candidate_count=fallback_candidate_count,
+            acceptance_profile=acceptance_profile,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "clip_annotations_path": str(annotations_path),
+        "clip_groups_path": str(groups_path),
+        "output_path": str(output),
+        "report_path": str(report),
+        "segment_count": len(ordered_annotations),
+        "candidate_count": len(mined_records),
+        "expected_pair_count": len(ordered_annotations) * (len(ordered_annotations) - 1) // 2,
+        "fallback_candidate_count": fallback_candidate_count,
+        "difference_type_counts": dict(Counter(str(item.get("difference", {}).get("type", "")) for item in mined_records)),
+        "acceptance_profile": acceptance_profile,
     }
 
 
@@ -4881,6 +5273,190 @@ def build_diagnostic_review_bundle(
     return summary
 
 
+def build_single_source_review_bundle(
+    *,
+    root: str | Path,
+    selected_source_path: str | Path,
+    segments_manifest_path: str | Path,
+    clip_annotations_path: str | Path,
+    ranked_pairs_path: str | Path,
+    accepted_pairs_path: str | Path,
+    output_dir: str | Path,
+    copy_videos: bool = True,
+) -> dict[str, Any]:
+    root_path = Path(root)
+    selected_path = Path(selected_source_path)
+    selected = json.loads(selected_path.read_text(encoding="utf-8"))
+    segments = list(_load_jsonl(Path(segments_manifest_path)))
+    annotations = list(_load_jsonl(Path(clip_annotations_path)))
+    ranked_pairs = list(_load_jsonl(Path(ranked_pairs_path)))
+    accepted_pairs = list(_load_jsonl(Path(accepted_pairs_path)))
+    annotation_lookup = _annotation_lookup(root=root_path, annotations=annotations)
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy2(selected_path, output_root / "selected_source_video.json")
+    source_path = Path(str(selected.get("source_path", "")).strip())
+    missing_videos: list[str] = []
+    if copy_videos:
+        if source_path.exists():
+            shutil.copy2(source_path, output_root / "source_30s.mp4")
+        else:
+            missing_videos.append(str(source_path))
+
+    segments_dir = output_root / "segments"
+    if copy_videos:
+        segments_dir.mkdir(parents=True, exist_ok=True)
+    segment_items: list[dict[str, Any]] = []
+    for index, segment in enumerate(segments, start=1):
+        clip_id = str(segment.get("clip_id", "")).strip()
+        segment_path = _resolve_under_root(root_path, str(segment.get("output_path", "")).strip())
+        annotation = annotation_lookup.get(clip_id) or {}
+        copied_name = ""
+        if copy_videos:
+            copied_name = f"{index:03d}_{_safe_id(clip_id)}.mp4"
+            if segment_path.exists():
+                shutil.copy2(segment_path, segments_dir / copied_name)
+            else:
+                missing_videos.append(str(segment_path))
+        segment_items.append(
+            {
+                "index": index,
+                "clip_id": clip_id,
+                "start_seconds": segment.get("start_seconds"),
+                "end_seconds": segment.get("end_seconds"),
+                "video": copied_name,
+                "summary": str(annotation.get("summary", "")).strip(),
+                "description": _review_annotation_description(annotation, fallback_caption=str(annotation.get("summary", ""))),
+            }
+        )
+
+    ranked_copy = output_root / "ranked_single_source_pairs.jsonl"
+    accepted_copy = output_root / "accepted_pairs.jsonl"
+    _write_jsonl(ranked_copy, ranked_pairs)
+    _write_jsonl(accepted_copy, accepted_pairs)
+    (output_root / "segment_descriptions.md").write_text(
+        _single_source_segment_descriptions_markdown(segment_items),
+        encoding="utf-8",
+    )
+    (output_root / "all_pair_ranking.md").write_text(
+        _single_source_pair_ranking_markdown(ranked_pairs),
+        encoding="utf-8",
+    )
+
+    top_pair_bundle = build_manual_review_bundle(
+        root=root_path,
+        pairs_path=accepted_copy,
+        output_dir=output_root / "top_pairs",
+        clip_annotations_path=clip_annotations_path,
+        copy_videos=copy_videos,
+    )
+    summary = {
+        "selected_source_path": str(selected_path),
+        "segments_manifest_path": str(segments_manifest_path),
+        "clip_annotations_path": str(clip_annotations_path),
+        "ranked_pairs_path": str(ranked_pairs_path),
+        "accepted_pairs_path": str(accepted_pairs_path),
+        "output_dir": str(output_root),
+        "segment_count": len(segments),
+        "ranked_pair_count": len(ranked_pairs),
+        "accepted_pair_count": len(accepted_pairs),
+        "top_pair_bundle": top_pair_bundle,
+        "missing_video_count": len(missing_videos),
+        "missing_videos": missing_videos,
+    }
+    (output_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    (output_root / "index.md").write_text(
+        _single_source_review_index_markdown(summary=summary, selected=selected, segment_items=segment_items),
+        encoding="utf-8",
+    )
+    return summary
+
+
+def _single_source_segment_descriptions_markdown(segment_items: list[dict[str, Any]]) -> str:
+    lines = ["# Segment Descriptions", ""]
+    for item in segment_items:
+        lines.extend(
+            [
+                f"## {item['index']:03d} `{item['clip_id']}`",
+                "",
+                f"- Time: `{item.get('start_seconds')}` -> `{item.get('end_seconds')}`",
+                f"- Video: `{item.get('video', '')}`",
+                "",
+                f"```json\n{json.dumps(item.get('description', {}), ensure_ascii=False, indent=2)}\n```"
+                if isinstance(item.get("description"), dict)
+                else (str(item.get("description", "")).strip() or str(item.get("summary", "")).strip() or "No annotation."),
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _single_source_pair_ranking_markdown(records: list[dict[str, Any]]) -> str:
+    lines = [
+        "# Ranked Single Source Pairs",
+        "",
+        "| # | accepted | type | edit_text | reference | target | reject_reason |",
+        "|---:|---|---|---|---|---|---|",
+    ]
+    for index, record in enumerate(records, start=1):
+        difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+        judge = record.get("judge", {}) if isinstance(record.get("judge"), dict) else {}
+        lines.append(
+            "| "
+            f"{index} | "
+            f"{'yes' if bool(record.get('accepted')) else 'no'} | "
+            f"{_markdown_table_cell(str(difference.get('type', '')))} | "
+            f"{_markdown_table_cell(str(record.get('edit_text', '')))} | "
+            f"{_markdown_table_cell(str(record.get('reference_clip_id', '')))} | "
+            f"{_markdown_table_cell(str(record.get('target_clip_id', '')))} | "
+            f"{_markdown_table_cell(str(judge.get('reject_reason', '')))} |"
+        )
+    if not records:
+        lines.append("| 0 | no | none | none | none | none | none |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _single_source_review_index_markdown(
+    *,
+    summary: dict[str, Any],
+    selected: dict[str, Any],
+    segment_items: list[dict[str, Any]],
+) -> str:
+    lines = [
+        "# Single Source Omni Pair Review",
+        "",
+        f"- Source clip id: `{selected.get('source_clip_id', '')}`",
+        f"- Source path: `{selected.get('source_path', '')}`",
+        f"- Segments: `{summary.get('segment_count', 0)}`",
+        f"- Ranked pairs: `{summary.get('ranked_pair_count', 0)}`",
+        f"- Accepted pairs: `{summary.get('accepted_pair_count', 0)}`",
+        f"- Missing videos: `{summary.get('missing_video_count', 0)}`",
+        "",
+        "## Files",
+        "",
+        "- `source_30s.mp4`",
+        "- `segments/`",
+        "- `segment_descriptions.md`",
+        "- `all_pair_ranking.md`",
+        "- `top_pairs/`",
+        "",
+        "## Segment Order",
+    ]
+    for item in segment_items:
+        lines.append(
+            f"- `{item['clip_id']}` `{item.get('start_seconds')}` -> `{item.get('end_seconds')}`: "
+            f"{str(item.get('summary', '')).strip()}"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _markdown_table_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ").strip()
+
+
 def validate_known_pairs(
     *,
     root: str | Path,
@@ -5692,6 +6268,326 @@ def _source_clip_duration_seconds(item: dict[str, Any], media: dict[str, Any]) -
     if start is not None and end is not None and end > start:
         return end - start
     return 0.0
+
+
+def _is_single_source_raw_video_candidate(
+    *,
+    root: Path,
+    item: dict[str, Any],
+    source_path: Path,
+    dataset: str,
+) -> bool:
+    if str(item.get("dataset", "")).strip() != dataset:
+        return False
+    path_text = _display_source_path(root, str(source_path)).replace("\\", "/").lower()
+    if "/clips/" in f"/{path_text}":
+        return False
+    return f"raw/{dataset}/video/" in path_text or f"raw_datasets/{dataset}/" in path_text
+
+
+def _single_source_local_selection_score(*, item: dict[str, Any], media: dict[str, Any]) -> float:
+    duration = float(media.get("duration_seconds") or item.get("duration_seconds") or 0.0)
+    score = 1.0 - min(1.0, abs(duration - 30.0) / 4.0) * 0.35
+    if media.get("has_audio"):
+        score += 0.20
+    if media.get("has_video"):
+        score += 0.20
+    width = int(media.get("width") or 0)
+    height = int(media.get("height") or 0)
+    if width >= 480 and height >= 270:
+        score += 0.10
+    text_blob = _normalized_phrase(json.dumps(item.get("text_fields", {}), ensure_ascii=False))
+    if any(token in text_blob for token in ("subtitle", "caption", "title card", "text only")):
+        score -= 0.15
+    if len(_tokenize_text(text_blob)) >= 6:
+        score += 0.05
+    return round(max(0.0, min(1.0, score)), 3)
+
+
+def _single_source_selection_annotation(
+    candidate: dict[str, Any],
+    normalized: dict[str, Any],
+    raw_model_output: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "clip_id": f"{_safe_id(str(candidate.get('source_clip_id', 'source')))}__selection",
+        "output_path": str(candidate.get("source_path", "")),
+        "source_path": str(candidate.get("source_path", "")),
+        "dataset": str(candidate.get("dataset", "")),
+        "summary": str(normalized.get("summary", "")).strip(),
+        "subjects": list(normalized.get("subjects", [])),
+        "object_counts": dict(normalized.get("object_counts", {})),
+        "actions": list(normalized.get("actions", [])),
+        "scene": str(normalized.get("scene", "")).strip(),
+        "attributes": list(normalized.get("attributes", [])),
+        "on_screen_text": list(normalized.get("on_screen_text", [])),
+        "visible_text": list(normalized.get("visible_text", [])),
+        "speech": list(normalized.get("speech", [])),
+        "audio_events": list(normalized.get("audio_events", [])),
+        "modalities": list(normalized.get("modalities", [])),
+        "storyline": list(normalized.get("storyline", [])),
+        "speakers_and_transcript": list(normalized.get("speakers_and_transcript", [])),
+        "detective_notes": list(normalized.get("detective_notes", [])),
+        "uncertainties": list(normalized.get("uncertainties", [])),
+        "fallback_used": False,
+        "raw_model_output": raw_model_output,
+    }
+
+
+def _single_source_omni_selection_score(annotation: dict[str, Any]) -> float:
+    score = _clean_stability_score(annotation) * 0.45
+    score += min(0.20, len(_normalize_list(annotation.get("storyline", []))) * 0.05)
+    score += min(0.12, len(_action_terms_from_annotation(annotation)) * 0.03)
+    score += min(0.12, len(_normalize_object_counts(annotation.get("object_counts", {}))) * 0.04)
+    score += min(0.08, len(_annotation_subject_signature_bundle(annotation)) * 0.03)
+    if _title_card_or_boundary_text(annotation):
+        score -= 0.25
+    if len(_normalize_list(annotation.get("visible_text", []))) >= 3:
+        score -= 0.10
+    if len(_speech_texts_from_annotation(annotation)) >= 3:
+        score -= 0.08
+    return round(max(0.0, min(1.0, score)), 3)
+
+
+def _single_source_selection_reasons(annotation: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if _clean_stability_score(annotation) >= 0.75:
+        reasons.append("clean/stable according to Omni annotation")
+    if len(_normalize_list(annotation.get("storyline", []))) >= 2:
+        reasons.append("multiple timeline moments available inside 30s")
+    if _action_terms_from_annotation(annotation):
+        reasons.append("action evidence available")
+    if _annotation_object_signature_bundle(annotation):
+        reasons.append("object evidence available")
+    if not _title_card_or_boundary_text(annotation):
+        reasons.append("not title-card/text-only dominant")
+    return reasons[:5]
+
+
+def _fixed_single_source_segments(
+    *,
+    duration_seconds: float,
+    segment_seconds: float,
+    min_clip_seconds: float,
+) -> list[tuple[float, float]]:
+    segments: list[tuple[float, float]] = []
+    start = 0.0
+    while start < duration_seconds:
+        end = min(start + segment_seconds, duration_seconds)
+        if end - start >= min_clip_seconds:
+            segments.append((round(start, 3), round(end, 3)))
+        start += segment_seconds
+    return segments
+
+
+def _clip_start_seconds(annotation: dict[str, Any]) -> float:
+    source_clip = annotation.get("source_clip", {}) if isinstance(annotation.get("source_clip"), dict) else {}
+    return _optional_float(source_clip.get("start_seconds")) or _optional_float(annotation.get("start_seconds")) or 0.0
+
+
+def _single_source_pair_candidate(
+    *,
+    root: Path,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    annotations: list[dict[str, Any]],
+    group_metadata: dict[str, str],
+    acceptance_profile: str,
+) -> tuple[dict[str, Any], bool]:
+    scored = _score_ordered_pair(
+        root=root,
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        annotations=annotations,
+        compute_visual_near_duplicate=False,
+    )
+    if scored is not None:
+        source_context = dict(scored.get("source_context", {}))
+        source_context["relation"] = "same_source_video"
+        source_context["single_source_pair"] = True
+        source_context["template_route"] = "single_source_chronological"
+        scored["source_context"] = source_context
+        quality = dict(scored.get("quality", {}))
+        quality["acceptance_profile"] = acceptance_profile
+        scored["quality"] = quality
+        scored["composite_score"] = _candidate_composite_score(quality, source_context)
+        return scored, False
+
+    detected = _detect_primary_difference(reference_annotation, target_annotation)
+    if detected is None:
+        detected = {
+            "type": "scene",
+            "from": _short_difference_value(str(reference_annotation.get("summary", "")) or "earlier segment"),
+            "to": _short_difference_value(str(target_annotation.get("summary", "")) or "later segment"),
+            "description": "the later segment differs from the earlier segment but local fields did not isolate a clean single delta",
+            "changed_types": ["scene"],
+        }
+    changed_types = list(detected.pop("changed_types"))
+    difference = detected
+    hard_negative_annotations = [
+        annotation
+        for annotation in annotations
+        if annotation.get("clip_id") not in {reference_annotation.get("clip_id"), target_annotation.get("clip_id")}
+    ][:3]
+    if len(hard_negative_annotations) < 2:
+        hard_negative_annotations = annotations[:2]
+    semantic_context_score = _same_context_score(reference_annotation, target_annotation)
+    source_context = {
+        **_source_context(reference_annotation, target_annotation),
+        "relation": "same_source_video",
+        "single_source_pair": True,
+        "template_route": "single_source_chronological",
+        "group_id": group_metadata.get("group_id", ""),
+    }
+    same_context_score = _pair_context_score(
+        semantic_context_score=semantic_context_score,
+        source_context=source_context,
+    )
+    difference_strength_score = _difference_strength_score(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        primary_difference=difference,
+        changed_types=changed_types,
+    )
+    quality = {
+        "same_context_score": round(same_context_score, 3),
+        "semantic_context_score": round(semantic_context_score, 3),
+        "edit_match_score": round(
+            max(
+                MIN_PAIR_EDIT_MATCH_SCORE,
+                _edit_match_score(
+                    same_context_score=same_context_score,
+                    primary_difference_type=str(difference.get("type", "")).strip(),
+                    changed_types=changed_types,
+                ),
+            ),
+            3,
+        ),
+        "target_uniqueness_score": round(
+            _target_uniqueness_score(
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                annotations=annotations,
+                primary_difference=difference,
+            ),
+            3,
+        ),
+        "difference_strength_score": round(difference_strength_score, 3),
+        "difference_type": str(difference.get("type", "")).strip(),
+        "acceptance_profile": acceptance_profile,
+        "single_source_fallback_candidate": 1.0,
+    }
+    if difference["type"] == "action":
+        quality["action_evidence_score"] = _action_evidence_score(reference_annotation, target_annotation)
+    if difference["type"] == "speech":
+        quality["speech_evidence_score"] = _speech_evidence_score(reference_annotation, target_annotation)
+        quality["speech_specificity_score"] = _speech_specificity_score(reference_annotation, target_annotation)
+        quality["speech_transcript_backed"] = 1.0 if _speech_is_transcript_backed(reference_annotation, target_annotation) else 0.0
+        quality["has_audio_modality"] = 1.0
+    if difference["type"] == "audio_event":
+        quality["non_speech_audio_event_score"] = _non_speech_audio_event_score(reference_annotation, target_annotation)
+        quality["has_audio_modality"] = 1.0
+    dominant_delta_decision = _dominant_delta_decision(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        difference=difference,
+        quality=quality,
+        source_context=source_context,
+    )
+    quality["dominant_delta_type"] = dominant_delta_decision["dominant_type"]
+    quality["audio_primary_allowed"] = 1.0 if dominant_delta_decision["audio_primary_allowed"] else 0.0
+    quality["visual_competing_delta_score"] = dominant_delta_decision["visual_competing_delta_score"]
+    quality["dominant_delta_decision"] = dominant_delta_decision
+    reference_path = _display_path(root, _resolve_under_root(root, reference_annotation["output_path"]))
+    target_path = _display_path(root, _resolve_under_root(root, target_annotation["output_path"]))
+    hard_negative_paths = [
+        _display_path(root, _resolve_under_root(root, annotation["output_path"])) for annotation in hard_negative_annotations[:3]
+    ]
+    return (
+        {
+            "proposal_id": _build_proposal_id(reference_path, target_path),
+            "reference_annotation": _sanitize_annotation_for_output(reference_annotation, root),
+            "target_annotation": _sanitize_annotation_for_output(target_annotation, root),
+            "primary_difference": difference,
+            "changed_difference_types": changed_types,
+            "quality": quality,
+            "composite_score": _candidate_composite_score(quality, source_context),
+            "source_context": source_context,
+            "dominant_delta_decision": dominant_delta_decision,
+            "difference_evidence": _difference_evidence_from_annotations(
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                primary_difference=difference,
+            ),
+            "hard_negative_annotations": [
+                _sanitize_annotation_for_output(annotation, root) for annotation in hard_negative_annotations[:3]
+            ],
+            "hard_negative_paths": hard_negative_paths,
+        },
+        True,
+    )
+
+
+def _short_difference_value(value: str, *, max_tokens: int = 8) -> str:
+    tokens = [token for token in re.split(r"\s+", value.strip()) if token]
+    return " ".join(tokens[:max_tokens]) or "segment"
+
+
+def _build_single_source_pair_report(
+    *,
+    output_path: Path,
+    group: dict[str, Any],
+    annotations: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    fallback_candidate_count: int,
+    acceptance_profile: str,
+) -> str:
+    difference_counts = Counter(str(item.get("difference", {}).get("type", "")) for item in candidates)
+    risk_counts = _candidate_risk_flag_counts(candidates)
+    expected_pair_count = len(annotations) * (len(annotations) - 1) // 2
+    lines = [
+        "# Single Source Pair Mining Report",
+        "",
+        f"- Output: `{output_path}`",
+        f"- Group: `{group.get('group_id', '')}`",
+        f"- Segments: `{len(annotations)}`",
+        f"- Expected pairs n*(n-1)/2: `{expected_pair_count}`",
+        f"- Mined pairs: `{len(candidates)}`",
+        f"- Fallback heuristic pairs: `{fallback_candidate_count}`",
+        f"- Acceptance profile: `{acceptance_profile}`",
+        "",
+        "## Difference Type Counts",
+    ]
+    for key, value in sorted(difference_counts.items()):
+        lines.append(f"- `{key or 'unknown'}`: `{value}`")
+    if not difference_counts:
+        lines.append("- none")
+    lines.extend(["", "## Risk Flag Counts"])
+    for key, value in sorted(risk_counts.items()):
+        lines.append(f"- `{key}`: `{value}`")
+    if not risk_counts:
+        lines.append("- none")
+    lines.extend(["", "## Segment Order"])
+    for annotation in annotations:
+        lines.append(
+            f"- `{annotation.get('clip_id', '')}` "
+            f"{_clip_start_seconds(annotation):.3f}s: {str(annotation.get('summary', '')).strip()}"
+        )
+    lines.extend(["", "## Candidate Pairs"])
+    for candidate in candidates:
+        difference = candidate.get("difference", {})
+        lines.append(
+            "- "
+            f"`{candidate.get('candidate_id', '')}` "
+            f"{candidate.get('reference_start_seconds', 0.0):.3f}s -> "
+            f"{candidate.get('target_start_seconds', 0.0):.3f}s "
+            f"`{difference.get('type', 'unknown')}` "
+            f"`{difference.get('from', '')}` -> `{difference.get('to', '')}`"
+        )
+    if not candidates:
+        lines.append("- none")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _optional_float(value: Any) -> float | None:
@@ -14149,6 +15045,31 @@ def build_parser() -> argparse.ArgumentParser:
     plan_detective_parser.add_argument("--min-clip-seconds", type=float, default=3.0)
     plan_detective_parser.add_argument("--max-clip-seconds", type=float, default=15.0)
 
+    select_single_source_parser = subparsers.add_parser("select-single-source-video")
+    select_single_source_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    select_single_source_parser.add_argument("--source-clips-path", required=True)
+    select_single_source_parser.add_argument("--output-path")
+    select_single_source_parser.add_argument("--candidates-output-path")
+    select_single_source_parser.add_argument("--selection-annotations-path")
+    select_single_source_parser.add_argument("--dataset", default="daily_omni")
+    select_single_source_parser.add_argument("--min-duration-seconds", type=float, default=28.0)
+    select_single_source_parser.add_argument("--max-duration-seconds", type=float, default=32.0)
+    select_single_source_parser.add_argument("--top-k", type=int, default=8)
+    select_single_source_parser.add_argument("--max-source-videos-scan", type=int, default=2000)
+    select_single_source_parser.add_argument("--base-url")
+    select_single_source_parser.add_argument("--api-key", default="EMPTY")
+    select_single_source_parser.add_argument("--model")
+    select_single_source_parser.add_argument("--timeout-seconds", type=float, default=180.0)
+
+    plan_single_source_parser = subparsers.add_parser("plan-single-source-clips")
+    plan_single_source_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    plan_single_source_parser.add_argument("--selected-source-path", required=True)
+    plan_single_source_parser.add_argument("--clip-plan-output-path")
+    plan_single_source_parser.add_argument("--clip-groups-output-path")
+    plan_single_source_parser.add_argument("--whole-manifest-output-path")
+    plan_single_source_parser.add_argument("--segment-seconds", type=float, default=5.0)
+    plan_single_source_parser.add_argument("--min-clip-seconds", type=float, default=3.0)
+
     stable_clips_parser = subparsers.add_parser("plan-stable-omni-clips")
     stable_clips_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
     stable_clips_parser.add_argument("--raw-index-path")
@@ -14197,6 +15118,14 @@ def build_parser() -> argparse.ArgumentParser:
     mine_pair_candidates_parser.add_argument("--report-path")
     mine_pair_candidates_parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_MINED_PAIR_CANDIDATES)
     mine_pair_candidates_parser.add_argument("--acceptance-profile", choices=sorted(ACCEPTANCE_PROFILE_NAMES), default=DEFAULT_ACCEPTANCE_PROFILE)
+
+    mine_single_source_parser = subparsers.add_parser("mine-single-source-pairs")
+    mine_single_source_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    mine_single_source_parser.add_argument("--clip-annotations-path", required=True)
+    mine_single_source_parser.add_argument("--clip-groups-path", required=True)
+    mine_single_source_parser.add_argument("--output-path")
+    mine_single_source_parser.add_argument("--report-path")
+    mine_single_source_parser.add_argument("--acceptance-profile", choices=sorted(ACCEPTANCE_PROFILE_NAMES), default=DEFAULT_ACCEPTANCE_PROFILE)
 
     propose_pairs_parser = subparsers.add_parser("propose-pairs")
     propose_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -14306,6 +15235,16 @@ def build_parser() -> argparse.ArgumentParser:
     diagnostic_bundle_parser.add_argument("--clip-annotations-path")
     diagnostic_bundle_parser.add_argument("--limit-per-bucket", type=int, default=5)
     diagnostic_bundle_parser.add_argument("--no-copy-videos", action="store_true")
+
+    single_source_bundle_parser = subparsers.add_parser("build-single-source-review-bundle")
+    single_source_bundle_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    single_source_bundle_parser.add_argument("--selected-source-path", required=True)
+    single_source_bundle_parser.add_argument("--segments-manifest-path", required=True)
+    single_source_bundle_parser.add_argument("--clip-annotations-path", required=True)
+    single_source_bundle_parser.add_argument("--ranked-pairs-path", required=True)
+    single_source_bundle_parser.add_argument("--accepted-pairs-path", required=True)
+    single_source_bundle_parser.add_argument("--output-dir", required=True)
+    single_source_bundle_parser.add_argument("--no-copy-videos", action="store_true")
     return parser
 
 
@@ -14366,6 +15305,39 @@ def main() -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
+    if args.command == "select-single-source-video":
+        result = select_single_source_video(
+            root=args.root,
+            source_clips_path=args.source_clips_path,
+            output_path=args.output_path,
+            candidates_output_path=args.candidates_output_path,
+            selection_annotations_path=args.selection_annotations_path,
+            dataset=args.dataset,
+            min_duration_seconds=args.min_duration_seconds,
+            max_duration_seconds=args.max_duration_seconds,
+            top_k=args.top_k,
+            max_source_videos_scan=args.max_source_videos_scan,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "plan-single-source-clips":
+        result = plan_single_source_clips(
+            root=args.root,
+            selected_source_path=args.selected_source_path,
+            clip_plan_output_path=args.clip_plan_output_path,
+            clip_groups_output_path=args.clip_groups_output_path,
+            whole_manifest_output_path=args.whole_manifest_output_path,
+            segment_seconds=args.segment_seconds,
+            min_clip_seconds=args.min_clip_seconds,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
     if args.command == "plan-stable-omni-clips":
         result = plan_stable_omni_clips(
             root=args.root,
@@ -14415,6 +15387,18 @@ def main() -> None:
             output_path=args.output_path,
             report_path=args.report_path,
             max_candidates=args.max_candidates,
+            acceptance_profile=args.acceptance_profile,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "mine-single-source-pairs":
+        result = mine_single_source_pairs(
+            root=args.root,
+            clip_annotations_path=args.clip_annotations_path,
+            clip_groups_path=args.clip_groups_path,
+            output_path=args.output_path,
+            report_path=args.report_path,
             acceptance_profile=args.acceptance_profile,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -14559,6 +15543,20 @@ def main() -> None:
             output_dir=args.output_dir,
             clip_annotations_path=args.clip_annotations_path,
             limit_per_bucket=args.limit_per_bucket,
+            copy_videos=not args.no_copy_videos,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "build-single-source-review-bundle":
+        result = build_single_source_review_bundle(
+            root=args.root,
+            selected_source_path=args.selected_source_path,
+            segments_manifest_path=args.segments_manifest_path,
+            clip_annotations_path=args.clip_annotations_path,
+            ranked_pairs_path=args.ranked_pairs_path,
+            accepted_pairs_path=args.accepted_pairs_path,
+            output_dir=args.output_dir,
             copy_videos=not args.no_copy_videos,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))

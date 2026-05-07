@@ -103,6 +103,23 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("diagnostic_bundle", script)
         self.assertIn("exploration_review_summary.md", script)
 
+    def test_single_source_omni_pair_script_runs_one_source_pipeline(self) -> None:
+        script = Path("scripts/run_single_source_omni_pair_pilot.sh").read_text(encoding="utf-8")
+
+        self.assertIn("select-single-source-video", script)
+        self.assertIn("plan-single-source-clips", script)
+        self.assertIn("extract-clips", script)
+        self.assertIn("detective-annotate-clips", script)
+        self.assertIn("mine-single-source-pairs", script)
+        self.assertIn("propose-group-pairs", script)
+        self.assertIn("build-single-source-review-bundle", script)
+        self.assertIn("MODEL=${MODEL:-qwen3-omni}", script)
+        self.assertIn("ZERO_ACCEPTED_STOP_AFTER=${ZERO_ACCEPTED_STOP_AFTER:-10}", script)
+        self.assertIn("MAX_PROPOSALS=${MAX_PROPOSALS:-15}", script)
+        self.assertIn("single_source_review_bundle", script)
+        self.assertIn("served_models=", script)
+        self.assertIn("is not served by", script)
+
     def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
         script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")
 

@@ -50,6 +50,7 @@ from app.composed_data import (
     annotate_clips,
     build_manual_review_bundle,
     build_diagnostic_review_bundle,
+    build_single_source_review_bundle,
     build_ffmpeg_extract_command,
     detective_annotate_clips,
     discover_raw_sources,
@@ -58,14 +59,17 @@ from app.composed_data import (
     index_raw_sources,
     main as composed_data_main,
     mine_pair_candidates,
+    mine_single_source_pairs,
     plan_audio_edits,
     plan_detective_event_clips,
+    plan_single_source_clips,
     plan_stable_omni_clips,
     cache_reference_understandings,
     plan_src_ref_images,
     select_src_ref_images,
     plan_video_masks,
     plan_video_edits,
+    select_single_source_video,
     propose_group_pairs,
     propose_pairs,
     validate_known_pairs,
@@ -217,6 +221,163 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(3, len(plan_records))
             self.assertEqual("same_source_video", group_records[0]["group_reason"])
             self.assertEqual([record["clip_id"] for record in plan_records], group_records[0]["candidate_clip_ids"])
+
+    def test_select_single_source_video_uses_daily_omni_raw_30s_not_existing_clips(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            raw_video = root / "raw" / "daily_omni" / "video" / "source_30s.mp4"
+            stable_clip = root / "clips" / "omni_stable" / "stable_4s.mp4"
+            raw_video.parent.mkdir(parents=True)
+            stable_clip.parent.mkdir(parents=True)
+            raw_video.write_bytes(b"raw")
+            stable_clip.write_bytes(b"clip")
+            source_clips_path = root / "metadata" / "source_clips_all.jsonl"
+            self._write_jsonl(
+                source_clips_path,
+                [
+                    {
+                        "clip_id": "stable_should_not_select",
+                        "dataset": "daily_omni",
+                        "source_path": str(stable_clip),
+                    },
+                    {
+                        "clip_id": "worldsense_should_not_select",
+                        "dataset": "worldsense",
+                        "source_path": str(raw_video),
+                    },
+                    {
+                        "clip_id": "daily_raw_source",
+                        "dataset": "daily_omni",
+                        "source_path": str(raw_video),
+                        "text_fields": {"caption": "clean 30 second presentation video"},
+                    },
+                ],
+            )
+
+            with mock.patch(
+                "app.composed_data.probe_media",
+                return_value={
+                    "duration_seconds": 30.0,
+                    "has_audio": True,
+                    "has_video": True,
+                    "width": 640,
+                    "height": 360,
+                    "fps": 30.0,
+                },
+            ):
+                summary = select_single_source_video(
+                    root=root,
+                    source_clips_path=source_clips_path,
+                    output_path=root / "metadata" / "selected_source_video.json",
+                    candidates_output_path=root / "metadata" / "selected_source_candidates.jsonl",
+                )
+
+            selected = json.loads((root / "metadata" / "selected_source_video.json").read_text(encoding="utf-8"))
+            self.assertEqual("daily_raw_source", summary["selected_source_clip_id"])
+            self.assertEqual(str(raw_video), selected["source_path"])
+            self.assertEqual(1, summary["eligible_count"])
+
+    def test_plan_single_source_clips_splits_30s_into_6_segments_and_15_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            source_video = root / "raw" / "daily_omni" / "video" / "source.mp4"
+            source_video.parent.mkdir(parents=True)
+            source_video.write_bytes(b"x")
+            selected_path = root / "metadata" / "selected_source_video.json"
+            selected_path.write_text(
+                json.dumps(
+                    {
+                        "source_clip_id": "daily_source",
+                        "dataset": "daily_omni",
+                        "source_path": str(source_video),
+                        "duration_seconds": 30.0,
+                        "media_probe": {"duration_seconds": 30.0, "has_audio": True, "has_video": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = plan_single_source_clips(
+                root=root,
+                selected_source_path=selected_path,
+                clip_plan_output_path=root / "metadata" / "single_source_clip_plan.jsonl",
+                clip_groups_output_path=root / "metadata" / "single_source_clip_groups.jsonl",
+                whole_manifest_output_path=root / "metadata" / "selected_source_manifest.jsonl",
+                segment_seconds=5.0,
+            )
+
+            plan_records = [
+                json.loads(line)
+                for line in (root / "metadata" / "single_source_clip_plan.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            group = json.loads((root / "metadata" / "single_source_clip_groups.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(6, summary["segment_count"])
+            self.assertEqual(15, summary["pair_count"])
+            self.assertEqual(6, len(plan_records))
+            self.assertEqual("single_source_video", group["group_reason"])
+            self.assertEqual([record["clip_id"] for record in plan_records], group["candidate_clip_ids"])
+
+    def test_mine_single_source_pairs_builds_all_chronological_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations = []
+            for index in range(6):
+                annotations.append(
+                    {
+                        "clip_id": f"seg_{index + 1}",
+                        "output_path": f"clips/seg_{index + 1}.mp4",
+                        "source_path": "raw/daily_omni/video/source.mp4",
+                        "source_clip": {"start_seconds": index * 5.0, "end_seconds": index * 5.0 + 5.0},
+                        "dataset": "daily_omni",
+                        "summary": f"segment {index + 1} shows a presenter with object {index}",
+                        "subjects": ["presenter"],
+                        "object_counts": {"person": 1, f"object_{index}": 1},
+                        "actions": ["speaking" if index < 3 else "demonstrating"],
+                        "scene": "studio desk",
+                        "attributes": [f"marker_{index}"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "fallback_used": False,
+                    }
+                )
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            groups_path = root / "metadata" / "single_source_clip_groups.jsonl"
+            self._write_jsonl(annotations_path, annotations)
+            self._write_jsonl(
+                groups_path,
+                [
+                    {
+                        "group_id": "single_source_daily_source",
+                        "group_reason": "single_source_video",
+                        "candidate_clip_ids": [item["clip_id"] for item in annotations],
+                    }
+                ],
+            )
+
+            summary = mine_single_source_pairs(
+                root=root,
+                clip_annotations_path=annotations_path,
+                clip_groups_path=groups_path,
+                output_path=root / "pairs" / "single_source_pair_candidates.jsonl",
+                report_path=root / "reports" / "single_source_pair_report.md",
+                acceptance_profile="exploration",
+            )
+
+            records = [
+                json.loads(line)
+                for line in (root / "pairs" / "single_source_pair_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(15, summary["expected_pair_count"])
+            self.assertEqual(15, summary["candidate_count"])
+            self.assertTrue(all(record["source_context"]["relation"] == "same_source_video" for record in records))
+            self.assertTrue(all(record["reference_start_seconds"] < record["target_start_seconds"] for record in records))
+            self.assertTrue(all(record["single_source_pair"] for record in records))
 
     def test_plan_stable_omni_clips_uses_cache_and_enforces_window_length(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -8349,6 +8510,102 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(any("missing src_mask" in issue for issue in metadata["review_bundle_issues"]))
             self.assertTrue(any("missing src_video_for_vace" in issue for issue in metadata["review_bundle_issues"]))
             self.assertTrue(any("missing review_inputs_dir" in issue for issue in metadata["review_bundle_issues"]))
+
+    def test_build_single_source_review_bundle_includes_source_segments_and_ranked_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            source = root / "raw" / "daily_omni" / "video" / "source.mp4"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"source")
+            for name in ("seg_1.mp4", "seg_2.mp4"):
+                (root / "clips" / name).write_bytes(b"clip")
+            selected_path = root / "metadata" / "selected_source_video.json"
+            selected_path.write_text(
+                json.dumps(
+                    {
+                        "source_clip_id": "daily_source",
+                        "dataset": "daily_omni",
+                        "source_path": str(source),
+                        "duration_seconds": 30.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            segments_path = root / "metadata" / "extracted_single_source_clips.jsonl"
+            self._write_jsonl(
+                segments_path,
+                [
+                    {"clip_id": "seg_1", "output_path": "clips/seg_1.mp4", "start_seconds": 0.0, "end_seconds": 5.0},
+                    {"clip_id": "seg_2", "output_path": "clips/seg_2.mp4", "start_seconds": 5.0, "end_seconds": 10.0},
+                ],
+            )
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "seg_1",
+                        "output_path": "clips/seg_1.mp4",
+                        "summary": "a presenter sits at a desk",
+                        "subjects": ["presenter"],
+                        "object_counts": {"person": 1},
+                        "actions": ["sitting"],
+                        "scene": "studio desk",
+                        "attributes": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                    },
+                    {
+                        "clip_id": "seg_2",
+                        "output_path": "clips/seg_2.mp4",
+                        "summary": "a presenter demonstrates a bottle",
+                        "subjects": ["presenter"],
+                        "object_counts": {"person": 1, "bottle": 1},
+                        "actions": ["demonstrating"],
+                        "scene": "studio desk",
+                        "attributes": [],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                    },
+                ],
+            )
+            pair = {
+                "proposal_id": "pair_1",
+                "sample_id": "pair_1",
+                "reference_clip_id": "seg_1",
+                "target_clip_id": "seg_2",
+                "reference_video": "clips/seg_1.mp4",
+                "target_video": "clips/seg_2.mp4",
+                "edit_text": "add a bottle to the desk demonstration",
+                "difference": {"type": "object_presence", "from": "no bottle", "to": "1 bottle"},
+                "accepted": True,
+                "judge": {"reject_reason": ""},
+            }
+            ranked_path = root / "pairs" / "ranked_single_source_pairs.jsonl"
+            accepted_path = root / "pairs" / "accepted_pairs.jsonl"
+            self._write_jsonl(ranked_path, [pair])
+            self._write_jsonl(accepted_path, [pair])
+
+            summary = build_single_source_review_bundle(
+                root=root,
+                selected_source_path=selected_path,
+                segments_manifest_path=segments_path,
+                clip_annotations_path=annotations_path,
+                ranked_pairs_path=ranked_path,
+                accepted_pairs_path=accepted_path,
+                output_dir=root / "single_source_review_bundle",
+            )
+
+            bundle = root / "single_source_review_bundle"
+            self.assertEqual(1, summary["accepted_pair_count"])
+            self.assertTrue((bundle / "source_30s.mp4").exists())
+            self.assertTrue((bundle / "segments" / "001_seg_1.mp4").exists())
+            self.assertTrue((bundle / "segment_descriptions.md").exists())
+            self.assertTrue((bundle / "all_pair_ranking.md").exists())
+            self.assertTrue((bundle / "top_pairs" / "review_items.jsonl").exists())
 
     def test_build_diagnostic_review_bundle_buckets_major_rejects(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
