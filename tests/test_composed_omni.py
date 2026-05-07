@@ -173,6 +173,76 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("include both from/to text", system_prompt)
         self.assertEqual(22.0, request_holder["timeout"])
 
+    def test_propose_single_source_pair_materializes_both_videos_and_requires_evidence(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "edit_text": "add a picture-in-picture demonstration overlay",
+                                "modalities": ["visual"],
+                                "reference_caption": "a woman speaks without an overlay",
+                                "target_caption": "a woman speaks with a picture-in-picture demo overlay",
+                                "difference": {
+                                    "type": "object_presence",
+                                    "from": "no picture-in-picture demonstration overlay",
+                                    "to": "picture-in-picture demonstration overlay",
+                                    "description": "a picture-in-picture demonstration overlay appears",
+                                },
+                                "dominant_delta": {
+                                    "type": "object_presence",
+                                    "from": "no overlay",
+                                    "to": "picture-in-picture overlay",
+                                    "reason": "the overlay is the clearest visual difference",
+                                },
+                                "discarded_deltas": ["minor blouse/shirt wording"],
+                                "evidence": ["target has a picture-in-picture overlay while reference does not"],
+                                "confidence": 0.86,
+                                "accept": True,
+                                "reject_reason": "",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8093/v1",
+            api_key="EMPTY",
+            model="qwen3-omni",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "reference.mp4"
+            target_path = Path(temp_dir) / "target.mp4"
+            reference_path.write_bytes(b"reference-video")
+            target_path.write_bytes(b"target-video")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.propose_single_source_pair(
+                    reference_clip_path=str(reference_path),
+                    target_clip_path=str(target_path),
+                    reference_annotation={"clip_id": "ref", "summary": "a woman speaks"},
+                    target_annotation={"clip_id": "target", "summary": "a woman speaks with overlay"},
+                )
+
+        self.assertTrue(normalized["accept"])
+        self.assertEqual("object_presence", normalized["difference"]["type"])
+        self.assertEqual(["target has a picture-in-picture overlay while reference does not"], normalized["evidence"])
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        content = request_body["messages"][1]["content"]
+        self.assertEqual("Reference clip:", content[0]["text"])
+        self.assertTrue(content[1]["video_url"]["url"].startswith("data:video/mp4;base64,"))
+        self.assertEqual("Target clip:", content[2]["text"])
+        self.assertTrue(content[3]["video_url"]["url"].startswith("data:video/mp4;base64,"))
+        self.assertIn("picture-in-picture", request_body["messages"][0]["content"])
+
     def test_plan_video_edit_materializes_reference_video_and_normalizes_plan(self) -> None:
         request_holder: dict[str, object] = {}
         response_payload = {

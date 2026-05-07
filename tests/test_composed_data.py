@@ -71,6 +71,7 @@ from app.composed_data import (
     plan_video_edits,
     select_single_source_video,
     propose_group_pairs,
+    propose_single_source_pairs,
     propose_pairs,
     validate_known_pairs,
     validate_pilot_dataset,
@@ -476,6 +477,161 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(all(record["source_context"]["relation"] == "same_source_video" for record in records))
             self.assertTrue(all(record["reference_start_seconds"] < record["target_start_seconds"] for record in records))
             self.assertTrue(all(record["single_source_pair"] for record in records))
+            self.assertTrue(all(record["candidate_stage"] == "enumeration_only" for record in records))
+            self.assertTrue(all(record["requires_pair_video_comparison"] for record in records))
+
+    def test_propose_single_source_pairs_uses_video_comparison_not_attribute_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4", "seg_3.mp4", "seg_4.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode("utf-8"))
+            annotations = [
+                {
+                    "clip_id": "seg_1",
+                    "output_path": "clips/seg_1.mp4",
+                    "dataset": "daily_omni",
+                    "summary": "a woman speaks to camera without an overlay",
+                    "subjects": ["woman presenter"],
+                    "object_counts": {"person": 1},
+                    "actions": ["speaking"],
+                    "scene": "beauty tutorial room",
+                    "attributes": ["dark blue blouse", "long brown hair"],
+                    "storyline": ["face-only speaking segment"],
+                    "visible_text": [],
+                    "speech": [],
+                    "audio_events": [],
+                },
+                {
+                    "clip_id": "seg_2",
+                    "output_path": "clips/seg_2.mp4",
+                    "dataset": "daily_omni",
+                    "summary": "a woman speaks while a picture-in-picture demo appears",
+                    "subjects": ["woman presenter"],
+                    "object_counts": {"person": 1, "picture-in-picture overlay": 1},
+                    "actions": ["speaking", "demonstrating"],
+                    "scene": "beauty tutorial room with overlay",
+                    "attributes": ["dark blue shirt", "long hair"],
+                    "storyline": ["picture-in-picture demonstration overlay appears"],
+                    "visible_text": [],
+                    "speech": [],
+                    "audio_events": [],
+                },
+                {
+                    "clip_id": "seg_3",
+                    "output_path": "clips/seg_3.mp4",
+                    "dataset": "daily_omni",
+                    "summary": "a product close-up",
+                    "subjects": ["mascara product"],
+                    "object_counts": {"mascara": 1},
+                    "actions": ["showing product"],
+                    "scene": "product close-up",
+                    "attributes": [],
+                    "storyline": ["product close-up"],
+                    "visible_text": [],
+                    "speech": [],
+                    "audio_events": [],
+                },
+                {
+                    "clip_id": "seg_4",
+                    "output_path": "clips/seg_4.mp4",
+                    "dataset": "daily_omni",
+                    "summary": "a woman holds a mascara wand",
+                    "subjects": ["woman presenter"],
+                    "object_counts": {"person": 1, "mascara wand": 1},
+                    "actions": ["holding mascara wand"],
+                    "scene": "beauty tutorial room",
+                    "attributes": [],
+                    "storyline": ["presenter holds mascara wand"],
+                    "visible_text": [],
+                    "speech": [],
+                    "audio_events": [],
+                },
+            ]
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            whole_path = root / "captions" / "single_source_whole_annotation.jsonl"
+            self._write_jsonl(annotations_path, annotations)
+            self._write_jsonl(whole_path, [{"clip_id": "whole", "summary": "beauty tutorial with product demonstrations"}])
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "candidate_1",
+                        "proposal_id": _build_proposal_id("clips/seg_1.mp4", "clips/seg_2.mp4"),
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "attribute", "from": "dark blue blouse", "to": "dark blue shirt"},
+                        "risk_flags": ["multi_delta"],
+                        "hard_negative_paths": ["clips/seg_3.mp4", "clips/seg_4.mp4"],
+                        "scores": {"same_context_score": 0.8, "target_uniqueness_score": 0.6, "difference_strength_score": 0.5},
+                    }
+                ],
+            )
+
+            client = mock.Mock()
+            client.propose_single_source_pair.return_value = (
+                {
+                    "edit_text": "add a picture-in-picture demonstration overlay",
+                    "modalities": ["visual"],
+                    "reference_caption": "a woman speaks to camera without an overlay",
+                    "target_caption": "a woman speaks while a picture-in-picture demo appears",
+                    "difference": {
+                        "type": "object_presence",
+                        "from": "no picture-in-picture demonstration overlay",
+                        "to": "picture-in-picture demonstration overlay",
+                        "description": "a picture-in-picture demonstration overlay appears in the target segment",
+                    },
+                    "dominant_delta": {
+                        "type": "object_presence",
+                        "from": "no overlay",
+                        "to": "picture-in-picture demonstration overlay",
+                        "reason": "the overlay is visually obvious while clothing wording is incidental",
+                    },
+                    "discarded_deltas": ["minor blouse/shirt wording"],
+                    "evidence": ["target segment contains a picture-in-picture demo overlay; reference does not"],
+                    "confidence": 0.86,
+                    "accept": True,
+                    "reject_reason": "",
+                },
+                {"raw": "ok"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    whole_annotation_path=whole_path,
+                    output_path=root / "pairs" / "ranked_single_source_pairs.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    max_accepted_pairs=5,
+                    acceptance_profile="exploration",
+                )
+
+            ranked = [
+                json.loads(line)
+                for line in (root / "pairs" / "ranked_single_source_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            accepted = [
+                json.loads(line)
+                for line in (root / "pairs" / "accepted_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["proposal_count"])
+            self.assertEqual("add a picture-in-picture demonstration overlay", ranked[0]["edit_text"])
+            self.assertEqual("object_presence", ranked[0]["difference"]["type"])
+            self.assertTrue(ranked[0]["accepted"])
+            self.assertEqual(1, len(accepted))
+            self.assertNotIn("change attribute from dark blue blouse to dark blue shirt", ranked[0]["edit_text"])
 
     def test_plan_stable_omni_clips_uses_cache_and_enforces_window_length(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -8704,6 +8860,10 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue((bundle / "segment_descriptions.md").exists())
             self.assertTrue((bundle / "all_pair_ranking.md").exists())
             self.assertTrue((bundle / "top_pairs" / "review_items.jsonl").exists())
+            pair_description = bundle / "pair_review" / "accepted" / "001_object_presence" / "description.md"
+            self.assertTrue(pair_description.exists())
+            self.assertIn("Reference Segment Description", pair_description.read_text(encoding="utf-8"))
+            self.assertIn("Target Segment Description", pair_description.read_text(encoding="utf-8"))
 
     def test_build_diagnostic_review_bundle_buckets_major_rejects(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

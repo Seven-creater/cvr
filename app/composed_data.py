@@ -1731,6 +1731,8 @@ def mine_single_source_pairs(
             record["candidate_index"] = len(mined_records) + 1
             record["single_source_pair"] = True
             record["chronological_pair"] = True
+            record["candidate_stage"] = "enumeration_only"
+            record["requires_pair_video_comparison"] = True
             record["reference_start_seconds"] = _clip_start_seconds(reference_annotation)
             record["target_start_seconds"] = _clip_start_seconds(target_annotation)
             if fallback_used:
@@ -1761,6 +1763,281 @@ def mine_single_source_pairs(
         "expected_pair_count": len(ordered_annotations) * (len(ordered_annotations) - 1) // 2,
         "fallback_candidate_count": fallback_candidate_count,
         "difference_type_counts": dict(Counter(str(item.get("difference", {}).get("type", "")) for item in mined_records)),
+        "acceptance_profile": acceptance_profile,
+    }
+
+
+def propose_single_source_pairs(
+    *,
+    root: str | Path,
+    clip_annotations_path: str | Path,
+    pair_candidates_path: str | Path,
+    base_url: str,
+    api_key: str,
+    model: str,
+    output_path: str | Path | None = None,
+    accepted_output_path: str | Path | None = None,
+    whole_annotation_path: str | Path | None = None,
+    timeout_seconds: float = 180.0,
+    max_accepted_pairs: int = 5,
+    max_proposals: int | None = None,
+    zero_accepted_stop_after: int = DEFAULT_ZERO_ACCEPTED_STOP_AFTER,
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
+) -> dict[str, Any]:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
+    layout = ensure_layout(root)
+    annotations_path = Path(clip_annotations_path)
+    candidates_path = Path(pair_candidates_path)
+    output = Path(output_path) if output_path else layout["pairs"] / "ranked_single_source_pairs.jsonl"
+    accepted_output = Path(accepted_output_path) if accepted_output_path else layout["pairs"] / DEFAULT_ACCEPTED_PAIRS_NAME
+    annotations = list(_load_jsonl(annotations_path))
+    candidates = list(_load_jsonl(candidates_path))
+    if not annotations:
+        raise ValueError("single-source annotations are empty")
+    if not candidates:
+        raise ValueError("single-source pair candidates are empty")
+
+    whole_annotations = list(_load_jsonl(Path(whole_annotation_path))) if whole_annotation_path else []
+    whole_annotation = whole_annotations[0] if whole_annotations else {}
+    annotations_by_id = {
+        str(item.get("clip_id", "")).strip(): item
+        for item in annotations
+        if str(item.get("clip_id", "")).strip()
+    }
+    existing_records = _load_records_by_key(output, "proposal_id")
+    if not output.exists():
+        _write_jsonl(output, [])
+    if not accepted_output.exists():
+        _write_jsonl(accepted_output, [])
+
+    client = OpenAIComposedDataClient(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout_seconds=timeout_seconds,
+    )
+    ordered_candidates = sorted(
+        candidates,
+        key=lambda item: (
+            int(item.get("candidate_index") or 0),
+            str(item.get("candidate_id", "")),
+        ),
+    )
+    output_records: list[dict[str, Any]] = []
+    accepted_total_count = 0
+    rejected_count = 0
+    fallback_count = 0
+    early_stop_reason = ""
+
+    def persist_progress() -> None:
+        current_accepted = _select_final_accepted_records(
+            output_records,
+            max_accepted_pairs=max_accepted_pairs,
+            acceptance_profile=acceptance_profile,
+        )
+        _write_jsonl(output, output_records)
+        _write_jsonl(accepted_output, current_accepted)
+
+    for candidate in ordered_candidates:
+        if max_proposals is not None and len(output_records) >= max_proposals:
+            break
+        reference_clip_id = str(candidate.get("reference_clip_id", "")).strip()
+        target_clip_id = str(candidate.get("target_clip_id", "")).strip()
+        reference_annotation = annotations_by_id.get(reference_clip_id)
+        target_annotation = annotations_by_id.get(target_clip_id)
+        if reference_annotation is None or target_annotation is None:
+            continue
+        reference_video = str(candidate.get("reference_video") or reference_annotation.get("output_path", "")).strip()
+        target_video = str(candidate.get("target_video") or target_annotation.get("output_path", "")).strip()
+        proposal_id = str(candidate.get("proposal_id") or candidate.get("candidate_id") or _build_proposal_id(reference_video, target_video))
+        print(
+            "[propose-single-source-pairs] start "
+            f"proposal_index={len(output_records) + 1} proposal_id={proposal_id}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if proposal_id in existing_records:
+            record = dict(existing_records[proposal_id])
+        else:
+            reference_path = _resolve_under_root(layout["root"], reference_video)
+            target_path = _resolve_under_root(layout["root"], target_video)
+            raw_model_output: dict[str, Any]
+            fallback_used = False
+            try:
+                model_fields, raw_model_output = client.propose_single_source_pair(
+                    reference_clip_path=str(reference_path),
+                    target_clip_path=str(target_path),
+                    reference_annotation=_annotation_prompt_view(reference_annotation),
+                    target_annotation=_annotation_prompt_view(target_annotation),
+                    whole_annotation=_single_source_whole_prompt_view(whole_annotation) if whole_annotation else None,
+                    candidate=_single_source_candidate_prompt_view(candidate),
+                )
+            except Exception as exc:
+                model_fields = _single_source_rejected_model_fields(
+                    candidate=candidate,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+                raw_model_output = {"error": f"{type(exc).__name__}: {exc}"}
+                fallback_used = True
+
+            difference = dict(model_fields.get("difference") or {})
+            difference_type = str(difference.get("type", "")).strip()
+            confidence = _score_float(model_fields.get("confidence"))
+            hard_negative_paths = _single_source_hard_negative_paths(
+                root=layout["root"],
+                candidate=candidate,
+                annotations=annotations,
+                reference_clip_id=reference_clip_id,
+                target_clip_id=target_clip_id,
+            )
+            quality = _single_source_pair_quality(
+                candidate=candidate,
+                model_fields=model_fields,
+                acceptance_profile=acceptance_profile,
+            )
+            edit_text_quality = _edit_text_quality_payload(
+                edit_text=str(model_fields.get("edit_text", "")),
+                difference=difference,
+                modalities=list(model_fields.get("modalities", [])),
+                reference_caption=str(model_fields.get("reference_caption", "")),
+                target_caption=str(model_fields.get("target_caption", "")),
+            )
+            weak_reason = _single_source_model_reject_reason(model_fields, edit_text_quality)
+            accepted = (
+                bool(model_fields.get("accept"))
+                and confidence >= _profile_threshold(acceptance_profile, "edit_match_score")
+                and difference_type not in FINAL_DISABLED_DIFFERENCE_TYPES
+                and not weak_reason
+                and not fallback_used
+            )
+            reject_reason = str(model_fields.get("reject_reason", "")).strip()
+            if not accepted:
+                reject_reason = "; ".join([item for item in (reject_reason, weak_reason) if item]).strip()
+                reject_reason = reject_reason or "single-source pair model rejected"
+            judge = {
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": bool(model_fields.get("accept")) and not weak_reason,
+                "single_main_difference": bool(model_fields.get("accept")) and not weak_reason,
+                "same_context_score": quality["same_context_score"],
+                "edit_match_score": quality["edit_match_score"],
+                "target_uniqueness_score": quality["target_uniqueness_score"],
+                "audio_required": "audio" in list(model_fields.get("modalities", [])),
+                "hard_negative_quality": "weak",
+                "accept": accepted,
+                "reject_reason": reject_reason,
+            }
+            verification = _single_source_pair_verification(model_fields, accepted=accepted, reject_reason=reject_reason)
+            source = {
+                "platform": str(target_annotation.get("dataset") or reference_annotation.get("dataset") or "daily_omni"),
+                "url": _resolve_under_root(layout["root"], target_video).resolve().as_uri(),
+                "license_note": DEFAULT_LICENSE_NOTE,
+            }
+            source_context = {
+                "relation": "same_source_video",
+                "single_source_pair": True,
+                "template_route": "single_source_pair_video_comparison",
+                "score": quality["same_context_score"],
+            }
+            record = {
+                "proposal_id": proposal_id,
+                "candidate_id": str(candidate.get("candidate_id", "")),
+                "candidate_stage": "pair_video_comparison",
+                "group_id": str(candidate.get("group_id", "")),
+                "group_reason": str(candidate.get("group_reason", "single_source_video")),
+                "reference_clip_id": reference_clip_id,
+                "target_clip_id": target_clip_id,
+                "reference_video": reference_video,
+                "target_video": target_video,
+                "edit_text": str(model_fields.get("edit_text", "")).strip(),
+                "modalities": list(model_fields.get("modalities", [])),
+                "reference_caption": str(model_fields.get("reference_caption", "")).strip(),
+                "target_caption": str(model_fields.get("target_caption", "")).strip(),
+                "difference": difference,
+                "dominant_delta": dict(model_fields.get("dominant_delta", {})),
+                "discarded_deltas": list(model_fields.get("discarded_deltas", [])),
+                "pair_video_evidence": list(model_fields.get("evidence", [])),
+                "confidence": confidence,
+                "hard_negatives": hard_negative_paths,
+                "quality": quality,
+                "heuristic_quality": dict(candidate.get("quality", {})) if isinstance(candidate.get("quality"), dict) else {},
+                "source_context": source_context,
+                "source": source,
+                "proposal_reason": str(model_fields.get("dominant_delta", {}).get("reason", "")).strip(),
+                "evidence": {
+                    **_evidence_from_annotations(reference_annotation, target_annotation),
+                    "pair_video_comparison": list(model_fields.get("evidence", [])),
+                    "discarded_deltas": list(model_fields.get("discarded_deltas", [])),
+                },
+                "judge": judge,
+                "verification": verification,
+                "edit_text_quality": edit_text_quality,
+                "observable_difference": {
+                    "passed": accepted,
+                    "frame_backed": bool(model_fields.get("evidence")),
+                    "failure_reason": "" if accepted else reject_reason,
+                    "reference_evidence": [],
+                    "target_evidence": list(model_fields.get("evidence", [])),
+                    "supporting_fields": ["pair_video_comparison"],
+                },
+                "dominant_delta_decision": dict(model_fields.get("dominant_delta", {})),
+                "accepted": accepted,
+                "fallback_used": fallback_used,
+                "raw_model_output": raw_model_output,
+                "single_source_pair": True,
+            }
+        if bool(record.get("fallback_used")):
+            fallback_count += 1
+        if bool(record.get("accepted")):
+            accepted_total_count += 1
+        else:
+            rejected_count += 1
+        output_records.append(record)
+        persist_progress()
+        current_accepted = _select_final_accepted_records(
+            output_records,
+            max_accepted_pairs=max_accepted_pairs,
+            acceptance_profile=acceptance_profile,
+        )
+        print(
+            "[propose-single-source-pairs] wrote "
+            f"proposal_count={len(output_records)} accepted_current={len(current_accepted)} "
+            f"accepted={bool(record.get('accepted'))} fallback={bool(record.get('fallback_used'))}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if (
+            zero_accepted_stop_after
+            and zero_accepted_stop_after > 0
+            and len(output_records) >= zero_accepted_stop_after
+            and not current_accepted
+        ):
+            early_stop_reason = (
+                f"zero accepted after {len(output_records)} single-source pair comparisons; "
+                "inspect selected source, segment captions, or pair-level Omni output"
+            )
+            print(f"[propose-single-source-pairs] EARLY_STOP: {early_stop_reason}", file=sys.stderr, flush=True)
+            break
+
+    accepted_records = _select_final_accepted_records(
+        output_records,
+        max_accepted_pairs=max_accepted_pairs,
+        acceptance_profile=acceptance_profile,
+    )
+    _write_jsonl(output, output_records)
+    _write_jsonl(accepted_output, accepted_records)
+    return {
+        "clip_annotations_path": str(annotations_path),
+        "pair_candidates_path": str(candidates_path),
+        "whole_annotation_path": str(whole_annotation_path or ""),
+        "output_path": str(output),
+        "accepted_output_path": str(accepted_output),
+        "candidate_count": len(candidates),
+        "proposal_count": len(output_records),
+        "accepted_count": len(accepted_records),
+        "accepted_total_count": accepted_total_count,
+        "rejected_count": rejected_count,
+        "fallback_count": fallback_count,
+        "early_stop_reason": early_stop_reason,
         "acceptance_profile": acceptance_profile,
     }
 
@@ -5369,6 +5646,13 @@ def build_single_source_review_bundle(
         clip_annotations_path=clip_annotations_path,
         copy_videos=copy_videos,
     )
+    pair_review_summary = _build_single_source_pair_review_items(
+        root=root_path,
+        output_dir=output_root / "pair_review",
+        ranked_pairs=ranked_pairs,
+        annotation_lookup=annotation_lookup,
+        copy_videos=copy_videos,
+    )
     summary = {
         "selected_source_path": str(selected_path),
         "segments_manifest_path": str(segments_manifest_path),
@@ -5380,6 +5664,7 @@ def build_single_source_review_bundle(
         "ranked_pair_count": len(ranked_pairs),
         "accepted_pair_count": len(accepted_pairs),
         "top_pair_bundle": top_pair_bundle,
+        "pair_review": pair_review_summary,
         "missing_video_count": len(missing_videos),
         "missing_videos": missing_videos,
     }
@@ -5433,6 +5718,118 @@ def _single_source_pair_ranking_markdown(records: list[dict[str, Any]]) -> str:
     if not records:
         lines.append("| 0 | no | none | none | none | none | none |")
     lines.append("")
+    return "\n".join(lines)
+
+
+def _build_single_source_pair_review_items(
+    *,
+    root: Path,
+    output_dir: Path,
+    ranked_pairs: list[dict[str, Any]],
+    annotation_lookup: dict[str, dict[str, Any]],
+    copy_videos: bool,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    bucket_counts: Counter[str] = Counter()
+    missing_videos: list[str] = []
+    for index, record in enumerate(ranked_pairs, start=1):
+        bucket = "accepted" if bool(record.get("accepted")) else "rejected"
+        bucket_counts[bucket] += 1
+        difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+        item_dir = output_dir / bucket / f"{index:03d}_{_safe_id(str(difference.get('type', 'pair')))}"
+        item_dir.mkdir(parents=True, exist_ok=True)
+        reference_video = str(record.get("reference_video", "")).strip()
+        target_video = str(record.get("target_video", "")).strip()
+        if copy_videos:
+            for filename, raw_path in (("reference.mp4", reference_video), ("target.mp4", target_video)):
+                resolved = _resolve_under_root(root, raw_path)
+                if resolved.exists():
+                    shutil.copy2(resolved, item_dir / filename)
+                else:
+                    missing_videos.append(str(resolved))
+        (item_dir / "edit_text.txt").write_text(str(record.get("edit_text", "")).strip() + "\n", encoding="utf-8")
+        (item_dir / "metadata.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        reference_annotation = annotation_lookup.get(str(record.get("reference_clip_id", "")).strip(), {})
+        target_annotation = annotation_lookup.get(str(record.get("target_clip_id", "")).strip(), {})
+        (item_dir / "description.md").write_text(
+            _single_source_pair_description_markdown(
+                record=record,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            ),
+            encoding="utf-8",
+        )
+    summary = {
+        "output_dir": str(output_dir),
+        "pair_count": len(ranked_pairs),
+        "bucket_counts": dict(bucket_counts),
+        "missing_video_count": len(missing_videos),
+        "missing_videos": missing_videos,
+    }
+    (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return summary
+
+
+def _single_source_pair_description_markdown(
+    *,
+    record: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> str:
+    difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+    judge = record.get("judge", {}) if isinstance(record.get("judge"), dict) else {}
+    lines = [
+        f"# Single Source Pair `{record.get('proposal_id', '')}`",
+        "",
+        f"- accepted: `{bool(record.get('accepted'))}`",
+        f"- edit_text: {str(record.get('edit_text', '')).strip()}",
+        f"- difference: `{json.dumps(difference, ensure_ascii=False)}`",
+        f"- confidence: `{record.get('confidence', '')}`",
+        f"- reject_reason: {str(judge.get('reject_reason', '')).strip()}",
+        "",
+        "## Dominant Delta",
+        "",
+        f"```json\n{json.dumps(record.get('dominant_delta', record.get('dominant_delta_decision', {})), ensure_ascii=False, indent=2)}\n```",
+        "",
+        "## Pair Video Evidence",
+        "",
+    ]
+    evidence = record.get("pair_video_evidence", [])
+    if isinstance(evidence, list) and evidence:
+        lines.extend([f"- {item}" for item in evidence])
+    else:
+        lines.append("- No pair-level evidence recorded.")
+    lines.extend(
+        [
+            "",
+            "## Discarded Deltas",
+            "",
+        ]
+    )
+    discarded = record.get("discarded_deltas", [])
+    if isinstance(discarded, list) and discarded:
+        lines.extend([f"- {item}" for item in discarded])
+    else:
+        lines.append("- None recorded.")
+    lines.extend(
+        [
+            "",
+            "## Reference Segment Description",
+            "",
+            f"```json\n{json.dumps(_review_annotation_description(reference_annotation), ensure_ascii=False, indent=2)}\n```",
+            "",
+            "## Target Segment Description",
+            "",
+            f"```json\n{json.dumps(_review_annotation_description(target_annotation), ensure_ascii=False, indent=2)}\n```",
+            "",
+            "## Review Focus",
+            "",
+            "- edit_text 是否描述了视频里最明显、可验证的主差异？",
+            "- 如果有产品、画中画、手持物或特写，是否优先于衣服/头发措辞差异？",
+            "- 是否只有一个主变化，而不是多个无关变化拼在一起？",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -6543,6 +6940,207 @@ def _single_source_pair_candidate(
             "hard_negative_paths": hard_negative_paths,
         },
         True,
+    )
+
+
+def _single_source_candidate_prompt_view(candidate: dict[str, Any]) -> dict[str, Any]:
+    difference = candidate.get("difference") if isinstance(candidate.get("difference"), dict) else {}
+    return {
+        "candidate_id": str(candidate.get("candidate_id", "")),
+        "candidate_index": candidate.get("candidate_index"),
+        "reference_clip_id": str(candidate.get("reference_clip_id", "")),
+        "target_clip_id": str(candidate.get("target_clip_id", "")),
+        "reference_start_seconds": candidate.get("reference_start_seconds"),
+        "target_start_seconds": candidate.get("target_start_seconds"),
+        "enumeration_hint_only": True,
+        "heuristic_difference": {
+            "type": str(difference.get("type", "")),
+            "from": str(difference.get("from", "")),
+            "to": str(difference.get("to", "")),
+            "description": str(difference.get("description", "")),
+        },
+        "risk_flags": list(candidate.get("risk_flags", [])) if isinstance(candidate.get("risk_flags"), list) else [],
+        "instruction": "Do not copy the heuristic difference if the videos show a stronger product, overlay, object, action, or composition change.",
+    }
+
+
+def _single_source_whole_prompt_view(annotation: dict[str, Any]) -> dict[str, Any]:
+    if not annotation:
+        return {}
+    return {
+        "clip_id": str(annotation.get("clip_id", "whole_source")),
+        "summary": _truncate_text(annotation.get("summary", ""), 700),
+        "subjects": _prompt_list(annotation.get("subjects", []), limit=8, text_limit=80),
+        "object_counts": dict(annotation.get("object_counts", {})) if isinstance(annotation.get("object_counts"), dict) else {},
+        "actions": _prompt_list(annotation.get("actions", []), limit=8, text_limit=80),
+        "scene": _truncate_text(annotation.get("scene", ""), 300),
+        "attributes": _prompt_list(annotation.get("attributes", []), limit=8, text_limit=120),
+        "storyline": _prompt_list(annotation.get("storyline", []), limit=8, text_limit=220),
+        "events": _prompt_list(annotation.get("events", []), limit=8, text_limit=220),
+        "visible_text": _prompt_list(annotation.get("visible_text", []), limit=8, text_limit=120),
+        "speakers_and_transcript": _prompt_list(annotation.get("speakers_and_transcript", []), limit=6, text_limit=220),
+        "audio_events": _prompt_list(annotation.get("audio_events", []), limit=8, text_limit=120),
+    }
+
+
+def _single_source_rejected_model_fields(*, candidate: dict[str, Any], reason: str) -> dict[str, Any]:
+    difference = candidate.get("difference") if isinstance(candidate.get("difference"), dict) else {}
+    if not difference or str(difference.get("type", "")).strip() not in ALLOWED_DIFFERENCE_TYPES:
+        difference = {
+            "type": "scene",
+            "from": "reference segment",
+            "to": "target segment",
+            "description": "single-source pair comparison failed before a reliable dominant delta could be written",
+        }
+    return {
+        "edit_text": "",
+        "modalities": ["visual"],
+        "reference_caption": "single-source reference segment",
+        "target_caption": "single-source target segment",
+        "difference": dict(difference),
+        "dominant_delta": {
+            "type": str(difference.get("type", "scene")),
+            "from": str(difference.get("from", "")),
+            "to": str(difference.get("to", "")),
+            "reason": reason,
+        },
+        "discarded_deltas": [],
+        "evidence": [reason],
+        "confidence": 0.0,
+        "accept": False,
+        "reject_reason": reason,
+    }
+
+
+def _single_source_hard_negative_paths(
+    *,
+    root: Path,
+    candidate: dict[str, Any],
+    annotations: list[dict[str, Any]],
+    reference_clip_id: str,
+    target_clip_id: str,
+) -> list[str]:
+    paths = [
+        str(item).strip()
+        for item in candidate.get("hard_negative_paths", [])
+        if str(item).strip()
+    ] if isinstance(candidate.get("hard_negative_paths"), list) else []
+    valid_paths: list[str] = []
+    for path in paths:
+        resolved = _resolve_under_root(root, path)
+        if resolved.exists() and path not in valid_paths:
+            valid_paths.append(path)
+    if len(valid_paths) >= 2:
+        return valid_paths[:3]
+    for annotation in annotations:
+        clip_id = str(annotation.get("clip_id", "")).strip()
+        if clip_id in {reference_clip_id, target_clip_id}:
+            continue
+        output_path = str(annotation.get("output_path", "")).strip()
+        if output_path and _resolve_under_root(root, output_path).exists() and output_path not in valid_paths:
+            valid_paths.append(output_path)
+        if len(valid_paths) >= 3:
+            break
+    return valid_paths
+
+
+def _single_source_pair_quality(
+    *,
+    candidate: dict[str, Any],
+    model_fields: dict[str, Any],
+    acceptance_profile: str,
+) -> dict[str, Any]:
+    scores = candidate.get("scores", {}) if isinstance(candidate.get("scores"), dict) else {}
+    heuristic_quality = candidate.get("quality", {}) if isinstance(candidate.get("quality"), dict) else {}
+    confidence = _score_float(model_fields.get("confidence"))
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
+    return {
+        "same_context_score": max(0.65, _score_float(scores.get("same_context_score", heuristic_quality.get("same_context_score")))),
+        "semantic_context_score": _score_float(scores.get("semantic_context_score", heuristic_quality.get("semantic_context_score"))),
+        "edit_match_score": confidence,
+        "target_uniqueness_score": max(confidence, _score_float(scores.get("target_uniqueness_score", heuristic_quality.get("target_uniqueness_score")))),
+        "difference_strength_score": max(confidence, _score_float(scores.get("difference_strength_score", heuristic_quality.get("difference_strength_score")))),
+        "difference_type": difference_type,
+        "pair_video_comparison_confidence": confidence,
+        "acceptance_profile": acceptance_profile,
+    }
+
+
+def _single_source_model_reject_reason(
+    model_fields: dict[str, Any],
+    edit_text_quality: dict[str, Any],
+) -> str:
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    edit_text = str(model_fields.get("edit_text", "")).strip()
+    reasons: list[str] = []
+    if difference_type in FINAL_DISABLED_DIFFERENCE_TYPES:
+        reasons.append(f"{difference_type} is diagnostic-only for single-source accepted pairs")
+    if difference_type == "attribute":
+        normalized_edit = _normalized_phrase(edit_text)
+        if _difference_values_are_too_similar(from_value, to_value):
+            reasons.append("weak_attribute_wording: from/to values are too similar")
+        if any(
+            phrase in normalized_edit
+            for phrase in (
+                "blouse to shirt",
+                "shirt to blouse",
+                "dark blue blouse to dark blue shirt",
+                "long brown hair to long hair",
+            )
+        ):
+            reasons.append("weak_attribute_wording: clothing or hair wording change is not a meaningful single-source edit")
+    if _score_float(edit_text_quality.get("score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "edit_text_quality_score"):
+        reasons.append("bad_edit_text_quality")
+    return "; ".join(_dedupe_strings(reasons))
+
+
+def _single_source_pair_verification(
+    model_fields: dict[str, Any],
+    *,
+    accepted: bool,
+    reject_reason: str,
+) -> dict[str, Any]:
+    evidence = list(model_fields.get("evidence", [])) if isinstance(model_fields.get("evidence"), list) else []
+    confidence = _score_float(model_fields.get("confidence"))
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    reason = "; ".join(evidence) if evidence else reject_reason
+    return _finalize_pair_verification(
+        {
+            "caption_delta": {
+                "caption_equivalent": not accepted,
+                "has_concrete_difference": accepted,
+                "difference_matches_edit": accepted,
+                "concrete_differences": [str(difference.get("description", "")).strip()] if str(difference.get("description", "")).strip() else [],
+                "reason": reason,
+            },
+            "edit_projection": {
+                "projected_target_caption": str(model_fields.get("target_caption", "")).strip(),
+                "target_matches_projection": accepted,
+                "score": confidence if accepted else 0.0,
+                "missing_requirements": [] if accepted else [reject_reason or "single-source pair rejected"],
+                "reason": reason,
+            },
+            "edit_necessity": {
+                "edit_needed": accepted,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": accepted,
+                "score": confidence if accepted else 0.0,
+                "reason": reason,
+            },
+            "edit_text_quality_check": {
+                "not_caption_like": bool(str(model_fields.get("edit_text", "")).strip()),
+                "matches_modality": accepted,
+                "single_primary_difference": accepted,
+                "reference_does_not_satisfy": True,
+                "target_satisfies": accepted,
+                "score": confidence if accepted else 0.0,
+                "failure_reason": "" if accepted else reject_reason,
+            },
+        }
     )
 
 
@@ -15148,6 +15746,22 @@ def build_parser() -> argparse.ArgumentParser:
     mine_single_source_parser.add_argument("--report-path")
     mine_single_source_parser.add_argument("--acceptance-profile", choices=sorted(ACCEPTANCE_PROFILE_NAMES), default=DEFAULT_ACCEPTANCE_PROFILE)
 
+    propose_single_source_parser = subparsers.add_parser("propose-single-source-pairs")
+    propose_single_source_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    propose_single_source_parser.add_argument("--clip-annotations-path", required=True)
+    propose_single_source_parser.add_argument("--pair-candidates-path", required=True)
+    propose_single_source_parser.add_argument("--whole-annotation-path")
+    propose_single_source_parser.add_argument("--output-path")
+    propose_single_source_parser.add_argument("--accepted-output-path")
+    propose_single_source_parser.add_argument("--base-url", required=True)
+    propose_single_source_parser.add_argument("--api-key", required=True)
+    propose_single_source_parser.add_argument("--model", required=True)
+    propose_single_source_parser.add_argument("--timeout-seconds", type=float, default=180.0)
+    propose_single_source_parser.add_argument("--max-accepted-pairs", type=int, default=5)
+    propose_single_source_parser.add_argument("--max-proposals", type=int)
+    propose_single_source_parser.add_argument("--zero-accepted-stop-after", type=int, default=DEFAULT_ZERO_ACCEPTED_STOP_AFTER)
+    propose_single_source_parser.add_argument("--acceptance-profile", choices=sorted(ACCEPTANCE_PROFILE_NAMES), default=DEFAULT_ACCEPTANCE_PROFILE)
+
     propose_pairs_parser = subparsers.add_parser("propose-pairs")
     propose_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
     propose_pairs_parser.add_argument("--clip-annotations-path", required=True)
@@ -15423,6 +16037,26 @@ def main() -> None:
             clip_groups_path=args.clip_groups_path,
             output_path=args.output_path,
             report_path=args.report_path,
+            acceptance_profile=args.acceptance_profile,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "propose-single-source-pairs":
+        result = propose_single_source_pairs(
+            root=args.root,
+            clip_annotations_path=args.clip_annotations_path,
+            pair_candidates_path=args.pair_candidates_path,
+            whole_annotation_path=args.whole_annotation_path,
+            output_path=args.output_path,
+            accepted_output_path=args.accepted_output_path,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            timeout_seconds=args.timeout_seconds,
+            max_accepted_pairs=args.max_accepted_pairs,
+            max_proposals=args.max_proposals,
+            zero_accepted_stop_after=args.zero_accepted_stop_after,
             acceptance_profile=args.acceptance_profile,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -284,11 +284,11 @@ fi
 require_file "$PAIR_CANDIDATES" "single source pair candidates"
 if stage_enabled propose; then
   run_with_timeout "propose-single-source-pairs" "$PROPOSE_TIMEOUT_SECONDS" \
-    python3 -m app.composed_data propose-group-pairs \
+    python3 -m app.composed_data propose-single-source-pairs \
       --root "$ROOT" \
       --clip-annotations-path "$SEGMENT_ANNOTATIONS" \
-      --clip-groups-path "$CLIP_GROUPS" \
-      --mined-candidates-path "$PAIR_CANDIDATES" \
+      --pair-candidates-path "$PAIR_CANDIDATES" \
+      --whole-annotation-path "$WHOLE_ANNOTATION" \
       --output-path "$RANKED_PAIRS" \
       --accepted-output-path "$ACCEPTED_PAIRS" \
       --base-url "$BASE_URL" \

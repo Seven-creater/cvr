@@ -89,6 +89,20 @@ REQUIRED_PAIR_VERIFICATION_FIELDS = (
     "edit_necessity",
 )
 
+REQUIRED_SINGLE_SOURCE_PAIR_FIELDS = (
+    "edit_text",
+    "modalities",
+    "reference_caption",
+    "target_caption",
+    "difference",
+    "dominant_delta",
+    "discarded_deltas",
+    "evidence",
+    "confidence",
+    "accept",
+    "reject_reason",
+)
+
 REQUIRED_VIDEO_EDIT_PLAN_FIELDS = (
     "should_generate",
     "source_prompt",
@@ -430,6 +444,36 @@ def _pair_proposal_system_prompt() -> str:
     )
 
 
+def _single_source_pair_system_prompt() -> str:
+    difference_types = ", ".join(sorted(ALLOWED_DIFFERENCE_TYPES))
+    return (
+        "You compare two short clips cut from the same original video for composed video retrieval. "
+        "Follow an Omni-Captioner/Omni-Detective style: inspect both videos, use the segment annotations as evidence, "
+        "then choose the single clearest change from reference to target. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"edit_text": string, "modalities": ["visual"|"audio", ...], '
+        '"reference_caption": string, "target_caption": string, '
+        '"difference": {"type": string, "from": string, "to": string, "description": string}, '
+        '"dominant_delta": {"type": string, "from": string, "to": string, "reason": string}, '
+        '"discarded_deltas": [string], "evidence": [string], "confidence": number, '
+        '"accept": boolean, "reject_reason": string}. '
+        f"Allowed difference.type values: {difference_types}. "
+        "Prefer concrete visual changes that are obvious to a human reviewer: object presence/count, a product shown or held, "
+        "picture-in-picture overlay appearing or disappearing, action/gesture changes, scene/composition/background changes, then attributes. "
+        "For beauty/tutorial/talking-head videos, do not choose tiny wording differences like blouse vs shirt or long brown hair vs long hair. "
+        "If a product, applicator, hand-held object, product close-up, or picture-in-picture demo is visible in one clip and not the other, "
+        "choose object_presence or scene/composition instead of clothing or hair attributes. "
+        "Speech and visible text are auxiliary evidence only for this pass; do not use them as the primary edit. "
+        "Write edit_text as a short imperative edit that changes the reference into the target, for example: "
+        "'add a picture-in-picture demonstration overlay', "
+        "'change the shot from face-only speaking to holding a mascara wand', or "
+        "'change the shot from the speaker to a product close-up'. "
+        "Reject the pair if the only difference is a near-duplicate attribute wording change, unclear clothing/hair wording, "
+        "or multiple equally strong unrelated changes. "
+        "When rejecting, still fill the best tentative edit_text and evidence, set accept=false, and explain reject_reason."
+    )
+
+
 def _pair_judge_system_prompt() -> str:
     return (
         "You are a strict judge for composed video retrieval dataset construction. "
@@ -654,6 +698,41 @@ def _build_pair_proposal_user_content(
         "Keep captions factual and concise."
     )
     return [{"type": "text", "text": prompt}]
+
+
+def _build_single_source_pair_user_content(
+    *,
+    reference_clip_path: str,
+    target_clip_path: str,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    whole_annotation: dict[str, Any] | None = None,
+    candidate: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    context_text = ""
+    if whole_annotation:
+        context_text = f"Whole source video context JSON:\n{json.dumps(whole_annotation, ensure_ascii=False)}\n"
+    candidate_text = ""
+    if candidate:
+        candidate_text = f"Chronological pair candidate JSON:\n{json.dumps(candidate, ensure_ascii=False)}\n"
+    prompt = (
+        "Task: compare two clips from the same original 30-second video and write one evidence-backed edit.\n"
+        "Use the actual videos as primary evidence. Use annotations only as supporting context.\n"
+        f"{context_text}"
+        f"Reference segment annotation JSON:\n{json.dumps(reference_annotation, ensure_ascii=False)}\n"
+        f"Target segment annotation JSON:\n{json.dumps(target_annotation, ensure_ascii=False)}\n"
+        f"{candidate_text}"
+        "Choose the dominant visible/audio difference that a human reviewer can verify by opening the two clips. "
+        "Prefer product/overlay/object/action/composition differences over tiny clothing or hair wording changes. "
+        "Return JSON only."
+    )
+    return [
+        {"type": "text", "text": "Reference clip:"},
+        {"type": "video_url", "video_url": {"url": reference_clip_path}},
+        {"type": "text", "text": "Target clip:"},
+        {"type": "video_url", "video_url": {"url": target_clip_path}},
+        {"type": "text", "text": prompt},
+    ]
 
 
 def _build_pair_judge_user_content(
@@ -964,6 +1043,30 @@ class OpenAIComposedDataClient:
         )
         return _normalize_pair_proposal_payload(raw_payload), raw_payload
 
+    def propose_single_source_pair(
+        self,
+        *,
+        reference_clip_path: str,
+        target_clip_path: str,
+        reference_annotation: dict[str, Any],
+        target_annotation: dict[str, Any],
+        whole_annotation: dict[str, Any] | None = None,
+        candidate: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_single_source_pair_user_content(
+                reference_clip_path=reference_clip_path,
+                target_clip_path=target_clip_path,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                whole_annotation=whole_annotation,
+                candidate=candidate,
+            ),
+            system_prompt=_single_source_pair_system_prompt(),
+            max_tokens=1500,
+        )
+        return _normalize_single_source_pair_payload(raw_payload), raw_payload
+
     def judge_pair(
         self,
         *,
@@ -1208,6 +1311,43 @@ def _normalize_pair_proposal_payload(payload: dict[str, Any]) -> dict[str, Any]:
     for field_name in ("edit_text", "reference_caption", "target_caption", "proposal_reason"):
         if not normalized[field_name]:
             raise ValueError(f"pair proposal {field_name} is required")
+    return normalized
+
+
+def _normalize_single_source_pair_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_SINGLE_SOURCE_PAIR_FIELDS)
+    if missing_fields:
+        raise ValueError(f"single-source pair proposal missing fields: {missing_fields}")
+
+    modalities = _normalize_modalities(payload.get("modalities")) or ["visual"]
+    dominant_delta = payload.get("dominant_delta")
+    if not isinstance(dominant_delta, dict):
+        raise ValueError("single-source pair dominant_delta must be an object")
+    normalized = {
+        "edit_text": str(payload.get("edit_text", "")).strip(),
+        "modalities": modalities,
+        "reference_caption": str(payload.get("reference_caption", "")).strip(),
+        "target_caption": str(payload.get("target_caption", "")).strip(),
+        "difference": _validate_difference(payload.get("difference")),
+        "dominant_delta": {
+            "type": str(dominant_delta.get("type", "")).strip(),
+            "from": str(dominant_delta.get("from", "")).strip(),
+            "to": str(dominant_delta.get("to", "")).strip(),
+            "reason": str(dominant_delta.get("reason", "")).strip(),
+        },
+        "discarded_deltas": _detail_list(payload.get("discarded_deltas")),
+        "evidence": _detail_list(payload.get("evidence")),
+        "confidence": _score_value(payload.get("confidence")),
+        "accept": _bool_value(payload.get("accept")),
+        "reject_reason": str(payload.get("reject_reason", "")).strip(),
+    }
+    for field_name in ("edit_text", "reference_caption", "target_caption"):
+        if not normalized[field_name]:
+            raise ValueError(f"single-source pair {field_name} is required")
+    if not normalized["dominant_delta"]["type"] or not normalized["dominant_delta"]["reason"]:
+        raise ValueError("single-source pair dominant_delta type and reason are required")
+    if not normalized["evidence"]:
+        raise ValueError("single-source pair evidence is required")
     return normalized
 
 
