@@ -48,29 +48,30 @@ ALLOWED_MODALITIES = {"visual", "audio"}
 ALLOWED_SOURCE_TYPES = {"natural", "synthetic_edit"}
 MAX_PAIR_CANDIDATES = 40
 MAX_PAIR_LOCAL_COMPARISONS = 240
+MAX_TEMPLATE_CLUSTER_COMPARISONS = 480
 MIN_PAIR_CONTEXT_SCORE = 0.03
 MAX_PAIR_CHANGED_TYPES = 5
 MIN_PAIR_EDIT_MATCH_SCORE = 0.15
 PAIR_PRIORITY = (
     "audio_event",
-    "speech",
-    "visible_text",
     "object_presence",
     "object_count",
     "action",
     "attribute",
     "scene",
+    "speech",
+    "visible_text",
 )
 HIGH_CONTEXT_PAIR_PRIORITY = PAIR_PRIORITY
 DIVERSE_PAIR_BUCKET_TARGETS = {
-    "audio_event": 4,
-    "speech": 3,
-    "visible_text": 3,
-    "object_presence": 3,
-    "object_count": 3,
-    "action": 3,
-    "attribute": 2,
-    "scene": 1,
+    "attribute": 4,
+    "object_presence": 4,
+    "object_count": 2,
+    "action": 4,
+    "scene": 3,
+    "audio_event": 3,
+    "speech": 1,
+    "visible_text": 1,
 }
 MIN_ACCEPT_SAME_CONTEXT_SCORE = 0.55
 MIN_ACCEPT_EDIT_MATCH_SCORE = 0.75
@@ -818,6 +819,7 @@ NATURAL_PAIR_GATE_LABELS = {
     "bad_imperative_edit_text": "bad_imperative_edit_text: edit_text is vague, malformed, or not an edit command",
     "too_similar_without_observable_delta": "too_similar_without_observable_delta: near-duplicate visual pair has no frame-backed delta",
     "too_broad_or_loose_pair": "too_broad_or_loose_pair: broad scene change without enough shared context",
+    "visible_text_disabled": "visible_text_disabled: visible-text edits are diagnostic only for this dataset pass",
     "ocr_template_risk": "ocr_template_risk: visible-text edit lacks reliable OCR evidence or target uniqueness",
     "audio_event_too_similar": "audio_event_too_similar: audio_event from/to values are too similar to be a useful edit",
     "visible_text_fragment_edit": "visible_text_fragment_edit: target visible text is only a fragment of the source text",
@@ -825,14 +827,114 @@ NATURAL_PAIR_GATE_LABELS = {
 VISIBLE_TEXT_FRAGMENT_MIN_SOURCE_TOKENS = 2
 VISIBLE_TEXT_FRAGMENT_MAX_TARGET_TOKEN_RATIO = 0.75
 FINAL_ACCEPT_BUCKET_TARGETS = {
-    "audio_event": 2,
-    "speech": 2,
-    "visible_text": 2,
-    "object_presence": 3,
-    "object_count": 2,
-    "action": 2,
-    "attribute": 2,
-    "scene": 1,
+    "attribute": 6,
+    "object_presence": 4,
+    "action": 3,
+    "scene": 3,
+    "audio_event": 4,
+    "speech": 0,
+    "visible_text": 0,
+}
+FINAL_DISABLED_DIFFERENCE_TYPES = {"speech", "visible_text"}
+MIN_TEMPLATE_SEMANTIC_CONTEXT_SCORE = 0.35
+MIN_TEMPLATE_COMPATIBILITY_SCORE = 0.72
+MIN_TEMPLATE_CLEAN_STABILITY_SCORE = 0.75
+MIN_TEMPLATE_SINGLE_DELTA_BUNDLE_SCORE = 0.75
+MIN_TEMPLATE_TARGET_UNIQUENESS_SCORE = 0.75
+MIN_TEMPLATE_DIFFERENCE_STRENGTH_SCORE = 0.75
+SAME_TEMPLATE_CLUSTER_RELATION = "same_template_cluster"
+DEFAULT_DIAGNOSTIC_BUNDLE_NAME = "diagnostic_bundle"
+DIAGNOSTIC_BUCKET_KEYS = ("ocr", "near_duplicate", "over_broad", "audio_weak")
+GENERIC_HUMAN_OBJECT_LABELS = {
+    "adult",
+    "audience",
+    "crowd",
+    "girl",
+    "guy",
+    "host",
+    "human",
+    "kid",
+    "man",
+    "men",
+    "people",
+    "person",
+    "presenter",
+    "speaker",
+    "staff",
+    "woman",
+    "women",
+}
+SUBJECT_SIGNATURE_MARKER_TOKENS = {
+    "bald",
+    "beard",
+    "bearded",
+    "blonde",
+    "blond",
+    "brown",
+    "brunette",
+    "curly",
+    "earring",
+    "earrings",
+    "glasses",
+    "gray",
+    "grey",
+    "hair",
+    "hat",
+    "headscarf",
+    "hoodie",
+    "jacket",
+    "mustache",
+    "moustache",
+    "necklace",
+    "ponytail",
+    "receding",
+    "red",
+    "robe",
+    "shirt",
+    "suit",
+    "sweater",
+    "tie",
+    "vest",
+    "wearing",
+    "white",
+}
+SCENE_SIGNATURE_MARKER_TOKENS = {
+    "airport",
+    "auditorium",
+    "beach",
+    "bedroom",
+    "classroom",
+    "conference",
+    "corridor",
+    "desk",
+    "forest",
+    "hallway",
+    "kitchen",
+    "lab",
+    "laboratory",
+    "lecture",
+    "living",
+    "office",
+    "outdoor",
+    "park",
+    "podium",
+    "stage",
+    "store",
+    "street",
+    "studio",
+    "workshop",
+}
+TITLE_CARD_HINT_TOKENS = {
+    "credits",
+    "headline",
+    "intro",
+    "logo",
+    "lower third",
+    "outro",
+    "subtitle",
+    "subtitles",
+    "title",
+    "watermark",
 }
 
 
@@ -1649,6 +1751,21 @@ def mine_pair_candidates(
             ):
                 candidate_by_id[mined["candidate_id"]] = mined
 
+    template_cluster_candidates = _build_template_cluster_pair_candidates(root=layout["root"], annotations=usable_annotations)
+    if template_cluster_candidates:
+        template_metadata = {
+            "group_id": "template_cluster_cross_video",
+            "group_reason": "cross-video template-cluster mining for clean subject/object/scene replacements",
+        }
+        group_candidate_counts[template_metadata["group_id"]] += len(template_cluster_candidates)
+        for candidate in template_cluster_candidates:
+            mined = _mined_pair_candidate_record(candidate, group_metadata=template_metadata)
+            existing = candidate_by_id.get(mined["candidate_id"])
+            if existing is None or _score_float(mined["scores"].get("local_candidate_score")) > _score_float(
+                existing.get("scores", {}).get("local_candidate_score")
+            ):
+                candidate_by_id[mined["candidate_id"]] = mined
+
     if len(candidate_by_id) < max_candidates and len(usable_annotations) >= 4:
         global_metadata = {
             "group_id": "global_same_context_backfill",
@@ -1707,6 +1824,7 @@ def _mined_pair_candidate_record(
     target_annotation = candidate["target_annotation"]
     difference = dict(candidate["primary_difference"])
     quality = dict(candidate["quality"])
+    source_context = dict(candidate.get("source_context", {}))
     risk_flags = _candidate_risk_flags(candidate)
     scores = {
         "same_context_score": _score_float(quality.get("same_context_score")),
@@ -1715,6 +1833,13 @@ def _mined_pair_candidate_record(
         "target_uniqueness_score": _score_float(quality.get("target_uniqueness_score")),
         "edit_match_score": _score_float(quality.get("edit_match_score")),
         "semantic_context_score": _score_float(quality.get("semantic_context_score")),
+        "template_compatibility_score": _score_float(
+            quality.get("template_compatibility_score", source_context.get("template_compatibility_score"))
+        ),
+        "clean_stability_score": _score_float(
+            quality.get("clean_stability_score", source_context.get("clean_stability_score"))
+        ),
+        "single_delta_bundle_score": _score_float(quality.get("single_delta_bundle_score")),
         "local_candidate_score": _score_float(candidate.get("composite_score")),
     }
     return {
@@ -1727,13 +1852,37 @@ def _mined_pair_candidate_record(
         "difference": difference,
         "changed_difference_types": list(candidate.get("changed_difference_types", [])),
         "modalities": _infer_pair_modalities(reference_annotation, target_annotation, difference["type"]),
-        "source_context": dict(candidate.get("source_context", {})),
+        "source_context": source_context,
         "scores": scores,
         "quality": quality,
         "evidence": dict(candidate.get("difference_evidence", {})),
         "risk_flags": risk_flags,
         "group_id": group_metadata.get("group_id", ""),
         "group_reason": group_metadata.get("group_reason", ""),
+        "subject_signature_bundle": {
+            "reference": list(source_context.get("subject_signature_bundle", {}).get("reference", []))
+            if isinstance(source_context.get("subject_signature_bundle"), dict)
+            else [],
+            "target": list(source_context.get("subject_signature_bundle", {}).get("target", []))
+            if isinstance(source_context.get("subject_signature_bundle"), dict)
+            else [],
+        },
+        "object_signature_bundle": {
+            "reference": list(source_context.get("object_signature_bundle", {}).get("reference", []))
+            if isinstance(source_context.get("object_signature_bundle"), dict)
+            else [],
+            "target": list(source_context.get("object_signature_bundle", {}).get("target", []))
+            if isinstance(source_context.get("object_signature_bundle"), dict)
+            else [],
+        },
+        "scene_signature_bundle": {
+            "reference": list(source_context.get("scene_signature_bundle", {}).get("reference", []))
+            if isinstance(source_context.get("scene_signature_bundle"), dict)
+            else [],
+            "target": list(source_context.get("scene_signature_bundle", {}).get("target", []))
+            if isinstance(source_context.get("scene_signature_bundle"), dict)
+            else [],
+        },
         "hard_negative_clip_ids": [
             str(annotation.get("clip_id", "")).strip()
             for annotation in candidate.get("hard_negative_annotations", [])
@@ -1754,6 +1903,10 @@ def _candidate_risk_flags(candidate: dict[str, Any]) -> list[str]:
         risk_flags.append("multi_delta")
     if _score_float(quality.get("difference_strength_score")) < MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE:
         risk_flags.append("weak_difference_strength")
+    if _score_float(quality.get("clean_stability_score")) and _score_float(quality.get("clean_stability_score")) < MIN_TEMPLATE_CLEAN_STABILITY_SCORE:
+        risk_flags.append("unclean_or_unstable_clip")
+    if _score_float(quality.get("title_card_or_boundary_text")) >= 1.0:
+        risk_flags.append("boundary_text_only")
     if difference_type == "scene":
         if _score_float(quality.get("same_context_score")) < 0.75 or str(source_context.get("relation", "")) in {
             "same_dataset",
@@ -1762,12 +1915,15 @@ def _candidate_risk_flags(candidate: dict[str, Any]) -> list[str]:
         }:
             risk_flags.append("too_broad_scene")
     if difference_type == "visible_text":
+        risk_flags.append("ocr_title_card_only")
         if _visible_text_fragment_edit(difference):
             risk_flags.append("visible_text_fragment_edit")
         if _score_float(quality.get("target_uniqueness_score")) < MIN_ACCEPT_TARGET_UNIQUENESS_SCORE:
             risk_flags.append("ocr_template_risk")
-    if difference_type == "speech" and _score_float(quality.get("speech_transcript_backed")) < 1.0:
-        risk_flags.append("speech_unbacked")
+    if difference_type == "speech":
+        risk_flags.append("speech_content_disabled")
+        if _score_float(quality.get("speech_transcript_backed")) < 1.0:
+            risk_flags.append("speech_unbacked")
     if difference_type == "audio_event" and _difference_values_are_too_similar(
         str(difference.get("from", "")),
         str(difference.get("to", "")),
@@ -1782,6 +1938,18 @@ def _candidate_risk_flags(candidate: dict[str, Any]) -> list[str]:
         )
         if not bool(observable.get("passed")):
             risk_flags.append("too_similar_without_observable_delta")
+    if str(source_context.get("relation", "")) == SAME_TEMPLATE_CLUSTER_RELATION:
+        if _score_float(quality.get("template_compatibility_score", source_context.get("template_compatibility_score"))) < MIN_TEMPLATE_COMPATIBILITY_SCORE:
+            risk_flags.append("cross_video_over_broad")
+        if difference_type == "attribute" and _score_float(quality.get("subject_signature_bundle_count")) < 1.0:
+            risk_flags.append("subject_bundle_underspecified")
+        subject_bundle = source_context.get("subject_signature_bundle", {})
+        if (
+            difference_type == "attribute"
+            and isinstance(subject_bundle, dict)
+            and subject_bundle.get("reference") == subject_bundle.get("target")
+        ):
+            risk_flags.append("near_duplicate_same_subject")
     return _dedupe_strings(risk_flags)
 
 
@@ -1794,6 +1962,462 @@ def _candidate_risk_flag_counts(candidates: list[dict[str, Any]]) -> Counter[str
         else:
             counts["none"] += 1
     return counts
+
+
+def _annotation_subject_signature_bundle(annotation: dict[str, Any]) -> list[str]:
+    bundle: list[str] = []
+    for subject in _normalize_list(annotation.get("subjects", [])):
+        normalized = _normalized_phrase(subject)
+        if normalized in {"man", "woman"} and normalized not in bundle:
+            bundle.append(normalized)
+    for attribute in _normalize_list(annotation.get("attributes", [])):
+        normalized = _normalized_phrase(attribute)
+        if normalized and _tokenize_text(normalized) & SUBJECT_SIGNATURE_MARKER_TOKENS and normalized not in bundle:
+            bundle.append(normalized)
+    summary = _normalized_phrase(str(annotation.get("summary", "")))
+    for phrase in (
+        "black jacket",
+        "brown shirt",
+        "maroon hoodie",
+        "red hair",
+        "curly hair",
+        "receding hairline",
+        "wearing glasses",
+        "glasses",
+        "beard",
+        "earrings",
+        "necklace",
+    ):
+        if phrase in summary and phrase not in bundle:
+            bundle.append(phrase)
+    return bundle[:4]
+
+
+def _annotation_object_signature_bundle(annotation: dict[str, Any]) -> list[str]:
+    counts = _normalize_object_counts(annotation.get("object_counts", {}))
+    bundle: list[str] = []
+    for label in sorted(counts):
+        normalized = _normalized_phrase(label)
+        if not normalized or normalized in GENERIC_HUMAN_OBJECT_LABELS:
+            continue
+        bundle.append(normalized)
+    return bundle[:3]
+
+
+def _coarse_scene_label(annotation: dict[str, Any]) -> str:
+    scene_text = _normalized_phrase(
+        " ".join(
+            [
+                str(annotation.get("scene", "")).strip(),
+                str(annotation.get("summary", "")).strip(),
+            ]
+        )
+    )
+    for token in sorted(SCENE_SIGNATURE_MARKER_TOKENS, key=len, reverse=True):
+        if token in scene_text:
+            return token
+    return ""
+
+
+def _annotation_scene_signature_bundle(annotation: dict[str, Any]) -> list[str]:
+    bundle: list[str] = []
+    coarse_scene = _coarse_scene_label(annotation)
+    if coarse_scene:
+        bundle.append(coarse_scene)
+    normalized_scene = _normalized_phrase(str(annotation.get("scene", "")))
+    if normalized_scene and normalized_scene not in bundle:
+        bundle.append(normalized_scene)
+    return bundle[:2]
+
+
+def _title_card_or_boundary_text(annotation: dict[str, Any]) -> bool:
+    visible_text = _normalize_list(annotation.get("visible_text") or annotation.get("on_screen_text", []))
+    summary = _normalized_phrase(str(annotation.get("summary", "")))
+    if any(token in summary for token in TITLE_CARD_HINT_TOKENS):
+        return True
+    if not visible_text:
+        return False
+    has_subjects = bool(_normalize_list(annotation.get("subjects", [])) or _normalize_object_counts(annotation.get("object_counts", {})))
+    has_actions = bool(_action_terms_from_annotation(annotation))
+    return not has_subjects or not has_actions
+
+
+def _human_subject_count(annotation: dict[str, Any]) -> int:
+    counts = _normalize_object_counts(annotation.get("object_counts", {}))
+    total = 0
+    for label, count in counts.items():
+        if _normalized_phrase(label) in GENERIC_HUMAN_OBJECT_LABELS:
+            total += count
+    if total > 0:
+        return total
+    return sum(1 for subject in _normalize_list(annotation.get("subjects", [])) if _normalized_phrase(subject) in GENERIC_HUMAN_OBJECT_LABELS)
+
+
+def _is_talking_head_template(annotation: dict[str, Any]) -> bool:
+    if _human_subject_count(annotation) != 1:
+        return False
+    actions = _action_terms_from_annotation(annotation)
+    merged_text = _normalized_phrase(" ".join(actions + [str(annotation.get("summary", ""))]))
+    scene = _normalized_phrase(str(annotation.get("scene", "")))
+    if any(token in merged_text for token in ("speak", "talk", "present", "lecture", "interview", "address")):
+        return True
+    return any(token in scene for token in ("desk", "stage", "studio", "podium", "lecture"))
+
+
+def _template_family(annotation: dict[str, Any]) -> str:
+    if _is_talking_head_template(annotation):
+        return "talking_head"
+    if _human_subject_count(annotation) <= 1 and _annotation_object_signature_bundle(annotation):
+        return "single_subject_scene"
+    if _human_subject_count(annotation) == 0 and _annotation_object_signature_bundle(annotation):
+        return "showcase"
+    return "general"
+
+
+def _clean_stability_score(annotation: dict[str, Any]) -> float:
+    score = 0.55
+    if _annotation_has_signal(annotation):
+        score += 0.10
+    if _is_talking_head_template(annotation):
+        score += 0.15
+    if _annotation_subject_signature_bundle(annotation):
+        score += 0.10
+    if _annotation_scene_signature_bundle(annotation):
+        score += 0.10
+    if _title_card_or_boundary_text(annotation):
+        score -= 0.35
+    summary = _normalized_phrase(str(annotation.get("summary", "")))
+    if any(token in summary for token in ("montage", "compilation", "multiple scenes", "quick cuts", "rapid cuts")):
+        score -= 0.20
+    if len(_normalize_list(annotation.get("uncertainties", []))) >= 2:
+        score -= 0.10
+    return max(0.0, min(1.0, round(score, 3)))
+
+
+def _template_compatibility_score(left: dict[str, Any], right: dict[str, Any]) -> float:
+    left_family = _template_family(left)
+    right_family = _template_family(right)
+    score = 0.0
+    if left_family == right_family:
+        score += 0.45
+    elif {left_family, right_family} <= {"talking_head", "single_subject_scene"}:
+        score += 0.28
+
+    left_scene = _coarse_scene_label(left)
+    right_scene = _coarse_scene_label(right)
+    if left_scene and right_scene:
+        if left_scene == right_scene:
+            score += 0.20
+        else:
+            score += _scene_similarity(left_scene, right_scene) * 0.10
+
+    left_humans = _human_subject_count(left)
+    right_humans = _human_subject_count(right)
+    if left_humans == right_humans and left_humans <= 2:
+        score += 0.15
+
+    action_similarity = _jaccard(_tokenize_values(_action_terms_from_annotation(left)), _tokenize_values(_action_terms_from_annotation(right)))
+    score += action_similarity * 0.10
+    if not _title_card_or_boundary_text(left) and not _title_card_or_boundary_text(right):
+        score += 0.10
+    return max(0.0, min(1.0, round(score, 3)))
+
+
+def _single_delta_bundle_score(
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    *,
+    difference_type: str,
+) -> float:
+    subject_changed = _annotation_subject_signature_bundle(reference_annotation) != _annotation_subject_signature_bundle(target_annotation)
+    object_changed = _annotation_object_signature_bundle(reference_annotation) != _annotation_object_signature_bundle(target_annotation)
+    scene_changed = _annotation_scene_signature_bundle(reference_annotation) != _annotation_scene_signature_bundle(target_annotation)
+    action_changed = bool(
+        _first_unique(_action_terms_from_annotation(reference_annotation), _action_terms_from_annotation(target_annotation))
+        or _first_unique(_action_terms_from_annotation(target_annotation), _action_terms_from_annotation(reference_annotation))
+    )
+    audio_changed = bool(
+        _first_unique(_non_speech_audio_terms(reference_annotation), _non_speech_audio_terms(target_annotation))
+        or _first_unique(_non_speech_audio_terms(target_annotation), _non_speech_audio_terms(reference_annotation))
+    )
+    text_changed = bool(
+        _first_unique(_visible_text_values(reference_annotation), _visible_text_values(target_annotation))
+        or _first_unique(_visible_text_values(target_annotation), _visible_text_values(reference_annotation))
+    )
+    changed_bundle_count = sum(
+        1 for changed in (subject_changed, object_changed, scene_changed, action_changed, audio_changed, text_changed) if changed
+    )
+    score = 1.0 if changed_bundle_count <= 1 else 0.85 if changed_bundle_count == 2 else 0.70 if changed_bundle_count == 3 else 0.55
+    expected_change = {
+        "attribute": subject_changed,
+        "object_presence": object_changed,
+        "scene": scene_changed,
+        "action": action_changed,
+        "audio_event": audio_changed,
+        "visible_text": text_changed,
+    }.get(difference_type, True)
+    if not expected_change:
+        score -= 0.35
+    return max(0.0, min(1.0, round(score, 3)))
+
+
+def _same_template_cluster_source_context(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    compatibility = _template_compatibility_score(left, right)
+    clean_stability = min(_clean_stability_score(left), _clean_stability_score(right))
+    dataset = str(left.get("dataset", "")).strip() or str(right.get("dataset", "")).strip()
+    return {
+        "relation": SAME_TEMPLATE_CLUSTER_RELATION,
+        "score": round(0.28 + compatibility * 0.52, 3),
+        "dataset": dataset,
+        "template_family": _template_family(left),
+        "template_compatibility_score": compatibility,
+        "clean_stability_score": clean_stability,
+    }
+
+
+def _template_cluster_key(annotation: dict[str, Any]) -> str:
+    dataset = str(annotation.get("dataset", "")).strip() or "unknown"
+    return f"{dataset}:{_template_family(annotation)}"
+
+
+def _build_template_cluster_pair_candidates(*, root: Path, annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    clusters: dict[str, list[dict[str, Any]]] = {}
+    for annotation in annotations:
+        if bool(annotation.get("fallback_used")) or not _annotation_has_signal(annotation):
+            continue
+        clusters.setdefault(_template_cluster_key(annotation), []).append(annotation)
+
+    candidates: list[dict[str, Any]] = []
+    comparison_count = 0
+    for cluster_annotations in clusters.values():
+        cluster_annotations.sort(
+            key=lambda item: (-_clean_stability_score(item), str(item.get("clip_id", "")))
+        )
+        for left_index, left in enumerate(cluster_annotations):
+            for right in cluster_annotations[left_index + 1 :]:
+                if comparison_count >= MAX_TEMPLATE_CLUSTER_COMPARISONS:
+                    break
+                if str(left.get("source_path", "")).strip() == str(right.get("source_path", "")).strip():
+                    continue
+                comparison_count += 1
+                candidate = _build_cross_video_template_candidate(
+                    root=root,
+                    reference_annotation=left,
+                    target_annotation=right,
+                    annotations=annotations,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+            if comparison_count >= MAX_TEMPLATE_CLUSTER_COMPARISONS:
+                break
+        if comparison_count >= MAX_TEMPLATE_CLUSTER_COMPARISONS:
+            break
+    candidates.sort(key=lambda item: (-item["composite_score"], item["proposal_id"]))
+    return candidates
+
+
+def _build_cross_video_template_candidate(
+    *,
+    root: Path,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    annotations: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if reference_annotation["clip_id"] == target_annotation["clip_id"]:
+        return None
+    if str(reference_annotation.get("dataset", "")).strip() != str(target_annotation.get("dataset", "")).strip():
+        return None
+
+    semantic_context_score = _same_context_score(reference_annotation, target_annotation)
+    template_compatibility_score = _template_compatibility_score(reference_annotation, target_annotation)
+    clean_stability_score = min(_clean_stability_score(reference_annotation), _clean_stability_score(target_annotation))
+    if (
+        semantic_context_score < MIN_TEMPLATE_SEMANTIC_CONTEXT_SCORE
+        or template_compatibility_score < MIN_TEMPLATE_COMPATIBILITY_SCORE
+        or clean_stability_score < MIN_TEMPLATE_CLEAN_STABILITY_SCORE
+    ):
+        return None
+
+    source_context = _same_template_cluster_source_context(reference_annotation, target_annotation)
+    subject_reference = _annotation_subject_signature_bundle(reference_annotation)
+    subject_target = _annotation_subject_signature_bundle(target_annotation)
+    object_reference = _annotation_object_signature_bundle(reference_annotation)
+    object_target = _annotation_object_signature_bundle(target_annotation)
+    scene_reference = _annotation_scene_signature_bundle(reference_annotation)
+    scene_target = _annotation_scene_signature_bundle(target_annotation)
+    audio_reference = _non_speech_audio_terms(reference_annotation)
+    audio_target = _non_speech_audio_terms(target_annotation)
+    reference_actions = _action_terms_from_annotation(reference_annotation)
+    target_actions = _action_terms_from_annotation(target_annotation)
+
+    candidate_specs: list[tuple[str, dict[str, Any]]] = []
+    if _is_talking_head_template(reference_annotation) and _is_talking_head_template(target_annotation):
+        if subject_reference and subject_target and subject_reference != subject_target:
+            candidate_specs.append(
+                (
+                    "cross_video_template_subject",
+                    {
+                        "type": "attribute",
+                        "from": f"speaker with {', '.join(subject_reference[:4])}",
+                        "to": f"speaker with {', '.join(subject_target[:4])}",
+                        "description": "the speaker's visual signature changes while the presentation template stays similar",
+                    },
+                )
+            )
+    if object_reference and object_target and object_reference != object_target:
+        candidate_specs.append(
+            (
+                "cross_video_template_object",
+                {
+                    "type": "object_presence",
+                    "from": _first_item(object_reference) or "featured object",
+                    "to": _first_item(object_target) or "featured object",
+                    "description": "the featured object changes while the shot template stays similar",
+                },
+            )
+        )
+    if scene_reference and scene_target and scene_reference != scene_target:
+        candidate_specs.append(
+            (
+                "cross_video_template_scene",
+                {
+                    "type": "scene",
+                    "from": _first_item(scene_reference) or str(reference_annotation.get("scene", "")).strip(),
+                    "to": _first_item(scene_target) or str(target_annotation.get("scene", "")).strip(),
+                    "description": "the setting changes while the clip template remains aligned",
+                },
+            )
+        )
+    removed_action = _first_unique(reference_actions, target_actions)
+    added_action = _first_unique(target_actions, reference_actions)
+    if removed_action and added_action:
+        candidate_specs.append(
+            (
+                "cross_video_template_action",
+                {
+                    "type": "action",
+                    "from": removed_action,
+                    "to": added_action,
+                    "description": "the action changes between otherwise template-compatible clips",
+                },
+            )
+        )
+    removed_audio = _first_unique(audio_reference, audio_target)
+    added_audio = _first_unique(audio_target, audio_reference)
+    if removed_audio and added_audio:
+        candidate_specs.append(
+            (
+                "cross_video_audio_nonspeech",
+                {
+                    "type": "audio_event",
+                    "from": removed_audio,
+                    "to": added_audio,
+                    "description": "the non-speech audio event changes while the visual template stays similar",
+                },
+            )
+        )
+
+    best_candidate: dict[str, Any] | None = None
+    best_tuple: tuple[float, float, float, str] | None = None
+    for route_name, difference in candidate_specs:
+        difference_type = str(difference.get("type", "")).strip()
+        single_delta_bundle_score = _single_delta_bundle_score(
+            reference_annotation,
+            target_annotation,
+            difference_type=difference_type,
+        )
+        if single_delta_bundle_score < MIN_TEMPLATE_SINGLE_DELTA_BUNDLE_SCORE:
+            continue
+        hard_negative_annotations = _select_hard_negative_annotations(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            annotations=annotations,
+            primary_difference=difference,
+        )
+        if len(hard_negative_annotations) < 2:
+            continue
+        target_uniqueness_score = _target_uniqueness_score(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            annotations=annotations,
+            primary_difference=difference,
+        )
+        if target_uniqueness_score < MIN_TEMPLATE_TARGET_UNIQUENESS_SCORE:
+            continue
+        difference_strength_score = _difference_strength_score(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            primary_difference=difference,
+            changed_types=[difference_type],
+        )
+        if difference_type == "attribute":
+            difference_strength_score = max(difference_strength_score, 0.80)
+        if difference_strength_score < MIN_TEMPLATE_DIFFERENCE_STRENGTH_SCORE:
+            continue
+
+        same_context_score = max(semantic_context_score, round(template_compatibility_score * 0.95, 3))
+        edit_match_score = max(
+            _edit_match_score(
+                same_context_score=same_context_score,
+                primary_difference_type=difference_type,
+                changed_types=[difference_type],
+            ),
+            round(template_compatibility_score * 0.45 + single_delta_bundle_score * 0.35 + clean_stability_score * 0.20, 3),
+        )
+        quality = {
+            "same_context_score": round(same_context_score, 3),
+            "semantic_context_score": round(semantic_context_score, 3),
+            "edit_match_score": round(edit_match_score, 3),
+            "target_uniqueness_score": round(target_uniqueness_score, 3),
+            "difference_strength_score": round(difference_strength_score, 3),
+            "difference_type": difference_type,
+            "template_compatibility_score": round(template_compatibility_score, 3),
+            "clean_stability_score": round(clean_stability_score, 3),
+            "single_delta_bundle_score": round(single_delta_bundle_score, 3),
+            "talking_head_template": 1.0 if _is_talking_head_template(reference_annotation) and _is_talking_head_template(target_annotation) else 0.0,
+            "title_card_or_boundary_text": 1.0
+            if _title_card_or_boundary_text(reference_annotation) or _title_card_or_boundary_text(target_annotation)
+            else 0.0,
+            "subject_signature_bundle_count": float(min(len(subject_reference), len(subject_target))),
+        }
+        if difference_type == "audio_event":
+            quality["non_speech_audio_event_score"] = _non_speech_audio_event_score(reference_annotation, target_annotation)
+            quality["has_audio_modality"] = 1.0
+        composite_score = _candidate_composite_score(quality, source_context)
+        reference_path = _display_path(root, _resolve_under_root(root, reference_annotation["output_path"]))
+        target_path = _display_path(root, _resolve_under_root(root, target_annotation["output_path"]))
+        hard_negative_paths = [
+            _display_path(root, _resolve_under_root(root, annotation["output_path"]))
+            for annotation in hard_negative_annotations[:3]
+        ]
+        candidate = {
+            "proposal_id": _build_proposal_id(reference_path, target_path),
+            "reference_annotation": _sanitize_annotation_for_output(reference_annotation, root),
+            "target_annotation": _sanitize_annotation_for_output(target_annotation, root),
+            "primary_difference": difference,
+            "changed_difference_types": [difference_type],
+            "quality": quality,
+            "composite_score": composite_score,
+            "source_context": {
+                **source_context,
+                "template_route": route_name,
+                "subject_signature_bundle": {"reference": subject_reference, "target": subject_target},
+                "object_signature_bundle": {"reference": object_reference, "target": object_target},
+                "scene_signature_bundle": {"reference": scene_reference, "target": scene_target},
+            },
+            "difference_evidence": _difference_evidence_from_annotations(
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                primary_difference=difference,
+            ),
+            "hard_negative_annotations": [_sanitize_annotation_for_output(annotation, root) for annotation in hard_negative_annotations[:3]],
+            "hard_negative_paths": hard_negative_paths,
+        }
+        candidate_tuple = (composite_score, difference_strength_score, target_uniqueness_score, route_name)
+        if best_tuple is None or candidate_tuple > best_tuple:
+            best_tuple = candidate_tuple
+            best_candidate = candidate
+    return best_candidate
 
 
 def _build_candidate_mining_report(
@@ -1809,6 +2433,7 @@ def _build_candidate_mining_report(
 ) -> str:
     difference_counts = Counter(str(item.get("difference", {}).get("type", "")) for item in candidates)
     relation_counts = Counter(str(item.get("source_context", {}).get("relation", "")) for item in candidates)
+    route_counts = Counter(str(item.get("source_context", {}).get("template_route", "")) for item in candidates if str(item.get("source_context", {}).get("template_route", "")).strip())
     risk_counts = _candidate_risk_flag_counts(candidates)
     lines = [
         "# Candidate Mining Report",
@@ -1830,6 +2455,11 @@ def _build_candidate_mining_report(
     for key, value in sorted(relation_counts.items()):
         lines.append(f"- `{key or 'unknown'}`: `{value}`")
     if not relation_counts:
+        lines.append("- none")
+    lines.extend(["", "## Template Route Counts"])
+    for key, value in sorted(route_counts.items()):
+        lines.append(f"- `{key}`: `{value}`")
+    if not route_counts:
         lines.append("- none")
     lines.extend(["", "## Risk Flag Counts"])
     for key, value in sorted(risk_counts.items()):
@@ -1857,6 +2487,7 @@ def _build_candidate_mining_report(
             f"`{difference.get('type', 'unknown')}` "
             f"`{difference.get('from', '')}` -> `{difference.get('to', '')}` "
             f"score=`{scores.get('local_candidate_score', 0.0)}` "
+            f"route=`{candidate.get('source_context', {}).get('template_route', candidate.get('source_context', {}).get('relation', ''))}` "
             f"risks=`{','.join(flags) if flags else 'none'}`"
         )
     if not candidates:
@@ -1918,6 +2549,9 @@ def _candidate_from_mined_record(
         ("edit_match_score", "edit_match_score"),
         ("target_uniqueness_score", "target_uniqueness_score"),
         ("difference_strength_score", "difference_strength_score"),
+        ("template_compatibility_score", "template_compatibility_score"),
+        ("clean_stability_score", "clean_stability_score"),
+        ("single_delta_bundle_score", "single_delta_bundle_score"),
     ):
         if target_key not in quality and source_key in scores:
             quality[target_key] = _score_float(scores.get(source_key))
@@ -2143,6 +2777,7 @@ def propose_group_pairs(
                             "changed_difference_types": list(candidate["changed_difference_types"]),
                             "heuristic_quality": dict(candidate["quality"]),
                             "source_context": dict(candidate["source_context"]),
+                            "mined_candidate": dict(candidate.get("mined_candidate", {})),
                         },
                     )
                     proposal_fallback_used = False
@@ -3901,6 +4536,78 @@ def build_manual_review_bundle(
     }
 
 
+def _diagnostic_bucket_key(record: dict[str, Any]) -> str:
+    difference_type = str(record.get("difference", {}).get("type", "")).strip()
+    reject_reason = str(record.get("judge", {}).get("reject_reason", "")).lower()
+    quality = record.get("quality", {}) if isinstance(record.get("quality"), dict) else {}
+    if difference_type == "visible_text" or _score_float(quality.get("visible_text_disabled")) >= 1.0:
+        return "ocr"
+    if (
+        difference_type == "audio_event"
+        or _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0
+        or _score_float(quality.get("audio_event_too_similar")) >= 1.0
+    ):
+        return "audio_weak"
+    if (
+        _score_float(quality.get("too_similar_without_observable_delta")) >= 1.0
+        or "caption_equivalent" in reject_reason
+        or "near-duplicate" in reject_reason
+        or "near duplicate" in reject_reason
+    ):
+        return "near_duplicate"
+    if (
+        _score_float(quality.get("too_broad_or_loose_pair")) >= 1.0
+        or "broad scene" in reject_reason
+        or "competing stronger difference" in reject_reason
+        or "multiple broad changes" in reject_reason
+    ):
+        return "over_broad"
+    return ""
+
+
+def build_diagnostic_review_bundle(
+    *,
+    root: str | Path,
+    pairs_path: str | Path,
+    output_dir: str | Path,
+    clip_annotations_path: str | Path | None = None,
+    limit_per_bucket: int = 5,
+    copy_videos: bool = True,
+) -> dict[str, Any]:
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    records = list(_load_jsonl(Path(pairs_path)))
+    selected: list[dict[str, Any]] = []
+    bucket_counts: Counter[str] = Counter()
+    for record in records:
+        if bool(record.get("accepted")):
+            continue
+        bucket = _diagnostic_bucket_key(record)
+        if not bucket or bucket_counts[bucket] >= max(0, limit_per_bucket):
+            continue
+        bucket_counts[bucket] += 1
+        selected.append(record)
+
+    selected_path = output_root / "_diagnostic_selected_pairs.jsonl"
+    _write_jsonl(selected_path, selected)
+    bundle_summary = build_manual_review_bundle(
+        root=root,
+        pairs_path=selected_path,
+        output_dir=output_root,
+        clip_annotations_path=clip_annotations_path,
+        copy_videos=copy_videos,
+    )
+    summary = {
+        "pairs_path": str(pairs_path),
+        "selected_count": len(selected),
+        "bucket_counts": dict(bucket_counts),
+        "output_dir": str(output_root),
+        "bundle_summary": bundle_summary,
+    }
+    (output_root / "diagnostic_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return summary
+
+
 def validate_known_pairs(
     *,
     root: str | Path,
@@ -5093,8 +5800,10 @@ def _validate_pilot_record(root: Path, record: dict[str, Any], line_number: int)
         difference_type = str(difference.get("type", "")).strip()
         if difference_type not in ALLOWED_DIFFERENCE_TYPES:
             errors.append(f"pilot line {line_number}: unsupported difference.type={difference_type!r}")
-        if difference_type == "speech":
-            errors.append(f"pilot line {line_number}: speech difference type is disabled for final Omni-CVR samples")
+        if difference_type in FINAL_DISABLED_DIFFERENCE_TYPES:
+            errors.append(
+                f"pilot line {line_number}: {difference_type} difference type is disabled for final Omni-CVR samples"
+            )
         if not any(str(difference.get(key, "")).strip() for key in ("from", "to", "description")):
             errors.append(f"pilot line {line_number}: difference must include from/to/description")
 
@@ -5176,13 +5885,15 @@ def _annotation_pairing_signal_score(annotation: dict[str, Any]) -> float:
     if _non_speech_audio_terms(annotation):
         score += 5.0
     if _speech_texts_from_annotation(annotation):
-        score += 4.0
+        score += 1.0
     if _visible_text_values(annotation):
-        score += 4.0
+        score += 1.0
     score += min(3.0, len(_normalize_object_counts(annotation.get("object_counts", {}))) * 0.5)
     score += min(2.0, len(_action_terms_from_annotation(annotation)) * 0.4)
     score += min(2.0, len(_normalize_list(annotation.get("attributes", []))) * 0.25)
     score += min(1.0, len(_normalize_list(annotation.get("storyline", []))) * 0.2)
+    score += _clean_stability_score(annotation) * 2.0
+    score += min(1.5, len(_annotation_subject_signature_bundle(annotation)) * 0.5)
     return score
 
 
@@ -6143,6 +6854,7 @@ def _natural_pair_quality_gate(
             failure_codes.append("too_broad_or_loose_pair")
 
     if difference_type == "visible_text":
+        failure_codes.append("visible_text_disabled")
         has_from_to = bool(str(difference.get("from", "")).strip() and str(difference.get("to", "")).strip())
         if (
             not has_from_to
@@ -6454,9 +7166,15 @@ def _carry_local_gate_quality(target_quality: dict[str, Any], source_quality: di
         "bad_imperative_edit_text",
         "too_similar_without_observable_delta",
         "too_broad_or_loose_pair",
+        "visible_text_disabled",
         "ocr_template_risk",
         "audio_event_too_similar",
         "visible_text_fragment_edit",
+        "template_compatibility_score",
+        "clean_stability_score",
+        "single_delta_bundle_score",
+        "title_card_or_boundary_text",
+        "talking_head_template",
         "competing_difference_passed",
         "audio_event_independent_evidence_passed",
         "synthetic_context_override",
@@ -6590,6 +7308,22 @@ def _score_ordered_pair(
         ),
         "difference_type": primary_difference["type"],
     }
+    if str(source_context.get("relation", "")) == SAME_TEMPLATE_CLUSTER_RELATION:
+        quality["template_compatibility_score"] = _score_float(source_context.get("template_compatibility_score"))
+        quality["clean_stability_score"] = _score_float(source_context.get("clean_stability_score"))
+        quality["single_delta_bundle_score"] = _single_delta_bundle_score(
+            reference_annotation,
+            target_annotation,
+            difference_type=str(primary_difference.get("type", "")).strip(),
+        )
+        quality["talking_head_template"] = 1.0 if _is_talking_head_template(reference_annotation) and _is_talking_head_template(target_annotation) else 0.0
+        quality["title_card_or_boundary_text"] = 1.0 if _title_card_or_boundary_text(reference_annotation) or _title_card_or_boundary_text(target_annotation) else 0.0
+        quality["subject_signature_bundle_count"] = float(
+            min(
+                len(_annotation_subject_signature_bundle(reference_annotation)),
+                len(_annotation_subject_signature_bundle(target_annotation)),
+            )
+        )
     if primary_difference["type"] == "action":
         quality["action_evidence_score"] = _action_evidence_score(reference_annotation, target_annotation)
     if primary_difference["type"] == "speech":
@@ -6633,7 +7367,11 @@ def _candidate_composite_score(quality: dict[str, Any], source_context: dict[str
         + _score_float(quality.get("difference_strength_score")) * 0.05,
         4,
     )
-    return round(composite_score + _score_float(source_context.get("score")) * 0.08, 4)
+    composite_score += _score_float(source_context.get("score")) * 0.08
+    composite_score += _score_float(quality.get("template_compatibility_score", source_context.get("template_compatibility_score"))) * 0.06
+    composite_score += _score_float(quality.get("single_delta_bundle_score")) * 0.05
+    composite_score += _score_float(quality.get("clean_stability_score", source_context.get("clean_stability_score"))) * 0.04
+    return round(composite_score, 4)
 
 
 def _visual_near_duplicate_score(left_path: Path, right_path: Path) -> float | None:
@@ -6773,6 +7511,13 @@ def _source_context(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
     if left_dataset and right_dataset:
         if left_dataset == right_dataset:
             text_score = _source_text_similarity(left, right)
+            template_compatibility = _template_compatibility_score(left, right)
+            clean_stability = min(_clean_stability_score(left), _clean_stability_score(right))
+            if template_compatibility >= MIN_TEMPLATE_COMPATIBILITY_SCORE and clean_stability >= MIN_TEMPLATE_CLEAN_STABILITY_SCORE:
+                return {
+                    **_same_template_cluster_source_context(left, right),
+                    "text_similarity": round(text_score, 3),
+                }
             return {
                 "relation": "same_dataset",
                 "score": round(0.25 + text_score * 0.35, 3),
@@ -6788,7 +7533,7 @@ def _source_context(left: dict[str, Any], right: dict[str, Any]) -> dict[str, An
 def _pair_context_score(*, semantic_context_score: float, source_context: dict[str, Any]) -> float:
     source_score = _score_float(source_context.get("score"))
     relation = str(source_context.get("relation", "")).strip()
-    if relation in {"shared_source_row", "same_source_video", "synthetic_from_reference"}:
+    if relation in {"shared_source_row", "same_source_video", SAME_TEMPLATE_CLUSTER_RELATION, "synthetic_from_reference"}:
         return max(semantic_context_score, source_score)
     return semantic_context_score
 
@@ -7347,6 +8092,8 @@ def _speech_content_edit_issues(*, edit_text: str, difference: dict[str, Any]) -
     difference_type = str(difference.get("type", "")).strip()
     if difference_type == "speech":
         issues.append("speech difference type is disabled for final Omni-CVR samples")
+    if difference_type == "visible_text":
+        issues.append("visible_text difference type is disabled for final Omni-CVR samples")
 
     text_parts = [
         edit_text,
@@ -7683,9 +8430,11 @@ def _build_fallback_edit_text(primary_difference: dict[str, Any]) -> str:
             return f"remove {from_value} from the audio"
         return f"replace {from_value} with {to_value} in the audio"
     if difference_type == "attribute":
+        if from_value.startswith("speaker with ") and to_value.startswith("speaker with "):
+            return f"change the speaker from {from_value.removeprefix('speaker with ').strip()} to {to_value.removeprefix('speaker with ').strip()}"
         return f"change the attribute from {from_value} to {to_value}"
     if difference_type == "scene":
-        return f"change the scene from {from_value} to {to_value}"
+        return f"change the setting from {from_value} to {to_value}"
     if difference_type == "speech":
         return f"change the speech from {_short_edit_phrase(from_value)} to {_short_edit_phrase(to_value)}"
     if difference_type == "visible_text":
@@ -9013,7 +9762,8 @@ def _accepted_record_signature(record: dict[str, Any]) -> tuple[str, ...]:
             to_value,
         )
     return (
-        str(record.get("group_id", "")).strip(),
+        str(record.get("reference_video", "")).strip(),
+        str(record.get("target_video", "")).strip(),
         str(difference.get("type", "")).strip(),
         from_value,
         to_value,
@@ -9042,6 +9792,9 @@ def _select_final_accepted_records(
         signature = _accepted_record_signature(record)
         proposal_id = str(record.get("proposal_id", "")).strip()
         target_video = str(record.get("target_video", "")).strip()
+        difference_type = str(record.get("difference", {}).get("type", "")).strip()
+        if difference_type in FINAL_DISABLED_DIFFERENCE_TYPES and str(record.get("source_type", "natural")).strip() != "synthetic_edit":
+            return False
         if signature in seen_signatures or proposal_id in selected_ids:
             return False
         if target_video and target_video in selected_target_videos:
@@ -12674,6 +13427,14 @@ def build_parser() -> argparse.ArgumentParser:
     review_bundle_parser.add_argument("--clip-annotations-path")
     review_bundle_parser.add_argument("--limit", type=int)
     review_bundle_parser.add_argument("--no-copy-videos", action="store_true")
+
+    diagnostic_bundle_parser = subparsers.add_parser("build-diagnostic-bundle")
+    diagnostic_bundle_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
+    diagnostic_bundle_parser.add_argument("--pairs-path", required=True)
+    diagnostic_bundle_parser.add_argument("--output-dir", required=True)
+    diagnostic_bundle_parser.add_argument("--clip-annotations-path")
+    diagnostic_bundle_parser.add_argument("--limit-per-bucket", type=int, default=5)
+    diagnostic_bundle_parser.add_argument("--no-copy-videos", action="store_true")
     return parser
 
 
@@ -12912,6 +13673,18 @@ def main() -> None:
             output_dir=args.output_dir,
             clip_annotations_path=args.clip_annotations_path,
             limit=args.limit,
+            copy_videos=not args.no_copy_videos,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "build-diagnostic-bundle":
+        result = build_diagnostic_review_bundle(
+            root=args.root,
+            pairs_path=args.pairs_path,
+            output_dir=args.output_dir,
+            clip_annotations_path=args.clip_annotations_path,
+            limit_per_bucket=args.limit_per_bucket,
             copy_videos=not args.no_copy_videos,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))

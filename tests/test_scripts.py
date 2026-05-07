@@ -91,7 +91,9 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('stage_enabled "propose"', script)
         self.assertIn('require_file "$RUN_ROOT/detective_annotations.jsonl"', script)
         self.assertIn("build-review-bundle", script)
+        self.assertIn("build-diagnostic-bundle", script)
         self.assertIn("manual_review_bundle", script)
+        self.assertIn("diagnostic_bundle", script)
 
     def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
         script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")

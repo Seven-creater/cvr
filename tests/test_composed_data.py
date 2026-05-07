@@ -47,6 +47,7 @@ from app.composed_data import (
     _audit_src_ref_image_candidate,
     annotate_clips,
     build_manual_review_bundle,
+    build_diagnostic_review_bundle,
     build_ffmpeg_extract_command,
     detective_annotate_clips,
     discover_raw_sources,
@@ -1642,6 +1643,118 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue((root / "reports" / "candidate_mining_report.md").exists())
             self.assertIn("Candidate Mining Report", (root / "reports" / "candidate_mining_report.md").read_text(encoding="utf-8"))
 
+    def test_mine_pair_candidates_adds_same_template_cluster_subject_swaps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("speaker_ref.mp4", "speaker_target_a.mp4", "speaker_target_b.mp4", "speaker_neg.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+            annotations_path = root / "captions" / "detective_annotations.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "speaker_ref",
+                        "output_path": "clips/speaker_ref.mp4",
+                        "dataset": "daily_omni",
+                        "source_path": "raw/ref.mp4",
+                        "summary": "A woman with earrings and glasses speaks at a studio desk.",
+                        "subjects": ["woman"],
+                        "object_counts": {"person": 1},
+                        "actions": ["speaking"],
+                        "scene": "studio desk",
+                        "attributes": ["earrings", "glasses", "studio presenter"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "speaker_target_a",
+                        "output_path": "clips/speaker_target_a.mp4",
+                        "dataset": "daily_omni",
+                        "source_path": "raw/target_a.mp4",
+                        "summary": "A bearded man in a black jacket speaks at the same studio desk.",
+                        "subjects": ["man"],
+                        "object_counts": {"person": 1},
+                        "actions": ["speaking"],
+                        "scene": "studio desk",
+                        "attributes": ["beard", "black jacket", "studio presenter"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "speaker_target_b",
+                        "output_path": "clips/speaker_target_b.mp4",
+                        "dataset": "daily_omni",
+                        "source_path": "raw/target_b.mp4",
+                        "summary": "A man in a brown shirt speaks at the same studio desk.",
+                        "subjects": ["man"],
+                        "object_counts": {"person": 1},
+                        "actions": ["speaking"],
+                        "scene": "studio desk",
+                        "attributes": ["brown shirt", "studio presenter"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "fallback_used": False,
+                    },
+                    {
+                        "clip_id": "speaker_neg",
+                        "output_path": "clips/speaker_neg.mp4",
+                        "dataset": "daily_omni",
+                        "source_path": "raw/neg.mp4",
+                        "summary": "A woman with earrings speaks in a studio hallway.",
+                        "subjects": ["woman"],
+                        "object_counts": {"person": 1},
+                        "actions": ["speaking"],
+                        "scene": "studio hallway",
+                        "attributes": ["earrings", "studio presenter"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "fallback_used": False,
+                    },
+                ],
+            )
+            groups_path = root / "metadata" / "clip_groups.jsonl"
+            self._write_jsonl(
+                groups_path,
+                [
+                    {
+                        "group_id": "group_speakers",
+                        "group_reason": "same_dataset_talking_head",
+                        "candidate_clip_ids": ["speaker_ref", "speaker_target_a", "speaker_target_b", "speaker_neg"],
+                    }
+                ],
+            )
+
+            mine_pair_candidates(
+                root=root,
+                clip_annotations_path=annotations_path,
+                clip_groups_path=groups_path,
+                output_path=root / "pairs" / "mined_pair_candidates.jsonl",
+                report_path=root / "reports" / "candidate_mining_report.md",
+                max_candidates=20,
+            )
+            records = [
+                json.loads(line)
+                for line in (root / "pairs" / "mined_pair_candidates.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+            subject_swaps = [
+                record
+                for record in records
+                if record["difference"]["type"] == "attribute"
+                and record["source_context"].get("relation") == "same_template_cluster"
+                and record["difference"]["from"].startswith("speaker with ")
+                and record["difference"]["to"].startswith("speaker with ")
+            ]
+            self.assertTrue(subject_swaps)
+
     def test_propose_group_pairs_uses_mined_candidates_without_rebuilding_groups(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3025,7 +3138,7 @@ class ComposedDataTests(unittest.TestCase):
         self.assertFalse(gate["passed"])
         self.assertIn("visible_text_fragment_edit", gate["failure_codes"])
 
-    def test_natural_pair_gate_allows_distinct_visible_text_replacement(self) -> None:
+    def test_natural_pair_gate_rejects_visible_text_even_when_ocr_is_distinct(self) -> None:
         gate = _natural_pair_quality_gate(
             record={
                 "edit_text": "change on-screen text from Singapore's Manufacturing to SCHOLAR",
@@ -3040,7 +3153,8 @@ class ComposedDataTests(unittest.TestCase):
             observable_difference={"passed": True, "frame_backed": True},
         )
 
-        self.assertTrue(gate["passed"])
+        self.assertFalse(gate["passed"])
+        self.assertIn("visible_text_disabled", gate["failure_codes"])
 
     def test_natural_pair_gate_rejects_audio_event_too_similar(self) -> None:
         gate = _natural_pair_quality_gate(
@@ -3780,7 +3894,7 @@ class ComposedDataTests(unittest.TestCase):
         self.assertFalse(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
         self.assertIn("audio_event lacks independent", _compose_reject_reason(prepared["judge"], prepared["verification"], prepared["quality"]))
 
-    def test_select_final_accepted_records_dedupes_repeated_group_audio_events(self) -> None:
+    def test_select_final_accepted_records_keeps_distinct_audio_pairs_with_same_delta(self) -> None:
         base_record = {
             "accepted": True,
             "group_id": "group_audio",
@@ -3866,15 +3980,15 @@ class ComposedDataTests(unittest.TestCase):
 
         accepted = _select_final_accepted_records(records, max_accepted_pairs=4)
 
-        self.assertEqual(3, len(accepted))
-        self.assertEqual(1, sum(1 for record in accepted if record["difference"]["type"] == "audio_event"))
+        self.assertEqual(4, len(accepted))
+        self.assertEqual(2, sum(1 for record in accepted if record["difference"]["type"] == "audio_event"))
         self.assertIn("action", {record["difference"]["type"] for record in accepted})
         self.assertIn("object_presence", {record["difference"]["type"] for record in accepted})
 
     def test_select_final_accepted_records_dedupes_reused_target_video(self) -> None:
         base_record = {
             "accepted": True,
-            "group_id": "group_text",
+            "group_id": "group_attr",
             "source_context": {"relation": "same_source_video"},
             "modalities": ["visual"],
             "target_video": "clips/shared_target.mp4",
@@ -3889,7 +4003,7 @@ class ComposedDataTests(unittest.TestCase):
             "transcript_backed": None,
             "group_reason": "same_source_video",
             "quality": {
-                "difference_type": "visible_text",
+                "difference_type": "attribute",
                 "difference_strength_score": 0.85,
                 "same_context_score": 0.9,
                 "target_uniqueness_score": 0.8,
@@ -3899,21 +4013,21 @@ class ComposedDataTests(unittest.TestCase):
         records = [
             {
                 **base_record,
-                "proposal_id": "proposal__text_a",
+                "proposal_id": "proposal__attr_a",
                 "reference_video": "clips/ref_a.mp4",
                 "reference_caption": "ref a",
-                "edit_text": "change on-screen text from A to B",
-                "difference": {"type": "visible_text", "from": "A", "to": "B"},
+                "edit_text": "change the speaker from woman with earrings to man with beard",
+                "difference": {"type": "attribute", "from": "speaker with woman, earrings", "to": "speaker with man, beard"},
             },
             {
                 **base_record,
-                "proposal_id": "proposal__text_b",
+                "proposal_id": "proposal__attr_b",
                 "reference_video": "clips/ref_b.mp4",
                 "reference_caption": "ref b",
-                "edit_text": "change on-screen text from C to D",
-                "difference": {"type": "visible_text", "from": "C", "to": "D"},
+                "edit_text": "change the speaker from woman with necklace to man with brown shirt",
+                "difference": {"type": "attribute", "from": "speaker with woman, necklace", "to": "speaker with man, brown shirt"},
                 "quality": {
-                    "difference_type": "visible_text",
+                    "difference_type": "attribute",
                     "difference_strength_score": 0.8,
                     "same_context_score": 0.9,
                     "target_uniqueness_score": 0.8,
@@ -3926,6 +4040,81 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertEqual(1, len(accepted))
         self.assertEqual("clips/shared_target.mp4", accepted[0]["target_video"])
+
+    def test_select_final_accepted_records_skips_disabled_difference_types(self) -> None:
+        base_record = {
+            "accepted": True,
+            "group_id": "group_mixed",
+            "source_context": {"relation": "same_template_cluster"},
+            "modalities": ["visual"],
+            "hard_negatives": ["clips/neg.mp4"],
+            "source": {"platform": "unknown", "url": "file:///tmp/target.mp4", "license_note": "internal"},
+            "evidence": {},
+            "judge": {},
+            "verification": {"passed": True},
+            "speech_quality": {},
+            "audio_event_quality": {},
+            "transcript_backed": None,
+            "group_reason": "same_template_cluster",
+        }
+        records = [
+            {
+                **base_record,
+                "proposal_id": "proposal__speech",
+                "reference_video": "clips/ref_speech.mp4",
+                "target_video": "clips/target_speech.mp4",
+                "reference_caption": "ref speech",
+                "target_caption": "target speech",
+                "edit_text": "change the speech from A to B",
+                "difference": {"type": "speech", "from": "A", "to": "B"},
+                "quality": {
+                    "difference_type": "speech",
+                    "difference_strength_score": 0.95,
+                    "same_context_score": 0.9,
+                    "target_uniqueness_score": 0.9,
+                    "edit_match_score": 0.9,
+                },
+            },
+            {
+                **base_record,
+                "proposal_id": "proposal__text",
+                "reference_video": "clips/ref_text.mp4",
+                "target_video": "clips/target_text.mp4",
+                "reference_caption": "ref text",
+                "target_caption": "target text",
+                "edit_text": "change on-screen text from A to B",
+                "difference": {"type": "visible_text", "from": "A", "to": "B"},
+                "quality": {
+                    "difference_type": "visible_text",
+                    "difference_strength_score": 0.95,
+                    "same_context_score": 0.9,
+                    "target_uniqueness_score": 0.9,
+                    "edit_match_score": 0.9,
+                },
+            },
+            {
+                **base_record,
+                "proposal_id": "proposal__attribute",
+                "reference_video": "clips/ref_attr.mp4",
+                "target_video": "clips/target_attr.mp4",
+                "reference_caption": "ref attr",
+                "target_caption": "target attr",
+                "edit_text": "change the speaker from woman with earrings to man with beard",
+                "difference": {"type": "attribute", "from": "speaker with woman, earrings", "to": "speaker with man, beard"},
+                "quality": {
+                    "difference_type": "attribute",
+                    "difference_strength_score": 0.88,
+                    "same_context_score": 0.86,
+                    "target_uniqueness_score": 0.84,
+                    "edit_match_score": 0.85,
+                },
+            },
+        ]
+
+        accepted = _select_final_accepted_records(records, max_accepted_pairs=3)
+
+        self.assertEqual(1, len(accepted))
+        self.assertEqual("attribute", accepted[0]["difference"]["type"])
 
     def test_select_final_accepted_records_keeps_distinct_synthetic_edits_with_same_delta(self) -> None:
         base_record = {
@@ -4163,7 +4352,7 @@ class ComposedDataTests(unittest.TestCase):
         self.assertIsNotNone(difference)
         self.assertEqual("speech", difference["type"])
 
-    def test_high_context_priority_prefers_visible_text_for_fusion_pairs(self) -> None:
+    def test_high_context_priority_prefers_object_presence_over_visible_text_for_fusion_pairs(self) -> None:
         reference = {
             "object_counts": {"person": 1},
             "actions": ["speaking"],
@@ -4188,7 +4377,7 @@ class ComposedDataTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(difference)
-        self.assertEqual("visible_text", difference["type"])
+        self.assertEqual("object_presence", difference["type"])
 
     def test_high_context_priority_prefers_audio_event_for_fusion_pairs(self) -> None:
         reference = {
@@ -7612,6 +7801,58 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(any("missing src_video_for_vace" in issue for issue in metadata["review_bundle_issues"]))
             self.assertTrue(any("missing review_inputs_dir" in issue for issue in metadata["review_bundle_issues"]))
 
+    def test_build_diagnostic_review_bundle_buckets_major_rejects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target_text.mp4").write_bytes(b"text")
+            (root / "target_audio.mp4").write_bytes(b"audio")
+            pairs_path = root / "judged.jsonl"
+            self._write_jsonl(
+                pairs_path,
+                [
+                    {
+                        "proposal_id": "proposal__ocr",
+                        "reference_video": "ref.mp4",
+                        "target_video": "target_text.mp4",
+                        "reference_caption": "ref",
+                        "target_caption": "target",
+                        "edit_text": "change on-screen text from A to B",
+                        "difference": {"type": "visible_text", "from": "A", "to": "B"},
+                        "hard_negatives": ["target_audio.mp4"],
+                        "accepted": False,
+                        "judge": {"reject_reason": "visible_text difference type is disabled for final Omni-CVR samples"},
+                        "quality": {"visible_text_disabled": 1.0},
+                        "source": {"platform": "unknown", "url": "file:///tmp/ocr.mp4", "license_note": "internal"},
+                    },
+                    {
+                        "proposal_id": "proposal__audio",
+                        "reference_video": "ref.mp4",
+                        "target_video": "target_audio.mp4",
+                        "reference_caption": "ref",
+                        "target_caption": "target",
+                        "edit_text": "replace speech with speech in the audio",
+                        "difference": {"type": "audio_event", "from": "speech", "to": "speech"},
+                        "hard_negatives": ["target_text.mp4"],
+                        "accepted": False,
+                        "judge": {"reject_reason": "audio_event lacks independent non-speech audio evidence"},
+                        "quality": {"audio_event_independent_evidence_passed": 0.0},
+                        "source": {"platform": "unknown", "url": "file:///tmp/audio.mp4", "license_note": "internal"},
+                    },
+                ],
+            )
+
+            summary = build_diagnostic_review_bundle(
+                root=root,
+                pairs_path=pairs_path,
+                output_dir=root / "diagnostic_bundle",
+            )
+
+            self.assertEqual(2, summary["selected_count"])
+            self.assertEqual(1, summary["bucket_counts"]["ocr"])
+            self.assertEqual(1, summary["bucket_counts"]["audio_weak"])
+            self.assertTrue((root / "diagnostic_bundle" / "index.md").exists())
+
     def test_pair_record_acceptance_issues_rejects_speech_difference_type(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -7630,6 +7871,25 @@ class ComposedDataTests(unittest.TestCase):
             )
 
             self.assertTrue(any("speech difference type is disabled" in issue for issue in issues))
+
+    def test_pair_record_acceptance_issues_rejects_visible_text_difference_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            issues = _pair_record_acceptance_issues(
+                root=root,
+                record={
+                    "reference_video": "ref.mp4",
+                    "target_video": "target.mp4",
+                    "edit_text": "change on-screen text from A to B",
+                    "difference": {"type": "visible_text", "from": "A", "to": "B"},
+                },
+                reference_annotation={"visible_text": ["A"]},
+                target_annotation={"visible_text": ["B"]},
+            )
+
+            self.assertTrue(any("visible_text difference type is disabled" in issue for issue in issues))
 
     def test_synthetic_audio_rejects_visual_drift_and_missing_target_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

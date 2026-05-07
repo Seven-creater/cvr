@@ -513,6 +513,15 @@ if stage_enabled "review"; then
   else
     echo "[omni-detective] no accepted pairs; skip manual review bundle"
   fi
+  if [ -s "$RUN_ROOT/judged_pair_proposals.jsonl" ]; then
+    python -m app.composed_data build-diagnostic-bundle \
+      --root "$ROOT" \
+      --pairs-path "$RUN_ROOT/judged_pair_proposals.jsonl" \
+      --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
+      --output-dir "$RUN_ROOT/diagnostic_bundle"
+  else
+    echo "[omni-detective] no judged pair proposals; skip diagnostic bundle"
+  fi
 else
   echo "[omni-detective] skip review start_stage=$START_STAGE"
 fi
