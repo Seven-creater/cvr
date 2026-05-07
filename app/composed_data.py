@@ -842,6 +842,45 @@ MIN_TEMPLATE_CLEAN_STABILITY_SCORE = 0.75
 MIN_TEMPLATE_SINGLE_DELTA_BUNDLE_SCORE = 0.75
 MIN_TEMPLATE_TARGET_UNIQUENESS_SCORE = 0.75
 MIN_TEMPLATE_DIFFERENCE_STRENGTH_SCORE = 0.75
+DEFAULT_ACCEPTANCE_PROFILE = "final"
+EXPLORATION_ACCEPTANCE_PROFILE = "exploration"
+ACCEPTANCE_PROFILE_NAMES = {DEFAULT_ACCEPTANCE_PROFILE, EXPLORATION_ACCEPTANCE_PROFILE}
+ACCEPTANCE_PROFILE_CONFIGS = {
+    DEFAULT_ACCEPTANCE_PROFILE: {
+        "template_semantic_context_score": MIN_TEMPLATE_SEMANTIC_CONTEXT_SCORE,
+        "template_compatibility_score": MIN_TEMPLATE_COMPATIBILITY_SCORE,
+        "template_clean_stability_score": MIN_TEMPLATE_CLEAN_STABILITY_SCORE,
+        "template_single_delta_bundle_score": MIN_TEMPLATE_SINGLE_DELTA_BUNDLE_SCORE,
+        "template_target_uniqueness_score": MIN_TEMPLATE_TARGET_UNIQUENESS_SCORE,
+        "template_difference_strength_score": MIN_TEMPLATE_DIFFERENCE_STRENGTH_SCORE,
+        "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
+        "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
+        "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
+        "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
+        "edit_necessity_score": MIN_ACCEPT_EDIT_NECESSITY_SCORE,
+        "edit_target_alignment_score": MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE,
+        "action_evidence_score": MIN_ACCEPT_ACTION_EVIDENCE_SCORE,
+        "non_speech_audio_event_score": MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE,
+        "edit_text_quality_score": MIN_ACCEPT_EDIT_TEXT_QUALITY_SCORE,
+    },
+    EXPLORATION_ACCEPTANCE_PROFILE: {
+        "template_semantic_context_score": 0.25,
+        "template_compatibility_score": 0.55,
+        "template_clean_stability_score": 0.55,
+        "template_single_delta_bundle_score": 0.50,
+        "template_target_uniqueness_score": 0.45,
+        "template_difference_strength_score": 0.50,
+        "same_context_score": 0.45,
+        "edit_match_score": 0.45,
+        "target_uniqueness_score": 0.45,
+        "difference_strength_score": 0.50,
+        "edit_necessity_score": 0.55,
+        "edit_target_alignment_score": 0.55,
+        "action_evidence_score": 0.45,
+        "non_speech_audio_event_score": 0.45,
+        "edit_text_quality_score": 0.55,
+    },
+}
 SAME_TEMPLATE_CLUSTER_RELATION = "same_template_cluster"
 DEFAULT_DIAGNOSTIC_BUNDLE_NAME = "diagnostic_bundle"
 DIAGNOSTIC_BUCKET_KEYS = ("ocr", "near_duplicate", "over_broad", "audio_weak")
@@ -864,6 +903,26 @@ GENERIC_HUMAN_OBJECT_LABELS = {
     "woman",
     "women",
 }
+
+
+def _normalize_acceptance_profile(value: str | None) -> str:
+    profile = str(value or DEFAULT_ACCEPTANCE_PROFILE).strip().lower()
+    if profile not in ACCEPTANCE_PROFILE_NAMES:
+        allowed = ", ".join(sorted(ACCEPTANCE_PROFILE_NAMES))
+        raise ValueError(f"unsupported acceptance_profile={value!r}; expected one of: {allowed}")
+    return profile
+
+
+def _acceptance_profile_config(acceptance_profile: str | None) -> dict[str, float]:
+    return ACCEPTANCE_PROFILE_CONFIGS[_normalize_acceptance_profile(acceptance_profile)]
+
+
+def _profile_threshold(acceptance_profile: str | None, key: str) -> float:
+    return _score_float(_acceptance_profile_config(acceptance_profile).get(key))
+
+
+def _is_exploration_profile(acceptance_profile: str | None) -> bool:
+    return _normalize_acceptance_profile(acceptance_profile) == EXPLORATION_ACCEPTANCE_PROFILE
 SUBJECT_SIGNATURE_MARKER_TOKENS = {
     "bald",
     "beard",
@@ -1693,7 +1752,9 @@ def mine_pair_candidates(
     output_path: str | Path | None = None,
     report_path: str | Path | None = None,
     max_candidates: int = DEFAULT_MAX_MINED_PAIR_CANDIDATES,
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> dict[str, Any]:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     layout = ensure_layout(root)
     annotations_path = Path(clip_annotations_path)
     groups_path = Path(clip_groups_path)
@@ -1751,7 +1812,11 @@ def mine_pair_candidates(
             ):
                 candidate_by_id[mined["candidate_id"]] = mined
 
-    template_cluster_candidates = _build_template_cluster_pair_candidates(root=layout["root"], annotations=usable_annotations)
+    template_cluster_candidates = _build_template_cluster_pair_candidates(
+        root=layout["root"],
+        annotations=usable_annotations,
+        acceptance_profile=acceptance_profile,
+    )
     if template_cluster_candidates:
         template_metadata = {
             "group_id": "template_cluster_cross_video",
@@ -1793,6 +1858,7 @@ def mine_pair_candidates(
             skipped_groups=skipped_groups,
             group_candidate_counts=group_candidate_counts,
             candidates=mined_records,
+            acceptance_profile=acceptance_profile,
         ),
         encoding="utf-8",
     )
@@ -1812,6 +1878,7 @@ def mine_pair_candidates(
             Counter(str(item.get("source_context", {}).get("relation", "")) for item in mined_records)
         ),
         "skipped_groups": dict(skipped_groups),
+        "acceptance_profile": acceptance_profile,
     }
 
 
@@ -1855,6 +1922,7 @@ def _mined_pair_candidate_record(
         "source_context": source_context,
         "scores": scores,
         "quality": quality,
+        "acceptance_profile": str(quality.get("acceptance_profile", DEFAULT_ACCEPTANCE_PROFILE)),
         "evidence": dict(candidate.get("difference_evidence", {})),
         "risk_flags": risk_flags,
         "group_id": group_metadata.get("group_id", ""),
@@ -2175,12 +2243,35 @@ def _same_template_cluster_source_context(left: dict[str, Any], right: dict[str,
     }
 
 
+def _template_final_threshold_warnings(quality: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    for field_name, threshold_key in (
+        ("semantic_context_score", "template_semantic_context_score"),
+        ("template_compatibility_score", "template_compatibility_score"),
+        ("clean_stability_score", "template_clean_stability_score"),
+        ("single_delta_bundle_score", "template_single_delta_bundle_score"),
+        ("target_uniqueness_score", "template_target_uniqueness_score"),
+        ("difference_strength_score", "template_difference_strength_score"),
+    ):
+        value = _score_float(quality.get(field_name))
+        threshold = _profile_threshold(DEFAULT_ACCEPTANCE_PROFILE, threshold_key)
+        if value < threshold:
+            warnings.append(f"{field_name}_below_final_threshold")
+    return warnings
+
+
 def _template_cluster_key(annotation: dict[str, Any]) -> str:
     dataset = str(annotation.get("dataset", "")).strip() or "unknown"
     return f"{dataset}:{_template_family(annotation)}"
 
 
-def _build_template_cluster_pair_candidates(*, root: Path, annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _build_template_cluster_pair_candidates(
+    *,
+    root: Path,
+    annotations: list[dict[str, Any]],
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
+) -> list[dict[str, Any]]:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     clusters: dict[str, list[dict[str, Any]]] = {}
     for annotation in annotations:
         if bool(annotation.get("fallback_used")) or not _annotation_has_signal(annotation):
@@ -2205,6 +2296,7 @@ def _build_template_cluster_pair_candidates(*, root: Path, annotations: list[dic
                     reference_annotation=left,
                     target_annotation=right,
                     annotations=annotations,
+                    acceptance_profile=acceptance_profile,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
@@ -2222,7 +2314,9 @@ def _build_cross_video_template_candidate(
     reference_annotation: dict[str, Any],
     target_annotation: dict[str, Any],
     annotations: list[dict[str, Any]],
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> dict[str, Any] | None:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     if reference_annotation["clip_id"] == target_annotation["clip_id"]:
         return None
     if str(reference_annotation.get("dataset", "")).strip() != str(target_annotation.get("dataset", "")).strip():
@@ -2232,9 +2326,9 @@ def _build_cross_video_template_candidate(
     template_compatibility_score = _template_compatibility_score(reference_annotation, target_annotation)
     clean_stability_score = min(_clean_stability_score(reference_annotation), _clean_stability_score(target_annotation))
     if (
-        semantic_context_score < MIN_TEMPLATE_SEMANTIC_CONTEXT_SCORE
-        or template_compatibility_score < MIN_TEMPLATE_COMPATIBILITY_SCORE
-        or clean_stability_score < MIN_TEMPLATE_CLEAN_STABILITY_SCORE
+        semantic_context_score < _profile_threshold(acceptance_profile, "template_semantic_context_score")
+        or template_compatibility_score < _profile_threshold(acceptance_profile, "template_compatibility_score")
+        or clean_stability_score < _profile_threshold(acceptance_profile, "template_clean_stability_score")
     ):
         return None
 
@@ -2326,7 +2420,7 @@ def _build_cross_video_template_candidate(
             target_annotation,
             difference_type=difference_type,
         )
-        if single_delta_bundle_score < MIN_TEMPLATE_SINGLE_DELTA_BUNDLE_SCORE:
+        if single_delta_bundle_score < _profile_threshold(acceptance_profile, "template_single_delta_bundle_score"):
             continue
         hard_negative_annotations = _select_hard_negative_annotations(
             reference_annotation=reference_annotation,
@@ -2342,7 +2436,7 @@ def _build_cross_video_template_candidate(
             annotations=annotations,
             primary_difference=difference,
         )
-        if target_uniqueness_score < MIN_TEMPLATE_TARGET_UNIQUENESS_SCORE:
+        if target_uniqueness_score < _profile_threshold(acceptance_profile, "template_target_uniqueness_score"):
             continue
         difference_strength_score = _difference_strength_score(
             reference_annotation=reference_annotation,
@@ -2352,7 +2446,7 @@ def _build_cross_video_template_candidate(
         )
         if difference_type == "attribute":
             difference_strength_score = max(difference_strength_score, 0.80)
-        if difference_strength_score < MIN_TEMPLATE_DIFFERENCE_STRENGTH_SCORE:
+        if difference_strength_score < _profile_threshold(acceptance_profile, "template_difference_strength_score"):
             continue
 
         same_context_score = max(semantic_context_score, round(template_compatibility_score * 0.95, 3))
@@ -2379,7 +2473,10 @@ def _build_cross_video_template_candidate(
             if _title_card_or_boundary_text(reference_annotation) or _title_card_or_boundary_text(target_annotation)
             else 0.0,
             "subject_signature_bundle_count": float(min(len(subject_reference), len(subject_target))),
+            "acceptance_profile": acceptance_profile,
         }
+        if _is_exploration_profile(acceptance_profile):
+            quality["exploration_warnings"] = _template_final_threshold_warnings(quality)
         if difference_type == "audio_event":
             quality["non_speech_audio_event_score"] = _non_speech_audio_event_score(reference_annotation, target_annotation)
             quality["has_audio_modality"] = 1.0
@@ -2430,6 +2527,7 @@ def _build_candidate_mining_report(
     skipped_groups: Counter[str],
     group_candidate_counts: Counter[str],
     candidates: list[dict[str, Any]],
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> str:
     difference_counts = Counter(str(item.get("difference", {}).get("type", "")) for item in candidates)
     relation_counts = Counter(str(item.get("source_context", {}).get("relation", "")) for item in candidates)
@@ -2444,6 +2542,7 @@ def _build_candidate_mining_report(
         f"- Duplicate annotation rows: `{duplicate_annotation_count}`",
         f"- Clip groups: `{group_count}`",
         f"- Mined candidates: `{len(candidates)}`",
+        f"- Acceptance profile: `{_normalize_acceptance_profile(acceptance_profile)}`",
         "",
         "## Difference Type Counts",
     ]
@@ -2542,6 +2641,8 @@ def _candidate_from_mined_record(
         return None
 
     quality = dict(mined.get("quality", {})) if isinstance(mined.get("quality"), dict) else {}
+    if "acceptance_profile" not in quality and str(mined.get("acceptance_profile", "")).strip():
+        quality["acceptance_profile"] = _normalize_acceptance_profile(str(mined.get("acceptance_profile")))
     scores = mined.get("scores", {}) if isinstance(mined.get("scores"), dict) else {}
     for source_key, target_key in (
         ("same_context_score", "same_context_score"),
@@ -2610,7 +2711,9 @@ def propose_group_pairs(
     timeout_seconds: float = 180.0,
     max_accepted_pairs: int = 10,
     max_proposals: int | None = None,
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> dict[str, Any]:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     layout = ensure_layout(root)
     annotations_path = Path(clip_annotations_path)
     groups_path = Path(clip_groups_path)
@@ -2672,7 +2775,11 @@ def propose_group_pairs(
     seen_proposal_ids: set[str] = set()
 
     def persist_progress() -> None:
-        current_accepted = _select_final_accepted_records(output_records, max_accepted_pairs=max_accepted_pairs)
+        current_accepted = _select_final_accepted_records(
+            output_records,
+            max_accepted_pairs=max_accepted_pairs,
+            acceptance_profile=acceptance_profile,
+        )
         _write_jsonl(output, output_records)
         _write_jsonl(accepted_output, current_accepted)
 
@@ -2822,6 +2929,7 @@ def propose_group_pairs(
                     reference_annotation=reference_annotation,
                     target_annotation=target_annotation,
                 )
+                proposal_quality["acceptance_profile"] = acceptance_profile
                 edit_text_quality = _edit_text_quality_payload(
                     edit_text=model_fields["edit_text"],
                     difference=model_fields["difference"],
@@ -2859,15 +2967,16 @@ def propose_group_pairs(
                     "difference_evidence": dict(proposal_difference_evidence),
                     "edit_text_quality": dict(edit_text_quality),
                     "observable_difference": dict(observable_difference),
+                    "acceptance_profile": acceptance_profile,
                     "acceptance_thresholds": {
-                        "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
-                        "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
-                        "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
-                        "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
-                        "action_evidence_score_for_action_edits": MIN_ACCEPT_ACTION_EVIDENCE_SCORE,
+                        "same_context_score": _profile_threshold(acceptance_profile, "same_context_score"),
+                        "edit_match_score": _profile_threshold(acceptance_profile, "edit_match_score"),
+                        "target_uniqueness_score": _profile_threshold(acceptance_profile, "target_uniqueness_score"),
+                        "difference_strength_score": _profile_threshold(acceptance_profile, "difference_strength_score"),
+                        "action_evidence_score_for_action_edits": _profile_threshold(acceptance_profile, "action_evidence_score"),
                         "speech_evidence_score_for_speech_edits": MIN_ACCEPT_SPEECH_EVIDENCE_SCORE,
                         "speech_specificity_score_for_speech_edits": MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE,
-                        "non_speech_audio_event_score_for_audio_event_edits": MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE,
+                        "non_speech_audio_event_score_for_audio_event_edits": _profile_threshold(acceptance_profile, "non_speech_audio_event_score"),
                         "max_visual_near_duplicate_score_for_visual_edits": MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE,
                     },
                 }
@@ -2888,7 +2997,7 @@ def propose_group_pairs(
 
                 judge = _finalize_pair_judge(judge)
                 pre_verification_quality = _effective_pair_quality(judge, None, proposal_quality)
-                if not _should_skip_pair_video_verification(judge, pre_verification_quality):
+                if not _should_skip_pair_video_verification(judge, pre_verification_quality, acceptance_profile=acceptance_profile):
                     try:
                         (
                             verification,
@@ -2926,7 +3035,7 @@ def propose_group_pairs(
                 verification = _finalize_pair_verification(verification)
                 fallback_used = proposal_fallback_used or judge_fallback_used or verification_fallback_used
                 effective_quality = _effective_pair_quality(judge, verification, proposal_quality)
-                accepted = _judge_accepts(judge, verification, effective_quality)
+                accepted = _judge_accepts(judge, verification, effective_quality, acceptance_profile=acceptance_profile)
                 if not accepted:
                     judge["reject_reason"] = _compose_reject_reason(judge, verification, effective_quality)
                 speech_quality = _speech_quality_payload(effective_quality)
@@ -2990,11 +3099,12 @@ def propose_group_pairs(
                 record,
                 reference_annotation=reference_annotation,
                 target_annotation=target_annotation,
+                acceptance_profile=acceptance_profile,
             )
             judge = dict(record.get("judge", {}))
             verification = record.get("verification", {})
             quality = record.get("quality", {})
-            record["accepted"] = _judge_accepts(judge, verification, quality)
+            record["accepted"] = _judge_accepts(judge, verification, quality, acceptance_profile=acceptance_profile)
             if not bool(record.get("accepted")):
                 judge["accept"] = False
                 judge["reject_reason"] = _compose_reject_reason(judge, verification, quality)
@@ -3004,6 +3114,7 @@ def propose_group_pairs(
                 record=record,
                 reference_annotation=reference_annotation,
                 target_annotation=target_annotation,
+                acceptance_profile=acceptance_profile,
             )
             if acceptance_issues:
                 record = _reject_record_with_acceptance_issues(record, acceptance_issues)
@@ -3022,7 +3133,7 @@ def propose_group_pairs(
             print(
                 "[propose-group-pairs] wrote "
                 f"proposal_count={len(output_records)} accepted_current="
-                f"{len(_select_final_accepted_records(output_records, max_accepted_pairs=max_accepted_pairs))} "
+                f"{len(_select_final_accepted_records(output_records, max_accepted_pairs=max_accepted_pairs, acceptance_profile=acceptance_profile))} "
                 f"accepted={bool(record.get('accepted'))} fallback={bool(record.get('fallback_used'))} "
                 f"skipped_video={bool(record.get('verification_skipped_before_video'))}",
                 file=sys.stderr,
@@ -3031,7 +3142,11 @@ def propose_group_pairs(
         if max_proposals is not None and len(output_records) >= max_proposals:
             break
 
-    accepted_records = _select_final_accepted_records(output_records, max_accepted_pairs=max_accepted_pairs)
+    accepted_records = _select_final_accepted_records(
+        output_records,
+        max_accepted_pairs=max_accepted_pairs,
+        acceptance_profile=acceptance_profile,
+    )
     _write_jsonl(output, output_records)
     _write_jsonl(accepted_output, accepted_records)
     verification_counts = _pair_verification_counts(output_records)
@@ -3055,17 +3170,18 @@ def propose_group_pairs(
         "fallback_count": fallback_count,
         "verification_counts": verification_counts,
         "thresholds": {
-            "same_context_score": MIN_ACCEPT_SAME_CONTEXT_SCORE,
-            "edit_match_score": MIN_ACCEPT_EDIT_MATCH_SCORE,
-            "target_uniqueness_score": MIN_ACCEPT_TARGET_UNIQUENESS_SCORE,
-            "edit_necessity_score": MIN_ACCEPT_EDIT_NECESSITY_SCORE,
-            "edit_target_alignment_score": MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE,
-            "difference_strength_score": MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE,
-            "action_evidence_score_for_action_edits": MIN_ACCEPT_ACTION_EVIDENCE_SCORE,
+            "same_context_score": _profile_threshold(acceptance_profile, "same_context_score"),
+            "edit_match_score": _profile_threshold(acceptance_profile, "edit_match_score"),
+            "target_uniqueness_score": _profile_threshold(acceptance_profile, "target_uniqueness_score"),
+            "edit_necessity_score": _profile_threshold(acceptance_profile, "edit_necessity_score"),
+            "edit_target_alignment_score": _profile_threshold(acceptance_profile, "edit_target_alignment_score"),
+            "difference_strength_score": _profile_threshold(acceptance_profile, "difference_strength_score"),
+            "action_evidence_score_for_action_edits": _profile_threshold(acceptance_profile, "action_evidence_score"),
             "speech_evidence_score_for_speech_edits": MIN_ACCEPT_SPEECH_EVIDENCE_SCORE,
             "speech_specificity_score_for_speech_edits": MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE,
-            "non_speech_audio_event_score_for_audio_event_edits": MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE,
+            "non_speech_audio_event_score_for_audio_event_edits": _profile_threshold(acceptance_profile, "non_speech_audio_event_score"),
         },
+        "acceptance_profile": acceptance_profile,
     }
 
 
@@ -6820,7 +6936,9 @@ def _natural_pair_quality_gate(
     record: dict[str, Any],
     edit_text_quality: dict[str, Any],
     observable_difference: dict[str, Any],
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> dict[str, Any]:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     if str(record.get("source_type", "natural")).strip() == "synthetic_edit":
         return {"passed": True, "failure_codes": [], "failure_reason": ""}
 
@@ -6850,7 +6968,10 @@ def _natural_pair_quality_gate(
             or normalized_edit.startswith("make it like")
             or normalized_edit.startswith("turn it into")
         )
-        if same_context < 0.75 or relation == "cross_dataset" or loose_edit:
+        if relation == "cross_dataset" or loose_edit or (
+            not _is_exploration_profile(acceptance_profile)
+            and same_context < 0.75
+        ):
             failure_codes.append("too_broad_or_loose_pair")
 
     if difference_type == "visible_text":
@@ -6907,7 +7028,9 @@ def _ensure_structured_gate_fields(
     *,
     reference_annotation: dict[str, Any],
     target_annotation: dict[str, Any],
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> dict[str, Any]:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     record = dict(record)
     quality = dict(record.get("quality", {}))
     edit_text_quality = dict(record.get("edit_text_quality") or {})
@@ -6938,6 +7061,7 @@ def _ensure_structured_gate_fields(
             record={**record, "quality": quality},
             edit_text_quality=edit_text_quality,
             observable_difference=observable_difference,
+            acceptance_profile=acceptance_profile,
         )
     for code in NATURAL_PAIR_GATE_LABELS:
         quality[code] = 0.0
@@ -7009,25 +7133,34 @@ def _ensure_structured_gate_fields(
             verification=verification,
             audio_event_evidence=audio_event_evidence,
         )
-        _sync_local_gate_failure(
-            verification,
-            passed=bool(competing_difference.get("passed", True)),
-            reason=str(competing_difference.get("failure_reason", "")).strip(),
-        )
-        _sync_local_gate_failure(
-            verification,
-            passed=bool(audio_event_evidence.get("passed", True)),
-            reason=str(audio_event_evidence.get("failure_reason", "")).strip(),
-        )
-        _sync_local_gate_failure(
-            verification,
-            passed=bool(natural_pair_gate.get("passed", True)),
-            reason=str(natural_pair_gate.get("failure_reason", "")).strip(),
-        )
+        if _is_exploration_profile(acceptance_profile):
+            quality["exploration_warnings"] = _dedupe_strings(
+                _normalize_list(quality.get("exploration_warnings", []))
+                + _normalize_list(natural_pair_gate.get("failure_codes", []))
+                + ([] if bool(competing_difference.get("passed", True)) else ["competing_difference"])
+                + ([] if bool(audio_event_evidence.get("passed", True)) else ["audio_event_weak_evidence"])
+            )
+        else:
+            _sync_local_gate_failure(
+                verification,
+                passed=bool(competing_difference.get("passed", True)),
+                reason=str(competing_difference.get("failure_reason", "")).strip(),
+            )
+            _sync_local_gate_failure(
+                verification,
+                passed=bool(audio_event_evidence.get("passed", True)),
+                reason=str(audio_event_evidence.get("failure_reason", "")).strip(),
+            )
+            _sync_local_gate_failure(
+                verification,
+                passed=bool(natural_pair_gate.get("passed", True)),
+                reason=str(natural_pair_gate.get("failure_reason", "")).strip(),
+            )
         verification["passed"] = _verification_accepts(verification)
         verification["failures"] = _verification_failures(verification)
         record["verification"] = verification
     record["quality"] = quality
+    record["quality"]["acceptance_profile"] = acceptance_profile
     record["edit_text_quality"] = edit_text_quality
     record["observable_difference"] = observable_difference
     record["natural_pair_gate"] = natural_pair_gate
@@ -7135,11 +7268,13 @@ def _prepare_record_for_acceptance(
     *,
     reference_annotation: dict[str, Any],
     target_annotation: dict[str, Any],
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> dict[str, Any]:
     record = _ensure_structured_gate_fields(
         record,
         reference_annotation=reference_annotation,
         target_annotation=target_annotation,
+        acceptance_profile=acceptance_profile,
     )
     judge = dict(record.get("judge", {}))
     verification = record.get("verification", {})
@@ -7149,6 +7284,9 @@ def _prepare_record_for_acceptance(
     local_gate_quality = dict(record.get("quality", {}))
     record["quality"] = _effective_pair_quality(judge, verification, heuristic_quality)
     _carry_local_gate_quality(record["quality"], local_gate_quality)
+    record["quality"]["acceptance_profile"] = _normalize_acceptance_profile(acceptance_profile)
+    if _is_exploration_profile(acceptance_profile):
+        record["quality"]["exploration_verification_passed"] = 1.0 if _verification_accepts(verification) else 0.0
     return record
 
 
@@ -7178,6 +7316,9 @@ def _carry_local_gate_quality(target_quality: dict[str, Any], source_quality: di
         "competing_difference_passed",
         "audio_event_independent_evidence_passed",
         "synthetic_context_override",
+        "acceptance_profile",
+        "exploration_warnings",
+        "exploration_verification_passed",
     ):
         if key in source_quality:
             target_quality[key] = source_quality[key]
@@ -8837,28 +8978,33 @@ def _compose_reject_reason(
         failures.append(f"hard_negative_quality is {hard_negative_quality or 'bad'}")
 
     quality = effective_quality or judge
+    acceptance_profile = _normalize_acceptance_profile(str(quality.get("acceptance_profile", DEFAULT_ACCEPTANCE_PROFILE)))
     same_context_score = _score_float(quality.get("same_context_score"))
-    if same_context_score < MIN_ACCEPT_SAME_CONTEXT_SCORE:
+    same_context_threshold = _profile_threshold(acceptance_profile, "same_context_score")
+    if same_context_score < same_context_threshold:
         failures.append(
-            f"same_context_score {same_context_score:.3f} is below {MIN_ACCEPT_SAME_CONTEXT_SCORE:.2f}"
+            f"same_context_score {same_context_score:.3f} is below {same_context_threshold:.2f}"
         )
     edit_match_score = _score_float(quality.get("edit_match_score"))
-    if edit_match_score < MIN_ACCEPT_EDIT_MATCH_SCORE:
+    edit_match_threshold = _profile_threshold(acceptance_profile, "edit_match_score")
+    if edit_match_score < edit_match_threshold:
         failures.append(
-            f"edit_match_score {edit_match_score:.3f} is below {MIN_ACCEPT_EDIT_MATCH_SCORE:.2f}"
+            f"edit_match_score {edit_match_score:.3f} is below {edit_match_threshold:.2f}"
         )
     target_uniqueness_score = _score_float(quality.get("target_uniqueness_score"))
-    if target_uniqueness_score < MIN_ACCEPT_TARGET_UNIQUENESS_SCORE:
+    target_uniqueness_threshold = _profile_threshold(acceptance_profile, "target_uniqueness_score")
+    if target_uniqueness_score < target_uniqueness_threshold:
         failures.append(
-            f"target_uniqueness_score {target_uniqueness_score:.3f} is below {MIN_ACCEPT_TARGET_UNIQUENESS_SCORE:.2f}"
+            f"target_uniqueness_score {target_uniqueness_score:.3f} is below {target_uniqueness_threshold:.2f}"
         )
     if "difference_strength_score" in quality:
         difference_strength_score = _score_float(quality.get("difference_strength_score"))
     else:
-        difference_strength_score = MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE
-    if difference_strength_score < MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE:
+        difference_strength_score = _profile_threshold(acceptance_profile, "difference_strength_score")
+    difference_strength_threshold = _profile_threshold(acceptance_profile, "difference_strength_score")
+    if difference_strength_score < difference_strength_threshold:
         failures.append(
-            f"difference_strength_score {difference_strength_score:.3f} is below {MIN_ACCEPT_DIFFERENCE_STRENGTH_SCORE:.2f}"
+            f"difference_strength_score {difference_strength_score:.3f} is below {difference_strength_threshold:.2f}"
         )
     visual_near_duplicate_score = _score_float(quality.get("visual_near_duplicate_score"))
     difference_type = str(quality.get("difference_type", "")).strip()
@@ -8868,9 +9014,10 @@ def _compose_reject_reason(
         )
     if difference_type == "action":
         action_evidence_score = _score_float(quality.get("action_evidence_score"))
-        if action_evidence_score < MIN_ACCEPT_ACTION_EVIDENCE_SCORE:
+        action_threshold = _profile_threshold(acceptance_profile, "action_evidence_score")
+        if action_evidence_score < action_threshold:
             failures.append(
-                f"action_evidence_score {action_evidence_score:.3f} is below {MIN_ACCEPT_ACTION_EVIDENCE_SCORE:.2f}"
+                f"action_evidence_score {action_evidence_score:.3f} is below {action_threshold:.2f}"
             )
     if difference_type == "speech":
         if _score_float(quality.get("has_audio_modality")) < 1.0:
@@ -8891,9 +9038,10 @@ def _compose_reject_reason(
             )
     if difference_type == "audio_event":
         non_speech_audio_event_score = _score_float(quality.get("non_speech_audio_event_score"))
-        if non_speech_audio_event_score < MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE:
+        audio_threshold = _profile_threshold(acceptance_profile, "non_speech_audio_event_score")
+        if non_speech_audio_event_score < audio_threshold:
             failures.append(
-                f"non_speech_audio_event_score {non_speech_audio_event_score:.3f} is below {MIN_ACCEPT_NON_SPEECH_AUDIO_EVENT_SCORE:.2f}"
+                f"non_speech_audio_event_score {non_speech_audio_event_score:.3f} is below {audio_threshold:.2f}"
             )
     if _score_float(quality.get("intraclip_change_conflict")) >= 1.0:
         failures.append("the proposed edit appears to describe an intra-clip transition instead of a cross-clip difference")
@@ -8927,8 +9075,12 @@ def _judge_accepts(
     judge: dict[str, Any],
     verification: dict[str, Any] | None = None,
     effective_quality: dict[str, Any] | None = None,
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> bool:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     quality = effective_quality or judge
+    if _is_exploration_profile(acceptance_profile):
+        return _exploration_judge_accepts(judge, verification, quality)
     judge_accepted = bool(
         not judge.get("reference_satisfies_edit")
         and judge.get("target_satisfies_edit")
@@ -8975,7 +9127,56 @@ def _judge_accepts(
     return judge_accepted and _verification_accepts(verification)
 
 
-def _should_skip_pair_video_verification(judge: dict[str, Any], quality: dict[str, Any]) -> bool:
+def _exploration_judge_accepts(
+    judge: dict[str, Any],
+    verification: dict[str, Any] | None,
+    quality: dict[str, Any],
+) -> bool:
+    difference_type = str(quality.get("difference_type", "")).strip()
+    hard_negative_quality = str(judge.get("hard_negative_quality", "")).strip().lower()
+    if difference_type in FINAL_DISABLED_DIFFERENCE_TYPES:
+        return False
+    if not bool(judge.get("accept")):
+        return False
+    if _boolish(judge.get("reference_satisfies_edit")) or not _boolish(judge.get("target_satisfies_edit")):
+        return False
+    if not _boolish(judge.get("single_main_difference")):
+        return False
+    if hard_negative_quality not in {"good", "weak"}:
+        return False
+    if _score_float(quality.get("same_context_score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "same_context_score"):
+        return False
+    if _score_float(quality.get("edit_match_score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "edit_match_score"):
+        return False
+    if _score_float(quality.get("target_uniqueness_score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "target_uniqueness_score"):
+        return False
+    if (
+        "difference_strength_score" in quality
+        and _score_float(quality.get("difference_strength_score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "difference_strength_score")
+    ):
+        return False
+    if difference_type == "action" and _score_float(quality.get("action_evidence_score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "action_evidence_score"):
+        return False
+    if difference_type == "audio_event":
+        if _score_float(quality.get("audio_event_too_similar")) >= 1.0:
+            return False
+        if _score_float(quality.get("non_speech_audio_event_score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "non_speech_audio_event_score"):
+            return False
+    if _score_float(quality.get("intraclip_change_conflict")) >= 1.0:
+        return False
+    if "edit_text_is_imperative" in quality and _score_float(quality.get("edit_text_is_imperative")) < 1.0:
+        return False
+    if "edit_text_quality_score" in quality and _score_float(quality.get("edit_text_quality_score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "edit_text_quality_score"):
+        return False
+    return True
+
+
+def _should_skip_pair_video_verification(
+    judge: dict[str, Any],
+    quality: dict[str, Any],
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
+) -> bool:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     hard_negative_quality = str(judge.get("hard_negative_quality", "")).strip().lower()
     if (
         not bool(judge.get("accept"))
@@ -8985,6 +9186,12 @@ def _should_skip_pair_video_verification(judge: dict[str, Any], quality: dict[st
         or hard_negative_quality not in {"good", "weak"}
     ):
         return True
+    if _is_exploration_profile(acceptance_profile):
+        difference_type = str(quality.get("difference_type", "")).strip()
+        return bool(
+            difference_type in FINAL_DISABLED_DIFFERENCE_TYPES
+            or _score_float(quality.get("intraclip_change_conflict")) >= 1.0
+        )
     if _structured_edit_text_failures(quality):
         return True
     if _observable_difference_rejects(quality):
@@ -9565,7 +9772,9 @@ def _pair_record_acceptance_issues(
     record: dict[str, Any],
     reference_annotation: dict[str, Any],
     target_annotation: dict[str, Any],
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> list[str]:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     issues: list[str] = []
     for field_name in ("reference_video", "target_video"):
         raw_path = str(record.get(field_name, "")).strip()
@@ -9593,14 +9802,20 @@ def _pair_record_acceptance_issues(
             issues.append("audio_event must not use speech-only or narration-only text as the main difference")
     quality = record.get("quality", {})
     if isinstance(quality, dict):
-        issues.extend(_structured_edit_text_failures(quality))
-        if _observable_difference_rejects(quality):
-            issues.append("observable_difference gate found no concrete visual delta evidence")
-        issues.extend(_natural_pair_quality_failures(quality))
-        if _score_float(quality.get("competing_difference_passed", 1.0)) < 1.0:
-            issues.append("single_main_difference failed: competing stronger difference")
-        if _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0:
-            issues.append("audio_event lacks independent non-speech audio evidence")
+        if _is_exploration_profile(acceptance_profile):
+            if "edit_text_is_imperative" in quality and _score_float(quality.get("edit_text_is_imperative")) < 1.0:
+                issues.append("edit_text is not an imperative edit")
+            if _score_float(quality.get("intraclip_change_conflict")) >= 1.0:
+                issues.append("the proposed edit appears to describe an intra-clip transition instead of a cross-clip difference")
+        else:
+            issues.extend(_structured_edit_text_failures(quality))
+            if _observable_difference_rejects(quality):
+                issues.append("observable_difference gate found no concrete visual delta evidence")
+            issues.extend(_natural_pair_quality_failures(quality))
+            if _score_float(quality.get("competing_difference_passed", 1.0)) < 1.0:
+                issues.append("single_main_difference failed: competing stronger difference")
+            if _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0:
+                issues.append("audio_event lacks independent non-speech audio evidence")
     issues.extend(
         _synthetic_edit_record_issues(
             root=root,
@@ -9775,7 +9990,9 @@ def _select_final_accepted_records(
     records: list[dict[str, Any]],
     *,
     max_accepted_pairs: int,
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> list[dict[str, Any]]:
+    acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     accepted_candidates = sorted(
         [record for record in records if bool(record.get("accepted"))],
         key=_accepted_record_sort_key,
@@ -13328,6 +13545,7 @@ def build_parser() -> argparse.ArgumentParser:
     mine_pair_candidates_parser.add_argument("--output-path")
     mine_pair_candidates_parser.add_argument("--report-path")
     mine_pair_candidates_parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_MINED_PAIR_CANDIDATES)
+    mine_pair_candidates_parser.add_argument("--acceptance-profile", choices=sorted(ACCEPTANCE_PROFILE_NAMES), default=DEFAULT_ACCEPTANCE_PROFILE)
 
     propose_pairs_parser = subparsers.add_parser("propose-pairs")
     propose_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -13354,6 +13572,7 @@ def build_parser() -> argparse.ArgumentParser:
     propose_group_pairs_parser.add_argument("--timeout-seconds", type=float, default=180.0)
     propose_group_pairs_parser.add_argument("--max-accepted-pairs", type=int, default=10)
     propose_group_pairs_parser.add_argument("--max-proposals", type=int)
+    propose_group_pairs_parser.add_argument("--acceptance-profile", choices=sorted(ACCEPTANCE_PROFILE_NAMES), default=DEFAULT_ACCEPTANCE_PROFILE)
     propose_group_pairs_parser.add_argument("--overwrite", action="store_true")
 
     plan_video_edits_parser = subparsers.add_parser("plan-video-edits")
@@ -13544,6 +13763,7 @@ def main() -> None:
             output_path=args.output_path,
             report_path=args.report_path,
             max_candidates=args.max_candidates,
+            acceptance_profile=args.acceptance_profile,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
@@ -13579,6 +13799,7 @@ def main() -> None:
             timeout_seconds=args.timeout_seconds,
             max_accepted_pairs=args.max_accepted_pairs,
             max_proposals=args.max_proposals,
+            acceptance_profile=args.acceptance_profile,
             overwrite=args.overwrite,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))

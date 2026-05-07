@@ -3106,6 +3106,21 @@ class ComposedDataTests(unittest.TestCase):
         self.assertFalse(gate["passed"])
         self.assertIn("too_broad_or_loose_pair", gate["failure_codes"])
 
+    def test_natural_pair_gate_allows_exploration_same_template_scene(self) -> None:
+        gate = _natural_pair_quality_gate(
+            record={
+                "edit_text": "change the setting from a studio desk to an office desk",
+                "difference": {"type": "scene", "from": "studio desk", "to": "office desk"},
+                "quality": {"same_context_score": 0.50},
+                "source_context": {"relation": "same_template_cluster"},
+            },
+            edit_text_quality={"score": 1.0, "is_imperative_edit": True, "bad_patterns": []},
+            observable_difference={"passed": True, "frame_backed": True},
+            acceptance_profile="exploration",
+        )
+
+        self.assertTrue(gate["passed"])
+
     def test_natural_pair_gate_marks_ocr_template_risk_without_evidence(self) -> None:
         gate = _natural_pair_quality_gate(
             record={
@@ -3186,6 +3201,77 @@ class ComposedDataTests(unittest.TestCase):
         )
 
         self.assertTrue(gate["passed"])
+
+    def test_judge_accepts_exploration_without_hard_verification_pass(self) -> None:
+        judge = {
+            "accept": True,
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "hard_negative_quality": "good",
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": True,
+                "has_concrete_difference": False,
+                "difference_matches_edit": False,
+            },
+            "edit_projection": {"target_matches_projection": False, "score": 0.0},
+            "edit_necessity": {
+                "edit_needed": False,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": False,
+                "score": 0.0,
+            },
+        }
+        quality = {
+            "difference_type": "attribute",
+            "same_context_score": 0.50,
+            "edit_match_score": 0.55,
+            "target_uniqueness_score": 0.55,
+            "difference_strength_score": 0.55,
+            "edit_text_is_imperative": 1.0,
+            "edit_text_quality_score": 0.75,
+        }
+
+        self.assertFalse(_judge_accepts(judge, verification, quality))
+        self.assertTrue(_judge_accepts(judge, verification, quality, acceptance_profile="exploration"))
+
+    def test_pair_record_acceptance_issues_treats_local_gates_as_exploration_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            record = {
+                "reference_video": "ref.mp4",
+                "target_video": "target.mp4",
+                "edit_text": "change the speaker from a woman with earrings to a man with a beard",
+                "difference": {"type": "attribute", "from": "woman with earrings", "to": "man with beard"},
+                "quality": {
+                    "difference_type": "attribute",
+                    "observable_difference_passed": 0.0,
+                    "too_similar_without_observable_delta": 1.0,
+                    "competing_difference_passed": 0.0,
+                    "edit_text_is_imperative": 1.0,
+                },
+            }
+
+            final_issues = _pair_record_acceptance_issues(
+                root=root,
+                record=record,
+                reference_annotation={"subjects": ["woman"], "attributes": ["earrings"]},
+                target_annotation={"subjects": ["man"], "attributes": ["beard"]},
+            )
+            exploration_issues = _pair_record_acceptance_issues(
+                root=root,
+                record=record,
+                reference_annotation={"subjects": ["woman"], "attributes": ["earrings"]},
+                target_annotation={"subjects": ["man"], "attributes": ["beard"]},
+                acceptance_profile="exploration",
+            )
+
+            self.assertTrue(final_issues)
+            self.assertEqual([], exploration_issues)
 
     def test_observable_difference_gate_rejects_caption_only_visual_delta(self) -> None:
         gate = _observable_difference_gate(
@@ -4115,6 +4201,55 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertEqual(1, len(accepted))
         self.assertEqual("attribute", accepted[0]["difference"]["type"])
+
+    def test_select_final_accepted_records_allows_one_reference_to_multiple_targets(self) -> None:
+        base_record = {
+            "accepted": True,
+            "group_id": "group_template",
+            "source_context": {"relation": "same_template_cluster"},
+            "modalities": ["visual"],
+            "reference_video": "clips/shared_ref.mp4",
+            "reference_caption": "woman speaking",
+            "hard_negatives": ["clips/neg.mp4"],
+            "source": {"platform": "unknown", "url": "file:///tmp/target.mp4", "license_note": "internal"},
+            "evidence": {},
+            "judge": {},
+            "verification": {"passed": True},
+            "speech_quality": {},
+            "audio_event_quality": {},
+            "transcript_backed": None,
+            "group_reason": "same_template_cluster",
+            "quality": {
+                "difference_type": "attribute",
+                "difference_strength_score": 0.88,
+                "same_context_score": 0.86,
+                "target_uniqueness_score": 0.84,
+                "edit_match_score": 0.85,
+            },
+        }
+        records = [
+            {
+                **base_record,
+                "proposal_id": "proposal__target_a",
+                "target_video": "clips/target_a.mp4",
+                "target_caption": "bearded man speaking",
+                "edit_text": "change the speaker from woman with earrings to man with beard",
+                "difference": {"type": "attribute", "from": "speaker with woman, earrings", "to": "speaker with man, beard"},
+            },
+            {
+                **base_record,
+                "proposal_id": "proposal__target_b",
+                "target_video": "clips/target_b.mp4",
+                "target_caption": "man in brown shirt speaking",
+                "edit_text": "change the speaker from woman with earrings to man with brown shirt",
+                "difference": {"type": "attribute", "from": "speaker with woman, earrings", "to": "speaker with man, brown shirt"},
+            },
+        ]
+
+        accepted = _select_final_accepted_records(records, max_accepted_pairs=2, acceptance_profile="exploration")
+
+        self.assertEqual(2, len(accepted))
+        self.assertEqual({"clips/target_a.mp4", "clips/target_b.mp4"}, {row["target_video"] for row in accepted})
 
     def test_select_final_accepted_records_keeps_distinct_synthetic_edits_with_same_delta(self) -> None:
         base_record = {

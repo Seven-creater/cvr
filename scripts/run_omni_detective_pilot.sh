@@ -29,6 +29,7 @@ ALLOW_PARTIAL_ANNOTATIONS=${ALLOW_PARTIAL_ANNOTATIONS:-0}
 MODEL_STAGE=${MODEL_STAGE:-instruct}
 GPU_IDS=${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-}}
 MAX_GPUS=${MAX_GPUS:-6}
+ACCEPTANCE_PROFILE=${ACCEPTANCE_PROFILE:-final}
 
 usage() {
   cat <<'EOF'
@@ -51,6 +52,7 @@ Options:
   --mine-candidates-timeout-seconds N
   --propose-timeout-seconds N
   --pair-request-timeout-seconds N
+  --acceptance-profile exploration|final
   --start-stage plan|extract|annotate|mine-candidates|propose|validate|review
   --allow-partial-annotations
   --model-stage VALUE
@@ -124,6 +126,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --pair-request-timeout-seconds)
       PAIR_REQUEST_TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
+    --acceptance-profile)
+      ACCEPTANCE_PROFILE="$2"
       shift 2
       ;;
     --start-stage)
@@ -315,7 +321,7 @@ echo "[omni-detective] model=$MODEL"
 echo "[resource-policy] one Omni model per run; do not keep Captioner/Instruct/Thinking loaded together"
 echo "[resource-policy] model_stage=$MODEL_STAGE gpu_ids=${GPU_IDS:-unset} gpu_count=$GPU_COUNT max_gpus=$MAX_GPUS"
 echo "[omni-detective] start_stage=$START_STAGE"
-echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS max_mined_candidates=$MAX_MINED_CANDIDATES annotation_max_passes=$ANNOTATION_MAX_PASSES annotation_pass_timeout_seconds=$ANNOTATION_PASS_TIMEOUT_SECONDS mine_candidates_timeout_seconds=$MINE_CANDIDATES_TIMEOUT_SECONDS propose_timeout_seconds=$PROPOSE_TIMEOUT_SECONDS pair_request_timeout_seconds=$PAIR_REQUEST_TIMEOUT_SECONDS allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
+echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS max_mined_candidates=$MAX_MINED_CANDIDATES annotation_max_passes=$ANNOTATION_MAX_PASSES annotation_pass_timeout_seconds=$ANNOTATION_PASS_TIMEOUT_SECONDS mine_candidates_timeout_seconds=$MINE_CANDIDATES_TIMEOUT_SECONDS propose_timeout_seconds=$PROPOSE_TIMEOUT_SECONDS pair_request_timeout_seconds=$PAIR_REQUEST_TIMEOUT_SECONDS acceptance_profile=$ACCEPTANCE_PROFILE allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
 if stage_enabled "annotate" || { stage_enabled "propose" && [ "$MAX_PROPOSALS" != "0" ]; }; then
   probe_omni_model
 else
@@ -419,7 +425,8 @@ run_mine_candidates() {
     --clip-groups-path "$RUN_ROOT/clip_groups.jsonl" \
     --output-path "$RUN_ROOT/mined_pair_candidates.jsonl" \
     --report-path "$RUN_ROOT/candidate_mining_report.md" \
-    --max-candidates "$MAX_MINED_CANDIDATES"
+    --max-candidates "$MAX_MINED_CANDIDATES" \
+    --acceptance-profile "$ACCEPTANCE_PROFILE"
   MINE_STATUS=$?
   set -e
   MINED_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/mined_pair_candidates.jsonl")
@@ -461,6 +468,7 @@ if stage_enabled "propose"; then
     --timeout-seconds "$PAIR_REQUEST_TIMEOUT_SECONDS" \
     --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
     --max-proposals "$MAX_PROPOSALS" \
+    --acceptance-profile "$ACCEPTANCE_PROFILE" \
     --overwrite
   PROPOSE_STATUS=$?
   set -e
@@ -526,6 +534,68 @@ else
   echo "[omni-detective] skip review start_stage=$START_STAGE"
 fi
 
+if [ "$ACCEPTANCE_PROFILE" = "exploration" ]; then
+  RUN_ROOT="$RUN_ROOT" python - <<'PY'
+import json
+import os
+from collections import Counter
+from pathlib import Path
+
+run_root = Path(os.environ["RUN_ROOT"])
+
+def load_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+accepted = load_jsonl(run_root / "accepted_pairs.jsonl")
+judged = load_jsonl(run_root / "judged_pair_proposals.jsonl")
+mined = load_jsonl(run_root / "mined_pair_candidates.jsonl")
+
+def difference_type(row: dict) -> str:
+    difference = row.get("difference")
+    return str(difference.get("type", "unknown")) if isinstance(difference, dict) else "unknown"
+
+accepted_types = Counter(difference_type(row) for row in accepted)
+warning_counts = Counter()
+cross_video_count = 0
+for row in accepted:
+    quality = row.get("quality") if isinstance(row.get("quality"), dict) else {}
+    warning_counts.update(str(item) for item in quality.get("exploration_warnings", []) if str(item).strip())
+    source_context = row.get("source_context") if isinstance(row.get("source_context"), dict) else {}
+    if source_context.get("relation") == "same_template_cluster":
+        cross_video_count += 1
+
+lines = [
+    "# Exploration Review Summary",
+    "",
+    f"- accepted_pairs: `{len(accepted)}`",
+    f"- judged_pair_proposals: `{len(judged)}`",
+    f"- mined_pair_candidates: `{len(mined)}`",
+    f"- cross_video_template_accepted: `{cross_video_count}`",
+    "",
+    "## Accepted Type Counts",
+]
+if accepted_types:
+    lines.extend(f"- `{key}`: `{value}`" for key, value in sorted(accepted_types.items()))
+else:
+    lines.append("- none")
+lines.extend(["", "## Exploration Warning Counts"])
+if warning_counts:
+    lines.extend(f"- `{key}`: `{value}`" for key, value in sorted(warning_counts.items()))
+else:
+    lines.append("- none")
+lines.extend(["", "## Review Priority"])
+for row in accepted[:20]:
+    lines.append(
+        f"- `{row.get('sample_id', row.get('proposal_id', 'unknown'))}` "
+        f"type=`{difference_type(row)}` "
+        f"edit=`{row.get('edit_text', '')}`"
+    )
+(run_root / "exploration_review_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+fi
+
 echo "[verify] outputs"
 ls -lh "$RUN_ROOT/clip_plan_detective.jsonl" || true
 ls -lh "$RUN_ROOT/clip_groups.jsonl" || true
@@ -536,6 +606,7 @@ ls -lh "$RUN_ROOT/candidate_mining_report.md" || true
 ls -lh "$RUN_ROOT/judged_pair_proposals.jsonl" || true
 ls -lh "$RUN_ROOT/accepted_pairs.jsonl" || true
 ls -lh "$RUN_ROOT/gallery.jsonl" || true
+ls -lh "$RUN_ROOT/exploration_review_summary.md" || true
 ls -ld "$RUN_ROOT/manual_review_bundle" || true
 cat "$RUN_ROOT/pilot_review.md" || true
 
