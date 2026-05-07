@@ -1907,6 +1907,8 @@ def propose_single_source_pairs(
                 model_fields=model_fields,
                 edit_text_quality=edit_text_quality,
                 acceptance_profile=acceptance_profile,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
             )
             weak_reason = "; ".join(acceptance_issues)
             model_accepted = (
@@ -7190,6 +7192,8 @@ def _recheck_existing_single_source_pair_record(
         model_fields=model_fields,
         edit_text_quality=edit_text_quality,
         acceptance_profile=acceptance_profile,
+        reference_annotation=record.get("reference_annotation", {}) if isinstance(record.get("reference_annotation"), dict) else None,
+        target_annotation=record.get("target_annotation", {}) if isinstance(record.get("target_annotation"), dict) else None,
     )
     record["single_source_pair_acceptance_issues"] = issues
     record["recommended_edit_text"] = record.get("recommended_edit_text") or _single_source_recommended_edit_text(model_fields)
@@ -7262,6 +7266,8 @@ def _single_source_pair_acceptance_issues(
     model_fields: dict[str, Any],
     edit_text_quality: dict[str, Any],
     acceptance_profile: str,
+    reference_annotation: dict[str, Any] | None = None,
+    target_annotation: dict[str, Any] | None = None,
 ) -> list[str]:
     reasons = _single_source_model_reject_issues(model_fields, edit_text_quality)
     confidence = _score_float(model_fields.get("confidence"))
@@ -7335,6 +7341,13 @@ def _single_source_pair_acceptance_issues(
     if "woman receiving" in normalized_edit and "inset" not in normalized_edit and "picture in picture" not in normalized_edit:
         if inset_subjects:
             reasons.append("subject_role_mismatch: inset woman described as primary subject")
+    text_driven_issue = _single_source_text_driven_product_change_issue(
+        model_fields=model_fields,
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+    )
+    if text_driven_issue:
+        reasons.append(text_driven_issue)
 
     return _dedupe_strings(reasons)
 
@@ -7394,6 +7407,82 @@ def _single_source_recommended_edit_text(model_fields: dict[str, Any]) -> str:
     if from_value and to_value and not edit_text:
         return f"change {from_value} to {to_value}"
     return edit_text
+
+
+def _single_source_text_driven_product_change_issue(
+    *,
+    model_fields: dict[str, Any],
+    reference_annotation: dict[str, Any] | None,
+    target_annotation: dict[str, Any] | None,
+) -> str:
+    if not reference_annotation or not target_annotation:
+        return ""
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
+    if difference_type not in {"object_presence", "object_count", "attribute", "scene"}:
+        return ""
+    reference_text = _visible_text_values(reference_annotation)
+    target_text = _visible_text_values(target_annotation)
+    if not reference_text or not target_text or not _strong_visible_text_delta(reference_annotation, target_annotation):
+        return ""
+
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    edit_text = str(model_fields.get("edit_text", "")).strip()
+    description = str(difference.get("description", "")).strip()
+    dominant_delta = model_fields.get("dominant_delta") if isinstance(model_fields.get("dominant_delta"), dict) else {}
+    combined = _normalized_phrase(
+        " ".join(
+            [
+                edit_text,
+                description,
+                from_value,
+                to_value,
+                str(dominant_delta.get("from", "")),
+                str(dominant_delta.get("to", "")),
+                str(dominant_delta.get("reason", "")),
+            ]
+        )
+    )
+    product_overlay_terms = (
+        "product image",
+        "product overlay",
+        "static image",
+        "brand",
+        "label",
+        "skincare",
+        "professional",
+        "pen",
+        "roller",
+    )
+    if not any(term in combined for term in product_overlay_terms):
+        return ""
+
+    reference_overlap = _visible_text_token_overlap_ratio(from_value, reference_text)
+    target_overlap = _visible_text_token_overlap_ratio(to_value, target_text)
+    if reference_overlap >= 0.50 and target_overlap >= 0.50:
+        return "text_driven_product_overlay_change: product from/to values are primarily OCR or packaging text"
+    if "visible text" in combined or "text on" in combined or "label" in combined:
+        return "text_driven_product_overlay_change: product change is described through on-screen text"
+    return ""
+
+
+def _visible_text_token_overlap_ratio(value: str, visible_text_values: list[str]) -> float:
+    value_tokens = {
+        token
+        for token in _tokenize_text(_normalized_phrase(value))
+        if len(token) >= 3 and token not in {"the", "and", "with", "from", "into", "image", "static", "product"}
+    }
+    if not value_tokens:
+        return 0.0
+    text_tokens = {
+        token
+        for token in _tokenize_text(_normalized_phrase(" ".join(visible_text_values)))
+        if len(token) >= 3
+    }
+    if not text_tokens:
+        return 0.0
+    return len(value_tokens & text_tokens) / max(1, len(value_tokens))
 
 
 def _single_source_delta_family_from_fields(model_fields: dict[str, Any]) -> str:

@@ -880,6 +880,110 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(1, sum(1 for item in ranked if item["accepted"]))
             self.assertTrue(any("duplicate_delta_family" in "; ".join(item["single_source_pair_acceptance_issues"]) for item in ranked))
 
+    def test_propose_single_source_pairs_rejects_text_driven_product_label_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_5.mp4", "seg_6.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode("utf-8"))
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "seg_5",
+                        "output_path": "clips/seg_5.mp4",
+                        "dataset": "daily_omni",
+                        "summary": "woman speaks with a black pen product image on the left",
+                        "visible_text": ["REVISION SKINCARE", "Brow-Lift Roller", "0.08 FL OZ"],
+                        "object_counts": {"woman": 1, "product": 1},
+                    },
+                    {
+                        "clip_id": "seg_6",
+                        "output_path": "clips/seg_6.mp4",
+                        "dataset": "daily_omni",
+                        "summary": "woman speaks with a similar black pen product image on the left",
+                        "visible_text": ["REVLON PROFESSIONAL", "Smooth Line Reliever Pen", "0.08 FL OZ"],
+                        "object_counts": {"woman": 1, "product": 1},
+                    },
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "candidate_1",
+                        "proposal_id": _build_proposal_id("clips/seg_5.mp4", "clips/seg_6.mp4"),
+                        "reference_clip_id": "seg_5",
+                        "target_clip_id": "seg_6",
+                        "reference_video": "clips/seg_5.mp4",
+                        "target_video": "clips/seg_6.mp4",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_single_source_pair.return_value = (
+                {
+                    "edit_text": "change the product image on the left from a Revision Skincare Brow-Lift Roller to a Revlon Professional Smooth Line Reliever Pen",
+                    "modalities": ["visual"],
+                    "reference_caption": "woman with a product image on the left",
+                    "target_caption": "woman with a similar product image on the left",
+                    "difference": {
+                        "type": "object_presence",
+                        "from": "Revision Skincare Brow-Lift Roller",
+                        "to": "Revlon Professional Smooth Line Reliever Pen",
+                        "description": "the product label text on the left changes",
+                    },
+                    "dominant_delta": {
+                        "type": "object_presence",
+                        "from": "Revision Skincare Brow-Lift Roller",
+                        "to": "Revlon Professional Smooth Line Reliever Pen",
+                        "reason": "the product image text on the left shows a different product name",
+                    },
+                    "reference_state": {"main_speaker": "woman", "inset_subjects": [], "product_overlay": "Revision Skincare Brow-Lift Roller", "composition": "speaker with product image overlay", "internal_transitions": []},
+                    "target_state": {"main_speaker": "woman", "inset_subjects": [], "product_overlay": "Revlon Professional Smooth Line Reliever Pen", "composition": "speaker with product image overlay", "internal_transitions": []},
+                    "delta_temporal_extent": {"reference": "product image throughout", "target": "product image throughout", "target_coverage": 1.0, "evidence": "only the package text differs"},
+                    "subject_roles": {"main_speaker": "woman", "inset_subjects": [], "product_overlay": "Revlon Professional Smooth Line Reliever Pen"},
+                    "is_segment_wide_delta": True,
+                    "discarded_deltas": [],
+                    "evidence": ["the visible text on the product image changes"],
+                    "confidence": 0.95,
+                    "accept": True,
+                    "reject_reason": "",
+                },
+                {"raw": "ok"},
+            )
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked_single_source_pairs.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    max_accepted_pairs=5,
+                    acceptance_profile="exploration",
+                )
+
+            ranked = [
+                json.loads(line)
+                for line in (root / "pairs" / "ranked_single_source_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            accepted = [
+                json.loads(line)
+                for line in (root / "pairs" / "accepted_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertFalse(ranked[0]["accepted"])
+            self.assertIn("text_driven_product_overlay_change", "; ".join(ranked[0]["single_source_pair_acceptance_issues"]))
+            self.assertEqual([], accepted)
+
     def test_plan_stable_omni_clips_uses_cache_and_enforces_window_length(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
