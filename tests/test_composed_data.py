@@ -4,6 +4,7 @@ import copy
 import json
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -4202,7 +4203,67 @@ class ComposedDataTests(unittest.TestCase):
         self.assertEqual(1, len(accepted))
         self.assertEqual("attribute", accepted[0]["difference"]["type"])
 
-    def test_select_final_accepted_records_allows_one_reference_to_multiple_targets(self) -> None:
+    def test_select_final_accepted_records_uses_one_per_exploration_bucket(self) -> None:
+        base_record = {
+            "accepted": True,
+            "group_id": "group_template",
+            "source_context": {"relation": "same_template_cluster"},
+            "modalities": ["visual"],
+            "reference_caption": "reference",
+            "target_caption": "target",
+            "hard_negatives": ["clips/neg.mp4"],
+            "source": {"platform": "unknown", "url": "file:///tmp/target.mp4", "license_note": "internal"},
+            "evidence": {},
+            "judge": {},
+            "verification": {"passed": True},
+            "speech_quality": {},
+            "audio_event_quality": {},
+            "transcript_backed": None,
+            "group_reason": "same_template_cluster",
+        }
+
+        def record(proposal_id: str, difference_type: str, reference_video: str, target_video: str) -> dict:
+            difference = {"type": difference_type, "from": f"old {difference_type}", "to": f"new {difference_type}"}
+            if difference_type == "audio_event":
+                difference = {"type": "audio_event", "from": "ambient drone", "to": "soft music"}
+            return {
+                **base_record,
+                "proposal_id": proposal_id,
+                "reference_video": reference_video,
+                "target_video": target_video,
+                "edit_text": f"change {difference_type}",
+                "difference": difference,
+                "quality": {
+                    "difference_type": difference_type,
+                    "difference_strength_score": 0.9,
+                    "same_context_score": 0.9,
+                    "target_uniqueness_score": 0.9,
+                    "edit_match_score": 0.9,
+                    "audio_primary_allowed": 1.0 if difference_type == "audio_event" else 0.0,
+                },
+            }
+
+        records = [
+            record("proposal__attr", "attribute", "clips/ref_attr.mp4", "clips/target_attr.mp4"),
+            record("proposal__object_a", "object_presence", "clips/ref_object_a.mp4", "clips/target_object_a.mp4"),
+            record("proposal__object_b", "object_count", "clips/ref_object_b.mp4", "clips/target_object_b.mp4"),
+            record("proposal__action", "action", "clips/ref_action.mp4", "clips/target_action.mp4"),
+            record("proposal__scene", "scene", "clips/ref_scene.mp4", "clips/target_scene.mp4"),
+            record("proposal__audio_a", "audio_event", "clips/ref_audio_a.mp4", "clips/target_audio_a.mp4"),
+            record("proposal__audio_b", "audio_event", "clips/ref_audio_b.mp4", "clips/target_audio_b.mp4"),
+        ]
+
+        accepted = _select_final_accepted_records(records, max_accepted_pairs=6, acceptance_profile="exploration")
+
+        bucket_counts = Counter(
+            "object" if row["difference"]["type"] in {"object_presence", "object_count"} else row["difference"]["type"]
+            for row in accepted
+        )
+        self.assertLessEqual(len(accepted), 5)
+        self.assertEqual({"attribute", "object", "action", "scene", "audio_event"}, set(bucket_counts))
+        self.assertTrue(all(count == 1 for count in bucket_counts.values()))
+
+    def test_select_final_accepted_records_limits_exploration_to_one_target_per_reference(self) -> None:
         base_record = {
             "accepted": True,
             "group_id": "group_template",
@@ -4248,8 +4309,8 @@ class ComposedDataTests(unittest.TestCase):
 
         accepted = _select_final_accepted_records(records, max_accepted_pairs=2, acceptance_profile="exploration")
 
-        self.assertEqual(2, len(accepted))
-        self.assertEqual({"clips/target_a.mp4", "clips/target_b.mp4"}, {row["target_video"] for row in accepted})
+        self.assertEqual(1, len(accepted))
+        self.assertIn(accepted[0]["target_video"], {"clips/target_a.mp4", "clips/target_b.mp4"})
 
     def test_select_final_accepted_records_keeps_distinct_synthetic_edits_with_same_delta(self) -> None:
         base_record = {
@@ -4514,7 +4575,7 @@ class ComposedDataTests(unittest.TestCase):
         self.assertIsNotNone(difference)
         self.assertEqual("object_presence", difference["type"])
 
-    def test_high_context_priority_prefers_audio_event_for_fusion_pairs(self) -> None:
+    def test_high_context_priority_keeps_audio_secondary_when_visual_object_changes(self) -> None:
         reference = {
             "object_counts": {"person": 1},
             "actions": ["speaking"],
@@ -4527,6 +4588,33 @@ class ComposedDataTests(unittest.TestCase):
             "object_counts": {"person": 1, "laptop": 1},
             "actions": ["speaking"],
             "audio_events": ["scratching sound"],
+            "attributes": ["studio"],
+            "scene": "studio desk shot",
+            "visible_text": [],
+        }
+
+        difference = _detect_primary_difference(
+            reference,
+            target,
+            priority_order=_difference_priority_order(same_context_score=0.9),
+        )
+
+        self.assertIsNotNone(difference)
+        self.assertEqual("object_presence", difference["type"])
+
+    def test_high_context_priority_allows_audio_event_when_visual_template_matches(self) -> None:
+        reference = {
+            "object_counts": {"person": 1},
+            "actions": ["speaking"],
+            "audio_events": ["low electronic hum"],
+            "attributes": ["studio"],
+            "scene": "studio desk shot",
+            "visible_text": [],
+        }
+        target = {
+            "object_counts": {"person": 1},
+            "actions": ["speaking"],
+            "audio_events": ["soft ambient music"],
             "attributes": ["studio"],
             "scene": "studio desk shot",
             "visible_text": [],
@@ -7879,10 +7967,17 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue((item_dir / "src_ref_images" / "001_jacket_png").exists())
             self.assertTrue((item_dir / "review_inputs" / "vace_prompt.txt").exists())
             self.assertTrue((item_dir / "metadata.json").exists())
+            self.assertTrue((item_dir / "description.md").exists())
+            description_text = (item_dir / "description.md").read_text(encoding="utf-8")
+            self.assertIn("Reference Omni Description", description_text)
+            self.assertIn("Target Omni Description", description_text)
+            self.assertIn("dominant_delta_decision", description_text)
             self.assertTrue((item_dir / "semantic_evaluation_result.json").exists())
             metadata = json.loads((item_dir / "metadata.json").read_text(encoding="utf-8"))
             self.assertFalse(metadata["incomplete_review_bundle"])
             self.assertEqual([], metadata["review_bundle_issues"])
+            self.assertIn("reference_omni_description", metadata)
+            self.assertIn("target_omni_description", metadata)
             self.assertIn("sample_1", (output_dir / "index.md").read_text(encoding="utf-8"))
             self.assertIn("complete", (output_dir / "index.md").read_text(encoding="utf-8"))
 
@@ -8062,6 +8157,49 @@ class ComposedDataTests(unittest.TestCase):
                     for warning in exploration_record["quality"].get("exploration_warnings", [])
                 )
             )
+
+    def test_pair_record_acceptance_issues_rejects_audio_when_visual_delta_dominates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ref.mp4").write_bytes(b"ref")
+            (root / "target.mp4").write_bytes(b"target")
+            record = {
+                "reference_video": "ref.mp4",
+                "target_video": "target.mp4",
+                "edit_text": "replace the mouse click sound with ambient music",
+                "difference": {"type": "audio_event", "from": "mouse click", "to": "ambient music"},
+                "source_context": {"relation": "same_template_cluster", "template_compatibility_score": 0.7},
+                "quality": {
+                    "difference_type": "audio_event",
+                    "same_context_score": 0.7,
+                    "non_speech_audio_event_score": 0.9,
+                    "has_audio_modality": 1.0,
+                },
+            }
+
+            issues = _pair_record_acceptance_issues(
+                root=root,
+                record=record,
+                reference_annotation={
+                    "subjects": ["man"],
+                    "summary": "A bearded man in a gray shirt sits at a wooden table.",
+                    "attributes": ["beard", "gray shirt", "wood wall"],
+                    "scene": "wood tabletop studio",
+                    "audio_events": ["mouse click"],
+                },
+                target_annotation={
+                    "subjects": ["man"],
+                    "summary": "A man in a black shirt speaks in a blue-lit studio.",
+                    "attributes": ["black shirt", "blue-lit studio"],
+                    "scene": "blue-lit recording room",
+                    "audio_events": ["ambient music"],
+                },
+                acceptance_profile="exploration",
+            )
+
+            self.assertTrue(any("audio_event cannot be the primary edit" in issue for issue in issues))
+            self.assertEqual(0.0, record["quality"]["audio_primary_allowed"])
+            self.assertIn("attribute", record["quality"]["dominant_delta_decision"]["visual_delta_types"])
 
     def test_judge_accepts_exploration_audio_speech_content_reject_as_diagnostic(self) -> None:
         judge = {

@@ -53,12 +53,12 @@ MIN_PAIR_CONTEXT_SCORE = 0.03
 MAX_PAIR_CHANGED_TYPES = 5
 MIN_PAIR_EDIT_MATCH_SCORE = 0.15
 PAIR_PRIORITY = (
-    "audio_event",
+    "attribute",
     "object_presence",
     "object_count",
     "action",
-    "attribute",
     "scene",
+    "audio_event",
     "speech",
     "visible_text",
 )
@@ -822,6 +822,7 @@ NATURAL_PAIR_GATE_LABELS = {
     "visible_text_disabled": "visible_text_disabled: visible-text edits are diagnostic only for this dataset pass",
     "ocr_template_risk": "ocr_template_risk: visible-text edit lacks reliable OCR evidence or target uniqueness",
     "audio_event_too_similar": "audio_event_too_similar: audio_event from/to values are too similar to be a useful edit",
+    "audio_secondary_due_to_visual_delta": "audio_secondary_due_to_visual_delta: stronger visual differences make audio a secondary delta",
     "visible_text_fragment_edit": "visible_text_fragment_edit: target visible text is only a fragment of the source text",
 }
 VISIBLE_TEXT_FRAGMENT_MIN_SOURCE_TOKENS = 2
@@ -835,7 +836,18 @@ FINAL_ACCEPT_BUCKET_TARGETS = {
     "speech": 0,
     "visible_text": 0,
 }
+EXPLORATION_SMALL_ACCEPT_BUCKET_TARGETS = {
+    "attribute": 1,
+    "object": 1,
+    "action": 1,
+    "scene": 1,
+    "audio_event": 1,
+}
 FINAL_DISABLED_DIFFERENCE_TYPES = {"speech", "visible_text"}
+DOMINANT_VISUAL_DIFFERENCE_TYPES = ("attribute", "object_presence", "object_count", "scene", "action")
+AUDIO_PRIMARY_MIN_SAME_CONTEXT_SCORE = 0.86
+AUDIO_PRIMARY_MIN_TEMPLATE_COMPATIBILITY_SCORE = 0.82
+AUDIO_PRIMARY_MIN_VISUAL_NEAR_DUPLICATE_SCORE = 0.98
 MIN_TEMPLATE_SEMANTIC_CONTEXT_SCORE = 0.35
 MIN_TEMPLATE_COMPATIBILITY_SCORE = 0.72
 MIN_TEMPLATE_CLEAN_STABILITY_SCORE = 0.75
@@ -1922,6 +1934,7 @@ def _mined_pair_candidate_record(
         "source_context": source_context,
         "scores": scores,
         "quality": quality,
+        "dominant_delta_decision": dict(candidate.get("dominant_delta_decision", quality.get("dominant_delta_decision", {}))),
         "acceptance_profile": str(quality.get("acceptance_profile", DEFAULT_ACCEPTANCE_PROFILE)),
         "evidence": dict(candidate.get("difference_evidence", {})),
         "risk_flags": risk_flags,
@@ -1997,6 +2010,8 @@ def _candidate_risk_flags(candidate: dict[str, Any]) -> list[str]:
         str(difference.get("to", "")),
     ):
         risk_flags.append("audio_too_similar")
+    if difference_type == "audio_event" and _score_float(quality.get("audio_primary_allowed", 1.0)) < 1.0:
+        risk_flags.append("audio_secondary_due_to_visual_delta")
     if difference_type in VISUAL_DIFFERENCE_TYPES:
         observable = _observable_difference_gate(
             reference_annotation=candidate["reference_annotation"],
@@ -2480,6 +2495,18 @@ def _build_cross_video_template_candidate(
         if difference_type == "audio_event":
             quality["non_speech_audio_event_score"] = _non_speech_audio_event_score(reference_annotation, target_annotation)
             quality["has_audio_modality"] = 1.0
+            audio_decision = _dominant_delta_decision(
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                difference=difference,
+                quality=quality,
+                source_context=source_context,
+            )
+            if not audio_decision["audio_primary_allowed"]:
+                quality["exploration_warnings"] = _dedupe_strings(
+                    _normalize_list(quality.get("exploration_warnings", []))
+                    + list(audio_decision.get("failure_flags", []))
+                )
         composite_score = _candidate_composite_score(quality, source_context)
         reference_path = _display_path(root, _resolve_under_root(root, reference_annotation["output_path"]))
         target_path = _display_path(root, _resolve_under_root(root, target_annotation["output_path"]))
@@ -2502,6 +2529,19 @@ def _build_cross_video_template_candidate(
                 "object_signature_bundle": {"reference": object_reference, "target": object_target},
                 "scene_signature_bundle": {"reference": scene_reference, "target": scene_target},
             },
+            "dominant_delta_decision": _dominant_delta_decision(
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                difference=difference,
+                quality=quality,
+                source_context={
+                    **source_context,
+                    "template_route": route_name,
+                    "subject_signature_bundle": {"reference": subject_reference, "target": subject_target},
+                    "object_signature_bundle": {"reference": object_reference, "target": object_target},
+                    "scene_signature_bundle": {"reference": scene_reference, "target": scene_target},
+                },
+            ),
             "difference_evidence": _difference_evidence_from_annotations(
                 reference_annotation=reference_annotation,
                 target_annotation=target_annotation,
@@ -2660,6 +2700,17 @@ def _candidate_from_mined_record(
     source_context = mined.get("source_context", {}) if isinstance(mined.get("source_context"), dict) else {}
     if not source_context:
         source_context = _source_context(reference_annotation, target_annotation)
+    dominant_delta_decision = _dominant_delta_decision(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        difference=difference,
+        quality=quality,
+        source_context=source_context,
+    )
+    quality["dominant_delta_type"] = dominant_delta_decision["dominant_type"]
+    quality["audio_primary_allowed"] = 1.0 if dominant_delta_decision["audio_primary_allowed"] else 0.0
+    quality["visual_competing_delta_score"] = dominant_delta_decision["visual_competing_delta_score"]
+    quality["dominant_delta_decision"] = dominant_delta_decision
 
     reference_path = _display_path(root, _resolve_under_root(root, reference_annotation["output_path"]))
     target_path = _display_path(root, _resolve_under_root(root, target_annotation["output_path"]))
@@ -2676,6 +2727,9 @@ def _candidate_from_mined_record(
         "composite_score": _score_float(scores.get("local_candidate_score"))
         or _candidate_composite_score(quality, source_context),
         "source_context": dict(source_context),
+        "dominant_delta_decision": dict(mined.get("dominant_delta_decision", dominant_delta_decision))
+        if isinstance(mined.get("dominant_delta_decision", dominant_delta_decision), dict)
+        else dominant_delta_decision,
         "difference_evidence": dict(mined.get("evidence", {}))
         if isinstance(mined.get("evidence"), dict)
         else _difference_evidence_from_annotations(
@@ -2924,7 +2978,7 @@ def propose_group_pairs(
                     raw_index=raw_index,
                 )
                 proposal_quality = _quality_for_model_fields(
-                    base_quality=candidate["quality"],
+                    base_quality={**candidate["quality"], "source_context": dict(candidate["source_context"])},
                     model_fields=model_fields,
                     reference_annotation=reference_annotation,
                     target_annotation=target_annotation,
@@ -3076,6 +3130,7 @@ def propose_group_pairs(
                     "audio_event_quality": audio_event_quality,
                     "edit_text_quality": edit_text_quality,
                     "observable_difference": observable_difference,
+                    "dominant_delta_decision": dict(effective_quality.get("dominant_delta_decision", {})),
                     "transcript_backed": speech_quality.get("transcript_backed"),
                     "accepted": accepted,
                     "fallback_used": fallback_used,
@@ -4571,6 +4626,12 @@ def build_manual_review_bundle(
             "target_video_absolute": str(target_path) if target_video_raw else "",
             "reference_caption": reference_caption,
             "target_caption": target_caption,
+            "reference_omni_description": _review_annotation_description(reference_annotation, fallback_caption=reference_caption),
+            "target_omni_description": _review_annotation_description(target_annotation, fallback_caption=target_caption),
+            "dominant_delta_decision": record.get("dominant_delta_decision", {}),
+            "secondary_deltas": _normalize_list(
+                (record.get("dominant_delta_decision", {}) if isinstance(record.get("dominant_delta_decision"), dict) else {}).get("secondary_delta_types", [])
+            ),
             "verification": record.get("verification", {}),
             "observable_difference": record.get("observable_difference", {}),
             "competing_difference": record.get("competing_difference", {}),
@@ -4622,6 +4683,10 @@ def build_manual_review_bundle(
             target_filename="target.mp4" if copy_videos and target_copy.exists() else "",
         )
         (item_dir / "review.md").write_text(review_md, encoding="utf-8")
+        (item_dir / "description.md").write_text(
+            _manual_review_description_markdown(metadata),
+            encoding="utf-8",
+        )
         items.append(
             {
                 "index": index,
@@ -6992,6 +7057,8 @@ def _natural_pair_quality_gate(
         str(difference.get("to", "")),
     ):
         failure_codes.append("audio_event_too_similar")
+    if difference_type == "audio_event" and _score_float(quality.get("audio_primary_allowed", 1.0)) < 1.0:
+        failure_codes.append("audio_secondary_due_to_visual_delta")
 
     failure_codes = _dedupe_strings(failure_codes)
     reasons = [NATURAL_PAIR_GATE_LABELS[code] for code in failure_codes if code in NATURAL_PAIR_GATE_LABELS]
@@ -7285,6 +7352,18 @@ def _prepare_record_for_acceptance(
     record["quality"] = _effective_pair_quality(judge, verification, heuristic_quality)
     _carry_local_gate_quality(record["quality"], local_gate_quality)
     record["quality"]["acceptance_profile"] = _normalize_acceptance_profile(acceptance_profile)
+    dominant_delta_decision = _dominant_delta_decision(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        difference=record.get("difference", {}) if isinstance(record.get("difference"), dict) else {},
+        quality=record["quality"],
+        source_context=record.get("source_context", {}) if isinstance(record.get("source_context"), dict) else {},
+    )
+    record["quality"]["dominant_delta_type"] = dominant_delta_decision["dominant_type"]
+    record["quality"]["audio_primary_allowed"] = 1.0 if dominant_delta_decision["audio_primary_allowed"] else 0.0
+    record["quality"]["visual_competing_delta_score"] = dominant_delta_decision["visual_competing_delta_score"]
+    record["quality"]["dominant_delta_decision"] = dominant_delta_decision
+    record["dominant_delta_decision"] = dominant_delta_decision
     if _is_exploration_profile(acceptance_profile):
         record["quality"]["exploration_verification_passed"] = 1.0 if _verification_accepts(verification) else 0.0
     return record
@@ -7319,6 +7398,10 @@ def _carry_local_gate_quality(target_quality: dict[str, Any], source_quality: di
         "acceptance_profile",
         "exploration_warnings",
         "exploration_verification_passed",
+        "dominant_delta_type",
+        "audio_primary_allowed",
+        "visual_competing_delta_score",
+        "dominant_delta_decision",
     ):
         if key in source_quality:
             target_quality[key] = source_quality[key]
@@ -7355,6 +7438,18 @@ def _quality_for_model_fields(
         target_annotation=target_annotation,
     ):
         quality["intraclip_change_conflict"] = 1.0
+    source_context = base_quality.get("source_context", {}) if isinstance(base_quality.get("source_context"), dict) else {}
+    dominant_delta_decision = _dominant_delta_decision(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        difference=difference,
+        quality=quality,
+        source_context=source_context,
+    )
+    quality["dominant_delta_type"] = dominant_delta_decision["dominant_type"]
+    quality["audio_primary_allowed"] = 1.0 if dominant_delta_decision["audio_primary_allowed"] else 0.0
+    quality["visual_competing_delta_score"] = dominant_delta_decision["visual_competing_delta_score"]
+    quality["dominant_delta_decision"] = dominant_delta_decision
     return quality
 
 
@@ -7480,6 +7575,17 @@ def _score_ordered_pair(
         quality["has_audio_modality"] = 1.0
     if visual_near_duplicate_score is not None:
         quality["visual_near_duplicate_score"] = round(visual_near_duplicate_score, 3)
+    dominant_delta_decision = _dominant_delta_decision(
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        difference=primary_difference,
+        quality=quality,
+        source_context=source_context,
+    )
+    quality["dominant_delta_type"] = dominant_delta_decision["dominant_type"]
+    quality["audio_primary_allowed"] = 1.0 if dominant_delta_decision["audio_primary_allowed"] else 0.0
+    quality["visual_competing_delta_score"] = dominant_delta_decision["visual_competing_delta_score"]
+    quality["dominant_delta_decision"] = dominant_delta_decision
     composite_score = _candidate_composite_score(quality, source_context)
     return {
         "proposal_id": _build_proposal_id(reference_path, target_path),
@@ -7490,6 +7596,7 @@ def _score_ordered_pair(
         "quality": quality,
         "composite_score": composite_score,
         "source_context": source_context,
+        "dominant_delta_decision": dominant_delta_decision,
         "difference_evidence": _difference_evidence_from_annotations(
             reference_annotation=reference_annotation,
             target_annotation=target_annotation,
@@ -7895,6 +8002,117 @@ def _detect_primary_difference(
     primary = dict(differences[changed_types[0]])
     primary["changed_types"] = changed_types
     return primary
+
+
+def _visual_delta_types(reference: dict[str, Any], target: dict[str, Any]) -> list[str]:
+    types: list[str] = []
+    reference_subject = _annotation_subject_signature_bundle(reference)
+    target_subject = _annotation_subject_signature_bundle(target)
+    if reference_subject and target_subject and reference_subject != target_subject:
+        types.append("attribute")
+
+    reference_counts = _normalize_object_counts(reference.get("object_counts", {}))
+    target_counts = _normalize_object_counts(target.get("object_counts", {}))
+    if any(reference_counts[label] != target_counts[label] for label in sorted(set(reference_counts) & set(target_counts))):
+        types.append("object_count")
+    reference_objects = _annotation_object_signature_bundle(reference)
+    target_objects = _annotation_object_signature_bundle(target)
+    if reference_objects and target_objects and reference_objects != target_objects:
+        types.append("object_presence")
+
+    reference_scene = _annotation_scene_signature_bundle(reference)
+    target_scene = _annotation_scene_signature_bundle(target)
+    if reference_scene and target_scene and reference_scene != target_scene:
+        types.append("scene")
+
+    reference_actions = _action_terms_from_annotation(reference)
+    target_actions = _action_terms_from_annotation(target)
+    if _first_unique(reference_actions, target_actions) and _first_unique(target_actions, reference_actions):
+        types.append("action")
+
+    return [difference_type for difference_type in DOMINANT_VISUAL_DIFFERENCE_TYPES if difference_type in set(types)]
+
+
+def _audio_event_changed(reference: dict[str, Any], target: dict[str, Any]) -> bool:
+    reference_audio = _non_speech_audio_terms(reference)
+    target_audio = _non_speech_audio_terms(target)
+    return bool(_first_unique(reference_audio, target_audio) or _first_unique(target_audio, reference_audio))
+
+
+def _audio_primary_allowed(
+    *,
+    quality: dict[str, Any],
+    source_context: dict[str, Any],
+    visual_delta_types: list[str],
+    audio_changed: bool,
+) -> bool:
+    if not audio_changed or visual_delta_types:
+        return False
+    same_context_score = _score_float(quality.get("same_context_score"))
+    template_compatibility_score = _score_float(
+        quality.get("template_compatibility_score", source_context.get("template_compatibility_score"))
+    )
+    visual_near_duplicate_score = _score_float(quality.get("visual_near_duplicate_score"))
+    relation = str(source_context.get("relation", "")).strip()
+    if visual_near_duplicate_score >= AUDIO_PRIMARY_MIN_VISUAL_NEAR_DUPLICATE_SCORE:
+        return True
+    if relation == "same_source_video" and same_context_score >= 0.78:
+        return True
+    return bool(
+        same_context_score >= AUDIO_PRIMARY_MIN_SAME_CONTEXT_SCORE
+        and template_compatibility_score >= AUDIO_PRIMARY_MIN_TEMPLATE_COMPATIBILITY_SCORE
+    )
+
+
+def _dominant_delta_decision(
+    *,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    difference: dict[str, Any],
+    quality: dict[str, Any],
+    source_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source_context = source_context if isinstance(source_context, dict) else {}
+    proposed_type = str(difference.get("type", "")).strip()
+    visual_delta_types = _visual_delta_types(reference_annotation, target_annotation)
+    audio_changed = _audio_event_changed(reference_annotation, target_annotation)
+    audio_allowed = _audio_primary_allowed(
+        quality=quality,
+        source_context=source_context,
+        visual_delta_types=visual_delta_types,
+        audio_changed=audio_changed,
+    )
+    dominant_type = proposed_type
+    reason = "proposed difference is the dominant observable delta"
+    if proposed_type == "audio_event" and not audio_allowed:
+        dominant_type = visual_delta_types[0] if visual_delta_types else "diagnostic_audio_event"
+        if visual_delta_types:
+            reason = "audio_event is secondary because stronger visual deltas exist"
+        else:
+            reason = "audio_event lacks near-identical visual context for audio-primary acceptance"
+    elif proposed_type not in visual_delta_types and visual_delta_types and proposed_type not in {"speech", "visible_text"}:
+        dominant_type = visual_delta_types[0]
+        reason = "a stronger visual delta is more suitable as the pair theme"
+
+    secondary = [item for item in [*visual_delta_types, "audio_event" if audio_changed else ""] if item and item != dominant_type]
+    visual_competing_delta_score = 0.0
+    if visual_delta_types:
+        visual_competing_delta_score = min(1.0, 0.45 + 0.15 * len(visual_delta_types))
+
+    flags: list[str] = []
+    if proposed_type == "audio_event" and not audio_allowed:
+        flags.append("audio_secondary_due_to_visual_delta" if visual_delta_types else "audio_primary_context_too_weak")
+
+    return {
+        "proposed_type": proposed_type,
+        "dominant_type": dominant_type,
+        "audio_primary_allowed": audio_allowed,
+        "visual_competing_delta_score": round(visual_competing_delta_score, 3),
+        "visual_delta_types": visual_delta_types,
+        "secondary_delta_types": _dedupe_strings(secondary),
+        "failure_flags": flags,
+        "reason": reason,
+    }
 
 
 def _edit_match_score(
@@ -8969,9 +9187,14 @@ def _effective_pair_quality(
         "observable_difference_frame_backed",
         "near_duplicate_without_delta",
         "synthetic_context_override",
+        "audio_primary_allowed",
+        "visual_competing_delta_score",
     ):
         if key in heuristic_quality:
             result[key] = _score_float(heuristic_quality.get(key))
+    for key in ("dominant_delta_type", "dominant_delta_decision"):
+        if key in heuristic_quality:
+            result[key] = heuristic_quality[key]
     return result
 
 
@@ -8992,6 +9215,8 @@ def _audio_event_quality_payload(quality: dict[str, Any]) -> dict[str, Any]:
     return {
         "non_speech_score": _score_float(quality.get("non_speech_audio_event_score")),
         "audio_required": _score_float(quality.get("has_audio_modality")) >= 1.0,
+        "audio_primary_allowed": _score_float(quality.get("audio_primary_allowed", 1.0)) >= 1.0,
+        "visual_competing_delta_score": _score_float(quality.get("visual_competing_delta_score")),
     }
 
 
@@ -9072,6 +9297,13 @@ def _compose_reject_reason(
                 f"speech_specificity_score {speech_specificity_score:.3f} is below {MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE:.2f}"
             )
     if difference_type == "audio_event":
+        if "audio_primary_allowed" in quality and _score_float(quality.get("audio_primary_allowed")) < 1.0:
+            decision = quality.get("dominant_delta_decision", {})
+            reason = str(decision.get("reason", "")).strip() if isinstance(decision, dict) else ""
+            failures.append(
+                "audio_event cannot be the primary edit"
+                + (f": {reason}" if reason else "")
+            )
         non_speech_audio_event_score = _score_float(quality.get("non_speech_audio_event_score"))
         audio_threshold = _profile_threshold(acceptance_profile, "non_speech_audio_event_score")
         if non_speech_audio_event_score < audio_threshold:
@@ -9193,6 +9425,8 @@ def _exploration_judge_accepts(
     if difference_type == "action" and _score_float(quality.get("action_evidence_score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "action_evidence_score"):
         return False
     if difference_type == "audio_event":
+        if "audio_primary_allowed" in quality and _score_float(quality.get("audio_primary_allowed")) < 1.0:
+            return False
         if _score_float(quality.get("audio_event_too_similar")) >= 1.0:
             return False
         if _score_float(quality.get("non_speech_audio_event_score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "non_speech_audio_event_score"):
@@ -9230,6 +9464,7 @@ def _should_skip_pair_video_verification(
         difference_type = str(quality.get("difference_type", "")).strip()
         return bool(
             difference_type in FINAL_DISABLED_DIFFERENCE_TYPES
+            or (difference_type == "audio_event" and "audio_primary_allowed" in quality and _score_float(quality.get("audio_primary_allowed")) < 1.0)
             or _score_float(quality.get("intraclip_change_conflict")) >= 1.0
         )
     if _structured_edit_text_failures(quality):
@@ -9861,6 +10096,25 @@ def _pair_record_acceptance_issues(
                 )
             else:
                 issues.append(issue)
+        dominant_delta_decision = _dominant_delta_decision(
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            difference=difference,
+            quality=quality,
+            source_context=record.get("source_context", {}) if isinstance(record.get("source_context"), dict) else {},
+        )
+        quality["dominant_delta_type"] = dominant_delta_decision["dominant_type"]
+        quality["audio_primary_allowed"] = 1.0 if dominant_delta_decision["audio_primary_allowed"] else 0.0
+        quality["visual_competing_delta_score"] = dominant_delta_decision["visual_competing_delta_score"]
+        quality["dominant_delta_decision"] = dominant_delta_decision
+        record["dominant_delta_decision"] = dominant_delta_decision
+        if not dominant_delta_decision["audio_primary_allowed"]:
+            reason = str(dominant_delta_decision.get("reason", "")).strip()
+            visual_types = ", ".join(dominant_delta_decision.get("visual_delta_types", []))
+            suffix = f": {reason}" if reason else ""
+            if visual_types:
+                suffix += f" ({visual_types})"
+            issues.append(f"audio_event cannot be the primary edit for this pair{suffix}")
     if isinstance(quality, dict):
         if _is_exploration_profile(acceptance_profile):
             if "edit_text_is_imperative" in quality and _score_float(quality.get("edit_text_is_imperative")) < 1.0:
@@ -10064,31 +10318,48 @@ def _select_final_accepted_records(
     seen_signatures: set[tuple[str, ...]] = set()
     selected_ids: set[str] = set()
     selected_target_videos: set[str] = set()
+    selected_reference_videos: set[str] = set()
+    bucket_targets = EXPLORATION_SMALL_ACCEPT_BUCKET_TARGETS if _is_exploration_profile(acceptance_profile) else FINAL_ACCEPT_BUCKET_TARGETS
+
+    def bucket_key(record: dict[str, Any]) -> str:
+        difference_type = str(record.get("difference", {}).get("type", "")).strip()
+        if _is_exploration_profile(acceptance_profile) and difference_type in {"object_presence", "object_count"}:
+            return "object"
+        return difference_type
 
     def try_select(record: dict[str, Any]) -> bool:
         signature = _accepted_record_signature(record)
         proposal_id = str(record.get("proposal_id", "")).strip()
+        reference_video = str(record.get("reference_video", "")).strip()
         target_video = str(record.get("target_video", "")).strip()
         difference_type = str(record.get("difference", {}).get("type", "")).strip()
         if difference_type in FINAL_DISABLED_DIFFERENCE_TYPES and str(record.get("source_type", "natural")).strip() != "synthetic_edit":
             return False
         if signature in seen_signatures or proposal_id in selected_ids:
             return False
+        if _is_exploration_profile(acceptance_profile) and reference_video and reference_video in selected_reference_videos:
+            return False
+        if _is_exploration_profile(acceptance_profile) and difference_type == "audio_event":
+            quality = record.get("quality", {}) if isinstance(record.get("quality"), dict) else {}
+            if "audio_primary_allowed" in quality and _score_float(quality.get("audio_primary_allowed")) < 1.0:
+                return False
         if target_video and target_video in selected_target_videos:
             return False
         selected.append(record)
         seen_signatures.add(signature)
         selected_ids.add(proposal_id)
+        if reference_video:
+            selected_reference_videos.add(reference_video)
         if target_video:
             selected_target_videos.add(target_video)
         return True
 
-    for difference_type, target_count in FINAL_ACCEPT_BUCKET_TARGETS.items():
+    for target_bucket, target_count in bucket_targets.items():
         bucket_count = 0
         for record in accepted_candidates:
             if len(selected) >= max_accepted_pairs or bucket_count >= target_count:
                 break
-            if str(record.get("difference", {}).get("type", "")).strip() != difference_type:
+            if bucket_key(record) != target_bucket:
                 continue
             if try_select(record):
                 bucket_count += 1
@@ -10096,6 +10367,12 @@ def _select_final_accepted_records(
     for record in accepted_candidates:
         if len(selected) >= max_accepted_pairs:
             break
+        if _is_exploration_profile(acceptance_profile):
+            target_bucket = bucket_key(record)
+            if target_bucket not in bucket_targets:
+                continue
+            if sum(1 for item in selected if bucket_key(item) == target_bucket) >= bucket_targets[target_bucket]:
+                continue
         try_select(record)
 
     return [_accepted_sample_from_record(record, index + 1) for index, record in enumerate(selected)]
@@ -10132,6 +10409,7 @@ def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str
         "verification": dict(record.get("verification", {})),
         "edit_text_quality": dict(record.get("edit_text_quality", {})),
         "observable_difference": dict(record.get("observable_difference", {})),
+        "dominant_delta_decision": dict(record.get("dominant_delta_decision", {})),
         "competing_difference": dict(record.get("competing_difference", {})),
         "audio_event_evidence": dict(record.get("audio_event_evidence", {})),
         "speech_quality": dict(record.get("speech_quality", {})),
@@ -10289,6 +10567,8 @@ def _manual_review_item_markdown(
         f"- 参考视频描述: {metadata.get('reference_caption', '')}",
         f"- 目标视频描述: {metadata.get('target_caption', '')}",
         f"- difference: `{json.dumps(difference, ensure_ascii=False)}`",
+        f"- dominant_delta_decision: `{json.dumps(metadata.get('dominant_delta_decision', {}), ensure_ascii=False)}`",
+        "- 详细双视频描述: `description.md`",
         f"- verification.passed: `{verification.get('passed')}`",
         f"- observable_difference.passed: `{observable.get('passed')}`",
         f"- competing_difference.passed: `{competing.get('passed')}`",
@@ -10347,6 +10627,54 @@ def _manual_review_item_markdown(
             "",
         ]
     )
+    return "\n".join(lines)
+
+
+def _review_annotation_description(annotation: dict[str, Any], *, fallback_caption: str = "") -> dict[str, Any]:
+    return {
+        "summary": str(annotation.get("summary") or annotation.get("caption") or fallback_caption).strip(),
+        "subjects": _normalize_list(annotation.get("subjects", []))[:8],
+        "subject_signature": _annotation_subject_signature_bundle(annotation)[:8],
+        "attributes": _normalize_list(annotation.get("attributes", []))[:8],
+        "scene": str(annotation.get("scene", "")).strip(),
+        "scene_signature": _annotation_scene_signature_bundle(annotation)[:8],
+        "actions": _action_terms_from_annotation(annotation)[:8],
+        "object_counts": _normalize_object_counts(annotation.get("object_counts", {})),
+        "object_signature": _annotation_object_signature_bundle(annotation)[:8],
+        "visible_text": _visible_text_values(annotation)[:8],
+        "speech": _speech_texts_from_annotation(annotation)[:5],
+        "audio_events": _non_speech_audio_terms(annotation)[:8],
+    }
+
+
+def _manual_review_description_markdown(metadata: dict[str, Any]) -> str:
+    reference_description = metadata.get("reference_omni_description", {})
+    target_description = metadata.get("target_omni_description", {})
+    dominant_delta = metadata.get("dominant_delta_decision", {})
+    difference = metadata.get("difference") if isinstance(metadata.get("difference"), dict) else {}
+    lines = [
+        f"# Pair Description: {metadata.get('sample_id', '')}",
+        "",
+        f"- edit_text: {metadata.get('edit_text', '')}",
+        f"- difference: `{json.dumps(difference, ensure_ascii=False)}`",
+        f"- dominant_delta_decision: `{json.dumps(dominant_delta, ensure_ascii=False)}`",
+        f"- secondary_deltas: `{json.dumps(metadata.get('secondary_deltas', []), ensure_ascii=False)}`",
+        "",
+        "## Reference Omni Description",
+        "",
+        f"```json\n{json.dumps(reference_description, ensure_ascii=False, indent=2)}\n```",
+        "",
+        "## Target Omni Description",
+        "",
+        f"```json\n{json.dumps(target_description, ensure_ascii=False, indent=2)}\n```",
+        "",
+        "## Review Focus",
+        "",
+        "- 先判断 edit_text 是否描述了最显著主差异。",
+        "- 如果主体、场景、物体或动作明显变化，弱音频差异不能作为主主题。",
+        "- 只接受一个清楚、稳定、可描述的主变化。",
+        "",
+    ]
     return "\n".join(lines)
 
 
