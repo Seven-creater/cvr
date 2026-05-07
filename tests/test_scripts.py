@@ -116,6 +116,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("MODEL=${MODEL:-qwen3-omni}", script)
         self.assertIn("ZERO_ACCEPTED_STOP_AFTER=${ZERO_ACCEPTED_STOP_AFTER:-10}", script)
         self.assertIn("MAX_PROPOSALS=${MAX_PROPOSALS:-15}", script)
+        self.assertIn("ANNOTATION_TIMEOUT_SECONDS=${ANNOTATION_TIMEOUT_SECONDS:-900}", script)
         self.assertIn("SOURCE_SELECTION_MODE=${SOURCE_SELECTION_MODE:-random}", script)
         self.assertIn("SOURCE_SELECTION_RANDOM_SEED=${SOURCE_SELECTION_RANDOM_SEED:-}", script)
         self.assertIn("SOURCE_SELECTION_TOP_K=${SOURCE_SELECTION_TOP_K:-1}", script)
