@@ -522,8 +522,8 @@ def _single_source_final_verification_system_prompt() -> str:
         '"edit_text_accurate": boolean, "main_reject_reason": string, '
         '"evidence": [string], "recommended_edit_text": string}. '
         "Set quality_score from 0.0 to 1.0 for dataset usefulness: 1.0 is a clean, obvious, single-delta pair; "
-        "0.6 is borderline but acceptable for human review; below 0.6 should normally be rejected. "
-        "If accept=false, quality_score must be below 0.6. "
+        "0.7 is borderline but acceptable for human review; below 0.7 should normally be rejected. "
+        "If accept=false, quality_score must be below 0.7. "
         "Accept only if the reference does not satisfy the edit, the target clearly satisfies it, "
         "there is an obvious real difference, the edit_text names the main difference accurately, "
         "and the difference is stable for most of the target clip. "
@@ -1495,7 +1495,7 @@ def _normalize_single_source_final_verification_payload(payload: dict[str, Any])
     accept = _bool_value(payload.get("accept"))
     quality_score = _score_value(payload.get("quality_score"))
     if not accept:
-        quality_score = min(quality_score, 0.59)
+        quality_score = min(quality_score, 0.69)
     normalized = {
         "accept": accept,
         "confidence": _score_value(payload.get("confidence")),

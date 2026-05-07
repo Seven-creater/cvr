@@ -417,7 +417,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("random", selected["selection_mode"])
             self.assertEqual(7, selected["random_seed"])
 
-    def test_plan_single_source_clips_splits_30s_into_6_segments_and_15_pairs(self) -> None:
+    def test_plan_single_source_clips_splits_30s_into_5_segments_and_10_pairs_with_6s(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             ensure_layout(root)
@@ -444,7 +444,7 @@ class ComposedDataTests(unittest.TestCase):
                 clip_plan_output_path=root / "metadata" / "single_source_clip_plan.jsonl",
                 clip_groups_output_path=root / "metadata" / "single_source_clip_groups.jsonl",
                 whole_manifest_output_path=root / "metadata" / "selected_source_manifest.jsonl",
-                segment_seconds=5.0,
+                segment_seconds=6.0,
             )
 
             plan_records = [
@@ -453,11 +453,65 @@ class ComposedDataTests(unittest.TestCase):
                 if line.strip()
             ]
             group = json.loads((root / "metadata" / "single_source_clip_groups.jsonl").read_text(encoding="utf-8").splitlines()[0])
-            self.assertEqual(6, summary["segment_count"])
-            self.assertEqual(15, summary["pair_count"])
-            self.assertEqual(6, len(plan_records))
+            self.assertEqual(5, summary["segment_count"])
+            self.assertEqual(10, summary["pair_count"])
+            self.assertEqual(5, len(plan_records))
             self.assertEqual("single_source_video", group["group_reason"])
             self.assertEqual([record["clip_id"] for record in plan_records], group["candidate_clip_ids"])
+            self.assertEqual(0.0, plan_records[0]["start_seconds"])
+            self.assertEqual(6.0, plan_records[0]["end_seconds"])
+            self.assertEqual(24.0, plan_records[-1]["start_seconds"])
+            self.assertEqual(30.0, plan_records[-1]["end_seconds"])
+
+    def test_plan_single_source_clips_respects_worldsense_30s_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            source_video = root / "raw_datasets" / "worldsense" / "_extracted" / "videos_chunk_001" / "videos" / "AAWgrzYx.mp4"
+            source_video.parent.mkdir(parents=True)
+            source_video.write_bytes(b"x")
+            selected_path = root / "metadata" / "selected_source_video.json"
+            selected_path.write_text(
+                json.dumps(
+                    {
+                        "source_clip_id": "worldsense_AAWgrzYx",
+                        "dataset": "worldsense",
+                        "source_path": str(source_video),
+                        "duration_seconds": 131.0,
+                        "source_window_start_seconds": 30.0,
+                        "source_window_duration_seconds": 30.0,
+                        "media_probe": {"duration_seconds": 131.0, "has_audio": True, "has_video": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = plan_single_source_clips(
+                root=root,
+                selected_source_path=selected_path,
+                clip_plan_output_path=root / "metadata" / "single_source_clip_plan.jsonl",
+                clip_groups_output_path=root / "metadata" / "single_source_clip_groups.jsonl",
+                whole_manifest_output_path=root / "metadata" / "selected_source_manifest.jsonl",
+                segment_seconds=6.0,
+            )
+
+            plan_records = [
+                json.loads(line)
+                for line in (root / "metadata" / "single_source_clip_plan.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            whole = json.loads((root / "metadata" / "selected_source_manifest.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            group = json.loads((root / "metadata" / "single_source_clip_groups.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(5, summary["segment_count"])
+            self.assertEqual(10, summary["pair_count"])
+            self.assertEqual(30.0, plan_records[0]["start_seconds"])
+            self.assertEqual(36.0, plan_records[0]["end_seconds"])
+            self.assertEqual(54.0, plan_records[-1]["start_seconds"])
+            self.assertEqual(60.0, plan_records[-1]["end_seconds"])
+            self.assertEqual(30.0, whole["start_seconds"])
+            self.assertEqual(60.0, whole["end_seconds"])
+            self.assertEqual("worldsense", group["dataset"])
+            self.assertEqual(30.0, group["source_window_start_seconds"])
 
     def test_mine_single_source_pairs_builds_all_chronological_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -702,7 +756,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual([], ranked[0]["single_source_pair_acceptance_issues"])
             self.assertEqual("add_pip_demo", ranked[0]["single_source_delta_family"])
             self.assertTrue(ranked[0]["final_omni_accept"])
-            self.assertGreaterEqual(ranked[0]["final_omni_verification"]["quality_score"], 0.60)
+            self.assertGreaterEqual(ranked[0]["final_omni_verification"]["quality_score"], 0.70)
 
     def test_propose_single_source_pairs_rejects_low_final_omni_score(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -756,7 +810,7 @@ class ComposedDataTests(unittest.TestCase):
                 },
                 {"raw": "ok"},
             )
-            client.verify_single_source_pair_final.return_value = self._single_source_final_accept_payload(score=0.50)
+            client.verify_single_source_pair_final.return_value = self._single_source_final_accept_payload(score=0.69)
             with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
                 propose_single_source_pairs(
                     root=root,

@@ -35,7 +35,7 @@ DEFAULT_MINED_PAIR_CANDIDATES_NAME = "mined_pair_candidates.jsonl"
 DEFAULT_CANDIDATE_MINING_REPORT_NAME = "candidate_mining_report.md"
 DEFAULT_MAX_MINED_PAIR_CANDIDATES = 240
 DEFAULT_ZERO_ACCEPTED_STOP_AFTER = 0
-MIN_SINGLE_SOURCE_FINAL_OMNI_QUALITY_SCORE = 0.60
+MIN_SINGLE_SOURCE_FINAL_OMNI_QUALITY_SCORE = 0.70
 DEFAULT_SELECTED_SINGLE_SOURCE_NAME = "selected_source_video.json"
 DEFAULT_SINGLE_SOURCE_CANDIDATES_NAME = "selected_source_candidates.jsonl"
 DEFAULT_SINGLE_SOURCE_CLIP_PLAN_NAME = "single_source_clip_plan.jsonl"
@@ -1596,8 +1596,22 @@ def plan_single_source_clips(
     source_clip_id = str(selected.get("source_clip_id", "")).strip() or _stable_hash(str(source_path))
     dataset = str(selected.get("dataset", "daily_omni")).strip() or "daily_omni"
     safe_source_id = _safe_id(source_clip_id)
+    window_start = _optional_float(selected.get("source_window_start_seconds")) or 0.0
+    window_duration = _optional_float(selected.get("source_window_duration_seconds"))
+    if window_duration is None or window_duration <= 0:
+        window_duration = max(0.0, duration - window_start)
+    window_end = window_start + window_duration
+    if window_start < 0:
+        raise ValueError("source_window_start_seconds must be non-negative")
+    if window_duration <= 0:
+        raise ValueError("source_window_duration_seconds must be positive")
+    if window_end > duration + 0.05:
+        raise ValueError(
+            "selected source window exceeds media duration: "
+            f"start={window_start:.3f} duration={window_duration:.3f} media_duration={duration:.3f}"
+        )
     segments = _fixed_single_source_segments(
-        duration_seconds=duration,
+        duration_seconds=window_duration,
         segment_seconds=segment_seconds,
         min_clip_seconds=min_clip_seconds,
     )
@@ -1607,6 +1621,8 @@ def plan_single_source_clips(
     plan_records: list[dict[str, Any]] = []
     candidate_clip_ids: list[str] = []
     for segment_index, (start_seconds, end_seconds) in enumerate(segments, start=1):
+        absolute_start_seconds = round(window_start + start_seconds, 3)
+        absolute_end_seconds = round(window_start + end_seconds, 3)
         clip_id = f"{safe_source_id}__single_{segment_index:03d}"
         candidate_clip_ids.append(clip_id)
         plan_records.append(
@@ -1614,13 +1630,17 @@ def plan_single_source_clips(
                 "clip_id": clip_id,
                 "source_path": str(source_path),
                 "output_path": f"clips/single_source/{safe_source_id}/{clip_id}.mp4",
-                "start_seconds": round(start_seconds, 3),
-                "end_seconds": round(end_seconds, 3),
+                "start_seconds": absolute_start_seconds,
+                "end_seconds": absolute_end_seconds,
                 "duration_seconds": round(end_seconds - start_seconds, 3),
                 "role": "single_source_segment",
-                "notes": "fixed 5s single-source Omni pair segment",
+                "notes": f"fixed {segment_seconds:g}s single-source Omni pair segment",
                 "dataset": dataset,
                 "source_clip_id": source_clip_id,
+                "source_window_start_seconds": round(window_start, 3),
+                "source_window_duration_seconds": round(window_duration, 3),
+                "relative_start_seconds": round(start_seconds, 3),
+                "relative_end_seconds": round(end_seconds, 3),
                 "group_id": f"single_source_{safe_source_id}",
                 "source_row_ids": list(selected.get("source_row_ids", [])),
                 "text_fields": selected.get("text_fields", {}),
@@ -1634,22 +1654,27 @@ def plan_single_source_clips(
         "group_reason": "single_source_video",
         "source_clip_ids": [source_clip_id],
         "candidate_clip_ids": candidate_clip_ids,
-        "group_tags": ["single_source", "daily_omni", "fixed_segments"],
+        "group_tags": ["single_source", dataset, "fixed_segments"],
         "source_path": _display_source_path(layout["root"], str(source_path)),
         "media_probe": media,
         "segment_seconds": segment_seconds,
+        "source_window_start_seconds": round(window_start, 3),
+        "source_window_duration_seconds": round(window_duration, 3),
     }
+    whole_clip_id = f"{safe_source_id}__whole_window"
     whole_record = {
-        "clip_id": f"{safe_source_id}__whole_30s",
+        "clip_id": whole_clip_id,
         "source_path": str(source_path),
-        "output_path": str(source_path),
-        "start_seconds": 0.0,
-        "end_seconds": round(duration, 3),
-        "duration_seconds": round(duration, 3),
+        "output_path": f"clips/single_source/{safe_source_id}/{whole_clip_id}.mp4",
+        "start_seconds": round(window_start, 3),
+        "end_seconds": round(window_end, 3),
+        "duration_seconds": round(window_duration, 3),
         "role": "single_source_whole_video",
-        "notes": "whole 30s source video for global Omni description",
+        "notes": "30s single-source window for global Omni description",
         "dataset": dataset,
         "source_clip_id": source_clip_id,
+        "source_window_start_seconds": round(window_start, 3),
+        "source_window_duration_seconds": round(window_duration, 3),
         "group_id": f"single_source_{safe_source_id}",
         "source_row_ids": list(selected.get("source_row_ids", [])),
         "text_fields": selected.get("text_fields", {}),
@@ -1665,6 +1690,8 @@ def plan_single_source_clips(
         "whole_manifest_output_path": str(whole_manifest_output),
         "source_clip_id": source_clip_id,
         "source_path": str(source_path),
+        "source_window_start_seconds": round(window_start, 3),
+        "source_window_duration_seconds": round(window_duration, 3),
         "segment_count": len(plan_records),
         "pair_count": len(plan_records) * (len(plan_records) - 1) // 2,
         "segment_seconds": segment_seconds,
@@ -2071,7 +2098,15 @@ def propose_single_source_pairs(
         print(
             "[propose-single-source-pairs] wrote "
             f"proposal_count={len(output_records)} accepted_current={len(current_accepted)} "
-            f"accepted={bool(record.get('accepted'))} fallback={bool(record.get('fallback_used'))}",
+            f"proposal_id={record.get('proposal_id', '')} "
+            f"accepted={bool(record.get('accepted'))} "
+            f"final_omni_accept={bool(record.get('final_omni_accept'))} "
+            f"final_omni_quality_score={_score_float((record.get('final_omni_verification') or {}).get('quality_score')) if isinstance(record.get('final_omni_verification'), dict) else 0.0:.2f} "
+            f"difference_type={record.get('difference', {}).get('type', '') if isinstance(record.get('difference'), dict) else ''} "
+            f"delta_family={record.get('single_source_delta_family', '')} "
+            f"fallback={bool(record.get('fallback_used'))} "
+            f"issues={';'.join(str(issue) for issue in record.get('single_source_pair_acceptance_issues', []))} "
+            f"edit_text={str(record.get('edit_text', '')).replace(chr(10), ' ')[:180]}",
             file=sys.stderr,
             flush=True,
         )

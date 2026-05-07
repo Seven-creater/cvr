@@ -16,7 +16,8 @@ RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/single_source_omni_pair_pilot}
 MODEL=${MODEL:-qwen3-omni}
 BASE_URL=${BASE_URL:-http://127.0.0.1:8093/v1}
 SOURCE_CLIPS=${SOURCE_CLIPS:-$ROOT/metadata/source_clips_all.jsonl}
-SEGMENT_SECONDS=${SEGMENT_SECONDS:-5}
+DATASET=${DATASET:-daily_omni}
+SEGMENT_SECONDS=${SEGMENT_SECONDS:-6}
 CONCURRENCY=${CONCURRENCY:-1}
 MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-5}
 MAX_PROPOSALS=${MAX_PROPOSALS:-15}
@@ -44,6 +45,7 @@ Options:
   --model NAME
   --base-url URL
   --source-clips PATH
+  --dataset daily_omni|worldsense
   --segment-seconds N
   --concurrency N
   --max-accepted-pairs N
@@ -72,6 +74,7 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL="$2"; shift 2 ;;
     --base-url) BASE_URL="$2"; shift 2 ;;
     --source-clips) SOURCE_CLIPS="$2"; shift 2 ;;
+    --dataset) DATASET="$2"; shift 2 ;;
     --segment-seconds) SEGMENT_SECONDS="$2"; shift 2 ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
     --max-accepted-pairs) MAX_ACCEPTED_PAIRS="$2"; shift 2 ;;
@@ -171,6 +174,7 @@ SELECTED_SOURCE="$RUN_ROOT/selected_source_video.json"
 SOURCE_CANDIDATES="$RUN_ROOT/selected_source_candidates.jsonl"
 SOURCE_SELECTION_ANNOTATIONS="$RUN_ROOT/selected_source_selection_annotations.jsonl"
 WHOLE_MANIFEST="$RUN_ROOT/selected_source_manifest.jsonl"
+WHOLE_EXTRACTED_MANIFEST="$RUN_ROOT/extracted_single_source_whole.jsonl"
 CLIP_PLAN="$RUN_ROOT/single_source_clip_plan.jsonl"
 CLIP_GROUPS="$RUN_ROOT/single_source_clip_groups.jsonl"
 SEGMENTS_MANIFEST="$RUN_ROOT/extracted_single_source_clips.jsonl"
@@ -192,6 +196,7 @@ if stage_enabled select; then
     --output-path "$SELECTED_SOURCE"
     --candidates-output-path "$SOURCE_CANDIDATES"
     --selection-annotations-path "$SOURCE_SELECTION_ANNOTATIONS"
+    --dataset "$DATASET"
     --top-k "$SOURCE_SELECTION_TOP_K"
     --max-source-videos-scan "$SOURCE_SELECTION_SCAN_LIMIT"
     --max-eligible-candidates "$SOURCE_SELECTION_MAX_ELIGIBLE"
@@ -235,6 +240,11 @@ require_file "$WHOLE_MANIFEST" "whole source manifest"
 if stage_enabled extract; then
   python3 -m app.composed_data extract-clips \
     --root "$ROOT" \
+    --plan-path "$WHOLE_MANIFEST" \
+    --output-manifest-path "$WHOLE_EXTRACTED_MANIFEST" \
+    --overwrite
+  python3 -m app.composed_data extract-clips \
+    --root "$ROOT" \
     --plan-path "$CLIP_PLAN" \
     --output-manifest-path "$SEGMENTS_MANIFEST" \
     --overwrite
@@ -243,11 +253,15 @@ else
 fi
 
 require_file "$SEGMENTS_MANIFEST" "extracted single source clips"
+WHOLE_ANNOTATION_MANIFEST="$WHOLE_EXTRACTED_MANIFEST"
+if [ ! -s "$WHOLE_ANNOTATION_MANIFEST" ]; then
+  WHOLE_ANNOTATION_MANIFEST="$WHOLE_MANIFEST"
+fi
 if stage_enabled annotate; then
   run_with_timeout "annotate-whole-source" "$ANNOTATION_TIMEOUT_SECONDS" \
     python3 -m app.composed_data detective-annotate-clips \
       --root "$ROOT" \
-      --clips-manifest-path "$WHOLE_MANIFEST" \
+      --clips-manifest-path "$WHOLE_ANNOTATION_MANIFEST" \
       --output-path "$WHOLE_ANNOTATION" \
       --base-url "$BASE_URL" \
       --api-key EMPTY \
@@ -312,11 +326,21 @@ if [ "$JUDGED_COUNT" -ge "$ZERO_ACCEPTED_STOP_AFTER" ] && [ "$ZERO_ACCEPTED_STOP
 fi
 
 if stage_enabled validate; then
-  python3 -m app.composed_data validate-pilot \
-    --root "$ROOT" \
-    --pilot-jsonl-path "$ACCEPTED_PAIRS" \
-    --gallery-output-path "$GALLERY" \
-    --report-output-path "$PILOT_REVIEW"
+  if [ "$ACCEPTED_COUNT" -eq 0 ]; then
+    echo "[single-source-omni] skip validate because accepted_pairs is empty; keep source as diagnostic"
+    : > "$GALLERY"
+    {
+      echo "# Single-source pilot review"
+      echo
+      echo "No accepted pairs for this source. Inspect ranked pairs and diagnostic review bundle."
+    } > "$PILOT_REVIEW"
+  else
+    python3 -m app.composed_data validate-pilot \
+      --root "$ROOT" \
+      --pilot-jsonl-path "$ACCEPTED_PAIRS" \
+      --gallery-output-path "$GALLERY" \
+      --report-output-path "$PILOT_REVIEW"
+  fi
 else
   echo "[single-source-omni] skip validate start_stage=$START_STAGE"
 fi

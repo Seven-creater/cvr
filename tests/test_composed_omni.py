@@ -284,7 +284,7 @@ class ComposedOmniClientTests(unittest.TestCase):
                             {
                                 "accept": True,
                                 "confidence": 0.82,
-                                "quality_score": 0.64,
+                                "quality_score": 0.74,
                                 "reference_satisfies_edit": False,
                                 "target_satisfies_edit": True,
                                 "observable_delta": True,
@@ -331,7 +331,7 @@ class ComposedOmniClientTests(unittest.TestCase):
                 )
 
         self.assertTrue(normalized["accept"])
-        self.assertEqual(0.64, normalized["quality_score"])
+        self.assertEqual(0.74, normalized["quality_score"])
         self.assertEqual("add a static product image overlay on the left", normalized["recommended_edit_text"])
         request_body = json.loads(request_holder["request"].data.decode("utf-8"))
         content = request_body["messages"][1]["content"]
@@ -340,7 +340,7 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertEqual("Target clip for final verification:", content[2]["text"])
         self.assertTrue(content[3]["video_url"]["url"].startswith("data:video/mp4;base64,"))
         self.assertIn("quality_score", request_body["messages"][0]["content"])
-        self.assertIn("0.6 is borderline", request_body["messages"][0]["content"])
+        self.assertIn("0.7 is borderline", request_body["messages"][0]["content"])
 
     def test_verify_single_source_pair_final_caps_rejected_quality_score(self) -> None:
         response_payload = {
@@ -394,7 +394,7 @@ class ComposedOmniClientTests(unittest.TestCase):
                 )
 
         self.assertFalse(normalized["accept"])
-        self.assertEqual(0.59, normalized["quality_score"])
+        self.assertEqual(0.69, normalized["quality_score"])
 
     def test_plan_video_edit_materializes_reference_video_and_normalizes_plan(self) -> None:
         request_holder: dict[str, object] = {}
