@@ -22,6 +22,7 @@ from app.composed_data import (
     _edit_text_quality_payload,
     _build_pair_candidates,
     _build_proposal_id,
+    _candidate_pre_propose_reject_reasons,
     _finalize_pair_verification,
     _has_intraclip_difference_conflict,
     _judge_accepts,
@@ -1890,6 +1891,95 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(1, summary["proposal_count"])
             client_cls.return_value.propose_pair.assert_called_once()
 
+    def test_propose_group_pairs_stops_after_zero_accepted_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("clip_ref.mp4", "clip_target.mp4", "clip_neg1.mp4", "clip_neg2.mp4"):
+                (root / "clips" / name).write_bytes(b"x")
+            annotations_path = root / "captions" / "detective_annotations.jsonl"
+            annotations = []
+            for clip_id, output_path, count in (
+                ("clip_ref", "clips/clip_ref.mp4", 1),
+                ("clip_target", "clips/clip_target.mp4", 2),
+                ("clip_neg1", "clips/clip_neg1.mp4", 1),
+                ("clip_neg2", "clips/clip_neg2.mp4", 1),
+            ):
+                annotations.append(
+                    {
+                        "clip_id": clip_id,
+                        "output_path": output_path,
+                        "source_asset_id": "source_cat",
+                        "source_path": "raw/cats.mp4",
+                        "summary": f"{count} orange cat resting on a sofa",
+                        "subjects": ["cat"],
+                        "object_counts": {"cat": count},
+                        "actions": ["resting"],
+                        "scene": "living room",
+                        "attributes": ["orange"],
+                        "visible_text": [],
+                        "speech": [],
+                        "audio_events": ["quiet room"],
+                        "modalities": ["visual", "audio"],
+                        "fallback_used": False,
+                    }
+                )
+            self._write_jsonl(annotations_path, annotations)
+            groups_path = root / "metadata" / "clip_groups.jsonl"
+            self._write_jsonl(
+                groups_path,
+                [{"group_id": "group_cat_room", "candidate_clip_ids": ["clip_ref", "clip_target", "clip_neg1", "clip_neg2"]}],
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient") as client_cls:
+                client_cls.return_value.propose_pair.side_effect = lambda **kwargs: (
+                    {
+                        "edit_text": "change the number of cat from 1 to 2",
+                        "modalities": ["visual"],
+                        "reference_caption": "one orange cat resting on a sofa",
+                        "target_caption": "two orange cats resting on a sofa",
+                        "difference": {
+                            "type": "object_count",
+                            "from": "1 cat",
+                            "to": "2 cat",
+                        },
+                        "proposal_reason": "test proposal",
+                    },
+                    {"provider": "mock"},
+                )
+                client_cls.return_value.judge_pair.return_value = (
+                    {
+                        "reference_satisfies_edit": False,
+                        "target_satisfies_edit": False,
+                        "single_main_difference": False,
+                        "same_context_score": 0.5,
+                        "edit_match_score": 0.5,
+                        "target_uniqueness_score": 0.5,
+                        "audio_required": False,
+                        "hard_negative_quality": "bad",
+                        "accept": False,
+                        "reject_reason": "test reject",
+                    },
+                    {"provider": "mock-judge"},
+                )
+
+                summary = propose_group_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    clip_groups_path=groups_path,
+                    output_path=root / "pairs" / "judged_pair_proposals.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    max_proposals=10,
+                    zero_accepted_stop_after=2,
+                )
+
+            self.assertEqual(2, summary["proposal_count"])
+            self.assertEqual(0, summary["accepted_count"])
+            self.assertIn("zero accepted after 2 judged proposals", summary["early_stop_reason"])
+
     def test_propose_group_pairs_retargets_secondary_audio_mined_candidate_to_subject_attribute(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2262,6 +2352,8 @@ class ComposedDataTests(unittest.TestCase):
             "7",
             "--max-proposals",
             "11",
+            "--zero-accepted-stop-after",
+            "10",
             "--timeout-seconds",
             "66",
         ]
@@ -2273,6 +2365,7 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertEqual(7, propose_mock.call_args.kwargs["max_accepted_pairs"])
         self.assertEqual(11, propose_mock.call_args.kwargs["max_proposals"])
+        self.assertEqual(10, propose_mock.call_args.kwargs["zero_accepted_stop_after"])
         self.assertEqual(66.0, propose_mock.call_args.kwargs["timeout_seconds"])
         self.assertEqual("/tmp/mined.jsonl", propose_mock.call_args.kwargs["mined_candidates_path"])
 
@@ -8426,6 +8519,27 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(any("audio_event cannot be the primary edit" in issue for issue in issues))
             self.assertEqual(0.0, record["quality"]["audio_primary_allowed"])
             self.assertIn("attribute", record["quality"]["dominant_delta_decision"]["visual_delta_types"])
+
+    def test_pre_propose_filter_blocks_visual_candidate_with_disabled_text_or_speech_competitor(self) -> None:
+        candidate = {
+            "primary_difference": {"type": "object_presence", "from": "bottles", "to": "animated image"},
+            "reference_annotation": {
+                "summary": "A presenter talks beside bottles.",
+                "visible_text": ["SUBSCRIBE"],
+                "speech": ["welcome to the bottle demonstration"],
+            },
+            "target_annotation": {
+                "summary": "A presenter talks beside an animated image.",
+                "visible_text": ["PLAY NOW"],
+                "speech": ["now watch this animated example"],
+            },
+        }
+
+        reasons = _candidate_pre_propose_reject_reasons(candidate, acceptance_profile="exploration")
+
+        self.assertIn("competing_disabled_visible_text", reasons)
+        self.assertIn("competing_disabled_speech", reasons)
+        self.assertEqual([], _candidate_pre_propose_reject_reasons(candidate, acceptance_profile="final"))
 
     def test_judge_accepts_exploration_audio_speech_content_reject_as_diagnostic(self) -> None:
         judge = {

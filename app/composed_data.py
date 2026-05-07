@@ -33,6 +33,7 @@ DEFAULT_SYNTHETIC_PILOT_REVIEW_NAME = "synthetic_pilot_review.md"
 DEFAULT_MINED_PAIR_CANDIDATES_NAME = "mined_pair_candidates.jsonl"
 DEFAULT_CANDIDATE_MINING_REPORT_NAME = "candidate_mining_report.md"
 DEFAULT_MAX_MINED_PAIR_CANDIDATES = 240
+DEFAULT_ZERO_ACCEPTED_STOP_AFTER = 0
 DEFAULT_VIDEO_EDIT_PLAN_NAME = "video_edit_plan.jsonl"
 DEFAULT_VIDEO_EDIT_PLANNER_CACHE_NAME = "video_edit_planner_cache.jsonl"
 DEFAULT_VIDEO_MASK_PLAN_NAME = "video_mask_plan.jsonl"
@@ -2806,6 +2807,7 @@ def propose_group_pairs(
     timeout_seconds: float = 180.0,
     max_accepted_pairs: int = 10,
     max_proposals: int | None = None,
+    zero_accepted_stop_after: int = DEFAULT_ZERO_ACCEPTED_STOP_AFTER,
     acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> dict[str, Any]:
     acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
@@ -2867,6 +2869,9 @@ def propose_group_pairs(
     fallback_count = 0
     rejected_count = 0
     accepted_total_count = 0
+    pre_propose_rejected_count = 0
+    pre_propose_reject_counts: Counter[str] = Counter()
+    early_stop_reason = ""
     seen_proposal_ids: set[str] = set()
 
     def persist_progress() -> None:
@@ -2878,6 +2883,21 @@ def propose_group_pairs(
         _write_jsonl(output, output_records)
         _write_jsonl(accepted_output, current_accepted)
 
+    def filter_pre_propose_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        nonlocal pre_propose_rejected_count
+        filtered: list[dict[str, Any]] = []
+        for candidate in candidates:
+            reasons = _candidate_pre_propose_reject_reasons(
+                candidate,
+                acceptance_profile=acceptance_profile,
+            )
+            if reasons:
+                pre_propose_rejected_count += 1
+                pre_propose_reject_counts.update(reasons)
+                continue
+            filtered.append(candidate)
+        return filtered
+
     if mined_path is not None:
         mined_records = list(_load_jsonl(mined_path))
         print(
@@ -2885,7 +2905,7 @@ def propose_group_pairs(
             file=sys.stderr,
             flush=True,
         )
-        mined_candidates = [
+        mined_candidates = filter_pre_propose_candidates([
             candidate
             for candidate in (
                 _candidate_from_mined_record(
@@ -2897,7 +2917,14 @@ def propose_group_pairs(
                 for record in mined_records
             )
             if candidate is not None
-        ]
+        ])
+        if pre_propose_rejected_count:
+            print(
+                "[propose-group-pairs] pre-propose filtered "
+                f"count={pre_propose_rejected_count} reasons={dict(pre_propose_reject_counts)}",
+                file=sys.stderr,
+                flush=True,
+            )
         candidate_batches = [
             (
                 1,
@@ -2932,10 +2959,12 @@ def propose_group_pairs(
             )
             if len(group_annotations) < 4:
                 continue
-            candidates = _build_pair_candidates(root=layout["root"], annotations=group_annotations)
+            candidates = filter_pre_propose_candidates(_build_pair_candidates(root=layout["root"], annotations=group_annotations))
             candidate_batches.append((group_index, len(groups), group_metadata, candidates, group_annotations))
 
     for group_index, group_total, group_metadata, candidates, group_annotations in candidate_batches:
+        if early_stop_reason:
+            break
         print(
             "[propose-group-pairs] group "
             f"{group_index}/{group_total} built_candidates={len(candidates)} total_candidate_count={candidate_count + len(candidates)}",
@@ -3227,15 +3256,32 @@ def propose_group_pairs(
                 rejected_count += 1
             output_records.append(record)
             persist_progress()
+            current_accepted_records = _select_final_accepted_records(
+                output_records,
+                max_accepted_pairs=max_accepted_pairs,
+                acceptance_profile=acceptance_profile,
+            )
             print(
                 "[propose-group-pairs] wrote "
                 f"proposal_count={len(output_records)} accepted_current="
-                f"{len(_select_final_accepted_records(output_records, max_accepted_pairs=max_accepted_pairs, acceptance_profile=acceptance_profile))} "
+                f"{len(current_accepted_records)} "
                 f"accepted={bool(record.get('accepted'))} fallback={bool(record.get('fallback_used'))} "
                 f"skipped_video={bool(record.get('verification_skipped_before_video'))}",
                 file=sys.stderr,
                 flush=True,
             )
+            if (
+                zero_accepted_stop_after
+                and zero_accepted_stop_after > 0
+                and len(output_records) >= zero_accepted_stop_after
+                and not current_accepted_records
+            ):
+                early_stop_reason = (
+                    f"zero accepted after {len(output_records)} judged proposals; "
+                    "stop early because candidate mining or gate logic needs inspection"
+                )
+                print(f"[propose-group-pairs] EARLY_STOP: {early_stop_reason}", file=sys.stderr, flush=True)
+                break
         if max_proposals is not None and len(output_records) >= max_proposals:
             break
 
@@ -3265,6 +3311,10 @@ def propose_group_pairs(
         "proposed_count": proposed_count,
         "reused_count": reused_count,
         "fallback_count": fallback_count,
+        "pre_propose_rejected_count": pre_propose_rejected_count,
+        "pre_propose_reject_counts": dict(pre_propose_reject_counts),
+        "early_stop_reason": early_stop_reason,
+        "zero_accepted_stop_after": zero_accepted_stop_after,
         "verification_counts": verification_counts,
         "thresholds": {
             "same_context_score": _profile_threshold(acceptance_profile, "same_context_score"),
@@ -6319,6 +6369,29 @@ def _retarget_audio_secondary_candidate_to_dominant_visual(candidate: dict[str, 
         mined_candidate["retargeted_from_difference_type"] = "audio_event"
         retargeted["mined_candidate"] = mined_candidate
     return retargeted
+
+
+def _candidate_pre_propose_reject_reasons(
+    candidate: dict[str, Any],
+    *,
+    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
+) -> list[str]:
+    if not _is_exploration_profile(acceptance_profile):
+        return []
+
+    difference = candidate.get("primary_difference", {})
+    difference_type = str(difference.get("type", "")).strip() if isinstance(difference, dict) else ""
+    reference_annotation = candidate.get("reference_annotation", {})
+    target_annotation = candidate.get("target_annotation", {})
+    reasons: list[str] = []
+    if difference_type in FINAL_DISABLED_DIFFERENCE_TYPES:
+        reasons.append(f"disabled_primary_{difference_type}")
+    if difference_type not in {"visible_text", "speech"}:
+        if _strong_visible_text_delta(reference_annotation, target_annotation):
+            reasons.append("competing_disabled_visible_text")
+        if _strong_speech_delta(reference_annotation, target_annotation):
+            reasons.append("competing_disabled_speech")
+    return _dedupe_strings(reasons)
 
 
 def _maybe_reorient_candidate_for_model_fields(
@@ -14150,6 +14223,7 @@ def build_parser() -> argparse.ArgumentParser:
     propose_group_pairs_parser.add_argument("--timeout-seconds", type=float, default=180.0)
     propose_group_pairs_parser.add_argument("--max-accepted-pairs", type=int, default=10)
     propose_group_pairs_parser.add_argument("--max-proposals", type=int)
+    propose_group_pairs_parser.add_argument("--zero-accepted-stop-after", type=int, default=DEFAULT_ZERO_ACCEPTED_STOP_AFTER)
     propose_group_pairs_parser.add_argument("--acceptance-profile", choices=sorted(ACCEPTANCE_PROFILE_NAMES), default=DEFAULT_ACCEPTANCE_PROFILE)
     propose_group_pairs_parser.add_argument("--overwrite", action="store_true")
 
@@ -14377,6 +14451,7 @@ def main() -> None:
             timeout_seconds=args.timeout_seconds,
             max_accepted_pairs=args.max_accepted_pairs,
             max_proposals=args.max_proposals,
+            zero_accepted_stop_after=args.zero_accepted_stop_after,
             acceptance_profile=args.acceptance_profile,
             overwrite=args.overwrite,
         )

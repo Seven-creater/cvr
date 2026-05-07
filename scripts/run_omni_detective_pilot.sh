@@ -24,6 +24,7 @@ ANNOTATION_PASS_TIMEOUT_SECONDS=${ANNOTATION_PASS_TIMEOUT_SECONDS:-900}
 MINE_CANDIDATES_TIMEOUT_SECONDS=${MINE_CANDIDATES_TIMEOUT_SECONDS:-120}
 PROPOSE_TIMEOUT_SECONDS=${PROPOSE_TIMEOUT_SECONDS:-900}
 PAIR_REQUEST_TIMEOUT_SECONDS=${PAIR_REQUEST_TIMEOUT_SECONDS:-90}
+ZERO_ACCEPTED_STOP_AFTER=${ZERO_ACCEPTED_STOP_AFTER:-10}
 START_STAGE=${START_STAGE:-plan}
 ALLOW_PARTIAL_ANNOTATIONS=${ALLOW_PARTIAL_ANNOTATIONS:-0}
 MODEL_STAGE=${MODEL_STAGE:-instruct}
@@ -52,6 +53,7 @@ Options:
   --mine-candidates-timeout-seconds N
   --propose-timeout-seconds N
   --pair-request-timeout-seconds N
+  --zero-accepted-stop-after N
   --acceptance-profile exploration|final
   --start-stage plan|extract|annotate|mine-candidates|propose|validate|review
   --allow-partial-annotations
@@ -126,6 +128,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --pair-request-timeout-seconds)
       PAIR_REQUEST_TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
+    --zero-accepted-stop-after)
+      ZERO_ACCEPTED_STOP_AFTER="$2"
       shift 2
       ;;
     --acceptance-profile)
@@ -321,7 +327,7 @@ echo "[omni-detective] model=$MODEL"
 echo "[resource-policy] one Omni model per run; do not keep Captioner/Instruct/Thinking loaded together"
 echo "[resource-policy] model_stage=$MODEL_STAGE gpu_ids=${GPU_IDS:-unset} gpu_count=$GPU_COUNT max_gpus=$MAX_GPUS"
 echo "[omni-detective] start_stage=$START_STAGE"
-echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS max_mined_candidates=$MAX_MINED_CANDIDATES annotation_max_passes=$ANNOTATION_MAX_PASSES annotation_pass_timeout_seconds=$ANNOTATION_PASS_TIMEOUT_SECONDS mine_candidates_timeout_seconds=$MINE_CANDIDATES_TIMEOUT_SECONDS propose_timeout_seconds=$PROPOSE_TIMEOUT_SECONDS pair_request_timeout_seconds=$PAIR_REQUEST_TIMEOUT_SECONDS acceptance_profile=$ACCEPTANCE_PROFILE allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
+echo "[omni-detective] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS max_mined_candidates=$MAX_MINED_CANDIDATES annotation_max_passes=$ANNOTATION_MAX_PASSES annotation_pass_timeout_seconds=$ANNOTATION_PASS_TIMEOUT_SECONDS mine_candidates_timeout_seconds=$MINE_CANDIDATES_TIMEOUT_SECONDS propose_timeout_seconds=$PROPOSE_TIMEOUT_SECONDS pair_request_timeout_seconds=$PAIR_REQUEST_TIMEOUT_SECONDS zero_accepted_stop_after=$ZERO_ACCEPTED_STOP_AFTER acceptance_profile=$ACCEPTANCE_PROFILE allow_partial_annotations=$ALLOW_PARTIAL_ANNOTATIONS"
 if stage_enabled "annotate" || { stage_enabled "propose" && [ "$MAX_PROPOSALS" != "0" ]; }; then
   probe_omni_model
 else
@@ -468,6 +474,7 @@ if stage_enabled "propose"; then
     --timeout-seconds "$PAIR_REQUEST_TIMEOUT_SECONDS" \
     --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
     --max-proposals "$MAX_PROPOSALS" \
+    --zero-accepted-stop-after "$ZERO_ACCEPTED_STOP_AFTER" \
     --acceptance-profile "$ACCEPTANCE_PROFILE" \
     --overwrite
   PROPOSE_STATUS=$?
@@ -478,6 +485,10 @@ if stage_enabled "propose"; then
   if [ "$PROPOSE_STATUS" -ne 0 ]; then
     echo "[omni-detective] propose failed or timed out; report this status immediately instead of waiting" >&2
     exit "$PROPOSE_STATUS"
+  fi
+  if [ "$ZERO_ACCEPTED_STOP_AFTER" -gt 0 ] && [ "$PROPOSAL_ROW_COUNT" -ge "$ZERO_ACCEPTED_STOP_AFTER" ] && [ "$ACCEPTED_ROW_COUNT" -eq 0 ]; then
+    echo "[omni-detective] EARLY_STOP: $PROPOSAL_ROW_COUNT judged and 0 accepted; report this status immediately instead of waiting" >&2
+    exit 10
   fi
 
   echo "[omni-detective] group proposal and judge done $(date)"
