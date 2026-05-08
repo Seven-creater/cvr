@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
+import os
 from pathlib import Path
+import shutil
 import time
 from typing import Any
 
@@ -71,14 +73,27 @@ def write_triplet_outputs(
     triplets: list[RefTargetEditTriplet],
     invalids: list[InvalidSample],
     summary: dict[str, Any],
+    materialize_videos: bool = True,
+    link_mode: str = "symlink",
 ) -> None:
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
+    output_triplets = (
+        _materialize_triplet_media(triplets, root=root, link_mode=link_mode)
+        if materialize_videos
+        else list(triplets)
+    )
+    summary = {
+        **summary,
+        "materialized_triplets_root": str(root / "triplets_media") if materialize_videos else "",
+        "materialized_videos": bool(materialize_videos),
+        "link_mode": link_mode if materialize_videos else "",
+    }
     _write_text_if_changed(
         root / "triplets.jsonl",
-        "".join(json.dumps(asdict(item), ensure_ascii=False) + "\n" for item in triplets),
+        "".join(json.dumps(asdict(item), ensure_ascii=False) + "\n" for item in output_triplets),
     )
-    _write_triplet_csv(root / "triplets.csv", triplets)
+    _write_triplet_csv(root / "triplets.csv", output_triplets)
     _write_text_if_changed(root / "summary.json", json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
     if invalids:
         _write_text_if_changed(
@@ -96,7 +111,14 @@ def build_and_write_triplets(args: argparse.Namespace) -> dict[str, Any]:
     triplets, invalids, summary = build_triplets(args.dataset_root, expected_count=args.expected_count)
     summary = dict(summary)
     summary["output_dir"] = str(output_dir)
-    write_triplet_outputs(output_dir=output_dir, triplets=triplets, invalids=invalids, summary=summary)
+    write_triplet_outputs(
+        output_dir=output_dir,
+        triplets=triplets,
+        invalids=invalids,
+        summary=summary,
+        materialize_videos=not args.no_materialize_videos,
+        link_mode=args.link_mode,
+    )
 
     errors: list[str] = []
     if invalids:
@@ -115,6 +137,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-root", default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--output-dir")
     parser.add_argument("--expected-count", type=int, default=DEFAULT_EXPECTED_COUNT)
+    parser.add_argument("--link-mode", choices=("symlink", "hardlink", "copy"), default="symlink")
+    parser.add_argument("--no-materialize-videos", action="store_true")
     return parser
 
 
@@ -243,6 +267,70 @@ def _write_triplet_csv(path: Path, triplets: list[RefTargetEditTriplet]) -> None
         temp_path.unlink()
     else:
         temp_path.replace(path)
+
+
+def _materialize_triplet_media(
+    triplets: list[RefTargetEditTriplet],
+    *,
+    root: Path,
+    link_mode: str,
+) -> list[RefTargetEditTriplet]:
+    materialized: list[RefTargetEditTriplet] = []
+    media_root = root / "triplets_media"
+    for item in triplets:
+        sample_root = media_root / item.sample_id
+        sample_root.mkdir(parents=True, exist_ok=True)
+        reference_dst = sample_root / "reference.mp4"
+        target_dst = sample_root / "target.mp4"
+        _materialize_file(Path(item.reference_video), reference_dst, mode=link_mode)
+        _materialize_file(Path(item.target_video), target_dst, mode=link_mode)
+        _write_text_if_changed(sample_root / "edit_text.txt", item.edit_text + "\n")
+        materialized.append(
+            replace(
+                item,
+                reference_video=str(reference_dst),
+                target_video=str(target_dst),
+            )
+        )
+    return materialized
+
+
+def _materialize_file(src: Path, dst: Path, *, mode: str) -> None:
+    src = src.resolve()
+    if dst.exists() or dst.is_symlink():
+        if _materialized_matches(src, dst):
+            return
+        dst.unlink()
+    if mode == "copy":
+        shutil.copy2(src, dst)
+        return
+    if mode == "hardlink":
+        try:
+            os.link(src, dst)
+            return
+        except OSError:
+            shutil.copy2(src, dst)
+            return
+    try:
+        dst.symlink_to(src)
+    except OSError:
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+
+
+def _materialized_matches(src: Path, dst: Path) -> bool:
+    try:
+        if dst.is_symlink():
+            return dst.resolve() == src
+        if os.path.samefile(src, dst):
+            return True
+        src_stat = src.stat()
+        dst_stat = dst.stat()
+        return dst_stat.st_size == src_stat.st_size and dst_stat.st_mtime_ns == src_stat.st_mtime_ns
+    except OSError:
+        return False
 
 
 def _write_text_if_changed(path: Path, text: str) -> None:

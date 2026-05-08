@@ -9,6 +9,8 @@ DATASET_ROOT=${DATASET_ROOT:-/data02/usr/wangqihao/Demo/test/data}
 RUNS_ROOT=${RUNS_ROOT:-/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs}
 OUTPUT_DIR=${OUTPUT_DIR:-$RUNS_ROOT/composed_triplets_full_$(date +%Y%m%d_%H%M%S)}
 EXPECTED_COUNT=${EXPECTED_COUNT:-943}
+LINK_MODE=${LINK_MODE:-symlink}
+MATERIALIZE_VIDEOS=${MATERIALIZE_VIDEOS:-1}
 
 usage() {
   cat <<'EOF'
@@ -21,6 +23,8 @@ Options:
   --dataset-root PATH
   --output-dir PATH
   --expected-count N
+  --link-mode symlink|hardlink|copy
+  --no-materialize-videos
   -h, --help
 EOF
 }
@@ -30,6 +34,8 @@ while [[ $# -gt 0 ]]; do
     --dataset-root) DATASET_ROOT="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --expected-count) EXPECTED_COUNT="$2"; shift 2 ;;
+    --link-mode) LINK_MODE="$2"; shift 2 ;;
+    --no-materialize-videos) MATERIALIZE_VIDEOS=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[build-composed-triplets] unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -44,10 +50,18 @@ echo "[build-composed-triplets] repo=$REPO_ROOT"
 echo "[build-composed-triplets] dataset_root=$DATASET_ROOT"
 echo "[build-composed-triplets] output_dir=$OUTPUT_DIR"
 echo "[build-composed-triplets] expected_count=$EXPECTED_COUNT"
+echo "[build-composed-triplets] materialize_videos=$MATERIALIZE_VIDEOS link_mode=$LINK_MODE"
+
+EXTRA_ARGS=(--link-mode "$LINK_MODE")
+if [ "$MATERIALIZE_VIDEOS" = "0" ]; then
+  EXTRA_ARGS+=(--no-materialize-videos)
+fi
 
 python3 -m app.composed_triplets \
   --dataset-root "$DATASET_ROOT" \
   --output-dir "$OUTPUT_DIR" \
-  --expected-count "$EXPECTED_COUNT"
+  --expected-count "$EXPECTED_COUNT" \
+  "${EXTRA_ARGS[@]}"
 
 echo "[build-composed-triplets] wrote $OUTPUT_DIR/triplets.jsonl"
+echo "[build-composed-triplets] media root: $OUTPUT_DIR/triplets_media"

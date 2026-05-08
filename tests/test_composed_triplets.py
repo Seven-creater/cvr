@@ -18,22 +18,36 @@ class ComposedTripletTests(unittest.TestCase):
 
             triplets, invalids, summary = build_triplets(root, expected_count=2)
             output_dir = root / "out"
-            write_triplet_outputs(output_dir=output_dir, triplets=triplets, invalids=invalids, summary=summary)
+            write_triplet_outputs(
+                output_dir=output_dir,
+                triplets=triplets,
+                invalids=invalids,
+                summary=summary,
+                link_mode="copy",
+            )
 
             jsonl_lines = (output_dir / "triplets.jsonl").read_text(encoding="utf-8").splitlines()
             csv_text = (output_dir / "triplets.csv").read_text(encoding="utf-8")
             summary_payload = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+            first_triplet = json.loads(jsonl_lines[0])
+            reference_video_exists = Path(first_triplet["reference_video"]).exists()
+            target_video_exists = Path(first_triplet["target_video"]).exists()
+            edit_text_exists = (output_dir / "triplets_media" / "00001_daily_case" / "edit_text.txt").exists()
 
         self.assertEqual([], invalids)
         self.assertEqual(2, len(jsonl_lines))
-        self.assertEqual("00001_daily_case", json.loads(jsonl_lines[0])["sample_id"])
+        self.assertEqual("00001_daily_case", first_triplet["sample_id"])
         self.assertIn("reference_video", jsonl_lines[0])
         self.assertIn("target_video", jsonl_lines[0])
         self.assertIn("edit_text", jsonl_lines[0])
         self.assertNotIn("target_caption", jsonl_lines[0])
+        self.assertTrue(reference_video_exists)
+        self.assertTrue(target_video_exists)
+        self.assertTrue(edit_text_exists)
         self.assertIn("sample_id,reference_video,target_video,edit_text", csv_text)
         self.assertEqual(2, summary_payload["valid_triplets"])
         self.assertEqual({"daily_omni": 1, "worldsense": 1, "unknown": 0}, summary_payload["dataset_counts"])
+        self.assertTrue(summary_payload["materialized_videos"])
 
     def test_strict_command_fails_and_writes_invalid_samples_for_missing_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -41,7 +55,13 @@ class ComposedTripletTests(unittest.TestCase):
             self._write_sample(root / "00001_good")
             self._write_sample(root / "00002_bad", include_target=False)
             output_dir = root / "out"
-            args = argparse.Namespace(dataset_root=str(root), output_dir=str(output_dir), expected_count=2)
+            args = argparse.Namespace(
+                dataset_root=str(root),
+                output_dir=str(output_dir),
+                expected_count=2,
+                no_materialize_videos=False,
+                link_mode="copy",
+            )
 
             with self.assertRaises(SystemExit):
                 build_and_write_triplets(args)
@@ -57,7 +77,13 @@ class ComposedTripletTests(unittest.TestCase):
             root = Path(temp_dir)
             self._write_sample(root / "00001_bad", edit_text="")
             output_dir = root / "out"
-            args = argparse.Namespace(dataset_root=str(root), output_dir=str(output_dir), expected_count=1)
+            args = argparse.Namespace(
+                dataset_root=str(root),
+                output_dir=str(output_dir),
+                expected_count=1,
+                no_materialize_videos=False,
+                link_mode="copy",
+            )
 
             with self.assertRaises(SystemExit):
                 build_and_write_triplets(args)
@@ -82,7 +108,13 @@ class ComposedTripletTests(unittest.TestCase):
             root = Path(temp_dir)
             self._write_sample(root / "00001_case")
             output_dir = root / "out"
-            args = argparse.Namespace(dataset_root=str(root), output_dir=str(output_dir), expected_count=2)
+            args = argparse.Namespace(
+                dataset_root=str(root),
+                output_dir=str(output_dir),
+                expected_count=2,
+                no_materialize_videos=False,
+                link_mode="copy",
+            )
 
             with self.assertRaises(SystemExit):
                 build_and_write_triplets(args)
