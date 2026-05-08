@@ -1858,11 +1858,7 @@ def propose_single_source_pairs(
     early_stop_reason = ""
 
     def persist_progress() -> None:
-        current_accepted = _select_final_accepted_records(
-            output_records,
-            max_accepted_pairs=max_accepted_pairs,
-            acceptance_profile=acceptance_profile,
-        )
+        current_accepted = _select_single_source_quality_passed_records(output_records)
         _write_jsonl(output, output_records)
         _write_jsonl(accepted_output, current_accepted)
 
@@ -2090,11 +2086,7 @@ def propose_single_source_pairs(
             acceptance_profile=acceptance_profile,
         )
         persist_progress()
-        current_accepted = _select_final_accepted_records(
-            output_records,
-            max_accepted_pairs=max_accepted_pairs,
-            acceptance_profile=acceptance_profile,
-        )
+        current_accepted = _select_single_source_quality_passed_records(output_records)
         print(
             "[propose-single-source-pairs] wrote "
             f"proposal_count={len(output_records)} accepted_current={len(current_accepted)} "
@@ -2123,21 +2115,13 @@ def propose_single_source_pairs(
             print(f"[propose-single-source-pairs] EARLY_STOP: {early_stop_reason}", file=sys.stderr, flush=True)
             break
 
-    accepted_records = _select_final_accepted_records(
-        output_records,
-        max_accepted_pairs=max_accepted_pairs,
-        acceptance_profile=acceptance_profile,
-    )
+    accepted_records = _select_single_source_quality_passed_records(output_records)
     _apply_single_source_delta_uniqueness(
         output_records,
         max_accepted_pairs=max_accepted_pairs,
         acceptance_profile=acceptance_profile,
     )
-    accepted_records = _select_final_accepted_records(
-        output_records,
-        max_accepted_pairs=max_accepted_pairs,
-        acceptance_profile=acceptance_profile,
-    )
+    accepted_records = _select_single_source_quality_passed_records(output_records)
     _write_jsonl(output, output_records)
     _write_jsonl(accepted_output, accepted_records)
     return {
@@ -7805,7 +7789,10 @@ def _apply_single_source_delta_uniqueness(
 ) -> None:
     if not records or not any(bool(record.get("single_source_pair")) for record in records):
         return
-    cap = min(max_accepted_pairs, 5)
+    # `max_accepted_pairs` is kept for API compatibility, but single-source
+    # production now treats all final-Omni-passed pairs as dataset candidates.
+    # We still remove duplicate delta families; we no longer demote clean pairs
+    # just because a per-source cap was reached.
     uniqueness_issue_prefixes = ("duplicate_delta_family", "single_source_accept_cap_exceeded")
     eligible: list[dict[str, Any]] = []
     for record in records:
@@ -7827,18 +7814,12 @@ def _apply_single_source_delta_uniqueness(
             record["single_source_delta_family"] = family
         eligible.append(record)
 
-    selected_ids: set[str] = set()
     selected_families: set[str] = set()
     for record in sorted(eligible, key=_accepted_record_sort_key):
-        proposal_id = str(record.get("proposal_id", "")).strip()
         family = str(record.get("single_source_delta_family", "")).strip()
-        if len(selected_ids) >= cap:
-            _set_single_source_record_acceptance(record, accepted=False, extra_issues=["single_source_accept_cap_exceeded"])
-            continue
         if family and family in selected_families:
             _set_single_source_record_acceptance(record, accepted=False, extra_issues=[f"duplicate_delta_family:{family}"])
             continue
-        selected_ids.add(proposal_id)
         if family:
             selected_families.add(family)
         _set_single_source_record_acceptance(record, accepted=True, extra_issues=[])
@@ -12949,6 +12930,18 @@ def _select_final_accepted_records(
         try_select(record)
 
     return [_accepted_sample_from_record(record, index + 1) for index, record in enumerate(selected)]
+
+
+def _select_single_source_quality_passed_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    accepted_candidates = sorted(
+        [
+            record
+            for record in records
+            if bool(record.get("single_source_pair")) and bool(record.get("accepted"))
+        ],
+        key=_accepted_record_sort_key,
+    )
+    return [_accepted_sample_from_record(record, index + 1) for index, record in enumerate(accepted_candidates)]
 
 
 def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str, Any]:

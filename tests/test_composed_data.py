@@ -1068,6 +1068,120 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(1, sum(1 for item in ranked if item["accepted"]))
             self.assertTrue(any("duplicate_delta_family" in "; ".join(item["single_source_pair_acceptance_issues"]) for item in ranked))
 
+    def test_propose_single_source_pairs_keeps_quality_passed_records_beyond_source_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4", "seg_3.mp4", "seg_4.mp4", "seg_5.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode("utf-8"))
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            annotations = [
+                {
+                    "clip_id": f"seg_{idx}",
+                    "output_path": f"clips/seg_{idx}.mp4",
+                    "dataset": "daily_omni",
+                    "summary": f"clean segment {idx}",
+                }
+                for idx in range(1, 6)
+            ]
+            candidates = [
+                {
+                    "candidate_id": f"candidate_{idx}",
+                    "proposal_id": _build_proposal_id(f"clips/seg_{idx}.mp4", f"clips/seg_{idx + 1}.mp4"),
+                    "reference_clip_id": f"seg_{idx}",
+                    "target_clip_id": f"seg_{idx + 1}",
+                    "reference_video": f"clips/seg_{idx}.mp4",
+                    "target_video": f"clips/seg_{idx + 1}.mp4",
+                }
+                for idx in range(1, 5)
+            ]
+            self._write_jsonl(annotations_path, annotations)
+            self._write_jsonl(candidates_path, candidates)
+
+            def pair_payload(index: int, difference_type: str, edit_text: str) -> tuple[dict[str, object], dict[str, object]]:
+                return (
+                    {
+                        "edit_text": edit_text,
+                        "modalities": ["visual"],
+                        "reference_caption": f"reference segment {index}",
+                        "target_caption": f"target segment {index}",
+                        "difference": {
+                            "type": difference_type,
+                            "from": f"state {index}",
+                            "to": f"state {index + 1}",
+                            "description": edit_text,
+                        },
+                        "dominant_delta": {
+                            "type": difference_type,
+                            "from": f"state {index}",
+                            "to": f"state {index + 1}",
+                            "reason": "the visible state change is clean and segment-wide",
+                        },
+                        "reference_state": {"main_speaker": "presenter", "inset_subjects": [], "product_overlay": "", "composition": "stable reference", "internal_transitions": []},
+                        "target_state": {"main_speaker": "presenter", "inset_subjects": [], "product_overlay": "", "composition": "stable target", "internal_transitions": []},
+                        "delta_temporal_extent": {"reference": "stable reference", "target": "stable target", "target_coverage": 0.9, "evidence": "target state persists"},
+                        "subject_roles": {"main_speaker": "presenter", "inset_subjects": [], "product_overlay": ""},
+                        "is_segment_wide_delta": True,
+                        "discarded_deltas": [],
+                        "evidence": ["target visibly contains the requested change"],
+                        "confidence": 0.9,
+                        "accept": True,
+                        "reject_reason": "",
+                    },
+                    {"raw": f"pair_{index}"},
+                )
+
+            client = mock.Mock()
+            client.propose_single_source_pair.side_effect = [
+                pair_payload(1, "object_presence", "add a handheld product demonstration"),
+                pair_payload(2, "action", "change the action from speaking to applying mascara"),
+                pair_payload(3, "scene", "change the setting from a desk shot to a bathroom mirror shot"),
+                pair_payload(4, "object_count", "change the number of displayed products from one to two"),
+            ]
+            client.verify_single_source_pair_final.side_effect = [
+                self._single_source_final_accept_payload(score=0.92),
+                self._single_source_final_accept_payload(score=0.91),
+                self._single_source_final_accept_payload(score=0.90),
+                self._single_source_final_accept_payload(score=0.89),
+            ]
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked_single_source_pairs.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted_pairs.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    max_accepted_pairs=3,
+                    acceptance_profile="exploration",
+                )
+
+            ranked = [
+                json.loads(line)
+                for line in (root / "pairs" / "ranked_single_source_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            accepted = [
+                json.loads(line)
+                for line in (root / "pairs" / "accepted_pairs.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(4, summary["proposal_count"])
+            self.assertEqual(4, summary["accepted_count"])
+            self.assertEqual(4, len(accepted))
+            self.assertEqual(4, sum(1 for item in ranked if item["accepted"]))
+            self.assertFalse(
+                any(
+                    "single_source_accept_cap_exceeded" in "; ".join(item["single_source_pair_acceptance_issues"])
+                    for item in ranked
+                )
+            )
+
     def test_propose_single_source_pairs_rejects_text_driven_product_label_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
