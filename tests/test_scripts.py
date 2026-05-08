@@ -245,6 +245,17 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("synthetic_pilot_review.md", script)
         self.assertIn("/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-instruct", script)
 
+    def test_composed_avigate_script_supports_sample_sized_runs(self) -> None:
+        script = Path("scripts/run_composed_avigate_smoke20.sh").read_text(encoding="utf-8")
+        wrapper = Path("scripts/run_composed_avigate_400.sh").read_text(encoding="utf-8")
+
+        self.assertIn("RUN_ROOT=${RUN_ROOT:-}", script)
+        self.assertIn("composed_avigate_eval${SAMPLE_SIZE}_", script)
+        self.assertIn('STAGED_ROOT="$RUN_ROOT/staged"', script)
+        self.assertIn('--sample-size "$SAMPLE_SIZE"', script)
+        self.assertIn("SAMPLE_SIZE=${SAMPLE_SIZE:-400}", wrapper)
+        self.assertIn("run_composed_avigate_smoke20.sh", wrapper)
+
     def test_vace_visual_synthetic_smoke_uses_plan_and_remuxes_audio(self) -> None:
         script = Path("scripts/run_vace_visual_synthetic_smoke.sh").read_text(encoding="utf-8")
 

@@ -13,8 +13,8 @@ export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 DATASET_ROOT=${DATASET_ROOT:-/data02/usr/wangqihao/Demo/test/data}
 RUNS_ROOT=${RUNS_ROOT:-/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs}
-RUN_ROOT=${RUN_ROOT:-$RUNS_ROOT/composed_avigate_smoke20_$(date +%Y%m%d_%H%M%S)}
-STAGED_ROOT=${STAGED_ROOT:-$RUNS_ROOT/composed_avigate_smoke20_staged}
+RUN_ROOT=${RUN_ROOT:-}
+STAGED_ROOT=${STAGED_ROOT:-}
 CACHE_DIR=${CACHE_DIR:-$RUNS_ROOT/composed_avigate_runtime_cache}
 
 MODEL_DIR=${MODEL_DIR:-/data02/pretrained_model/cvr_learn/cvr_model/01_lightweight_task_specific/avigate/ckpt_msrvtt_paper_like_4gpu_stable}
@@ -37,6 +37,10 @@ FFMPEG=${FFMPEG:-ffmpeg}
 usage() {
   cat <<'EOF'
 Usage: run_composed_avigate_smoke20.sh [options]
+
+Runs a composed AVIGATE baseline plus AVIGATE+Omni slice. The legacy
+script name is kept for compatibility; use --sample-size to choose 20,
+400, or a larger slice.
 
 Options:
   --dataset-root PATH
@@ -84,15 +88,22 @@ while [[ $# -gt 0 ]]; do
     --link-mode) LINK_MODE="$2"; shift 2 ;;
     --ffmpeg) FFMPEG="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "[composed-avigate-smoke20] unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    *) echo "[composed-avigate] unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [ -z "$RUN_ROOT" ]; then
+  RUN_ROOT="$RUNS_ROOT/composed_avigate_eval${SAMPLE_SIZE}_$(date +%Y%m%d_%H%M%S)"
+fi
+if [ -z "$STAGED_ROOT" ]; then
+  STAGED_ROOT="$RUN_ROOT/staged"
+fi
 
 require_path() {
   local label="$1"
   local path="$2"
   if [ ! -e "$path" ]; then
-    echo "[composed-avigate-smoke20] missing $label: $path" >&2
+    echo "[composed-avigate] missing $label: $path" >&2
     exit 1
   fi
 }
@@ -101,7 +112,7 @@ require_path "dataset root" "$DATASET_ROOT"
 require_path "AVIGATE model dir" "$MODEL_DIR"
 require_path "AVIGATE checkpoint" "$CHECKPOINT"
 require_path "CLIP weight" "$CLIP_WEIGHT"
-command -v "$FFMPEG" >/dev/null 2>&1 || { echo "[composed-avigate-smoke20] ffmpeg not found: $FFMPEG" >&2; exit 1; }
+command -v "$FFMPEG" >/dev/null 2>&1 || { echo "[composed-avigate] ffmpeg not found: $FFMPEG" >&2; exit 1; }
 
 if [ -z "$CHECKER_MODEL" ]; then
   CHECKER_MODEL=$(python3 - "$CHECKER_BASE_URL" "$CHECKER_API_KEY" <<'PY'
@@ -126,13 +137,13 @@ fi
 
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
 
-echo "[composed-avigate-smoke20] repo=$REPO_ROOT"
-echo "[composed-avigate-smoke20] dataset_root=$DATASET_ROOT sample_size=$SAMPLE_SIZE"
-echo "[composed-avigate-smoke20] run_root=$RUN_ROOT"
-echo "[composed-avigate-smoke20] staged_root=$STAGED_ROOT"
-echo "[composed-avigate-smoke20] cache_dir=$CACHE_DIR"
-echo "[composed-avigate-smoke20] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
-echo "[composed-avigate-smoke20] checker_base_url=$CHECKER_BASE_URL checker_model=$CHECKER_MODEL"
+echo "[composed-avigate] repo=$REPO_ROOT"
+echo "[composed-avigate] dataset_root=$DATASET_ROOT sample_size=$SAMPLE_SIZE"
+echo "[composed-avigate] run_root=$RUN_ROOT"
+echo "[composed-avigate] staged_root=$STAGED_ROOT"
+echo "[composed-avigate] cache_dir=$CACHE_DIR"
+echo "[composed-avigate] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
+echo "[composed-avigate] checker_base_url=$CHECKER_BASE_URL checker_model=$CHECKER_MODEL"
 
 python3 -m app.composed_avigate_smoke \
   --dataset-root "$DATASET_ROOT" \
@@ -155,4 +166,4 @@ python3 -m app.composed_avigate_smoke \
   --link-mode "$LINK_MODE" \
   --ffmpeg "$FFMPEG"
 
-echo "[composed-avigate-smoke20] comparison: $RUN_ROOT/comparison.md"
+echo "[composed-avigate] comparison: $RUN_ROOT/comparison.md"

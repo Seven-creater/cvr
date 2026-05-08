@@ -267,7 +267,7 @@ def resolve_checker_model(base_url: str, api_key: str) -> str:
 
 
 def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
-    run_root = Path(args.run_root or _default_run_root())
+    run_root = Path(args.run_root or _default_run_root(args.sample_size))
     run_root.mkdir(parents=True, exist_ok=True)
     staged_root = Path(args.staged_root) if args.staged_root else run_root / "staged"
 
@@ -313,7 +313,7 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run a 20-sample composed AVIGATE vs AVIGATE+Omni smoke test")
+    parser = argparse.ArgumentParser(description="Run a composed AVIGATE vs AVIGATE+Omni evaluation slice")
     parser.add_argument("--dataset-root", default=DEFAULT_DATASET_ROOT)
     parser.add_argument("--run-root")
     parser.add_argument("--staged-root")
@@ -487,14 +487,14 @@ def _metric_row(metrics: dict[str, Any]) -> dict[str, Any]:
 
 def _comparison_markdown(comparison: dict[str, Any]) -> str:
     lines = [
-        "# Composed AVIGATE Smoke20 Comparison",
+        "# Composed AVIGATE Comparison",
         "",
         f"- run_root: `{comparison['run_root']}`",
         f"- staged_root: `{comparison['staged_root']}`",
         f"- checker_model: `{comparison.get('checker_model') or 'skipped'}`",
         f"- sample_count: `{comparison['sample_count']}`",
         "",
-        "| 方法 | R@1 | R@5 | R@10 |",
+        "| Method | R@1 | R@5 | R@10 |",
         "|---|---:|---:|---:|",
     ]
     for row in comparison["rows"]:
@@ -530,9 +530,9 @@ def _first_model_id(payload: Any) -> str | None:
     return None
 
 
-def _default_run_root() -> str:
+def _default_run_root(sample_size: int) -> str:
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    return f"{DEFAULT_OUTPUT_ROOT}/composed_avigate_smoke20_{stamp}"
+    return f"{DEFAULT_OUTPUT_ROOT}/composed_avigate_eval{sample_size}_{stamp}"
 
 
 if __name__ == "__main__":
