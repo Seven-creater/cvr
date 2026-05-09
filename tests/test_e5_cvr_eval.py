@@ -53,22 +53,26 @@ class E5CVREvalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             triplets = self._write_three_triplets(root)
+            progress: list[str] = []
             index = build_or_load_target_index(
                 triplets=triplets,
                 encoder=FakeE5Encoder(),
                 index_dir=root / "target_index",
-                runtime_info={"model_path": "fake-e5", "video_fps": 1},
+                runtime_info={"model_path": "fake-e5", "video_fps": 1, "batch_size": 1},
+                progress=progress.append,
             )
             loaded = build_or_load_target_index(
                 triplets=triplets,
                 encoder=FakeE5Encoder(),
                 index_dir=root / "target_index",
-                runtime_info={"model_path": "fake-e5", "video_fps": 1},
+                runtime_info={"model_path": "fake-e5", "video_fps": 1, "batch_size": 1},
             )
 
             self.assertEqual(["sample1", "sample2", "sample3"], [record.sample_id for record in index.records])
             self.assertEqual((3, 3), index.embeddings.shape)
             self.assertEqual((3, 3), loaded.embeddings.shape)
+            self.assertTrue(any("target 1-1/3 start" in message for message in progress))
+            self.assertTrue(any("target 3-3/3 done" in message for message in progress))
             self.assertTrue((root / "target_index" / "target_embeddings.npy").exists())
             self.assertTrue((root / "target_index" / "target_index.json").exists())
 
@@ -83,6 +87,7 @@ class E5CVREvalTests(unittest.TestCase):
                 runtime_info={"model_path": "fake-e5", "video_fps": 1},
             )
 
+            progress: list[str] = []
             summary = run_eval_slice(
                 triplets=triplets,
                 target_index=index,
@@ -92,6 +97,7 @@ class E5CVREvalTests(unittest.TestCase):
                 recall_ks=(1, 2, 3),
                 topk_trace=3,
                 runtime_info={"model_path": "fake-e5", "video_fps": 1},
+                progress=progress.append,
             )
             traces = [
                 json.loads(line)
@@ -104,6 +110,8 @@ class E5CVREvalTests(unittest.TestCase):
             self.assertEqual(2, len(traces))
             self.assertEqual(1, traces[1]["target_rank"])
             self.assertNotIn("target_caption", traces[0])
+            self.assertTrue(any("query 1/2 start" in message for message in progress))
+            self.assertTrue(any("query 2/2 done rank=1" in message for message in progress))
 
     def test_trace_keeps_target_rank_and_topk_hits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

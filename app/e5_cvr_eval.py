@@ -160,8 +160,14 @@ def build_or_load_target_index(
             _emit(progress, f"[e5-cvr] loaded target index: {embeddings_path}")
             return loaded
 
-    _emit(progress, f"[e5-cvr] encoding {len(records)} target videos")
-    embeddings = _normalize_rows(encoder.encode_document([record.target_video for record in records]))
+    target_batch_size = _positive_int(runtime_payload.get("batch_size"), default=1)
+    _emit(progress, f"[e5-cvr] encoding {len(records)} target videos batch_size={target_batch_size}")
+    embeddings = _encode_records_with_progress(
+        encoder=encoder,
+        records=records,
+        batch_size=target_batch_size,
+        progress=progress,
+    )
     if embeddings.shape[0] != len(records):
         raise ValueError(f"target embedding row count mismatch: {embeddings.shape[0]} vs {len(records)}")
     metadata = {
@@ -215,32 +221,36 @@ def run_eval_slice(
         raise ValueError(f"{len(missing)} query targets are missing from target gallery, e.g. {missing[:3]}")
 
     hit_counts = {k: 0 for k in recall_ks}
-    trace_lines: list[str] = []
-    for query_index, triplet in enumerate(selected, start=1):
-        _emit(progress, f"[e5-cvr] query {query_index}/{len(selected)} sample_id={triplet.sample_id}")
-        query_embedding = _normalize_rows(encoder.encode_document([_query_payload(triplet)]))[0]
-        scores = target_index.embeddings @ query_embedding
-        order = np.argsort(-scores, kind="stable")
-        target_index_value = target_position[triplet.sample_id]
-        target_rank = int(np.where(order == target_index_value)[0][0]) + 1
-        for k in recall_ks:
-            if target_rank <= k:
-                hit_counts[k] += 1
-        trace_lines.append(
-            json.dumps(
-                {
-                    "sample_id": triplet.sample_id,
-                    "reference_video": triplet.reference_video,
-                    "target_video": triplet.target_video,
-                    "edit_text": triplet.edit_text,
-                    "target_rank": target_rank,
-                    "target_score": round(float(scores[target_index_value]), 6),
-                    "query_index": query_index,
-                    "topk_hits": _topk_hits(order=order, scores=scores, target_index=target_index, topk=max_trace),
-                },
-                ensure_ascii=False,
+    traces_path = output_root / "traces.jsonl"
+    with traces_path.open("w", encoding="utf-8") as traces_file:
+        for query_index, triplet in enumerate(selected, start=1):
+            _emit(progress, f"[e5-cvr] query {query_index}/{len(selected)} start sample_id={triplet.sample_id}")
+            query_embedding = _normalize_rows(encoder.encode_document([_query_payload(triplet)]))[0]
+            scores = target_index.embeddings @ query_embedding
+            order = np.argsort(-scores, kind="stable")
+            target_index_value = target_position[triplet.sample_id]
+            target_rank = int(np.where(order == target_index_value)[0][0]) + 1
+            for k in recall_ks:
+                if target_rank <= k:
+                    hit_counts[k] += 1
+            traces_file.write(
+                json.dumps(
+                    {
+                        "sample_id": triplet.sample_id,
+                        "reference_video": triplet.reference_video,
+                        "target_video": triplet.target_video,
+                        "edit_text": triplet.edit_text,
+                        "target_rank": target_rank,
+                        "target_score": round(float(scores[target_index_value]), 6),
+                        "query_index": query_index,
+                        "topk_hits": _topk_hits(order=order, scores=scores, target_index=target_index, topk=max_trace),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
             )
-        )
+            traces_file.flush()
+            _emit(progress, f"[e5-cvr] query {query_index}/{len(selected)} done rank={target_rank}")
 
     runtime_payload = asdict(runtime_info) if isinstance(runtime_info, E5RuntimeInfo) else dict(runtime_info)
     summary = {
@@ -254,7 +264,6 @@ def run_eval_slice(
         "target_index": target_index.metadata,
     }
     (output_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (output_root / "traces.jsonl").write_text("\n".join(trace_lines) + ("\n" if trace_lines else ""), encoding="utf-8")
     return summary
 
 
@@ -428,6 +437,31 @@ def _try_load_target_index(*, index_path: Path, embeddings_path: Path, cache_key
     return TargetIndex(records=records, embeddings=_normalize_rows(embeddings), metadata=metadata)
 
 
+def _encode_records_with_progress(
+    *,
+    encoder: Any,
+    records: list[TargetRecord],
+    batch_size: int,
+    progress: Callable[[str], None] | None,
+) -> np.ndarray:
+    chunks: list[np.ndarray] = []
+    total = len(records)
+    for start in range(0, total, batch_size):
+        stop = min(start + batch_size, total)
+        batch = records[start:stop]
+        sample_ids = ",".join(record.sample_id for record in batch[:3])
+        suffix = "..." if len(batch) > 3 else ""
+        _emit(progress, f"[e5-cvr] target {start + 1}-{stop}/{total} start sample_id={sample_ids}{suffix}")
+        encoded = _normalize_rows(encoder.encode_document([record.target_video for record in batch]))
+        if encoded.shape[0] != len(batch):
+            raise ValueError(f"target batch row count mismatch: {encoded.shape[0]} vs {len(batch)}")
+        chunks.append(encoded)
+        _emit(progress, f"[e5-cvr] target {start + 1}-{stop}/{total} done")
+    if not chunks:
+        raise ValueError("no target embeddings were encoded")
+    return _normalize_rows(np.vstack(chunks))
+
+
 def _target_index_cache_key(*, records: list[TargetRecord], runtime_info: dict[str, Any]) -> str:
     payload = {
         "runtime": runtime_info,
@@ -489,6 +523,14 @@ def _normalize_ks(raw: tuple[int, ...]) -> list[int]:
     if not values:
         raise ValueError("topk values must contain at least one positive integer")
     return values
+
+
+def _positive_int(value: Any, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _comparison_markdown(comparison: dict[str, Any]) -> str:
