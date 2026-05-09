@@ -249,6 +249,60 @@ class E5CVREvalTests(unittest.TestCase):
             self.assertEqual(0, reused_summary["generated_count"])
             self.assertEqual(3, reused_summary["reused_count"])
 
+    def test_composed_query_with_muted_reference_keeps_edit_text_and_original_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            triplets = self._write_three_triplets(root)
+
+            def runner(command: list[str]) -> None:
+                Path(command[-1]).write_bytes(b"muted")
+
+            def probe(path: Path) -> list[dict[str, str]]:
+                return [{"codec_type": "video"}] if path.exists() else []
+
+            prepared, _ = prepare_reference_audio_triplets(
+                triplets=triplets,
+                reference_audio_mode="muted",
+                cache_dir=root / "muted_cache",
+                output_dir=root / "run",
+                command_runner=runner,
+                stream_probe=probe,
+            )
+            index = build_or_load_target_index(
+                triplets=prepared,
+                encoder=FakeE5Encoder(),
+                index_dir=root / "target_index",
+                runtime_info={"model_path": "fake-e5", "video_fps": 1},
+            )
+            encoder = CapturingE5Encoder()
+
+            summary = run_eval_slice(
+                triplets=prepared,
+                target_index=index,
+                encoder=encoder,
+                output_dir=root / "eval",
+                sample_size=1,
+                recall_ks=(1, 5, 10),
+                topk_trace=1,
+                runtime_info={"model_path": "fake-e5", "video_fps": 1},
+                query_mode="composed",
+                reference_audio_mode="muted",
+            )
+            trace = json.loads((root / "eval" / "traces.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            payload = encoder.calls[0][0]
+
+            self.assertIsInstance(payload, dict)
+            self.assertEqual(prepared[0].reference_video, payload["video"])
+            self.assertNotEqual(triplets[0].reference_video, payload["video"])
+            self.assertIn(triplets[0].edit_text, payload["text"])
+            self.assertEqual(triplets[0].target_video, prepared[0].target_video)
+            self.assertEqual(triplets[0].target_video, trace["target_video"])
+            self.assertEqual("composed", summary["query_mode"])
+            self.assertTrue(summary["uses_edit_text_for_embedding"])
+            self.assertEqual("muted", summary["reference_audio_mode"])
+            self.assertEqual("original", summary["target_audio_mode"])
+            self.assertTrue(trace["query_used_text"])
+
     def test_trace_keeps_target_rank_and_topk_hits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
