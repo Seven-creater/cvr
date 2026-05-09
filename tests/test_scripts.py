@@ -271,6 +271,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--video-audio-mode \"$VIDEO_AUDIO_MODE\"", script)
         self.assertIn("load_audio_from_video=$LOAD_AUDIO_FROM_VIDEO", script)
         self.assertIn("use_audio_in_video=$LOAD_AUDIO_FROM_VIDEO", script)
+        self.assertIn("processor_video_kwargs_sanitizer=runtime", script)
         self.assertIn("e5_audio_on", script)
         self.assertIn("e5_audio_off", script)
         self.assertIn("video_only_ref_${REFERENCE_AUDIO_MODE}_eval_", script)

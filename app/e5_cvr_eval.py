@@ -57,6 +57,7 @@ class E5RuntimeInfo:
     video_audio_mode: str
     load_audio_from_video: bool
     use_audio_in_video: bool
+    processor_video_kwargs_sanitizer: bool
 
 
 @dataclass(frozen=True)
@@ -231,7 +232,17 @@ def load_e5_encoder(
             raise RuntimeError(f"failed to load e5 with flash attention and fallback: {second_error}") from first_error
         used_attention = "default"
 
-    _configure_video_processing(model, max_pixels=video_max_pixels, fps=video_fps, load_audio_from_video=load_audio_from_video)
+    processor_video_kwargs_sanitizer = _configure_video_processing(
+        model,
+        max_pixels=video_max_pixels,
+        fps=video_fps,
+        load_audio_from_video=load_audio_from_video,
+    )
+    if load_audio_from_video and not processor_video_kwargs_sanitizer:
+        raise RuntimeError(
+            "audio-in-video e5 evaluation needs a processor __call__ sanitizer for load_audio_from_video; "
+            "could not find a patchable processor/tokenizer on the SentenceTransformer module"
+        )
     info = E5RuntimeInfo(
         model_path=str(model_root),
         device=device,
@@ -244,6 +255,7 @@ def load_e5_encoder(
         video_audio_mode=video_audio_mode,
         load_audio_from_video=load_audio_from_video,
         use_audio_in_video=load_audio_from_video,
+        processor_video_kwargs_sanitizer=processor_video_kwargs_sanitizer,
     )
     return E5SentenceTransformerEncoder(model, batch_size=batch_size), info
 
@@ -335,6 +347,7 @@ def run_eval_slice(
     video_audio_mode = str(runtime_payload.get("video_audio_mode", VIDEO_AUDIO_MODE_OFF))
     load_audio_from_video = bool(runtime_payload.get("load_audio_from_video", False))
     use_audio_in_video = bool(runtime_payload.get("use_audio_in_video", load_audio_from_video))
+    processor_video_kwargs_sanitizer = bool(runtime_payload.get("processor_video_kwargs_sanitizer", False))
     if sample_size <= 0:
         raise ValueError("sample_size must be positive")
     if sample_size > len(triplets):
@@ -381,6 +394,7 @@ def run_eval_slice(
                         "video_audio_mode": video_audio_mode,
                         "load_audio_from_video": load_audio_from_video,
                         "use_audio_in_video": use_audio_in_video,
+                        "processor_video_kwargs_sanitizer": processor_video_kwargs_sanitizer,
                         "reference_audio_mode": reference_audio_mode,
                         "target_audio_mode": "original",
                         "reference_audio_transform": _reference_audio_transform(reference_audio_mode),
@@ -403,6 +417,7 @@ def run_eval_slice(
         "video_audio_mode": video_audio_mode,
         "load_audio_from_video": load_audio_from_video,
         "use_audio_in_video": use_audio_in_video,
+        "processor_video_kwargs_sanitizer": processor_video_kwargs_sanitizer,
         "reference_audio_mode": reference_audio_mode,
         "target_audio_mode": "original",
         "reference_audio_transform": _reference_audio_transform(reference_audio_mode),
@@ -504,6 +519,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "video_audio_mode": video_audio_mode,
         "load_audio_from_video": runtime_info.load_audio_from_video,
         "use_audio_in_video": runtime_info.use_audio_in_video,
+        "processor_video_kwargs_sanitizer": runtime_info.processor_video_kwargs_sanitizer,
         "reference_audio_mode": reference_audio_mode,
         "target_audio_mode": "original",
         "audio_removed_scope": reference_audio_summary["audio_removed_scope"],
@@ -736,16 +752,14 @@ def _encode_with_sentence_transformers(model: Any, inputs: list[Any], *, batch_s
         return _as_2d_float32(model.encode_document(inputs, **kwargs))
 
 
-def _configure_video_processing(model: Any, *, max_pixels: int, fps: int, load_audio_from_video: bool) -> None:
+def _configure_video_processing(model: Any, *, max_pixels: int, fps: int, load_audio_from_video: bool) -> bool:
     processing = {
         "video": {
             "max_pixels": max_pixels,
             "do_sample_frames": True,
             "fps": fps,
-            "use_audio_in_video": load_audio_from_video,
-        },
-        "chat_template": {
             "load_audio_from_video": load_audio_from_video,
+            "use_audio_in_video": load_audio_from_video,
         }
     }
     try:
@@ -764,6 +778,43 @@ def _configure_video_processing(model: Any, *, max_pixels: int, fps: int, load_a
             setattr(target, "processing_kwargs", processing)
         except Exception:
             pass
+    return _patch_processor_video_kwargs_sanitizer(target) if load_audio_from_video else False
+
+
+def _patch_processor_video_kwargs_sanitizer(target: Any) -> bool:
+    patched = False
+    seen: set[int] = set()
+    for attr_name in ("processor", "tokenizer"):
+        processor = getattr(target, attr_name, None)
+        if processor is None or id(processor) in seen:
+            continue
+        seen.add(id(processor))
+        patched = _patch_processor_instance_video_kwargs_sanitizer(processor) or patched
+    return patched
+
+
+def _patch_processor_instance_video_kwargs_sanitizer(processor: Any) -> bool:
+    processor_cls = processor.__class__
+    marker = "_cvr_load_audio_from_video_sanitizer"
+    if getattr(processor_cls, marker, False):
+        return True
+    original_call = getattr(processor_cls, "__call__", None)
+    if original_call is None:
+        return False
+
+    def sanitized_call(self: Any, *args: Any, **kwargs: Any) -> Any:
+        videos_kwargs = kwargs.get("videos_kwargs")
+        if isinstance(videos_kwargs, dict) and "load_audio_from_video" in videos_kwargs:
+            videos_kwargs = dict(videos_kwargs)
+            videos_kwargs.pop("load_audio_from_video", None)
+            kwargs["videos_kwargs"] = videos_kwargs
+        return original_call(self, *args, **kwargs)
+
+    sanitized_call.__name__ = getattr(original_call, "__name__", "__call__")
+    sanitized_call.__doc__ = getattr(original_call, "__doc__", None)
+    setattr(processor_cls, "__call__", sanitized_call)
+    setattr(processor_cls, marker, True)
+    return True
 
 
 def _build_model_kwargs(torch_module: Any, *, torch_dtype: str, attn_implementation: str) -> dict[str, Any]:
@@ -930,6 +981,7 @@ def _comparison_markdown(comparison: dict[str, Any]) -> str:
         f"- video_audio_mode: `{comparison['video_audio_mode']}`",
         f"- load_audio_from_video: `{str(comparison['load_audio_from_video']).lower()}`",
         f"- use_audio_in_video: `{str(comparison['use_audio_in_video']).lower()}`",
+        f"- processor_video_kwargs_sanitizer: `{str(comparison['processor_video_kwargs_sanitizer']).lower()}`",
         f"- reference_audio_mode: `{comparison['reference_audio_mode']}`",
         f"- target_audio_mode: `{comparison['target_audio_mode']}`",
         f"- reference_audio_transform: `{comparison['reference_audio']['reference_audio_transform']}`",
