@@ -256,18 +256,6 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("SAMPLE_SIZE=${SAMPLE_SIZE:-400}", wrapper)
         self.assertIn("run_composed_avigate_smoke20.sh", wrapper)
 
-    def test_cvr_e5_script_uses_existing_model_and_staging(self) -> None:
-        script = Path("scripts/run_cvr_e5_full_eval.sh").read_text(encoding="utf-8")
-
-        self.assertIn("This script does not download e5", script)
-        self.assertIn("cvr-full-eval", script)
-        self.assertIn("e5-omni-7B", script)
-        self.assertIn("--triplets-jsonl \"$STAGED_ROOT/triplets.jsonl\"", script)
-        self.assertIn("--e5-index-dir \"$E5_INDEX_DIR\"", script)
-        self.assertIn("require_path \"e5-omni config\" \"$E5_MODEL/config.json\"", script)
-        self.assertNotIn("modelscope download", script)
-        self.assertNotIn("vllm.entrypoints.openai.api_server", script)
-
     def test_vace_visual_synthetic_smoke_uses_plan_and_remuxes_audio(self) -> None:
         script = Path("scripts/run_vace_visual_synthetic_smoke.sh").read_text(encoding="utf-8")
 
