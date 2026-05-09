@@ -11,6 +11,7 @@ from app.e5_cvr_eval import (
     E5CVRTriplet,
     build_or_load_target_index,
     load_triplets_jsonl,
+    prepare_reference_audio_triplets,
     run_eval_slice,
 )
 
@@ -191,6 +192,63 @@ class E5CVREvalTests(unittest.TestCase):
             self.assertEqual("video-only", trace["query_mode"])
             self.assertFalse(trace["query_used_text"])
 
+    def test_reference_audio_muted_only_rewrites_reference_and_reuses_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            triplets = self._write_three_triplets(root)
+            commands: list[list[str]] = []
+            progress: list[str] = []
+
+            def runner(command: list[str]) -> None:
+                commands.append(command)
+                Path(command[-1]).write_bytes(b"muted")
+
+            def probe(path: Path) -> list[dict[str, str]]:
+                return [{"codec_type": "video"}] if path.exists() else []
+
+            prepared, summary = prepare_reference_audio_triplets(
+                triplets=triplets,
+                reference_audio_mode="muted",
+                cache_dir=root / "muted_cache",
+                output_dir=root / "run",
+                command_runner=runner,
+                stream_probe=probe,
+                progress=progress.append,
+            )
+
+            self.assertEqual(3, len(prepared))
+            self.assertNotEqual(triplets[0].reference_video, prepared[0].reference_video)
+            self.assertEqual(triplets[0].target_video, prepared[0].target_video)
+            self.assertIn("-map", commands[0])
+            self.assertIn("0:v:0", commands[0])
+            self.assertIn("-c:v", commands[0])
+            self.assertIn("copy", commands[0])
+            self.assertIn("-an", commands[0])
+            self.assertEqual("reference_only", summary["audio_removed_scope"])
+            self.assertTrue(summary["audio_removed"])
+            self.assertEqual(3, summary["generated_count"])
+            self.assertEqual(0, summary["reused_count"])
+            self.assertTrue((root / "run" / "reference_muted_triplets.jsonl").exists())
+            self.assertTrue((root / "run" / "reference_muted_media_manifest.jsonl").exists())
+            self.assertTrue(any("strip-audio start" in message for message in progress))
+            self.assertTrue(any("wrote reference muted triplets" in message for message in progress))
+
+            def failing_runner(command: list[str]) -> None:
+                raise AssertionError("muted reference should be reused from cache")
+
+            reused, reused_summary = prepare_reference_audio_triplets(
+                triplets=triplets,
+                reference_audio_mode="muted",
+                cache_dir=root / "muted_cache",
+                output_dir=root / "run_reused",
+                command_runner=failing_runner,
+                stream_probe=probe,
+            )
+
+            self.assertEqual([item.reference_video for item in prepared], [item.reference_video for item in reused])
+            self.assertEqual(0, reused_summary["generated_count"])
+            self.assertEqual(3, reused_summary["reused_count"])
+
     def test_trace_keeps_target_rank_and_topk_hits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -211,12 +269,17 @@ class E5CVREvalTests(unittest.TestCase):
                 recall_ks=(1, 5, 10),
                 topk_trace=2,
                 runtime_info={"model_path": "fake-e5", "video_fps": 1},
+                reference_audio_mode="muted",
             )
             first_trace = json.loads((root / "full3" / "traces.jsonl").read_text(encoding="utf-8").splitlines()[0])
 
             self.assertEqual("sample1", first_trace["sample_id"])
             self.assertEqual(1, first_trace["target_rank"])
             self.assertIn("target_score", first_trace)
+            self.assertEqual("muted", first_trace["reference_audio_mode"])
+            self.assertEqual("original", first_trace["target_audio_mode"])
+            self.assertEqual("reference_only", first_trace["audio_removed_scope"])
+            self.assertTrue(first_trace["audio_removed"])
             self.assertEqual("sample1", first_trace["topk_hits"][0]["sample_id"])
 
     def _write_three_triplets(self, root: Path) -> list[E5CVRTriplet]:

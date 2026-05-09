@@ -20,6 +20,8 @@ GPU_ID=${GPU_ID:-4}
 EXPECTED_COUNT=${EXPECTED_COUNT:-943}
 SMOKE_SIZE=${SMOKE_SIZE:-20}
 QUERY_MODE=${QUERY_MODE:-composed}
+REFERENCE_AUDIO_MODE=${REFERENCE_AUDIO_MODE:-original}
+REFERENCE_AUDIO_CACHE_DIR=${REFERENCE_AUDIO_CACHE_DIR:-$RUNS_ROOT/e5_reference_muted_media_cache}
 TOPK=${TOPK:-1,5,10}
 TOPK_TRACE=${TOPK_TRACE:-10}
 BATCH_SIZE=${BATCH_SIZE:-1}
@@ -27,6 +29,8 @@ TORCH_DTYPE=${TORCH_DTYPE:-bfloat16}
 ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-flash_attention_2}
 VIDEO_MAX_PIXELS=${VIDEO_MAX_PIXELS:-50176}
 VIDEO_FPS=${VIDEO_FPS:-1}
+FFMPEG=${FFMPEG:-ffmpeg}
+FFPROBE=${FFPROBE:-ffprobe}
 FORCE_REBUILD_INDEX=${FORCE_REBUILD_INDEX:-0}
 
 usage() {
@@ -47,6 +51,8 @@ Options:
   --expected-count N
   --smoke-size N
   --query-mode composed|video-only
+  --reference-audio-mode original|muted
+  --reference-audio-cache-dir PATH
   --topk 1,5,10
   --topk-trace N
   --batch-size N
@@ -54,6 +60,8 @@ Options:
   --attn-implementation NAME
   --video-max-pixels N
   --video-fps N
+  --ffmpeg PATH
+  --ffprobe PATH
   --force-rebuild-index
   -h, --help
 EOF
@@ -70,6 +78,8 @@ while [[ $# -gt 0 ]]; do
     --expected-count) EXPECTED_COUNT="$2"; shift 2 ;;
     --smoke-size) SMOKE_SIZE="$2"; shift 2 ;;
     --query-mode) QUERY_MODE="$2"; shift 2 ;;
+    --reference-audio-mode) REFERENCE_AUDIO_MODE="$2"; shift 2 ;;
+    --reference-audio-cache-dir) REFERENCE_AUDIO_CACHE_DIR="$2"; shift 2 ;;
     --topk) TOPK="$2"; shift 2 ;;
     --topk-trace) TOPK_TRACE="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
@@ -77,6 +87,8 @@ while [[ $# -gt 0 ]]; do
     --attn-implementation) ATTN_IMPLEMENTATION="$2"; shift 2 ;;
     --video-max-pixels) VIDEO_MAX_PIXELS="$2"; shift 2 ;;
     --video-fps) VIDEO_FPS="$2"; shift 2 ;;
+    --ffmpeg) FFMPEG="$2"; shift 2 ;;
+    --ffprobe) FFPROBE="$2"; shift 2 ;;
     --force-rebuild-index) FORCE_REBUILD_INDEX=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[e5-cvr] unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -91,7 +103,11 @@ if [ -z "$TRIPLETS_JSONL" ]; then
 fi
 
 if [ -z "$RUN_ROOT" ]; then
-  if [ "$QUERY_MODE" = "video-only" ]; then
+  if [ "$REFERENCE_AUDIO_MODE" = "muted" ] && [ "$QUERY_MODE" = "video-only" ]; then
+    RUN_ROOT=$RUNS_ROOT/e5_video_only_ref_muted_eval_$(date +%Y%m%d_%H%M%S)
+  elif [ "$REFERENCE_AUDIO_MODE" = "muted" ]; then
+    RUN_ROOT=$RUNS_ROOT/e5_ref_muted_eval_$(date +%Y%m%d_%H%M%S)
+  elif [ "$QUERY_MODE" = "video-only" ]; then
     RUN_ROOT=$RUNS_ROOT/e5_video_only_eval_$(date +%Y%m%d_%H%M%S)
   else
     RUN_ROOT=$RUNS_ROOT/e5_cvr_eval_$(date +%Y%m%d_%H%M%S)
@@ -112,6 +128,10 @@ require_path "e5 config" "$E5_MODEL/config.json"
 require_path "triplets jsonl" "$TRIPLETS_JSONL"
 if [ -n "$TARGET_INDEX_DIR" ]; then
   require_path "target index dir" "$TARGET_INDEX_DIR"
+fi
+if [ "$REFERENCE_AUDIO_MODE" = "muted" ]; then
+  command -v "$FFMPEG" >/dev/null || { echo "[e5-cvr] missing ffmpeg: $FFMPEG" >&2; exit 1; }
+  command -v "$FFPROBE" >/dev/null || { echo "[e5-cvr] missing ffprobe: $FFPROBE" >&2; exit 1; }
 fi
 
 python3 - <<'PY'
@@ -136,6 +156,9 @@ echo "[e5-cvr] triplets_jsonl=$TRIPLETS_JSONL"
 echo "[e5-cvr] e5_model=$E5_MODEL"
 echo "[e5-cvr] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
 echo "[e5-cvr] query_mode=$QUERY_MODE"
+echo "[e5-cvr] reference_audio_mode=$REFERENCE_AUDIO_MODE"
+echo "[e5-cvr] target_audio_mode=original"
+echo "[e5-cvr] reference_audio_cache_dir=$REFERENCE_AUDIO_CACHE_DIR"
 echo "[e5-cvr] target_index_dir=${TARGET_INDEX_DIR:-$RUN_ROOT/target_index}"
 echo "[e5-cvr] smoke_size=$SMOKE_SIZE expected_count=$EXPECTED_COUNT"
 echo "[e5-cvr] video_max_pixels=$VIDEO_MAX_PIXELS video_fps=$VIDEO_FPS"
@@ -147,6 +170,8 @@ ARGS=(
   --runs-root "$RUNS_ROOT"
   --expected-count "$EXPECTED_COUNT"
   --query-mode "$QUERY_MODE"
+  --reference-audio-mode "$REFERENCE_AUDIO_MODE"
+  --reference-audio-cache-dir "$REFERENCE_AUDIO_CACHE_DIR"
   --e5-model "$E5_MODEL"
   --device cuda
   --torch-dtype "$TORCH_DTYPE"
@@ -154,6 +179,8 @@ ARGS=(
   --batch-size "$BATCH_SIZE"
   --video-max-pixels "$VIDEO_MAX_PIXELS"
   --video-fps "$VIDEO_FPS"
+  --ffmpeg "$FFMPEG"
+  --ffprobe "$FFPROBE"
   --smoke-size "$SMOKE_SIZE"
   --topk "$TOPK"
   --topk-trace "$TOPK_TRACE"
