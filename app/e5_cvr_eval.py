@@ -56,6 +56,7 @@ class E5RuntimeInfo:
     video_fps: int
     video_audio_mode: str
     load_audio_from_video: bool
+    use_audio_in_video: bool
 
 
 @dataclass(frozen=True)
@@ -242,6 +243,7 @@ def load_e5_encoder(
         video_fps=video_fps,
         video_audio_mode=video_audio_mode,
         load_audio_from_video=load_audio_from_video,
+        use_audio_in_video=load_audio_from_video,
     )
     return E5SentenceTransformerEncoder(model, batch_size=batch_size), info
 
@@ -332,6 +334,7 @@ def run_eval_slice(
     runtime_payload = asdict(runtime_info) if isinstance(runtime_info, E5RuntimeInfo) else dict(runtime_info)
     video_audio_mode = str(runtime_payload.get("video_audio_mode", VIDEO_AUDIO_MODE_OFF))
     load_audio_from_video = bool(runtime_payload.get("load_audio_from_video", False))
+    use_audio_in_video = bool(runtime_payload.get("use_audio_in_video", load_audio_from_video))
     if sample_size <= 0:
         raise ValueError("sample_size must be positive")
     if sample_size > len(triplets):
@@ -377,6 +380,7 @@ def run_eval_slice(
                         "query_used_text": _query_uses_text(query_mode),
                         "video_audio_mode": video_audio_mode,
                         "load_audio_from_video": load_audio_from_video,
+                        "use_audio_in_video": use_audio_in_video,
                         "reference_audio_mode": reference_audio_mode,
                         "target_audio_mode": "original",
                         "reference_audio_transform": _reference_audio_transform(reference_audio_mode),
@@ -398,6 +402,7 @@ def run_eval_slice(
         "uses_edit_text_for_embedding": _query_uses_text(query_mode),
         "video_audio_mode": video_audio_mode,
         "load_audio_from_video": load_audio_from_video,
+        "use_audio_in_video": use_audio_in_video,
         "reference_audio_mode": reference_audio_mode,
         "target_audio_mode": "original",
         "reference_audio_transform": _reference_audio_transform(reference_audio_mode),
@@ -498,6 +503,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "uses_edit_text_for_embedding": _query_uses_text(query_mode),
         "video_audio_mode": video_audio_mode,
         "load_audio_from_video": runtime_info.load_audio_from_video,
+        "use_audio_in_video": runtime_info.use_audio_in_video,
         "reference_audio_mode": reference_audio_mode,
         "target_audio_mode": "original",
         "audio_removed_scope": reference_audio_summary["audio_removed_scope"],
@@ -736,6 +742,9 @@ def _configure_video_processing(model: Any, *, max_pixels: int, fps: int, load_a
             "max_pixels": max_pixels,
             "do_sample_frames": True,
             "fps": fps,
+            "use_audio_in_video": load_audio_from_video,
+        },
+        "chat_template": {
             "load_audio_from_video": load_audio_from_video,
         }
     }
@@ -745,7 +754,11 @@ def _configure_video_processing(model: Any, *, max_pixels: int, fps: int, load_a
         target = model
     existing = getattr(target, "processing_kwargs", None)
     if isinstance(existing, dict):
-        existing.update(processing)
+        for key, value in processing.items():
+            if isinstance(existing.get(key), dict):
+                existing[key].update(value)
+            else:
+                existing[key] = value
     else:
         try:
             setattr(target, "processing_kwargs", processing)
@@ -916,6 +929,7 @@ def _comparison_markdown(comparison: dict[str, Any]) -> str:
         f"- uses_edit_text_for_embedding: `{str(comparison['uses_edit_text_for_embedding']).lower()}`",
         f"- video_audio_mode: `{comparison['video_audio_mode']}`",
         f"- load_audio_from_video: `{str(comparison['load_audio_from_video']).lower()}`",
+        f"- use_audio_in_video: `{str(comparison['use_audio_in_video']).lower()}`",
         f"- reference_audio_mode: `{comparison['reference_audio_mode']}`",
         f"- target_audio_mode: `{comparison['target_audio_mode']}`",
         f"- reference_audio_transform: `{comparison['reference_audio']['reference_audio_transform']}`",
