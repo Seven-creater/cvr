@@ -256,6 +256,18 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("SAMPLE_SIZE=${SAMPLE_SIZE:-400}", wrapper)
         self.assertIn("run_composed_avigate_smoke20.sh", wrapper)
 
+    def test_e5_cvr_eval_script_is_e5_only_and_uses_existing_model(self) -> None:
+        script = Path("scripts/run_e5_cvr_eval.sh").read_text(encoding="utf-8")
+
+        self.assertIn("app.e5_cvr_eval", script)
+        self.assertIn("e5-omni-7B", script)
+        self.assertIn("require_path \"e5 config\" \"$E5_MODEL/config.json\"", script)
+        self.assertIn("--triplets-jsonl \"$TRIPLETS_JSONL\"", script)
+        self.assertIn("VIDEO_MAX_PIXELS=${VIDEO_MAX_PIXELS:-50176}", script)
+        self.assertNotIn("modelscope download", script)
+        self.assertNotIn("vllm.entrypoints.openai.api_server", script)
+        self.assertNotIn("8092", script)
+
     def test_vace_visual_synthetic_smoke_uses_plan_and_remuxes_audio(self) -> None:
         script = Path("scripts/run_vace_visual_synthetic_smoke.sh").read_text(encoding="utf-8")
 
