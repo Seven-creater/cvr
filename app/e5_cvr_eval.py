@@ -15,7 +15,7 @@ import numpy as np
 
 DEFAULT_RUNS_ROOT = "/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs"
 DEFAULT_E5_MODEL = "/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/e5-omni-7B"
-DEFAULT_REFERENCE_AUDIO_CACHE_DIR = f"{DEFAULT_RUNS_ROOT}/e5_reference_muted_media_cache"
+DEFAULT_REFERENCE_AUDIO_CACHE_DIR = f"{DEFAULT_RUNS_ROOT}/e5_reference_audio_media_cache"
 DEFAULT_EXPECTED_COUNT = 943
 DEFAULT_SMOKE_SIZE = 20
 DEFAULT_TOPK = "1,5,10"
@@ -26,7 +26,11 @@ QUERY_MODE_VIDEO_ONLY = "video-only"
 QUERY_MODES = (QUERY_MODE_COMPOSED, QUERY_MODE_VIDEO_ONLY)
 REFERENCE_AUDIO_MODE_ORIGINAL = "original"
 REFERENCE_AUDIO_MODE_MUTED = "muted"
-REFERENCE_AUDIO_MODES = (REFERENCE_AUDIO_MODE_ORIGINAL, REFERENCE_AUDIO_MODE_MUTED)
+REFERENCE_AUDIO_MODE_SILENT = "silent"
+REFERENCE_AUDIO_MODES = (REFERENCE_AUDIO_MODE_ORIGINAL, REFERENCE_AUDIO_MODE_MUTED, REFERENCE_AUDIO_MODE_SILENT)
+VIDEO_AUDIO_MODE_ON = "on"
+VIDEO_AUDIO_MODE_OFF = "off"
+VIDEO_AUDIO_MODES = (VIDEO_AUDIO_MODE_ON, VIDEO_AUDIO_MODE_OFF)
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,8 @@ class E5RuntimeInfo:
     batch_size: int
     video_max_pixels: int
     video_fps: int
+    video_audio_mode: str
+    load_audio_from_video: bool
 
 
 @dataclass(frozen=True)
@@ -125,9 +131,9 @@ def prepare_reference_audio_triplets(
     output_root = Path(output_dir)
     cache_root.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(parents=True, exist_ok=True)
-    triplets_path = output_root / "reference_muted_triplets.jsonl"
-    manifest_path = output_root / "reference_muted_media_manifest.jsonl"
-    summary_path = output_root / "reference_muted_media_summary.json"
+    triplets_path = output_root / f"reference_{mode}_triplets.jsonl"
+    manifest_path = output_root / f"reference_{mode}_media_manifest.jsonl"
+    summary_path = output_root / f"reference_{mode}_media_summary.json"
     prepared: list[E5CVRTriplet] = []
     generated = 0
     reused = 0
@@ -139,20 +145,20 @@ def prepare_reference_audio_triplets(
             source = Path(triplet.reference_video)
             if not source.exists():
                 raise FileNotFoundError(f"reference video not found for {triplet.sample_id}: {source}")
-            muted_path = _muted_reference_path(source=source, sample_id=triplet.sample_id, cache_dir=cache_root)
-            if _muted_video_is_valid(muted_path, stream_probe=probe):
+            prepared_path = _reference_audio_path(source=source, sample_id=triplet.sample_id, cache_dir=cache_root, mode=mode)
+            if _reference_audio_video_is_valid(prepared_path, mode=mode, stream_probe=probe):
                 action = "reuse"
                 reused += 1
-                _emit(progress, f"[e5-cvr] strip-audio reuse {index}/{len(triplets)} sample_id={triplet.sample_id} role=reference path={muted_path}")
+                _emit(progress, f"[e5-cvr] reference-audio {mode} reuse {index}/{len(triplets)} sample_id={triplet.sample_id} role=reference path={prepared_path}")
             else:
-                _emit(progress, f"[e5-cvr] strip-audio start {index}/{len(triplets)} sample_id={triplet.sample_id} role=reference src={source}")
-                _strip_reference_audio(source=source, output=muted_path, ffmpeg=ffmpeg, command_runner=runner)
-                if not _muted_video_is_valid(muted_path, stream_probe=probe):
-                    raise RuntimeError(f"muted reference video failed validation: {muted_path}")
+                _emit(progress, f"[e5-cvr] reference-audio {mode} start {index}/{len(triplets)} sample_id={triplet.sample_id} role=reference src={source}")
+                _rewrite_reference_audio(source=source, output=prepared_path, mode=mode, ffmpeg=ffmpeg, command_runner=runner)
+                if not _reference_audio_video_is_valid(prepared_path, mode=mode, stream_probe=probe):
+                    raise RuntimeError(f"{mode} reference video failed validation: {prepared_path}")
                 action = "generated"
                 generated += 1
-                _emit(progress, f"[e5-cvr] strip-audio done {index}/{len(triplets)} sample_id={triplet.sample_id} role=reference path={muted_path}")
-            prepared_triplet = replace(triplet, reference_video=str(muted_path))
+                _emit(progress, f"[e5-cvr] reference-audio {mode} done {index}/{len(triplets)} sample_id={triplet.sample_id} role=reference path={prepared_path}")
+            prepared_triplet = replace(triplet, reference_video=str(prepared_path))
             prepared.append(prepared_triplet)
             triplets_file.write(json.dumps(asdict(prepared_triplet), ensure_ascii=False) + "\n")
             triplets_file.flush()
@@ -163,7 +169,8 @@ def prepare_reference_audio_triplets(
                         "action": action,
                         "role": "reference",
                         "original_reference_video": triplet.reference_video,
-                        "muted_reference_video": str(muted_path),
+                        "prepared_reference_video": str(prepared_path),
+                        "reference_audio_mode": mode,
                         "target_video": triplet.target_video,
                     },
                     ensure_ascii=False,
@@ -182,9 +189,9 @@ def prepare_reference_audio_triplets(
     summary["triplets_path"] = str(triplets_path)
     summary["manifest_path"] = str(manifest_path)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    _emit(progress, f"[e5-cvr] wrote reference muted triplets: {triplets_path}")
-    _emit(progress, f"[e5-cvr] wrote reference muted media manifest: {manifest_path}")
-    _emit(progress, f"[e5-cvr] wrote reference muted media summary: {summary_path}")
+    _emit(progress, f"[e5-cvr] wrote reference {mode} triplets: {triplets_path}")
+    _emit(progress, f"[e5-cvr] wrote reference {mode} media manifest: {manifest_path}")
+    _emit(progress, f"[e5-cvr] wrote reference {mode} media summary: {summary_path}")
     return prepared, summary
 
 
@@ -197,7 +204,10 @@ def load_e5_encoder(
     batch_size: int,
     video_max_pixels: int,
     video_fps: int,
+    video_audio_mode: str = VIDEO_AUDIO_MODE_ON,
 ) -> tuple[E5SentenceTransformerEncoder, E5RuntimeInfo]:
+    video_audio_mode = _normalize_video_audio_mode(video_audio_mode)
+    load_audio_from_video = _video_audio_loads(video_audio_mode)
     model_root = Path(model_path)
     if not model_root.exists():
         raise FileNotFoundError(f"e5 model path not found: {model_root}")
@@ -220,7 +230,7 @@ def load_e5_encoder(
             raise RuntimeError(f"failed to load e5 with flash attention and fallback: {second_error}") from first_error
         used_attention = "default"
 
-    _configure_video_processing(model, max_pixels=video_max_pixels, fps=video_fps)
+    _configure_video_processing(model, max_pixels=video_max_pixels, fps=video_fps, load_audio_from_video=load_audio_from_video)
     info = E5RuntimeInfo(
         model_path=str(model_root),
         device=device,
@@ -230,6 +240,8 @@ def load_e5_encoder(
         batch_size=batch_size,
         video_max_pixels=video_max_pixels,
         video_fps=video_fps,
+        video_audio_mode=video_audio_mode,
+        load_audio_from_video=load_audio_from_video,
     )
     return E5SentenceTransformerEncoder(model, batch_size=batch_size), info
 
@@ -258,6 +270,12 @@ def build_or_load_target_index(
         if loaded is not None:
             _emit(progress, f"[e5-cvr] loaded target index: {embeddings_path}")
             return loaded
+        if index_path.exists() or embeddings_path.exists():
+            raise ValueError(
+                "target index exists but cache key does not match this runtime; "
+                "do not reuse audio-off/no-sound e5 results for audio-enabled CVR. "
+                f"Use a fresh target index dir or pass --force-rebuild-index: {root}"
+            )
 
     target_batch_size = _positive_int(runtime_payload.get("batch_size"), default=1)
     _emit(progress, f"[e5-cvr] encoding {len(records)} target videos batch_size={target_batch_size}")
@@ -311,6 +329,9 @@ def run_eval_slice(
 ) -> dict[str, Any]:
     query_mode = _normalize_query_mode(query_mode)
     reference_audio_mode = _normalize_reference_audio_mode(reference_audio_mode)
+    runtime_payload = asdict(runtime_info) if isinstance(runtime_info, E5RuntimeInfo) else dict(runtime_info)
+    video_audio_mode = str(runtime_payload.get("video_audio_mode", VIDEO_AUDIO_MODE_OFF))
+    load_audio_from_video = bool(runtime_payload.get("load_audio_from_video", False))
     if sample_size <= 0:
         raise ValueError("sample_size must be positive")
     if sample_size > len(triplets):
@@ -329,7 +350,11 @@ def run_eval_slice(
     traces_path = output_root / "traces.jsonl"
     with traces_path.open("w", encoding="utf-8") as traces_file:
         for query_index, triplet in enumerate(selected, start=1):
-            _emit(progress, f"[e5-cvr] query {query_index}/{len(selected)} start sample_id={triplet.sample_id} mode={query_mode}")
+            _emit(
+                progress,
+                f"[e5-cvr] query {query_index}/{len(selected)} start sample_id={triplet.sample_id} "
+                f"mode={query_mode} video_audio_mode={video_audio_mode}",
+            )
             query_embedding = _normalize_rows(encoder.encode_document([_query_payload(triplet, query_mode=query_mode)]))[0]
             scores = target_index.embeddings @ query_embedding
             order = np.argsort(-scores, kind="stable")
@@ -350,10 +375,13 @@ def run_eval_slice(
                         "query_index": query_index,
                         "query_mode": query_mode,
                         "query_used_text": _query_uses_text(query_mode),
+                        "video_audio_mode": video_audio_mode,
+                        "load_audio_from_video": load_audio_from_video,
                         "reference_audio_mode": reference_audio_mode,
                         "target_audio_mode": "original",
-                        "audio_removed_scope": "reference_only" if reference_audio_mode == REFERENCE_AUDIO_MODE_MUTED else "none",
-                        "audio_removed": reference_audio_mode == REFERENCE_AUDIO_MODE_MUTED,
+                        "reference_audio_transform": _reference_audio_transform(reference_audio_mode),
+                        "audio_removed_scope": "reference_only" if _reference_audio_removed(reference_audio_mode) else "none",
+                        "audio_removed": _reference_audio_removed(reference_audio_mode),
                         "topk_hits": _topk_hits(order=order, scores=scores, target_index=target_index, topk=max_trace),
                     },
                     ensure_ascii=False,
@@ -363,16 +391,18 @@ def run_eval_slice(
             traces_file.flush()
             _emit(progress, f"[e5-cvr] query {query_index}/{len(selected)} done rank={target_rank}")
 
-    runtime_payload = asdict(runtime_info) if isinstance(runtime_info, E5RuntimeInfo) else dict(runtime_info)
     summary = {
         "mode": "e5-cvr-only",
         "query_mode": query_mode,
         "query_input": _query_input_label(query_mode),
         "uses_edit_text_for_embedding": _query_uses_text(query_mode),
+        "video_audio_mode": video_audio_mode,
+        "load_audio_from_video": load_audio_from_video,
         "reference_audio_mode": reference_audio_mode,
         "target_audio_mode": "original",
-        "audio_removed_scope": "reference_only" if reference_audio_mode == REFERENCE_AUDIO_MODE_MUTED else "none",
-        "audio_removed": reference_audio_mode == REFERENCE_AUDIO_MODE_MUTED,
+        "reference_audio_transform": _reference_audio_transform(reference_audio_mode),
+        "audio_removed_scope": "reference_only" if _reference_audio_removed(reference_audio_mode) else "none",
+        "audio_removed": _reference_audio_removed(reference_audio_mode),
         "query_count": len(selected),
         "gallery_count": len(target_index.records),
         "recall": {f"R@{k}": round(hit_counts[k] / max(1, len(selected)), 4) for k in recall_ks},
@@ -390,7 +420,8 @@ def run_eval_slice(
 def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     query_mode = _normalize_query_mode(args.query_mode)
     reference_audio_mode = _normalize_reference_audio_mode(args.reference_audio_mode)
-    run_root = Path(args.run_root or _default_run_root(query_mode=query_mode, reference_audio_mode=reference_audio_mode))
+    video_audio_mode = _normalize_video_audio_mode(args.video_audio_mode)
+    run_root = Path(args.run_root or _default_run_root(query_mode=query_mode, reference_audio_mode=reference_audio_mode, video_audio_mode=video_audio_mode))
     run_root.mkdir(parents=True, exist_ok=True)
     triplets_path = Path(args.triplets_jsonl) if args.triplets_jsonl else find_latest_triplets(args.runs_root)
     triplets = load_triplets_jsonl(triplets_path, expected_count=args.expected_count)
@@ -411,6 +442,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         batch_size=args.batch_size,
         video_max_pixels=args.video_max_pixels,
         video_fps=args.video_fps,
+        video_audio_mode=video_audio_mode,
     )
     index = build_or_load_target_index(
         triplets=triplets,
@@ -464,6 +496,8 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "query_mode": query_mode,
         "query_input": _query_input_label(query_mode),
         "uses_edit_text_for_embedding": _query_uses_text(query_mode),
+        "video_audio_mode": video_audio_mode,
+        "load_audio_from_video": runtime_info.load_audio_from_video,
         "reference_audio_mode": reference_audio_mode,
         "target_audio_mode": "original",
         "audio_removed_scope": reference_audio_summary["audio_removed_scope"],
@@ -496,6 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--video-max-pixels", type=int, default=DEFAULT_VIDEO_MAX_PIXELS)
     parser.add_argument("--video-fps", type=int, default=1)
+    parser.add_argument("--video-audio-mode", choices=VIDEO_AUDIO_MODES, default=VIDEO_AUDIO_MODE_ON)
     parser.add_argument("--smoke-size", type=int, default=DEFAULT_SMOKE_SIZE)
     parser.add_argument("--query-mode", choices=QUERY_MODES, default=QUERY_MODE_COMPOSED)
     parser.add_argument("--reference-audio-mode", choices=REFERENCE_AUDIO_MODES, default=REFERENCE_AUDIO_MODE_ORIGINAL)
@@ -545,8 +580,9 @@ def _reference_audio_summary(*, mode: str, cache_dir: str, total: int, generated
     return {
         "reference_audio_mode": mode,
         "target_audio_mode": "original",
-        "audio_removed_scope": "reference_only" if mode == REFERENCE_AUDIO_MODE_MUTED else "none",
-        "audio_removed": mode == REFERENCE_AUDIO_MODE_MUTED,
+        "audio_removed_scope": "reference_only" if _reference_audio_removed(mode) else "none",
+        "audio_removed": _reference_audio_removed(mode),
+        "reference_audio_transform": _reference_audio_transform(mode),
         "media_cache_dir": cache_dir,
         "total": total,
         "generated_count": generated,
@@ -554,9 +590,23 @@ def _reference_audio_summary(*, mode: str, cache_dir: str, total: int, generated
     }
 
 
-def _muted_reference_path(*, source: Path, sample_id: str, cache_dir: Path) -> Path:
+def _reference_audio_removed(mode: str) -> bool:
+    return _normalize_reference_audio_mode(mode) != REFERENCE_AUDIO_MODE_ORIGINAL
+
+
+def _reference_audio_transform(mode: str) -> str:
+    mode = _normalize_reference_audio_mode(mode)
+    if mode == REFERENCE_AUDIO_MODE_MUTED:
+        return "strip"
+    if mode == REFERENCE_AUDIO_MODE_SILENT:
+        return "silent"
+    return "none"
+
+
+def _reference_audio_path(*, source: Path, sample_id: str, cache_dir: Path, mode: str) -> Path:
+    mode = _normalize_reference_audio_mode(mode)
     fingerprint = _file_fingerprint_hash(source)
-    return cache_dir / f"{_safe_filename_part(sample_id)}_{fingerprint}.mp4"
+    return cache_dir / mode / f"{_safe_filename_part(sample_id)}_{fingerprint}.mp4"
 
 
 def _file_fingerprint_hash(path: Path) -> str:
@@ -574,26 +624,52 @@ def _safe_filename_part(value: str) -> str:
     return (safe or "sample")[:80]
 
 
-def _strip_reference_audio(
+def _rewrite_reference_audio(
     *,
     source: Path,
     output: Path,
+    mode: str,
     ffmpeg: str,
     command_runner: Callable[[list[str]], None],
 ) -> None:
+    mode = _normalize_reference_audio_mode(mode)
     output.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(source),
-        "-map",
-        "0:v:0",
-        "-c:v",
-        "copy",
-        "-an",
-        str(output),
-    ]
+    if mode == REFERENCE_AUDIO_MODE_MUTED:
+        command = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-an",
+            str(output),
+        ]
+    elif mode == REFERENCE_AUDIO_MODE_SILENT:
+        command = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(source),
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=16000",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(output),
+        ]
+    else:
+        raise ValueError(f"cannot rewrite reference audio for mode {mode!r}")
     command_runner(command)
 
 
@@ -601,16 +677,21 @@ def _run_command(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
-def _muted_video_is_valid(path: Path, *, stream_probe: Callable[[Path], list[dict[str, Any]]]) -> bool:
+def _reference_audio_video_is_valid(path: Path, *, mode: str, stream_probe: Callable[[Path], list[dict[str, Any]]]) -> bool:
     if not path.exists():
         return False
+    mode = _normalize_reference_audio_mode(mode)
     try:
         streams = stream_probe(path)
     except Exception:
         return False
     has_video = any(stream.get("codec_type") == "video" for stream in streams)
     has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
-    return has_video and not has_audio
+    if mode == REFERENCE_AUDIO_MODE_MUTED:
+        return has_video and not has_audio
+    if mode == REFERENCE_AUDIO_MODE_SILENT:
+        return has_video and has_audio
+    return has_video
 
 
 def _probe_streams(path: Path, *, ffprobe: str) -> list[dict[str, Any]]:
@@ -649,8 +730,15 @@ def _encode_with_sentence_transformers(model: Any, inputs: list[Any], *, batch_s
         return _as_2d_float32(model.encode_document(inputs, **kwargs))
 
 
-def _configure_video_processing(model: Any, *, max_pixels: int, fps: int) -> None:
-    processing = {"video": {"max_pixels": max_pixels, "do_sample_frames": True, "fps": fps}}
+def _configure_video_processing(model: Any, *, max_pixels: int, fps: int, load_audio_from_video: bool) -> None:
+    processing = {
+        "video": {
+            "max_pixels": max_pixels,
+            "do_sample_frames": True,
+            "fps": fps,
+            "load_audio_from_video": load_audio_from_video,
+        }
+    }
     try:
         target = model[0]
     except Exception:
@@ -658,6 +746,11 @@ def _configure_video_processing(model: Any, *, max_pixels: int, fps: int) -> Non
     existing = getattr(target, "processing_kwargs", None)
     if isinstance(existing, dict):
         existing.update(processing)
+    else:
+        try:
+            setattr(target, "processing_kwargs", processing)
+        except Exception:
+            pass
 
 
 def _build_model_kwargs(torch_module: Any, *, torch_dtype: str, attn_implementation: str) -> dict[str, Any]:
@@ -794,6 +887,16 @@ def _normalize_reference_audio_mode(value: str) -> str:
     return value
 
 
+def _normalize_video_audio_mode(value: str) -> str:
+    if value not in VIDEO_AUDIO_MODES:
+        raise ValueError(f"video_audio_mode must be one of {', '.join(VIDEO_AUDIO_MODES)}, got {value!r}")
+    return value
+
+
+def _video_audio_loads(value: str) -> bool:
+    return _normalize_video_audio_mode(value) == VIDEO_AUDIO_MODE_ON
+
+
 def _query_uses_text(query_mode: str) -> bool:
     return _normalize_query_mode(query_mode) == QUERY_MODE_COMPOSED
 
@@ -811,8 +914,11 @@ def _comparison_markdown(comparison: dict[str, Any]) -> str:
         f"- query_mode: `{comparison['query_mode']}`",
         f"- query_input: `{comparison['query_input']}`",
         f"- uses_edit_text_for_embedding: `{str(comparison['uses_edit_text_for_embedding']).lower()}`",
+        f"- video_audio_mode: `{comparison['video_audio_mode']}`",
+        f"- load_audio_from_video: `{str(comparison['load_audio_from_video']).lower()}`",
         f"- reference_audio_mode: `{comparison['reference_audio_mode']}`",
         f"- target_audio_mode: `{comparison['target_audio_mode']}`",
+        f"- reference_audio_transform: `{comparison['reference_audio']['reference_audio_transform']}`",
         f"- audio_removed_scope: `{comparison['audio_removed_scope']}`",
         "",
         "| Split | R@1 | R@5 | R@10 |",
@@ -829,13 +935,17 @@ def _fmt(value: Any) -> str:
     return f"{float(value):.4f}"
 
 
-def _default_run_root(*, query_mode: str, reference_audio_mode: str) -> str:
+def _default_run_root(*, query_mode: str, reference_audio_mode: str, video_audio_mode: str) -> str:
     query_mode = _normalize_query_mode(query_mode)
     reference_audio_mode = _normalize_reference_audio_mode(reference_audio_mode)
-    if reference_audio_mode == REFERENCE_AUDIO_MODE_MUTED:
-        prefix = "e5_video_only_ref_muted_eval" if query_mode == QUERY_MODE_VIDEO_ONLY else "e5_ref_muted_eval"
+    video_audio_mode = _normalize_video_audio_mode(video_audio_mode)
+    audio_prefix = "e5_audio_on" if video_audio_mode == VIDEO_AUDIO_MODE_ON else "e5_audio_off"
+    if reference_audio_mode == REFERENCE_AUDIO_MODE_ORIGINAL:
+        suffix = "video_only_eval" if query_mode == QUERY_MODE_VIDEO_ONLY else "composed_eval"
     else:
-        prefix = "e5_video_only_eval" if query_mode == QUERY_MODE_VIDEO_ONLY else "e5_cvr_eval"
+        query_part = "video_only" if query_mode == QUERY_MODE_VIDEO_ONLY else "composed"
+        suffix = f"{query_part}_ref_{reference_audio_mode}_eval"
+    prefix = f"{audio_prefix}_{suffix}"
     return f"{DEFAULT_RUNS_ROOT}/{prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
 
 

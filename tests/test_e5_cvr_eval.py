@@ -9,6 +9,7 @@ import numpy as np
 
 from app.e5_cvr_eval import (
     E5CVRTriplet,
+    _configure_video_processing,
     build_or_load_target_index,
     load_triplets_jsonl,
     prepare_reference_audio_triplets,
@@ -92,6 +93,57 @@ class E5CVREvalTests(unittest.TestCase):
             self.assertTrue(any("loaded target index" in message for message in loaded_progress))
             self.assertTrue((root / "target_index" / "target_embeddings.npy").exists())
             self.assertTrue((root / "target_index" / "target_index.json").exists())
+
+    def test_target_index_rejects_audio_mode_mismatch_in_existing_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            triplets = self._write_three_triplets(root)
+            build_or_load_target_index(
+                triplets=triplets,
+                encoder=FakeE5Encoder(),
+                index_dir=root / "target_index",
+                runtime_info={
+                    "model_path": "fake-e5",
+                    "video_fps": 1,
+                    "batch_size": 1,
+                    "video_audio_mode": "off",
+                    "load_audio_from_video": False,
+                },
+            )
+
+            with self.assertRaisesRegex(ValueError, "do not reuse audio-off"):
+                build_or_load_target_index(
+                    triplets=triplets,
+                    encoder=FailingE5Encoder(),
+                    index_dir=root / "target_index",
+                    runtime_info={
+                        "model_path": "fake-e5",
+                        "video_fps": 1,
+                        "batch_size": 1,
+                        "video_audio_mode": "on",
+                        "load_audio_from_video": True,
+                    },
+                )
+
+    def test_configure_video_processing_enables_audio_loading(self) -> None:
+        class FakeModule:
+            def __init__(self) -> None:
+                self.processing_kwargs = {"video": {"fps": 99}}
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.module = FakeModule()
+
+            def __getitem__(self, index: int) -> FakeModule:
+                return self.module
+
+        model = FakeModel()
+        _configure_video_processing(model, max_pixels=123, fps=2, load_audio_from_video=True)
+
+        self.assertEqual(
+            {"max_pixels": 123, "do_sample_frames": True, "fps": 2, "load_audio_from_video": True},
+            model.module.processing_kwargs["video"],
+        )
 
     def test_query_subset_uses_full_gallery_and_calculates_recall(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -226,11 +278,12 @@ class E5CVREvalTests(unittest.TestCase):
             self.assertIn("-an", commands[0])
             self.assertEqual("reference_only", summary["audio_removed_scope"])
             self.assertTrue(summary["audio_removed"])
+            self.assertEqual("strip", summary["reference_audio_transform"])
             self.assertEqual(3, summary["generated_count"])
             self.assertEqual(0, summary["reused_count"])
             self.assertTrue((root / "run" / "reference_muted_triplets.jsonl").exists())
             self.assertTrue((root / "run" / "reference_muted_media_manifest.jsonl").exists())
-            self.assertTrue(any("strip-audio start" in message for message in progress))
+            self.assertTrue(any("reference-audio muted start" in message for message in progress))
             self.assertTrue(any("wrote reference muted triplets" in message for message in progress))
 
             def failing_runner(command: list[str]) -> None:
@@ -248,6 +301,39 @@ class E5CVREvalTests(unittest.TestCase):
             self.assertEqual([item.reference_video for item in prepared], [item.reference_video for item in reused])
             self.assertEqual(0, reused_summary["generated_count"])
             self.assertEqual(3, reused_summary["reused_count"])
+
+    def test_reference_audio_silent_keeps_audio_track_for_audio_on_ablation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            triplets = self._write_three_triplets(root)
+            commands: list[list[str]] = []
+
+            def runner(command: list[str]) -> None:
+                commands.append(command)
+                Path(command[-1]).write_bytes(b"silent")
+
+            def probe(path: Path) -> list[dict[str, str]]:
+                return [{"codec_type": "video"}, {"codec_type": "audio"}] if path.exists() else []
+
+            prepared, summary = prepare_reference_audio_triplets(
+                triplets=triplets,
+                reference_audio_mode="silent",
+                cache_dir=root / "audio_cache",
+                output_dir=root / "run",
+                command_runner=runner,
+                stream_probe=probe,
+            )
+
+            self.assertEqual(3, len(prepared))
+            self.assertNotEqual(triplets[0].reference_video, prepared[0].reference_video)
+            self.assertEqual(triplets[0].target_video, prepared[0].target_video)
+            self.assertIn("anullsrc=channel_layout=stereo:sample_rate=16000", commands[0])
+            self.assertIn("-c:a", commands[0])
+            self.assertIn("aac", commands[0])
+            self.assertEqual("silent", summary["reference_audio_mode"])
+            self.assertEqual("silent", summary["reference_audio_transform"])
+            self.assertTrue(summary["audio_removed"])
+            self.assertTrue((root / "run" / "reference_silent_triplets.jsonl").exists())
 
     def test_composed_query_with_muted_reference_keeps_edit_text_and_original_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -302,6 +388,41 @@ class E5CVREvalTests(unittest.TestCase):
             self.assertEqual("muted", summary["reference_audio_mode"])
             self.assertEqual("original", summary["target_audio_mode"])
             self.assertTrue(trace["query_used_text"])
+
+    def test_summary_and_trace_mark_audio_enabled_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            triplets = self._write_three_triplets(root)
+            runtime = {
+                "model_path": "fake-e5",
+                "video_fps": 1,
+                "batch_size": 1,
+                "video_audio_mode": "on",
+                "load_audio_from_video": True,
+            }
+            index = build_or_load_target_index(
+                triplets=triplets,
+                encoder=FakeE5Encoder(),
+                index_dir=root / "target_index",
+                runtime_info=runtime,
+            )
+
+            summary = run_eval_slice(
+                triplets=triplets,
+                target_index=index,
+                encoder=FakeE5Encoder(),
+                output_dir=root / "eval",
+                sample_size=1,
+                recall_ks=(1, 5, 10),
+                topk_trace=1,
+                runtime_info=runtime,
+            )
+            trace = json.loads((root / "eval" / "traces.jsonl").read_text(encoding="utf-8").splitlines()[0])
+
+            self.assertEqual("on", summary["video_audio_mode"])
+            self.assertTrue(summary["load_audio_from_video"])
+            self.assertEqual("on", trace["video_audio_mode"])
+            self.assertTrue(trace["load_audio_from_video"])
 
     def test_trace_keeps_target_rank_and_topk_hits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

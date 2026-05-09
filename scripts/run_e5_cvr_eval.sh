@@ -21,7 +21,8 @@ EXPECTED_COUNT=${EXPECTED_COUNT:-943}
 SMOKE_SIZE=${SMOKE_SIZE:-20}
 QUERY_MODE=${QUERY_MODE:-composed}
 REFERENCE_AUDIO_MODE=${REFERENCE_AUDIO_MODE:-original}
-REFERENCE_AUDIO_CACHE_DIR=${REFERENCE_AUDIO_CACHE_DIR:-$RUNS_ROOT/e5_reference_muted_media_cache}
+REFERENCE_AUDIO_CACHE_DIR=${REFERENCE_AUDIO_CACHE_DIR:-$RUNS_ROOT/e5_reference_audio_media_cache}
+VIDEO_AUDIO_MODE=${VIDEO_AUDIO_MODE:-on}
 TOPK=${TOPK:-1,5,10}
 TOPK_TRACE=${TOPK_TRACE:-10}
 BATCH_SIZE=${BATCH_SIZE:-1}
@@ -51,8 +52,9 @@ Options:
   --expected-count N
   --smoke-size N
   --query-mode composed|video-only
-  --reference-audio-mode original|muted
+  --reference-audio-mode original|muted|silent
   --reference-audio-cache-dir PATH
+  --video-audio-mode on|off
   --topk 1,5,10
   --topk-trace N
   --batch-size N
@@ -80,6 +82,7 @@ while [[ $# -gt 0 ]]; do
     --query-mode) QUERY_MODE="$2"; shift 2 ;;
     --reference-audio-mode) REFERENCE_AUDIO_MODE="$2"; shift 2 ;;
     --reference-audio-cache-dir) REFERENCE_AUDIO_CACHE_DIR="$2"; shift 2 ;;
+    --video-audio-mode) VIDEO_AUDIO_MODE="$2"; shift 2 ;;
     --topk) TOPK="$2"; shift 2 ;;
     --topk-trace) TOPK_TRACE="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
@@ -103,15 +106,34 @@ if [ -z "$TRIPLETS_JSONL" ]; then
 fi
 
 if [ -z "$RUN_ROOT" ]; then
-  if [ "$REFERENCE_AUDIO_MODE" = "muted" ] && [ "$QUERY_MODE" = "video-only" ]; then
-    RUN_ROOT=$RUNS_ROOT/e5_video_only_ref_muted_eval_$(date +%Y%m%d_%H%M%S)
-  elif [ "$REFERENCE_AUDIO_MODE" = "muted" ]; then
-    RUN_ROOT=$RUNS_ROOT/e5_ref_muted_eval_$(date +%Y%m%d_%H%M%S)
-  elif [ "$QUERY_MODE" = "video-only" ]; then
-    RUN_ROOT=$RUNS_ROOT/e5_video_only_eval_$(date +%Y%m%d_%H%M%S)
+  if [ "$VIDEO_AUDIO_MODE" = "on" ]; then
+    AUDIO_PREFIX=e5_audio_on
+    LOAD_AUDIO_FROM_VIDEO=true
+  elif [ "$VIDEO_AUDIO_MODE" = "off" ]; then
+    AUDIO_PREFIX=e5_audio_off
+    LOAD_AUDIO_FROM_VIDEO=false
   else
-    RUN_ROOT=$RUNS_ROOT/e5_cvr_eval_$(date +%Y%m%d_%H%M%S)
+    echo "[e5-cvr] invalid video audio mode: $VIDEO_AUDIO_MODE" >&2
+    exit 2
   fi
+  if [ "$REFERENCE_AUDIO_MODE" = "original" ] && [ "$QUERY_MODE" = "composed" ]; then
+    RUN_ROOT=$RUNS_ROOT/${AUDIO_PREFIX}_composed_eval_$(date +%Y%m%d_%H%M%S)
+  elif [ "$REFERENCE_AUDIO_MODE" = "original" ] && [ "$QUERY_MODE" = "video-only" ]; then
+    RUN_ROOT=$RUNS_ROOT/${AUDIO_PREFIX}_video_only_eval_$(date +%Y%m%d_%H%M%S)
+  elif [ "$QUERY_MODE" = "video-only" ]; then
+    RUN_ROOT=$RUNS_ROOT/${AUDIO_PREFIX}_video_only_ref_${REFERENCE_AUDIO_MODE}_eval_$(date +%Y%m%d_%H%M%S)
+  else
+    RUN_ROOT=$RUNS_ROOT/${AUDIO_PREFIX}_composed_ref_${REFERENCE_AUDIO_MODE}_eval_$(date +%Y%m%d_%H%M%S)
+  fi
+fi
+
+if [ "$VIDEO_AUDIO_MODE" = "on" ]; then
+  LOAD_AUDIO_FROM_VIDEO=true
+elif [ "$VIDEO_AUDIO_MODE" = "off" ]; then
+  LOAD_AUDIO_FROM_VIDEO=false
+else
+  echo "[e5-cvr] invalid video audio mode: $VIDEO_AUDIO_MODE" >&2
+  exit 2
 fi
 
 require_path() {
@@ -129,7 +151,7 @@ require_path "triplets jsonl" "$TRIPLETS_JSONL"
 if [ -n "$TARGET_INDEX_DIR" ]; then
   require_path "target index dir" "$TARGET_INDEX_DIR"
 fi
-if [ "$REFERENCE_AUDIO_MODE" = "muted" ]; then
+if [ "$REFERENCE_AUDIO_MODE" != "original" ]; then
   command -v "$FFMPEG" >/dev/null || { echo "[e5-cvr] missing ffmpeg: $FFMPEG" >&2; exit 1; }
   command -v "$FFPROBE" >/dev/null || { echo "[e5-cvr] missing ffprobe: $FFPROBE" >&2; exit 1; }
 fi
@@ -158,6 +180,8 @@ echo "[e5-cvr] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
 echo "[e5-cvr] query_mode=$QUERY_MODE"
 echo "[e5-cvr] reference_audio_mode=$REFERENCE_AUDIO_MODE"
 echo "[e5-cvr] target_audio_mode=original"
+echo "[e5-cvr] video_audio_mode=$VIDEO_AUDIO_MODE"
+echo "[e5-cvr] load_audio_from_video=$LOAD_AUDIO_FROM_VIDEO"
 echo "[e5-cvr] reference_audio_cache_dir=$REFERENCE_AUDIO_CACHE_DIR"
 echo "[e5-cvr] target_index_dir=${TARGET_INDEX_DIR:-$RUN_ROOT/target_index}"
 echo "[e5-cvr] smoke_size=$SMOKE_SIZE expected_count=$EXPECTED_COUNT"
@@ -172,6 +196,7 @@ ARGS=(
   --query-mode "$QUERY_MODE"
   --reference-audio-mode "$REFERENCE_AUDIO_MODE"
   --reference-audio-cache-dir "$REFERENCE_AUDIO_CACHE_DIR"
+  --video-audio-mode "$VIDEO_AUDIO_MODE"
   --e5-model "$E5_MODEL"
   --device cuda
   --torch-dtype "$TORCH_DTYPE"
