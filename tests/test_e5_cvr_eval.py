@@ -9,7 +9,6 @@ import numpy as np
 
 from app.e5_cvr_eval import (
     E5CVRTriplet,
-    TargetRecord,
     build_or_load_target_index,
     load_triplets_jsonl,
     run_eval_slice,
@@ -40,6 +39,20 @@ class FakeE5Encoder:
         return [1.0, 0.0, 0.0]
 
 
+class CapturingE5Encoder(FakeE5Encoder):
+    def __init__(self) -> None:
+        self.calls: list[list[object]] = []
+
+    def encode_document(self, inputs: list[object]) -> np.ndarray:
+        self.calls.append(list(inputs))
+        return super().encode_document(inputs)
+
+
+class FailingE5Encoder:
+    def encode_document(self, inputs: list[object]) -> np.ndarray:
+        raise AssertionError("target index should have been loaded from cache")
+
+
 class E5CVREvalTests(unittest.TestCase):
     def test_load_triplets_rejects_missing_required_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -61,11 +74,13 @@ class E5CVREvalTests(unittest.TestCase):
                 runtime_info={"model_path": "fake-e5", "video_fps": 1, "batch_size": 1},
                 progress=progress.append,
             )
+            loaded_progress: list[str] = []
             loaded = build_or_load_target_index(
                 triplets=triplets,
-                encoder=FakeE5Encoder(),
+                encoder=FailingE5Encoder(),
                 index_dir=root / "target_index",
                 runtime_info={"model_path": "fake-e5", "video_fps": 1, "batch_size": 1},
+                progress=loaded_progress.append,
             )
 
             self.assertEqual(["sample1", "sample2", "sample3"], [record.sample_id for record in index.records])
@@ -73,6 +88,7 @@ class E5CVREvalTests(unittest.TestCase):
             self.assertEqual((3, 3), loaded.embeddings.shape)
             self.assertTrue(any("target 1-1/3 start" in message for message in progress))
             self.assertTrue(any("target 3-3/3 done" in message for message in progress))
+            self.assertTrue(any("loaded target index" in message for message in loaded_progress))
             self.assertTrue((root / "target_index" / "target_embeddings.npy").exists())
             self.assertTrue((root / "target_index" / "target_index.json").exists())
 
@@ -112,6 +128,68 @@ class E5CVREvalTests(unittest.TestCase):
             self.assertNotIn("target_caption", traces[0])
             self.assertTrue(any("query 1/2 start" in message for message in progress))
             self.assertTrue(any("query 2/2 done rank=1" in message for message in progress))
+
+    def test_query_mode_composed_passes_video_and_text_to_encoder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            triplets = self._write_three_triplets(root)
+            index = build_or_load_target_index(
+                triplets=triplets,
+                encoder=FakeE5Encoder(),
+                index_dir=root / "target_index",
+                runtime_info={"model_path": "fake-e5", "video_fps": 1},
+            )
+            encoder = CapturingE5Encoder()
+
+            summary = run_eval_slice(
+                triplets=triplets,
+                target_index=index,
+                encoder=encoder,
+                output_dir=root / "composed",
+                sample_size=1,
+                recall_ks=(1, 5, 10),
+                topk_trace=1,
+                runtime_info={"model_path": "fake-e5", "video_fps": 1},
+                query_mode="composed",
+            )
+
+            self.assertIsInstance(encoder.calls[0][0], dict)
+            self.assertIn("text", encoder.calls[0][0])
+            self.assertEqual("composed", summary["query_mode"])
+            self.assertTrue(summary["uses_edit_text_for_embedding"])
+
+    def test_query_mode_video_only_passes_only_reference_video_to_encoder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            triplets = self._write_three_triplets(root)
+            index = build_or_load_target_index(
+                triplets=triplets,
+                encoder=FakeE5Encoder(),
+                index_dir=root / "target_index",
+                runtime_info={"model_path": "fake-e5", "video_fps": 1},
+            )
+            encoder = CapturingE5Encoder()
+
+            summary = run_eval_slice(
+                triplets=triplets,
+                target_index=index,
+                encoder=encoder,
+                output_dir=root / "video_only",
+                sample_size=1,
+                recall_ks=(1, 5, 10),
+                topk_trace=1,
+                runtime_info={"model_path": "fake-e5", "video_fps": 1},
+                query_mode="video-only",
+            )
+            trace = json.loads((root / "video_only" / "traces.jsonl").read_text(encoding="utf-8").splitlines()[0])
+
+            self.assertEqual([triplets[0].reference_video], encoder.calls[0])
+            self.assertEqual("video-only", summary["query_mode"])
+            self.assertEqual("reference_video", summary["query_input"])
+            self.assertFalse(summary["uses_edit_text_for_embedding"])
+            self.assertEqual("", summary["query_template"])
+            self.assertEqual("video-only", trace["query_mode"])
+            self.assertFalse(trace["query_used_text"])
 
     def test_trace_keeps_target_rank_and_topk_hits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

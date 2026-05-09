@@ -19,6 +19,9 @@ DEFAULT_SMOKE_SIZE = 20
 DEFAULT_TOPK = "1,5,10"
 DEFAULT_VIDEO_MAX_PIXELS = 64 * 28 * 28
 QUERY_TEMPLATE = "Edit the reference video so that: {edit_text}"
+QUERY_MODE_COMPOSED = "composed"
+QUERY_MODE_VIDEO_ONLY = "video-only"
+QUERY_MODES = (QUERY_MODE_COMPOSED, QUERY_MODE_VIDEO_ONLY)
 
 
 @dataclass(frozen=True)
@@ -191,6 +194,8 @@ def build_or_load_target_index(
         + "\n",
         encoding="utf-8",
     )
+    _emit(progress, f"[e5-cvr] wrote target embeddings: {embeddings_path}")
+    _emit(progress, f"[e5-cvr] wrote target index: {index_path}")
     return index
 
 
@@ -204,8 +209,10 @@ def run_eval_slice(
     recall_ks: tuple[int, ...],
     topk_trace: int,
     runtime_info: E5RuntimeInfo | dict[str, Any],
+    query_mode: str = QUERY_MODE_COMPOSED,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    query_mode = _normalize_query_mode(query_mode)
     if sample_size <= 0:
         raise ValueError("sample_size must be positive")
     if sample_size > len(triplets):
@@ -224,8 +231,8 @@ def run_eval_slice(
     traces_path = output_root / "traces.jsonl"
     with traces_path.open("w", encoding="utf-8") as traces_file:
         for query_index, triplet in enumerate(selected, start=1):
-            _emit(progress, f"[e5-cvr] query {query_index}/{len(selected)} start sample_id={triplet.sample_id}")
-            query_embedding = _normalize_rows(encoder.encode_document([_query_payload(triplet)]))[0]
+            _emit(progress, f"[e5-cvr] query {query_index}/{len(selected)} start sample_id={triplet.sample_id} mode={query_mode}")
+            query_embedding = _normalize_rows(encoder.encode_document([_query_payload(triplet, query_mode=query_mode)]))[0]
             scores = target_index.embeddings @ query_embedding
             order = np.argsort(-scores, kind="stable")
             target_index_value = target_position[triplet.sample_id]
@@ -243,6 +250,8 @@ def run_eval_slice(
                         "target_rank": target_rank,
                         "target_score": round(float(scores[target_index_value]), 6),
                         "query_index": query_index,
+                        "query_mode": query_mode,
+                        "query_used_text": _query_uses_text(query_mode),
                         "topk_hits": _topk_hits(order=order, scores=scores, target_index=target_index, topk=max_trace),
                     },
                     ensure_ascii=False,
@@ -255,20 +264,26 @@ def run_eval_slice(
     runtime_payload = asdict(runtime_info) if isinstance(runtime_info, E5RuntimeInfo) else dict(runtime_info)
     summary = {
         "mode": "e5-cvr-only",
+        "query_mode": query_mode,
+        "query_input": _query_input_label(query_mode),
+        "uses_edit_text_for_embedding": _query_uses_text(query_mode),
         "query_count": len(selected),
         "gallery_count": len(target_index.records),
         "recall": {f"R@{k}": round(hit_counts[k] / max(1, len(selected)), 4) for k in recall_ks},
         "topk_trace": topk_trace,
-        "query_template": QUERY_TEMPLATE,
+        "query_template": QUERY_TEMPLATE if _query_uses_text(query_mode) else "",
         "runtime": runtime_payload,
         "target_index": target_index.metadata,
     }
     (output_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _emit(progress, f"[e5-cvr] wrote traces: {traces_path}")
+    _emit(progress, f"[e5-cvr] wrote summary: {output_root / 'summary.json'}")
     return summary
 
 
 def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
-    run_root = Path(args.run_root or _default_run_root())
+    query_mode = _normalize_query_mode(args.query_mode)
+    run_root = Path(args.run_root or _default_run_root(query_mode=query_mode))
     run_root.mkdir(parents=True, exist_ok=True)
     triplets_path = Path(args.triplets_jsonl) if args.triplets_jsonl else find_latest_triplets(args.runs_root)
     triplets = load_triplets_jsonl(triplets_path, expected_count=args.expected_count)
@@ -284,11 +299,22 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     index = build_or_load_target_index(
         triplets=triplets,
         encoder=encoder,
-        index_dir=run_root / "target_index",
+        index_dir=Path(args.target_index_dir) if args.target_index_dir else run_root / "target_index",
         runtime_info=runtime_info,
         force_rebuild=args.force_rebuild_index,
         progress=lambda message: print(message, flush=True),
     )
+    target_index_dir = Path(args.target_index_dir) if args.target_index_dir else run_root / "target_index"
+    target_index_reference = {
+        "target_index_dir": str(target_index_dir),
+        "gallery_count": len(index.records),
+        "target_index": index.metadata,
+    }
+    (run_root / "target_index_reference.json").write_text(
+        json.dumps(target_index_reference, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"[e5-cvr] wrote target index reference: {run_root / 'target_index_reference.json'}", flush=True)
     recall_ks = tuple(_normalize_ks(parse_topk(args.topk)))
     smoke_summary = run_eval_slice(
         triplets=triplets,
@@ -299,6 +325,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         recall_ks=recall_ks,
         topk_trace=args.topk_trace,
         runtime_info=runtime_info,
+        query_mode=query_mode,
         progress=lambda message: print(message, flush=True),
     )
     full_summary = run_eval_slice(
@@ -310,11 +337,15 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         recall_ks=recall_ks,
         topk_trace=args.topk_trace,
         runtime_info=runtime_info,
+        query_mode=query_mode,
         progress=lambda message: print(message, flush=True),
     )
     comparison = {
         "run_root": str(run_root),
         "triplets_jsonl": str(triplets_path),
+        "query_mode": query_mode,
+        "query_input": _query_input_label(query_mode),
+        "uses_edit_text_for_embedding": _query_uses_text(query_mode),
         "rows": [
             {"split": "smoke20", **smoke_summary["recall"]},
             {"split": f"full{len(triplets)}", **full_summary["recall"]},
@@ -322,6 +353,8 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     }
     (run_root / "comparison.json").write_text(json.dumps(comparison, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (run_root / "comparison.md").write_text(_comparison_markdown(comparison), encoding="utf-8")
+    print(f"[e5-cvr] wrote comparison json: {run_root / 'comparison.json'}", flush=True)
+    print(f"[e5-cvr] wrote comparison md: {run_root / 'comparison.md'}", flush=True)
     print(json.dumps(comparison, ensure_ascii=False, indent=2))
     return comparison
 
@@ -331,6 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--triplets-jsonl")
     parser.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
     parser.add_argument("--run-root")
+    parser.add_argument("--target-index-dir")
     parser.add_argument("--expected-count", type=int, default=DEFAULT_EXPECTED_COUNT)
     parser.add_argument("--e5-model", default=DEFAULT_E5_MODEL)
     parser.add_argument("--device", default="cuda")
@@ -340,6 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-max-pixels", type=int, default=DEFAULT_VIDEO_MAX_PIXELS)
     parser.add_argument("--video-fps", type=int, default=1)
     parser.add_argument("--smoke-size", type=int, default=DEFAULT_SMOKE_SIZE)
+    parser.add_argument("--query-mode", choices=QUERY_MODES, default=QUERY_MODE_COMPOSED)
     parser.add_argument("--topk", default=DEFAULT_TOPK)
     parser.add_argument("--topk-trace", type=int, default=10)
     parser.add_argument("--force-rebuild-index", action="store_true")
@@ -379,7 +414,10 @@ def _triplet_from_payload(payload: dict[str, Any], *, line_number: int) -> E5CVR
     )
 
 
-def _query_payload(triplet: E5CVRTriplet) -> dict[str, str]:
+def _query_payload(triplet: E5CVRTriplet, *, query_mode: str) -> str | dict[str, str]:
+    query_mode = _normalize_query_mode(query_mode)
+    if query_mode == QUERY_MODE_VIDEO_ONLY:
+        return triplet.reference_video
     return {
         "video": triplet.reference_video,
         "text": QUERY_TEMPLATE.format(edit_text=triplet.edit_text.strip().rstrip(".")),
@@ -533,12 +571,29 @@ def _positive_int(value: Any, *, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _normalize_query_mode(value: str) -> str:
+    if value not in QUERY_MODES:
+        raise ValueError(f"query_mode must be one of {', '.join(QUERY_MODES)}, got {value!r}")
+    return value
+
+
+def _query_uses_text(query_mode: str) -> bool:
+    return _normalize_query_mode(query_mode) == QUERY_MODE_COMPOSED
+
+
+def _query_input_label(query_mode: str) -> str:
+    return "reference_video + edit_text" if _query_uses_text(query_mode) else "reference_video"
+
+
 def _comparison_markdown(comparison: dict[str, Any]) -> str:
     lines = [
         "# e5-omni CVR Only Comparison",
         "",
         f"- run_root: `{comparison['run_root']}`",
         f"- triplets_jsonl: `{comparison['triplets_jsonl']}`",
+        f"- query_mode: `{comparison['query_mode']}`",
+        f"- query_input: `{comparison['query_input']}`",
+        f"- uses_edit_text_for_embedding: `{str(comparison['uses_edit_text_for_embedding']).lower()}`",
         "",
         "| Split | R@1 | R@5 | R@10 |",
         "|---|---:|---:|---:|",
@@ -554,8 +609,9 @@ def _fmt(value: Any) -> str:
     return f"{float(value):.4f}"
 
 
-def _default_run_root() -> str:
-    return f"{DEFAULT_RUNS_ROOT}/e5_cvr_eval_{time.strftime('%Y%m%d_%H%M%S')}"
+def _default_run_root(*, query_mode: str) -> str:
+    prefix = "e5_video_only_eval" if _normalize_query_mode(query_mode) == QUERY_MODE_VIDEO_ONLY else "e5_cvr_eval"
+    return f"{DEFAULT_RUNS_ROOT}/{prefix}_{time.strftime('%Y%m%d_%H%M%S')}"
 
 
 def _import_torch() -> Any:

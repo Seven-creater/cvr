@@ -12,12 +12,14 @@ cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 RUNS_ROOT=${RUNS_ROOT:-/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs}
-RUN_ROOT=${RUN_ROOT:-$RUNS_ROOT/e5_cvr_eval_$(date +%Y%m%d_%H%M%S)}
+RUN_ROOT=${RUN_ROOT:-}
+TARGET_INDEX_DIR=${TARGET_INDEX_DIR:-}
 TRIPLETS_JSONL=${TRIPLETS_JSONL:-}
 E5_MODEL=${E5_MODEL:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/e5-omni-7B}
 GPU_ID=${GPU_ID:-4}
 EXPECTED_COUNT=${EXPECTED_COUNT:-943}
 SMOKE_SIZE=${SMOKE_SIZE:-20}
+QUERY_MODE=${QUERY_MODE:-composed}
 TOPK=${TOPK:-1,5,10}
 TOPK_TRACE=${TOPK_TRACE:-10}
 BATCH_SIZE=${BATCH_SIZE:-1}
@@ -39,10 +41,12 @@ Options:
   --triplets-jsonl PATH
   --run-root PATH
   --runs-root PATH
+  --target-index-dir PATH
   --e5-model PATH
   --gpu-id ID
   --expected-count N
   --smoke-size N
+  --query-mode composed|video-only
   --topk 1,5,10
   --topk-trace N
   --batch-size N
@@ -60,10 +64,12 @@ while [[ $# -gt 0 ]]; do
     --triplets-jsonl) TRIPLETS_JSONL="$2"; shift 2 ;;
     --run-root) RUN_ROOT="$2"; shift 2 ;;
     --runs-root) RUNS_ROOT="$2"; shift 2 ;;
+    --target-index-dir) TARGET_INDEX_DIR="$2"; shift 2 ;;
     --e5-model) E5_MODEL="$2"; shift 2 ;;
     --gpu-id) GPU_ID="$2"; shift 2 ;;
     --expected-count) EXPECTED_COUNT="$2"; shift 2 ;;
     --smoke-size) SMOKE_SIZE="$2"; shift 2 ;;
+    --query-mode) QUERY_MODE="$2"; shift 2 ;;
     --topk) TOPK="$2"; shift 2 ;;
     --topk-trace) TOPK_TRACE="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
@@ -84,6 +90,14 @@ if [ -z "$TRIPLETS_JSONL" ]; then
   fi
 fi
 
+if [ -z "$RUN_ROOT" ]; then
+  if [ "$QUERY_MODE" = "video-only" ]; then
+    RUN_ROOT=$RUNS_ROOT/e5_video_only_eval_$(date +%Y%m%d_%H%M%S)
+  else
+    RUN_ROOT=$RUNS_ROOT/e5_cvr_eval_$(date +%Y%m%d_%H%M%S)
+  fi
+fi
+
 require_path() {
   local label="$1"
   local path="$2"
@@ -96,6 +110,9 @@ require_path() {
 require_path "e5 model dir" "$E5_MODEL"
 require_path "e5 config" "$E5_MODEL/config.json"
 require_path "triplets jsonl" "$TRIPLETS_JSONL"
+if [ -n "$TARGET_INDEX_DIR" ]; then
+  require_path "target index dir" "$TARGET_INDEX_DIR"
+fi
 
 python3 - <<'PY'
 import importlib.util
@@ -118,6 +135,8 @@ echo "[e5-cvr] run_root=$RUN_ROOT"
 echo "[e5-cvr] triplets_jsonl=$TRIPLETS_JSONL"
 echo "[e5-cvr] e5_model=$E5_MODEL"
 echo "[e5-cvr] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
+echo "[e5-cvr] query_mode=$QUERY_MODE"
+echo "[e5-cvr] target_index_dir=${TARGET_INDEX_DIR:-$RUN_ROOT/target_index}"
 echo "[e5-cvr] smoke_size=$SMOKE_SIZE expected_count=$EXPECTED_COUNT"
 echo "[e5-cvr] video_max_pixels=$VIDEO_MAX_PIXELS video_fps=$VIDEO_FPS"
 
@@ -127,6 +146,7 @@ ARGS=(
   --run-root "$RUN_ROOT"
   --runs-root "$RUNS_ROOT"
   --expected-count "$EXPECTED_COUNT"
+  --query-mode "$QUERY_MODE"
   --e5-model "$E5_MODEL"
   --device cuda
   --torch-dtype "$TORCH_DTYPE"
@@ -138,6 +158,10 @@ ARGS=(
   --topk "$TOPK"
   --topk-trace "$TOPK_TRACE"
 )
+
+if [ -n "$TARGET_INDEX_DIR" ]; then
+  ARGS+=(--target-index-dir "$TARGET_INDEX_DIR")
+fi
 
 if [ "$FORCE_REBUILD_INDEX" = "1" ]; then
   ARGS+=(--force-rebuild-index)
