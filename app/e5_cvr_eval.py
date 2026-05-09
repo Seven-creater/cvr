@@ -56,7 +56,6 @@ class E5RuntimeInfo:
     video_fps: int
     video_audio_mode: str
     load_audio_from_video: bool
-    use_audio_in_video: bool
     processor_video_kwargs_sanitizer: bool
 
 
@@ -254,7 +253,6 @@ def load_e5_encoder(
         video_fps=video_fps,
         video_audio_mode=video_audio_mode,
         load_audio_from_video=load_audio_from_video,
-        use_audio_in_video=load_audio_from_video,
         processor_video_kwargs_sanitizer=processor_video_kwargs_sanitizer,
     )
     return E5SentenceTransformerEncoder(model, batch_size=batch_size), info
@@ -346,7 +344,6 @@ def run_eval_slice(
     runtime_payload = asdict(runtime_info) if isinstance(runtime_info, E5RuntimeInfo) else dict(runtime_info)
     video_audio_mode = str(runtime_payload.get("video_audio_mode", VIDEO_AUDIO_MODE_OFF))
     load_audio_from_video = bool(runtime_payload.get("load_audio_from_video", False))
-    use_audio_in_video = bool(runtime_payload.get("use_audio_in_video", load_audio_from_video))
     processor_video_kwargs_sanitizer = bool(runtime_payload.get("processor_video_kwargs_sanitizer", False))
     if sample_size <= 0:
         raise ValueError("sample_size must be positive")
@@ -393,7 +390,6 @@ def run_eval_slice(
                         "query_used_text": _query_uses_text(query_mode),
                         "video_audio_mode": video_audio_mode,
                         "load_audio_from_video": load_audio_from_video,
-                        "use_audio_in_video": use_audio_in_video,
                         "processor_video_kwargs_sanitizer": processor_video_kwargs_sanitizer,
                         "reference_audio_mode": reference_audio_mode,
                         "target_audio_mode": "original",
@@ -416,7 +412,6 @@ def run_eval_slice(
         "uses_edit_text_for_embedding": _query_uses_text(query_mode),
         "video_audio_mode": video_audio_mode,
         "load_audio_from_video": load_audio_from_video,
-        "use_audio_in_video": use_audio_in_video,
         "processor_video_kwargs_sanitizer": processor_video_kwargs_sanitizer,
         "reference_audio_mode": reference_audio_mode,
         "target_audio_mode": "original",
@@ -518,7 +513,6 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "uses_edit_text_for_embedding": _query_uses_text(query_mode),
         "video_audio_mode": video_audio_mode,
         "load_audio_from_video": runtime_info.load_audio_from_video,
-        "use_audio_in_video": runtime_info.use_audio_in_video,
         "processor_video_kwargs_sanitizer": runtime_info.processor_video_kwargs_sanitizer,
         "reference_audio_mode": reference_audio_mode,
         "target_audio_mode": "original",
@@ -759,7 +753,6 @@ def _configure_video_processing(model: Any, *, max_pixels: int, fps: int, load_a
             "do_sample_frames": True,
             "fps": fps,
             "load_audio_from_video": load_audio_from_video,
-            "use_audio_in_video": load_audio_from_video,
         }
     }
     try:
@@ -980,7 +973,6 @@ def _comparison_markdown(comparison: dict[str, Any]) -> str:
         f"- uses_edit_text_for_embedding: `{str(comparison['uses_edit_text_for_embedding']).lower()}`",
         f"- video_audio_mode: `{comparison['video_audio_mode']}`",
         f"- load_audio_from_video: `{str(comparison['load_audio_from_video']).lower()}`",
-        f"- use_audio_in_video: `{str(comparison['use_audio_in_video']).lower()}`",
         f"- processor_video_kwargs_sanitizer: `{str(comparison['processor_video_kwargs_sanitizer']).lower()}`",
         f"- reference_audio_mode: `{comparison['reference_audio_mode']}`",
         f"- target_audio_mode: `{comparison['target_audio_mode']}`",

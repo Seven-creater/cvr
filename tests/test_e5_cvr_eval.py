@@ -155,15 +155,14 @@ class E5CVREvalTests(unittest.TestCase):
                 "do_sample_frames": True,
                 "fps": 2,
                 "load_audio_from_video": True,
-                "use_audio_in_video": True,
             },
             model.module.processing_kwargs["video"],
         )
         self.assertEqual({"foo": "bar"}, model.module.processing_kwargs["chat_template"])
         self.assertTrue(patched)
 
-        result = model.module.processor(videos_kwargs={"load_audio_from_video": True, "use_audio_in_video": True})
-        self.assertEqual({"use_audio_in_video": True}, result["videos_kwargs"])
+        result = model.module.processor(videos_kwargs={"load_audio_from_video": True, "max_pixels": 123})
+        self.assertEqual({"max_pixels": 123}, result["videos_kwargs"])
 
     def test_query_subset_uses_full_gallery_and_calculates_recall(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -419,7 +418,6 @@ class E5CVREvalTests(unittest.TestCase):
                 "batch_size": 1,
                 "video_audio_mode": "on",
                 "load_audio_from_video": True,
-                "use_audio_in_video": True,
                 "processor_video_kwargs_sanitizer": True,
             }
             index = build_or_load_target_index(
@@ -443,11 +441,9 @@ class E5CVREvalTests(unittest.TestCase):
 
             self.assertEqual("on", summary["video_audio_mode"])
             self.assertTrue(summary["load_audio_from_video"])
-            self.assertTrue(summary["use_audio_in_video"])
             self.assertTrue(summary["processor_video_kwargs_sanitizer"])
             self.assertEqual("on", trace["video_audio_mode"])
             self.assertTrue(trace["load_audio_from_video"])
-            self.assertTrue(trace["use_audio_in_video"])
             self.assertTrue(trace["processor_video_kwargs_sanitizer"])
 
     def test_trace_keeps_target_rank_and_topk_hits(self) -> None:
