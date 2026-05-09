@@ -10,7 +10,7 @@ from app.avigate_official import (
     retrieve_videos_from_text_official,
 )
 from app.omni_checker import OmniChecker, RetrievalHints
-from app.retrieval_types import RetrievalHit
+from app.retrieval_types import RetrievalHit, VideoRow
 
 
 def run_official_agent_partial_eval(
@@ -233,6 +233,103 @@ def run_t2v_official_agent_case(
     }
 
 
+def run_cvr_agent_case(
+    *,
+    sample_id: str,
+    query_text: str,
+    reference_video_path: str,
+    edit_text: str,
+    reference_caption: str,
+    runtime: Any,
+    checker: OmniChecker,
+    target_video_id: str | None,
+    avigate_hits: list[RetrievalHit],
+    e5_hits: list[RetrievalHit],
+    fused_hits: list[RetrievalHit],
+    fused_evidence: list[dict],
+    omni_concurrency: int = 4,
+    rerank_window: int = 5,
+    progress: Callable[[str], None] | None = None,
+) -> dict:
+    _emit_progress(progress, f"[cvr] understand composed query sample_id={sample_id}")
+    query_understanding = checker.understand_t2v_query(query_text)
+    reference_video = VideoRow(
+        video_id=f"{sample_id}::reference",
+        video_path=reference_video_path,
+    )
+    _emit_progress(progress, f"[cvr] describe reference sample_id={sample_id}")
+    reference_description = checker.describe_video(reference_video)
+
+    omni_calls = 2
+    fallback_used = query_understanding.fallback_used or reference_description.fallback_used
+    fallback_stage = "query_or_reference_understanding" if fallback_used else None
+    reranked_hits = _clone_hits(fused_hits)
+    candidate_video_descriptions: list[dict] = []
+
+    if fused_hits:
+        window = min(max(1, int(rerank_window)), len(fused_hits))
+        candidate_video_descriptions = _describe_candidate_videos(
+            hits=fused_hits[:window],
+            runtime=runtime,
+            checker=checker,
+            omni_concurrency=omni_concurrency,
+            progress=progress,
+        )
+        omni_calls += len(candidate_video_descriptions)
+        if any(item["video_description"].get("fallback_used") for item in candidate_video_descriptions):
+            fallback_used = True
+            fallback_stage = fallback_stage or "candidate_video_description"
+
+        candidate_payloads = _build_cvr_candidate_payloads(
+            candidate_video_descriptions,
+            fused_evidence=fused_evidence,
+        )
+        if candidate_payloads:
+            _emit_progress(progress, "[cvr] rerank fused candidate videos")
+            rerank_result = checker.rerank_cvr_t2v(
+                reference_video=reference_video,
+                reference_description=reference_description,
+                edit_text=edit_text,
+                query_understanding=query_understanding,
+                candidates=candidate_payloads,
+            )
+            omni_calls += 1
+            reranked_hits, repair_used = _rerank_hits(
+                fused_hits,
+                rerank_result.ordered_video_ids,
+                key_name="video_id",
+                window=window,
+            )
+            if rerank_result.fallback_used or repair_used:
+                fallback_used = True
+                fallback_stage = "cvr_t2v_rerank"
+                reranked_hits = _clone_hits(fused_hits)
+
+    final_result = _build_final_result(reranked_hits, fused_hits, key_name="video_id")
+    return {
+        "mode": "cvr-agent",
+        "sample_id": sample_id,
+        "query_text": query_text,
+        "reference_video_path": reference_video_path,
+        "edit_text": edit_text,
+        "reference_caption": reference_caption,
+        "target_video_id": target_video_id,
+        "query_understanding": query_understanding.to_dict(),
+        "reference_description": reference_description.to_dict(),
+        "avigate_hits": [hit.to_dict() for hit in avigate_hits],
+        "e5_hits": [hit.to_dict() for hit in e5_hits],
+        "fused_hits": [hit.to_dict() for hit in fused_hits],
+        "fused_evidence": list(fused_evidence),
+        "initial_hits": [hit.to_dict() for hit in fused_hits],
+        "candidate_video_descriptions": candidate_video_descriptions,
+        "reranked_hits": [hit.to_dict() for hit in reranked_hits],
+        "final_result": final_result,
+        "omni_calls": omni_calls,
+        "fallback_used": fallback_used,
+        "fallback_stage": fallback_stage,
+    }
+
+
 def run_v2t_official_agent_case(
     *,
     query_video_id: str,
@@ -326,6 +423,34 @@ def _describe_candidate_videos(
     for item in described:
         item.pop("_order", None)
     return described
+
+
+def _build_cvr_candidate_payloads(
+    candidate_video_descriptions: list[dict],
+    *,
+    fused_evidence: list[dict],
+) -> list[dict]:
+    evidence_by_id = {
+        str(item.get("video_id", "")).strip(): item
+        for item in fused_evidence
+        if str(item.get("video_id", "")).strip()
+    }
+    payloads: list[dict] = []
+    for item in candidate_video_descriptions:
+        candidate = dict(item["candidate"])
+        video_id = str(candidate.get("video_id", "")).strip()
+        source_evidence = evidence_by_id.get(video_id, {})
+        payloads.append(
+            {
+                "video_id": video_id,
+                "fused_rank": item["rank"],
+                "fused_score": candidate.get("score"),
+                "source_ranks": source_evidence.get("source_ranks", {}),
+                "source_scores": source_evidence.get("source_scores", {}),
+                "video_description": item["video_description"],
+            }
+        )
+    return payloads
 
 
 def _describe_one_candidate(

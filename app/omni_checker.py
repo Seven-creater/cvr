@@ -42,6 +42,8 @@ REQUIRED_T2V_RERANK_FIELDS = (
     "reason",
 )
 
+REQUIRED_CVR_RERANK_FIELDS = REQUIRED_T2V_RERANK_FIELDS
+
 REQUIRED_V2T_RERANK_FIELDS = (
     "ordered_text_ids",
     "top_choice_text_id",
@@ -297,6 +299,17 @@ class OmniChecker(Protocol):
     def rerank_t2v(self, query_understanding: T2VQueryUnderstanding, candidates: list[dict]) -> T2VRerankResult:
         ...
 
+    def rerank_cvr_t2v(
+        self,
+        *,
+        reference_video: VideoRow,
+        reference_description: VideoDescription,
+        edit_text: str,
+        query_understanding: T2VQueryUnderstanding,
+        candidates: list[dict],
+    ) -> T2VRerankResult:
+        ...
+
     def rerank_v2t(
         self,
         query_video: VideoRow,
@@ -345,6 +358,33 @@ def build_t2v_rerank_user_content(query_understanding: T2VQueryUnderstanding, ca
     return [{"type": "text", "text": prompt}]
 
 
+def build_cvr_t2v_rerank_user_content(
+    *,
+    reference_video: VideoRow,
+    reference_description: VideoDescription,
+    edit_text: str,
+    query_understanding: T2VQueryUnderstanding,
+    candidates: list[dict],
+) -> list[dict]:
+    prompt = (
+        "Task: rerank candidate target videos for composed video retrieval.\n"
+        "You are given a reference video, an edit instruction, a reference description, "
+        "and candidate target video descriptions with retrieval-source evidence.\n"
+        f"Edit instruction: {edit_text}\n"
+        f"Reference description JSON:\n{json.dumps(reference_description.to_dict(), ensure_ascii=False)}\n"
+        f"Query understanding JSON:\n{json.dumps(query_understanding.to_dict(), ensure_ascii=False)}\n"
+        f"Candidate videos JSON:\n{json.dumps(candidates, ensure_ascii=False)}\n"
+        "Rank only the provided candidate video_ids. Keep the full candidate set. "
+        "Prefer candidates that preserve the reference content while reflecting the requested edit. "
+        "Penalize candidates that match the reference but miss the edit, match the edit but change unrelated content, "
+        "or reverse the edit direction."
+    )
+    return [
+        {"type": "video_url", "video_url": {"url": reference_video.video_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
 def build_v2t_rerank_user_content(video_description: VideoDescription, candidates: list[dict]) -> list[dict]:
     prompt = (
         "Task: rerank candidate texts for a video-to-text query.\n"
@@ -388,6 +428,18 @@ def _t2v_rerank_system_prompt() -> str:
         '"confidence": float, "reason": string}. '
         "Use only candidate video_ids that appear in the input, include every candidate exactly once, and do not invent ids. "
         "Prefer candidates whose subject, action, and scene specifically match the query, and penalize broad but weakly related matches."
+    )
+
+
+def _cvr_t2v_rerank_system_prompt() -> str:
+    return (
+        "You are a composed video retrieval verifier. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"ordered_video_ids": [string], "top_choice_video_id": string, '
+        '"confidence": float, "reason": string}. '
+        "Use only candidate video_ids that appear in the input, include every candidate exactly once, and do not invent ids. "
+        "The top_choice_video_id must equal the first ordered_video_ids item. "
+        "Base the decision on whether the target video is the edited version of the reference."
     )
 
 
@@ -550,6 +602,34 @@ class OpenAIOmniChecker:
             return _fallback_t2v_rerank(candidate_ids, reason="t2v_rerank_incomplete")
         return T2VRerankResult.from_dict(payload)
 
+    def rerank_cvr_t2v(
+        self,
+        *,
+        reference_video: VideoRow,
+        reference_description: VideoDescription,
+        edit_text: str,
+        query_understanding: T2VQueryUnderstanding,
+        candidates: list[dict],
+    ) -> T2VRerankResult:
+        candidate_ids = [str(item.get("video_id", "")).strip() for item in candidates if str(item.get("video_id", "")).strip()]
+        try:
+            payload = self._request_payload(
+                build_cvr_t2v_rerank_user_content(
+                    reference_video=reference_video,
+                    reference_description=reference_description,
+                    edit_text=edit_text,
+                    query_understanding=query_understanding,
+                    candidates=candidates,
+                ),
+                _cvr_t2v_rerank_system_prompt(),
+                max_tokens=768,
+            )
+        except Exception as exc:
+            return _fallback_t2v_rerank(candidate_ids, reason=f"cvr_t2v_rerank_failed:{type(exc).__name__}")
+        if _missing_fields(payload, REQUIRED_CVR_RERANK_FIELDS):
+            return _fallback_t2v_rerank(candidate_ids, reason="cvr_t2v_rerank_incomplete")
+        return T2VRerankResult.from_dict(payload)
+
     def rerank_v2t(
         self,
         query_video: VideoRow,
@@ -577,11 +657,13 @@ class MockOmniChecker:
         t2v_understanding_results: dict[str, T2VQueryUnderstanding | dict] | None = None,
         video_description_results: dict[str, VideoDescription | dict] | None = None,
         t2v_rerank_results: dict[str, T2VRerankResult | dict] | None = None,
+        cvr_t2v_rerank_results: dict[str, T2VRerankResult | dict] | None = None,
         v2t_rerank_results: dict[str, V2TRerankResult | dict] | None = None,
     ) -> None:
         self.t2v_understanding_results = dict(t2v_understanding_results or {})
         self.video_description_results = dict(video_description_results or {})
         self.t2v_rerank_results = dict(t2v_rerank_results or {})
+        self.cvr_t2v_rerank_results = dict(cvr_t2v_rerank_results or {})
         self.v2t_rerank_results = dict(v2t_rerank_results or {})
         self.video_description_calls: list[str] = []
         self._video_description_cache: dict[str, VideoDescription] = {}
@@ -629,6 +711,29 @@ class MockOmniChecker:
 
     def rerank_t2v(self, query_understanding: T2VQueryUnderstanding, candidates: list[dict]) -> T2VRerankResult:
         resolved = self.t2v_rerank_results.get(query_understanding.retrieval_text)
+        if isinstance(resolved, T2VRerankResult):
+            return resolved
+        if isinstance(resolved, dict):
+            return T2VRerankResult.from_dict(resolved)
+        candidate_ids = [str(item.get("video_id", "")).strip() for item in candidates if str(item.get("video_id", "")).strip()]
+        return T2VRerankResult(
+            ordered_video_ids=candidate_ids,
+            top_choice_video_id=candidate_ids[0] if candidate_ids else "",
+            confidence=0.0,
+            reason="mock default",
+        )
+
+    def rerank_cvr_t2v(
+        self,
+        *,
+        reference_video: VideoRow,
+        reference_description: VideoDescription,
+        edit_text: str,
+        query_understanding: T2VQueryUnderstanding,
+        candidates: list[dict],
+    ) -> T2VRerankResult:
+        _ = reference_video, reference_description, edit_text
+        resolved = self.cvr_t2v_rerank_results.get(query_understanding.retrieval_text)
         if isinstance(resolved, T2VRerankResult):
             return resolved
         if isinstance(resolved, dict):

@@ -17,6 +17,16 @@ from app.avigate_official import (
     retrieve_texts_from_video_official,
     retrieve_videos_from_text_official,
 )
+from app.cvr_pipeline import (
+    run_avigate_selected_baseline,
+    run_cvr_agent_eval,
+    run_cvr_fusion_eval,
+    run_e5_only_eval,
+    write_cvr_comparison,
+)
+from app.cvr_query_builder import load_cvr_triplets_jsonl
+from app.e5_omni_index import build_or_load_e5_target_index, records_from_video_rows
+from app.e5_omni_runtime import DEFAULT_E5_OMNI_MODEL_PATH, E5OmniRuntimeConfig, load_e5_omni_runtime
 from app.omni_checker import OpenAIOmniChecker
 from app.retrieval_types import parse_topk_values
 
@@ -197,6 +207,109 @@ def command_avigate_agent_merge(args: argparse.Namespace) -> None:
     print(json.dumps(merged, ensure_ascii=False, indent=2))
 
 
+def command_cvr_full_eval(args: argparse.Namespace) -> None:
+    output_root = Path(args.output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    recall_ks = tuple(parse_topk_values(args.topk))
+    avigate_runtime = build_avigate_runtime(args)
+    triplets = load_cvr_triplets_jsonl(
+        args.triplets_jsonl,
+        sample_size=args.sample_size,
+        start_index=args.start_index,
+    )
+    _validate_triplets_in_gallery(triplets, avigate_runtime)
+
+    e5_runtime = load_e5_omni_runtime(
+        E5OmniRuntimeConfig(
+            model_path=args.e5_model,
+            device=args.e5_device,
+            torch_dtype=args.e5_torch_dtype,
+            attn_implementation=args.e5_attn_implementation,
+            batch_size=args.e5_batch_size,
+            video_max_pixels=args.e5_video_max_pixels,
+            video_fps=args.e5_video_fps,
+        )
+    )
+    e5_index = build_or_load_e5_target_index(
+        runtime=e5_runtime,
+        records=records_from_video_rows(avigate_runtime.video_rows),
+        index_dir=args.e5_index_dir or str(output_root / "e5_index"),
+        force_rebuild=args.force_e5_index,
+    )
+
+    progress = lambda message: print(message, file=sys.stderr, flush=True)
+    baseline_summary = run_avigate_selected_baseline(
+        avigate_runtime=avigate_runtime,
+        triplets=triplets,
+        recall_ks=recall_ks,
+        topk=args.topk_value,
+        output_dir=output_root / "avigate_baseline",
+        progress=progress,
+    )
+    e5_summary = run_e5_only_eval(
+        e5_runtime=e5_runtime,
+        e5_index=e5_index,
+        triplets=triplets,
+        recall_ks=recall_ks,
+        topk=args.topk_value,
+        output_dir=output_root / "e5_only",
+        progress=progress,
+    )
+    fusion_summary = run_cvr_fusion_eval(
+        avigate_runtime=avigate_runtime,
+        e5_runtime=e5_runtime,
+        e5_index=e5_index,
+        triplets=triplets,
+        recall_ks=recall_ks,
+        avigate_topk=args.avigate_topk,
+        e5_topk=args.e5_topk,
+        fused_topk=args.fused_topk,
+        output_dir=output_root / "fusion",
+        progress=progress,
+    )
+
+    agent_summary = None
+    if not args.skip_agent:
+        checker = OpenAIOmniChecker(
+            base_url=args.checker_base_url,
+            api_key=args.checker_api_key,
+            model=args.checker_model,
+            timeout_seconds=args.checker_timeout_seconds,
+        )
+        agent_summary = run_cvr_agent_eval(
+            avigate_runtime=avigate_runtime,
+            e5_runtime=e5_runtime,
+            e5_index=e5_index,
+            checker=checker,
+            triplets=triplets,
+            recall_ks=recall_ks,
+            avigate_topk=args.avigate_topk,
+            e5_topk=args.e5_topk,
+            fused_topk=args.fused_topk,
+            rerank_window=args.rerank_window,
+            omni_concurrency=args.omni_concurrency,
+            output_dir=output_root / "agent",
+            progress=progress,
+        )
+
+    comparison = write_cvr_comparison(
+        output_dir=output_root,
+        baseline_summary=baseline_summary,
+        e5_summary=e5_summary,
+        fusion_summary=fusion_summary,
+        agent_summary=agent_summary,
+    )
+    print(json.dumps(comparison, ensure_ascii=False, indent=2))
+
+
+def _validate_triplets_in_gallery(triplets: list, runtime) -> None:
+    video_ids = {row.video_id for row in runtime.video_rows}
+    missing = [triplet.sample_id for triplet in triplets if triplet.sample_id not in video_ids]
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise ValueError(f"{len(missing)} triplets are missing from AVIGATE gallery, e.g. {preview}")
+
+
 def _merge_metric_dicts(summaries: list[dict], key: str, total_runs: int) -> dict:
     metric_names = set()
     for summary in summaries:
@@ -279,6 +392,33 @@ def build_parser() -> argparse.ArgumentParser:
     avigate_agent_merge = subparsers.add_parser("avigate-agent-merge")
     avigate_agent_merge.add_argument("--output-dir", required=True)
     avigate_agent_merge.add_argument("inputs", nargs="+")
+
+    cvr_full_eval = subparsers.add_parser("cvr-full-eval", parents=[avigate_shared])
+    cvr_full_eval.add_argument("--triplets-jsonl", required=True)
+    cvr_full_eval.add_argument("--output-dir", required=True)
+    cvr_full_eval.add_argument("--sample-size", type=int)
+    cvr_full_eval.add_argument("--start-index", type=int, default=0)
+    cvr_full_eval.add_argument("--topk", default="1,5,10")
+    cvr_full_eval.add_argument("--topk-value", type=int, default=10)
+    cvr_full_eval.add_argument("--e5-model", default=DEFAULT_E5_OMNI_MODEL_PATH)
+    cvr_full_eval.add_argument("--e5-index-dir")
+    cvr_full_eval.add_argument("--force-e5-index", action="store_true")
+    cvr_full_eval.add_argument("--e5-device", default="cuda")
+    cvr_full_eval.add_argument("--e5-torch-dtype", default="bfloat16")
+    cvr_full_eval.add_argument("--e5-attn-implementation", default="flash_attention_2")
+    cvr_full_eval.add_argument("--e5-batch-size", type=int, default=1)
+    cvr_full_eval.add_argument("--e5-video-max-pixels", type=int, default=128 * 28 * 28)
+    cvr_full_eval.add_argument("--e5-video-fps", type=int, default=1)
+    cvr_full_eval.add_argument("--avigate-topk", type=int, default=50)
+    cvr_full_eval.add_argument("--e5-topk", type=int, default=50)
+    cvr_full_eval.add_argument("--fused-topk", type=int, default=20)
+    cvr_full_eval.add_argument("--skip-agent", action="store_true")
+    cvr_full_eval.add_argument("--omni-concurrency", type=int, default=2)
+    cvr_full_eval.add_argument("--rerank-window", type=int, default=5)
+    cvr_full_eval.add_argument("--checker-base-url", default="http://127.0.0.1:8092/v1")
+    cvr_full_eval.add_argument("--checker-api-key", default="EMPTY")
+    cvr_full_eval.add_argument("--checker-model", default="qwen2.5-omni")
+    cvr_full_eval.add_argument("--checker-timeout-seconds", type=float, default=180.0)
     return parser
 
 
@@ -301,6 +441,9 @@ def main() -> None:
         return
     if args.command == "avigate-agent-merge":
         command_avigate_agent_merge(args)
+        return
+    if args.command == "cvr-full-eval":
+        command_cvr_full_eval(args)
         return
     command_avigate_v2t_case(args)
 
