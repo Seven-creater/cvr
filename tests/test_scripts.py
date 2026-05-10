@@ -704,6 +704,22 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--output-dir", script)
         self.assertIn("reference.mp4, target.mp4, review.md, metadata.json", script)
 
+    def test_audio_matters_natural_script_uses_natural_omni_pipeline(self) -> None:
+        script = Path("scripts/run_audio_matters_natural_omni.sh").read_text(encoding="utf-8")
+
+        self.assertIn("plan-detective-clips", script)
+        self.assertIn("extract-clips", script)
+        self.assertIn("detective-annotate-clips", script)
+        self.assertIn("app.audio_matters_natural mine-candidates", script)
+        self.assertIn("propose-group-pairs", script)
+        self.assertIn("audio_matters_triplets.jsonl", script)
+        self.assertIn("http://127.0.0.1:8093/v1", script)
+        self.assertNotIn("/Demo/test/data", script)
+        self.assertNotIn("build_composed_triplets.sh", script)
+        self.assertNotIn("modelscope download", script)
+        self.assertNotIn("8092", script)
+        self.assertNotIn("vace", script.lower())
+
     def test_masked_vace_pipeline_queue_keeps_omni_and_splits_gpus(self) -> None:
         script = Path("scripts/run_masked_vace_pipeline_queue.sh").read_text(encoding="utf-8")
 
