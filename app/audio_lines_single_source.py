@@ -33,6 +33,42 @@ from app.composed_data import (
 
 VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
 VISUAL_LINE_TYPES = {"attribute", "object_presence", "object_count", "action", "scene"}
+AUDIO_LINE_PROFILE_DEFAULT = "default"
+AUDIO_LINE_PROFILE_V4_STRICT = "v4_strict"
+AUDIO_LINE_PROFILES = {AUDIO_LINE_PROFILE_DEFAULT, AUDIO_LINE_PROFILE_V4_STRICT}
+V4_A_STRONG_VISUAL_TYPES = {"scene", "action", "object_presence"}
+V4_VAGUE_AUDIO_TERMS = {
+    "buzz",
+    "buzzing",
+    "click",
+    "clicking",
+    "electronic tone",
+    "electronic hum",
+    "hum",
+    "humming",
+    "low frequency",
+    "low-frequency",
+    "tone",
+}
+V4_CONCRETE_AUDIO_TERMS = {
+    "applause",
+    "cheer",
+    "cheering",
+    "chant",
+    "crowd",
+    "music",
+    "song",
+    "whistle",
+    "siren",
+    "bell",
+    "rain",
+    "water",
+    "wind",
+    "engine",
+    "machinery",
+    "footstep",
+    "footsteps",
+}
 
 
 def prepare_existing_single_source_clips(
@@ -42,6 +78,7 @@ def prepare_existing_single_source_clips(
     run_root: str | Path,
     max_source_folders: int | None = None,
     annotation_search_roots: list[str | Path] | None = None,
+    force_audio_focused_refresh: bool = False,
 ) -> dict[str, Any]:
     root_path = Path(root)
     source_root = Path(single_source_root)
@@ -119,7 +156,7 @@ def prepare_existing_single_source_clips(
                 normalized["annotation_reuse_key"] = reused["key"]
                 reused_annotations.append(normalized)
                 audio_present = _annotation_has_audio_fields(normalized)
-                if not audio_present:
+                if force_audio_focused_refresh or not audio_present:
                     audio_refresh_manifest.append(record)
                 reuse_rows.append(
                     {
@@ -187,6 +224,7 @@ def prepare_existing_single_source_clips(
         "reused_annotation_count": len(reused_annotations),
         "missing_annotation_count": len(missing_annotation_manifest),
         "audio_refresh_needed_count": len(audio_refresh_manifest),
+        "force_audio_focused_refresh": bool(force_audio_focused_refresh),
         "annotation_sources": annotation_sources,
         "outputs": {key: str(value) for key, value in paths.items()},
         "skipped_folders": skipped_folders[:50],
@@ -231,7 +269,9 @@ def split_audio_line_candidates(
     min_audio_anchor_score: float = 0.86,
     max_a_candidates: int | None = None,
     max_b_candidates: int | None = None,
+    audio_line_quality_profile: str = AUDIO_LINE_PROFILE_DEFAULT,
 ) -> dict[str, Any]:
+    audio_line_quality_profile = _normalize_audio_line_quality_profile(audio_line_quality_profile)
     root_path = Path(root)
     annotations = list(_load_jsonl(Path(clip_annotations_path)))
     candidates = list(_load_jsonl(Path(pair_candidates_path)))
@@ -249,20 +289,74 @@ def split_audio_line_candidates(
             continue
         difference = candidate.get("difference") if isinstance(candidate.get("difference"), dict) else {}
         difference_type = str(difference.get("type", "")).strip()
+        visual_delta_strength = _visual_delta_strength(candidate, reference, target)
+        visual_context_similarity = _visual_context_similarity(reference, target)
         if difference_type in VISUAL_LINE_TYPES:
             score, min_rms = _pair_audio_anchor_score(root_path, reference, target, audio_features)
-            if score >= min_audio_anchor_score:
-                a_records.append(_line_candidate(candidate, VISUAL_AUDIO_ANCHOR_LINE, score=score, min_rms=min_rms))
+            if score >= min_audio_anchor_score and _v4_a_candidate_allowed(
+                audio_line_quality_profile=audio_line_quality_profile,
+                difference_type=difference_type,
+                visual_delta_strength=visual_delta_strength,
+            ):
+                a_records.append(
+                    _line_candidate(
+                        candidate,
+                        VISUAL_AUDIO_ANCHOR_LINE,
+                        score=score,
+                        min_rms=min_rms,
+                        visual_delta_strength=visual_delta_strength,
+                        visual_context_similarity=visual_context_similarity,
+                        audio_line_quality_profile=audio_line_quality_profile,
+                    )
+                )
             else:
-                reject_counts["a_audio_anchor_below_threshold"] += 1
-        if _speech_is_transcript_backed(reference, target):
-            b_records.append(_speech_line_candidate(candidate, reference, target))
+                if score < min_audio_anchor_score:
+                    reject_counts["a_audio_anchor_below_threshold"] += 1
+                else:
+                    reject_counts["a_v4_visual_delta_too_weak"] += 1
+        if _speech_is_transcript_backed(reference, target) and _v4_b_candidate_allowed(
+            audio_line_quality_profile=audio_line_quality_profile,
+            visual_delta_strength=visual_delta_strength,
+            visual_context_similarity=visual_context_similarity,
+            audio_text=" ".join(_speech_texts_from_annotation(reference)[:2] + _speech_texts_from_annotation(target)[:2]),
+            difference_type="speech",
+        ):
+            b_records.append(
+                _speech_line_candidate(
+                    candidate,
+                    reference,
+                    target,
+                    visual_delta_strength=visual_delta_strength,
+                    visual_context_similarity=visual_context_similarity,
+                    audio_line_quality_profile=audio_line_quality_profile,
+                )
+            )
         else:
             non_speech_score = _non_speech_audio_event_score(reference, target)
-            if non_speech_score >= 0.45:
-                b_records.append(_audio_event_line_candidate(candidate, reference, target, non_speech_score))
+            audio_text = " ".join(_normalize_list(reference.get("audio_events", [])) + _normalize_list(target.get("audio_events", [])))
+            if non_speech_score >= 0.45 and _v4_b_candidate_allowed(
+                audio_line_quality_profile=audio_line_quality_profile,
+                visual_delta_strength=visual_delta_strength,
+                visual_context_similarity=visual_context_similarity,
+                audio_text=audio_text,
+                difference_type="audio_event",
+            ):
+                b_records.append(
+                    _audio_event_line_candidate(
+                        candidate,
+                        reference,
+                        target,
+                        non_speech_score,
+                        visual_delta_strength=visual_delta_strength,
+                        visual_context_similarity=visual_context_similarity,
+                        audio_line_quality_profile=audio_line_quality_profile,
+                    )
+                )
             else:
-                reject_counts["b_missing_audio_evidence"] += 1
+                if non_speech_score < 0.45:
+                    reject_counts["b_missing_audio_evidence"] += 1
+                else:
+                    reject_counts["b_v4_visual_or_audio_gate_failed"] += 1
         if index % 50 == 0:
             print(f"[audio-lines-split] processed {index}/{len(candidates)}", file=sys.stderr, flush=True)
 
@@ -283,6 +377,7 @@ def split_audio_line_candidates(
         "a_candidate_count": len(a_records),
         "b_candidate_count": len(b_records),
         "min_audio_anchor_score": min_audio_anchor_score,
+        "audio_line_quality_profile": audio_line_quality_profile,
         "reject_counts": dict(reject_counts),
         "a_output_path": str(a_output_path),
         "b_output_path": str(b_output_path),
@@ -467,28 +562,147 @@ def _pair_audio_anchor_score(root: Path, reference: dict[str, Any], target: dict
     return audio_anchor_score(features[0], features[1]), min(float(features[0].rms), float(features[1].rms))
 
 
-def _line_candidate(candidate: dict[str, Any], line: str, *, score: float = 0.0, min_rms: float = 0.0) -> dict[str, Any]:
+def _normalize_audio_line_quality_profile(value: str | None) -> str:
+    profile = str(value or AUDIO_LINE_PROFILE_DEFAULT).strip().lower().replace("-", "_")
+    if profile in {"", "none"}:
+        return AUDIO_LINE_PROFILE_DEFAULT
+    if profile not in AUDIO_LINE_PROFILES:
+        raise ValueError(f"unsupported audio_line_quality_profile={value!r}; expected one of {sorted(AUDIO_LINE_PROFILES)}")
+    return profile
+
+
+def _annotation_text(annotation: dict[str, Any], fields: tuple[str, ...]) -> str:
+    parts: list[str] = []
+    for field in fields:
+        value = annotation.get(field)
+        if isinstance(value, dict):
+            parts.extend(str(key) for key in value.keys())
+            parts.extend(str(item) for item in value.values())
+        else:
+            parts.extend(_normalize_list(value))
+            if isinstance(value, str):
+                parts.append(value)
+    return " ".join(part for part in parts if str(part).strip())
+
+
+def _token_set(value: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", value.lower()) if len(token) >= 3}
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    if not left and not right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(1, len(left | right))
+
+
+def _visual_context_similarity(reference: dict[str, Any], target: dict[str, Any]) -> float:
+    fields = ("summary", "subjects", "actions", "scene", "attributes")
+    ref_tokens = _token_set(_annotation_text(reference, fields))
+    tgt_tokens = _token_set(_annotation_text(target, fields))
+    base = _jaccard(ref_tokens, tgt_tokens)
+    if str(reference.get("dataset", "")) == str(target.get("dataset", "")):
+        base += 0.05
+    return round(min(1.0, base), 3)
+
+
+def _visual_delta_strength(candidate: dict[str, Any], reference: dict[str, Any], target: dict[str, Any]) -> float:
+    difference = candidate.get("difference") if isinstance(candidate.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
+    ref_visual = _annotation_text(reference, ("summary", "subjects", "actions", "scene", "attributes", "object_counts"))
+    tgt_visual = _annotation_text(target, ("summary", "subjects", "actions", "scene", "attributes", "object_counts"))
+    distance = 1.0 - _jaccard(_token_set(ref_visual), _token_set(tgt_visual))
+    type_bonus = {
+        "scene": 0.28,
+        "action": 0.22,
+        "object_presence": 0.18,
+        "object_count": 0.12,
+        "attribute": 0.04,
+        "visible_text": -0.25,
+    }.get(difference_type, 0.0)
+    return round(max(0.0, min(1.0, distance + type_bonus)), 3)
+
+
+def _v4_a_candidate_allowed(*, audio_line_quality_profile: str, difference_type: str, visual_delta_strength: float) -> bool:
+    if audio_line_quality_profile != AUDIO_LINE_PROFILE_V4_STRICT:
+        return True
+    return difference_type in V4_A_STRONG_VISUAL_TYPES and visual_delta_strength >= 0.45
+
+
+def _v4_b_candidate_allowed(
+    *,
+    audio_line_quality_profile: str,
+    visual_delta_strength: float,
+    visual_context_similarity: float,
+    audio_text: str,
+    difference_type: str,
+) -> bool:
+    if audio_line_quality_profile != AUDIO_LINE_PROFILE_V4_STRICT:
+        return True
+    if visual_delta_strength > 0.62 or visual_context_similarity < 0.18:
+        return False
+    normalized_audio = audio_text.lower()
+    if difference_type == "audio_event":
+        if not any(term in normalized_audio for term in V4_CONCRETE_AUDIO_TERMS):
+            return False
+        if any(term in normalized_audio for term in V4_VAGUE_AUDIO_TERMS) and not any(term in normalized_audio for term in V4_CONCRETE_AUDIO_TERMS):
+            return False
+    return True
+
+
+def _line_candidate(
+    candidate: dict[str, Any],
+    line: str,
+    *,
+    score: float = 0.0,
+    min_rms: float = 0.0,
+    visual_delta_strength: float = 0.0,
+    visual_context_similarity: float = 0.0,
+    audio_line_quality_profile: str = AUDIO_LINE_PROFILE_DEFAULT,
+) -> dict[str, Any]:
     record = dict(candidate)
+    audio_line_quality_profile = _normalize_audio_line_quality_profile(audio_line_quality_profile)
     quality = dict(record.get("quality", {})) if isinstance(record.get("quality"), dict) else {}
+    visual_hint_difference = record.get("difference") if isinstance(record.get("difference"), dict) else {}
     quality.update(
         {
             "audio_dataset_line": line,
+            "audio_line_quality_profile": audio_line_quality_profile,
             "audio_anchor_required": 1.0 if line == VISUAL_AUDIO_ANCHOR_LINE else quality.get("audio_anchor_required", 0.0),
             "audio_anchor_score": round(score, 4) if line == VISUAL_AUDIO_ANCHOR_LINE else quality.get("audio_anchor_score", 0.0),
             "audio_anchor_min_rms": round(min_rms, 6) if line == VISUAL_AUDIO_ANCHOR_LINE else quality.get("audio_anchor_min_rms", 0.0),
             "audio_anchor_type": "same_source_similar_audio" if line == VISUAL_AUDIO_ANCHOR_LINE else quality.get("audio_anchor_type", ""),
             "edit_primary_modality": "visual" if line == VISUAL_AUDIO_ANCHOR_LINE else "audio",
+            "visual_delta_strength": round(float(visual_delta_strength), 3),
+            "visual_context_similarity": round(float(visual_context_similarity), 3),
+            "visual_hint_difference_type": str(visual_hint_difference.get("type", "")).strip(),
         }
     )
     record["quality"] = quality
     record["audio_dataset_line"] = line
+    record["audio_line_quality_profile"] = audio_line_quality_profile
     record["risk_flags"] = _dedupe_strings(_normalize_list(record.get("risk_flags", [])) + [line])
     record["proposal_id"] = f"{line}_{record.get('proposal_id') or _build_proposal_id(str(record.get('reference_video', '')), str(record.get('target_video', '')))}"
     return record
 
 
-def _speech_line_candidate(candidate: dict[str, Any], reference: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
-    record = _line_candidate(candidate, SPEECH_AUDIO_CONTENT_LINE)
+def _speech_line_candidate(
+    candidate: dict[str, Any],
+    reference: dict[str, Any],
+    target: dict[str, Any],
+    *,
+    visual_delta_strength: float = 0.0,
+    visual_context_similarity: float = 0.0,
+    audio_line_quality_profile: str = AUDIO_LINE_PROFILE_DEFAULT,
+) -> dict[str, Any]:
+    record = _line_candidate(
+        candidate,
+        SPEECH_AUDIO_CONTENT_LINE,
+        visual_delta_strength=visual_delta_strength,
+        visual_context_similarity=visual_context_similarity,
+        audio_line_quality_profile=audio_line_quality_profile,
+    )
     reference_speech = "; ".join(_speech_texts_from_annotation(reference)[:2]) or "reference speech"
     target_speech = "; ".join(_speech_texts_from_annotation(target)[:2]) or "target speech"
     record["difference"] = {
@@ -505,14 +719,30 @@ def _speech_line_candidate(candidate: dict[str, Any], reference: dict[str, Any],
             "speech_evidence_score": _speech_evidence_score(reference, target),
             "speech_specificity_score": _speech_specificity_score(reference, target),
             "speech_transcript_backed": 1.0,
+            "audio_content_delta_strength": max(_speech_evidence_score(reference, target), _speech_specificity_score(reference, target)),
         }
     )
     record["quality"] = quality
     return record
 
 
-def _audio_event_line_candidate(candidate: dict[str, Any], reference: dict[str, Any], target: dict[str, Any], score: float) -> dict[str, Any]:
-    record = _line_candidate(candidate, SPEECH_AUDIO_CONTENT_LINE)
+def _audio_event_line_candidate(
+    candidate: dict[str, Any],
+    reference: dict[str, Any],
+    target: dict[str, Any],
+    score: float,
+    *,
+    visual_delta_strength: float = 0.0,
+    visual_context_similarity: float = 0.0,
+    audio_line_quality_profile: str = AUDIO_LINE_PROFILE_DEFAULT,
+) -> dict[str, Any]:
+    record = _line_candidate(
+        candidate,
+        SPEECH_AUDIO_CONTENT_LINE,
+        visual_delta_strength=visual_delta_strength,
+        visual_context_similarity=visual_context_similarity,
+        audio_line_quality_profile=audio_line_quality_profile,
+    )
     record["difference"] = {
         "type": "audio_event",
         "from": "; ".join(_normalize_list(reference.get("audio_events", []))[:2]) or "reference audio",
@@ -520,13 +750,28 @@ def _audio_event_line_candidate(candidate: dict[str, Any], reference: dict[str, 
         "description": "the non-speech audio event differs between the reference and target clips",
     }
     quality = dict(record.get("quality", {}))
-    quality.update({"difference_type": "audio_event", "has_audio_modality": 1.0, "non_speech_audio_event_score": round(score, 3)})
+    quality.update({"difference_type": "audio_event", "has_audio_modality": 1.0, "non_speech_audio_event_score": round(score, 3), "audio_content_delta_strength": round(score, 3)})
     record["quality"] = quality
     return record
 
 
-def _line_candidate_sort_key(record: dict[str, Any]) -> tuple[float, float, str]:
+def _line_candidate_sort_key(record: dict[str, Any]) -> tuple[Any, ...]:
     quality = record.get("quality", {}) if isinstance(record.get("quality"), dict) else {}
+    if str(quality.get("audio_line_quality_profile", "")) == AUDIO_LINE_PROFILE_V4_STRICT:
+        if str(record.get("audio_dataset_line", "")) == VISUAL_AUDIO_ANCHOR_LINE:
+            return (
+                _score_float(quality.get("visual_delta_strength")),
+                _score_float(quality.get("audio_anchor_score")),
+                _score_float(record.get("composite_score")),
+                str(record.get("proposal_id", "")),
+            )
+        if str(record.get("audio_dataset_line", "")) == SPEECH_AUDIO_CONTENT_LINE:
+            return (
+                _score_float(quality.get("visual_context_similarity")),
+                _score_float(quality.get("audio_content_delta_strength")),
+                _score_float(record.get("composite_score")),
+                str(record.get("proposal_id", "")),
+            )
     return (
         _score_float(quality.get("audio_anchor_score", quality.get("speech_evidence_score", quality.get("non_speech_audio_event_score", 0.0)))),
         _score_float(record.get("composite_score")),
@@ -564,6 +809,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--run-root", required=True)
     prepare.add_argument("--max-source-folders", type=int)
     prepare.add_argument("--annotation-search-root", action="append", default=[])
+    prepare.add_argument("--force-audio-focused-refresh", action="store_true")
 
     merge_ann = subparsers.add_parser("merge-annotations")
     merge_ann.add_argument("--base-annotations-path", required=True)
@@ -580,6 +826,7 @@ def build_parser() -> argparse.ArgumentParser:
     split.add_argument("--min-audio-anchor-score", type=float, default=0.86)
     split.add_argument("--max-a-candidates", type=int)
     split.add_argument("--max-b-candidates", type=int)
+    split.add_argument("--audio-line-quality-profile", default=AUDIO_LINE_PROFILE_DEFAULT)
 
     shard = subparsers.add_parser("shard-jsonl")
     shard.add_argument("--input-path", required=True)
@@ -603,6 +850,7 @@ def main() -> None:
             run_root=args.run_root,
             max_source_folders=args.max_source_folders,
             annotation_search_roots=args.annotation_search_root,
+            force_audio_focused_refresh=args.force_audio_focused_refresh,
         )
     elif args.command == "merge-annotations":
         result = merge_annotations(
@@ -621,6 +869,7 @@ def main() -> None:
             min_audio_anchor_score=args.min_audio_anchor_score,
             max_a_candidates=args.max_a_candidates,
             max_b_candidates=args.max_b_candidates,
+            audio_line_quality_profile=args.audio_line_quality_profile,
         )
     elif args.command == "shard-jsonl":
         result = shard_jsonl(input_path=args.input_path, output_dir=args.output_dir, shards=args.shards, prefix=args.prefix)

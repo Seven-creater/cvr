@@ -870,6 +870,40 @@ AUDIO_MATTERS_ACCEPTANCE_PROFILE = "audio_matters"
 STANDARD_AUDIO_DATASET_LINE = "standard"
 VISUAL_AUDIO_ANCHOR_LINE = "visual_audio_anchor"
 SPEECH_AUDIO_CONTENT_LINE = "speech_audio_content"
+AUDIO_LINE_QUALITY_PROFILE_V4_STRICT = "v4_strict"
+V4_A_STRONG_VISUAL_TYPES = {"scene", "action", "object_presence"}
+V4_VAGUE_AUDIO_TERMS = (
+    "buzz",
+    "buzzing",
+    "click",
+    "clicking",
+    "electronic tone",
+    "electronic hum",
+    "hum",
+    "humming",
+    "low frequency",
+    "low-frequency",
+    "tone",
+)
+V4_CONCRETE_AUDIO_TERMS = (
+    "applause",
+    "cheer",
+    "cheering",
+    "chant",
+    "crowd",
+    "music",
+    "song",
+    "whistle",
+    "siren",
+    "bell",
+    "rain",
+    "water",
+    "wind",
+    "engine",
+    "machinery",
+    "footstep",
+    "footsteps",
+)
 AUDIO_DATASET_LINE_NAMES = {
     STANDARD_AUDIO_DATASET_LINE,
     VISUAL_AUDIO_ANCHOR_LINE,
@@ -1999,6 +2033,7 @@ def propose_single_source_pairs(
                 edit_text_quality=edit_text_quality,
                 acceptance_profile=acceptance_profile,
                 audio_dataset_line=audio_dataset_line,
+                candidate_quality=quality,
                 reference_annotation=reference_annotation,
                 target_annotation=target_annotation,
             )
@@ -2097,6 +2132,7 @@ def propose_single_source_pairs(
                 "target_caption": str(model_fields.get("target_caption", "")).strip(),
                 "difference": difference,
                 "audio_dataset_line": audio_dataset_line,
+                "audio_line_quality_profile": str(quality.get("audio_line_quality_profile", "")).strip(),
                 "audio_matters_line": "visual_edit_audio_anchor" if audio_dataset_line == VISUAL_AUDIO_ANCHOR_LINE else "",
                 "dominant_delta": dict(model_fields.get("dominant_delta", {})),
                 "reference_state": dict(model_fields.get("reference_state", {})) if isinstance(model_fields.get("reference_state"), dict) else {},
@@ -2255,6 +2291,7 @@ def detective_annotate_clips(
     overwrite: bool = False,
     timeout_seconds: float = 180.0,
     concurrency: int = 1,
+    audio_focused: bool = False,
 ) -> dict[str, Any]:
     return _annotate_clips_impl(
         root=root,
@@ -2267,6 +2304,7 @@ def detective_annotate_clips(
         overwrite=overwrite,
         detective=True,
         concurrency=concurrency,
+        audio_focused=audio_focused,
     )
 
 
@@ -2282,6 +2320,7 @@ def _annotate_clips_impl(
     timeout_seconds: float,
     detective: bool,
     concurrency: int,
+    audio_focused: bool = False,
 ) -> dict[str, Any]:
     layout = ensure_layout(root)
     manifest_path = Path(clips_manifest_path)
@@ -2321,6 +2360,7 @@ def _annotate_clips_impl(
                 normalized, raw_model_output = local_client.annotate_clip_detective(
                     clip_path=str(clip_path),
                     tool_observations=tool_observations,
+                    audio_focused=audio_focused,
                 )
                 fallback_used = False
             except Exception as detective_exc:
@@ -2390,6 +2430,7 @@ def _annotate_clips_impl(
                     "detective_trajectory": list(normalized.get("detective_trajectory", [])),
                     "uncertainties": list(normalized.get("uncertainties", [])),
                     "detective_fallback_used": detective_fallback_used,
+                    "audio_focused_annotation": bool(audio_focused),
                 }
             )
             if detective_fallback_reason:
@@ -2454,6 +2495,7 @@ def _annotate_clips_impl(
         "reused_count": reused_count,
         "fallback_count": fallback_count,
         "annotation_mode": "detective" if detective else "single_pass",
+        "audio_focused_annotation": bool(audio_focused),
         "detective_to_single_pass_count": detective_to_single_pass_count if detective else 0,
         "concurrency": concurrency,
     }
@@ -5799,8 +5841,45 @@ def build_manual_review_bundle(
         metadata["incomplete_review_bundle"] = bool(review_bundle_issues)
         if review_bundle_issues:
             incomplete_review_bundle_count += 1
+        final_verification = record.get("final_omni_verification", {}) if isinstance(record.get("final_omni_verification"), dict) else {}
+        local_gate_report = record.get("local_gate_report", {}) if isinstance(record.get("local_gate_report"), dict) else {}
+        review_metadata = {
+            "line": str(record.get("audio_dataset_line", "")).strip(),
+            "audio_line_quality_profile": str(record.get("audio_line_quality_profile") or quality.get("audio_line_quality_profile", "")).strip(),
+            "edit_text": str(record.get("edit_text", "")).strip(),
+            "difference": record.get("difference", {}),
+            "reference_video": reference_video_raw,
+            "target_video": target_video_raw,
+            "visual_verdict": {
+                "visual_delta_strength": quality.get("visual_delta_strength"),
+                "visual_context_similarity": quality.get("visual_context_similarity"),
+                "reference_satisfies_edit": final_verification.get("reference_satisfies_edit"),
+                "target_satisfies_edit": final_verification.get("target_satisfies_edit"),
+                "observable_delta": final_verification.get("observable_delta"),
+                "single_primary_delta": final_verification.get("single_primary_delta"),
+                "evidence": final_verification.get("evidence", []),
+            },
+            "audio_verdict": {
+                "audio_anchor_score": audio_anchor.get("audio_anchor_score"),
+                "audio_anchor_type": audio_anchor.get("audio_anchor_type", ""),
+                "speech_evidence_score": quality.get("speech_evidence_score"),
+                "speech_specificity_score": quality.get("speech_specificity_score"),
+                "non_speech_audio_event_score": quality.get("non_speech_audio_event_score"),
+                "audio_content_delta_strength": quality.get("audio_content_delta_strength"),
+            },
+            "omni_accept": bool(record.get("accepted")),
+            "omni_reject_reason": str(judge.get("reject_reason", "")).strip(),
+            "local_gate_report": local_gate_report,
+            "pair_video_evidence": record.get("pair_video_evidence", []),
+            "reference_omni_description": metadata["reference_omni_description"],
+            "target_omni_description": metadata["target_omni_description"],
+        }
         (item_dir / "metadata.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (item_dir / "review_metadata.json").write_text(
+            json.dumps(review_metadata, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         (item_dir / "semantic_evaluation_result.json").write_text(
@@ -5837,6 +5916,7 @@ def build_manual_review_bundle(
                 "edit_text": str(record.get("edit_text", "")).strip(),
                 "item_dir": str(item_dir),
                 "review_md": str(item_dir / "review.md"),
+                "review_metadata": str(item_dir / "review_metadata.json"),
                 "reference_video": str(reference_copy if copy_videos and reference_copy.exists() else reference_path),
                 "target_video": str(target_copy if copy_videos and target_copy.exists() else target_path),
                 "incomplete_review_bundle": bool(review_bundle_issues),
@@ -7465,15 +7545,27 @@ def _single_source_pair_candidate(
 def _single_source_candidate_prompt_view(candidate: dict[str, Any]) -> dict[str, Any]:
     difference = candidate.get("difference") if isinstance(candidate.get("difference"), dict) else {}
     audio_dataset_line = _normalize_audio_dataset_line(candidate.get("audio_dataset_line"))
+    quality = dict(candidate.get("quality", {})) if isinstance(candidate.get("quality"), dict) else {}
+    profile = str(quality.get("audio_line_quality_profile") or candidate.get("audio_line_quality_profile") or "").strip()
     instruction = "Do not copy the heuristic difference if the videos show a stronger product, overlay, object, action, or composition change."
     if audio_dataset_line == VISUAL_AUDIO_ANCHOR_LINE:
         instruction = (
             "A-line visual_audio_anchor: audio is preserved context only. Choose a clear visual delta and do not mention audio, sound, speech, music, or transcript in edit_text."
         )
+        if profile == AUDIO_LINE_QUALITY_PROFILE_V4_STRICT:
+            instruction += (
+                " v4_strict: accept only large visual shot/scene/subject/action changes, like changing a news anchor shot to flood aerial footage. "
+                "Reject near-duplicate visuals, lighting changes, tiny hand/object changes, camera distance changes, visible-text-only edits, and wording-only attribute edits."
+            )
     elif audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE:
         instruction = (
             "B-line speech_audio_content: choose speech content or concrete non-speech audio_event as the primary delta; reject if visuals are the main change."
         )
+        if profile == AUDIO_LINE_QUALITY_PROFILE_V4_STRICT:
+            instruction += (
+                " v4_strict: the visual context must stay similar, like two cricket broadcast clips where crowd cheering or speech content changes. "
+                "Reject pairs with large visual scene/subject changes and reject vague hum/click/tone guesses unless there is explicit evidence."
+            )
     return {
         "candidate_id": str(candidate.get("candidate_id", "")),
         "candidate_index": candidate.get("candidate_index"),
@@ -7490,7 +7582,7 @@ def _single_source_candidate_prompt_view(candidate: dict[str, Any]) -> dict[str,
             "description": str(difference.get("description", "")),
         },
         "risk_flags": list(candidate.get("risk_flags", [])) if isinstance(candidate.get("risk_flags"), list) else [],
-        "quality": dict(candidate.get("quality", {})) if isinstance(candidate.get("quality"), dict) else {},
+        "quality": quality,
         "instruction": instruction,
     }
 
@@ -7591,6 +7683,8 @@ def _recheck_existing_single_source_pair_record(
         model_fields=model_fields,
         edit_text_quality=edit_text_quality,
         acceptance_profile=acceptance_profile,
+        audio_dataset_line=str(record.get("audio_dataset_line") or STANDARD_AUDIO_DATASET_LINE),
+        candidate_quality=record.get("quality", {}) if isinstance(record.get("quality"), dict) else {},
         reference_annotation=record.get("reference_annotation", {}) if isinstance(record.get("reference_annotation"), dict) else None,
         target_annotation=record.get("target_annotation", {}) if isinstance(record.get("target_annotation"), dict) else None,
     )
@@ -7600,6 +7694,7 @@ def _recheck_existing_single_source_pair_record(
         difference_type=str(difference.get("type", "")).strip(),
         confidence=_score_float(record.get("confidence")),
         acceptance_profile=acceptance_profile,
+        audio_dataset_line=str(record.get("audio_dataset_line") or STANDARD_AUDIO_DATASET_LINE),
         reference_video_exists=True,
         target_video_exists=True,
     )
@@ -7703,6 +7798,10 @@ def _single_source_pair_quality(
         "non_speech_audio_event_score",
         "has_audio_modality",
         "audio_dataset_line",
+        "audio_line_quality_profile",
+        "visual_delta_strength",
+        "visual_context_similarity",
+        "audio_content_delta_strength",
     ):
         if key in heuristic_quality:
             quality[key] = heuristic_quality[key]
@@ -7717,6 +7816,7 @@ def _single_source_pair_acceptance_issues(
     edit_text_quality: dict[str, Any],
     acceptance_profile: str,
     audio_dataset_line: str = STANDARD_AUDIO_DATASET_LINE,
+    candidate_quality: dict[str, Any] | None = None,
     reference_annotation: dict[str, Any] | None = None,
     target_annotation: dict[str, Any] | None = None,
 ) -> list[str]:
@@ -7808,6 +7908,7 @@ def _single_source_pair_acceptance_issues(
         _single_source_audio_line_acceptance_issues(
             model_fields=model_fields,
             audio_dataset_line=audio_dataset_line,
+            candidate_quality=candidate_quality,
             reference_annotation=reference_annotation,
             target_annotation=target_annotation,
         )
@@ -7977,12 +8078,15 @@ def _single_source_audio_line_acceptance_issues(
     *,
     model_fields: dict[str, Any],
     audio_dataset_line: str,
+    candidate_quality: dict[str, Any] | None,
     reference_annotation: dict[str, Any] | None,
     target_annotation: dict[str, Any] | None,
 ) -> list[str]:
     line = _normalize_audio_dataset_line(audio_dataset_line)
     if line == STANDARD_AUDIO_DATASET_LINE:
         return []
+    candidate_quality = candidate_quality if isinstance(candidate_quality, dict) else {}
+    profile = str(candidate_quality.get("audio_line_quality_profile", "")).strip()
     difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
     difference_type = str(difference.get("type", "")).strip()
     modalities = {str(item).strip().lower() for item in _normalize_list(model_fields.get("modalities", []))}
@@ -7996,6 +8100,12 @@ def _single_source_audio_line_acceptance_issues(
             issues.append("visual_audio_anchor edit must not require audio modality")
         if any(word in edit_text for word in audio_words):
             issues.append("visual_audio_anchor edit_text mentions audio/speech terms")
+        if profile == AUDIO_LINE_QUALITY_PROFILE_V4_STRICT:
+            visual_delta_strength = _score_float(candidate_quality.get("visual_delta_strength"))
+            if difference_type not in V4_A_STRONG_VISUAL_TYPES:
+                issues.append(f"visual_too_similar_for_A: {difference_type or 'missing'} is not a large visual delta type")
+            if visual_delta_strength < 0.45:
+                issues.append(f"visual_too_similar_for_A: visual_delta_strength {visual_delta_strength:.2f} < 0.45")
     elif line == SPEECH_AUDIO_CONTENT_LINE:
         if difference_type not in {"speech", "audio_event"}:
             issues.append(f"speech_audio_content requires speech or audio_event difference type, got {difference_type or 'missing'}")
@@ -8012,6 +8122,32 @@ def _single_source_audio_line_acceptance_issues(
             )
             if score < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "non_speech_audio_event_score"):
                 issues.append("speech_audio_content audio_event edit lacks non-speech audio evidence")
+        if profile == AUDIO_LINE_QUALITY_PROFILE_V4_STRICT:
+            visual_delta_strength = _score_float(candidate_quality.get("visual_delta_strength"))
+            visual_context_similarity = _score_float(candidate_quality.get("visual_context_similarity"))
+            if visual_delta_strength > 0.62:
+                issues.append(f"visual_too_different_for_B: visual_delta_strength {visual_delta_strength:.2f} > 0.62")
+            if visual_context_similarity < 0.18:
+                issues.append(f"visual_too_different_for_B: visual_context_similarity {visual_context_similarity:.2f} < 0.18")
+            if difference_type == "audio_event":
+                evidence_text = _normalized_phrase(
+                    " ".join(
+                        [
+                            str(difference.get("from", "")),
+                            str(difference.get("to", "")),
+                            str(difference.get("description", "")),
+                            " ".join(_normalize_list(reference_annotation.get("audio_events", []))) if reference_annotation else "",
+                            " ".join(_normalize_list(target_annotation.get("audio_events", []))) if target_annotation else "",
+                            " ".join(model_fields.get("evidence", [])) if isinstance(model_fields.get("evidence"), list) else "",
+                        ]
+                    )
+                )
+                has_concrete_audio = any(term in evidence_text for term in V4_CONCRETE_AUDIO_TERMS)
+                has_vague_audio = any(term in evidence_text for term in V4_VAGUE_AUDIO_TERMS)
+                if not has_concrete_audio:
+                    issues.append("audio_not_primary: missing concrete audio event evidence")
+                if has_vague_audio and not has_concrete_audio:
+                    issues.append("vague_audio_event: vague hum/click/tone without explicit evidence")
     return _dedupe_strings(issues)
 
 
@@ -17175,6 +17311,7 @@ def build_parser() -> argparse.ArgumentParser:
     detective_annotate_parser.add_argument("--timeout-seconds", type=float, default=180.0)
     detective_annotate_parser.add_argument("--concurrency", type=int, default=1)
     detective_annotate_parser.add_argument("--overwrite", action="store_true")
+    detective_annotate_parser.add_argument("--audio-focused", action="store_true")
 
     mine_pair_candidates_parser = subparsers.add_parser("mine-pair-candidates")
     mine_pair_candidates_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -17466,6 +17603,7 @@ def main() -> None:
             timeout_seconds=args.timeout_seconds,
             concurrency=args.concurrency,
             overwrite=args.overwrite,
+            audio_focused=args.audio_focused,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

@@ -274,6 +274,73 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("main speaker", request_body["messages"][0]["content"])
         self.assertIn("inset", request_body["messages"][0]["content"])
 
+    def test_propose_single_source_pair_includes_v4_audio_line_guidance(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "edit_text": "change the shot from a studio anchor to aerial flood footage",
+                                "modalities": ["visual"],
+                                "reference_caption": "a news anchor speaks in a studio",
+                                "target_caption": "aerial flood footage is shown",
+                                "difference": {"type": "scene", "from": "studio anchor", "to": "aerial flood footage", "description": "large visual shot change"},
+                                "dominant_delta": {"type": "scene", "from": "studio", "to": "flood aerial", "reason": "large visual change"},
+                                "reference_state": {"main_speaker": "anchor", "inset_subjects": [], "product_overlay": "", "composition": "studio anchor", "internal_transitions": []},
+                                "target_state": {"main_speaker": "", "inset_subjects": [], "product_overlay": "", "composition": "aerial footage", "internal_transitions": []},
+                                "delta_temporal_extent": {"reference": "studio", "target": "aerial", "target_coverage": 0.9, "evidence": "target shows flood aerial"},
+                                "subject_roles": {"main_speaker": "anchor", "inset_subjects": [], "product_overlay": ""},
+                                "is_segment_wide_delta": True,
+                                "discarded_deltas": [],
+                                "evidence": ["target is flood aerial footage"],
+                                "confidence": 0.9,
+                                "accept": True,
+                                "reject_reason": "",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8093/v1",
+            api_key="EMPTY",
+            model="qwen3-omni",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "reference.mp4"
+            target_path = Path(temp_dir) / "target.mp4"
+            reference_path.write_bytes(b"reference-video")
+            target_path.write_bytes(b"target-video")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                client.propose_single_source_pair(
+                    reference_clip_path=str(reference_path),
+                    target_clip_path=str(target_path),
+                    reference_annotation={"clip_id": "ref", "summary": "a news anchor speaks"},
+                    target_annotation={"clip_id": "target", "summary": "flood aerial footage"},
+                    candidate={
+                        "audio_dataset_line": "visual_audio_anchor",
+                        "quality": {"audio_line_quality_profile": "v4_strict"},
+                        "instruction": "v4_strict: accept only large visual changes like a studio anchor shot to flood aerial footage",
+                    },
+                    audio_dataset_line="visual_audio_anchor",
+                )
+
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        system_prompt = request_body["messages"][0]["content"]
+        user_text = request_body["messages"][1]["content"][-1]["text"]
+        self.assertIn("news/program audio context", system_prompt)
+        self.assertIn("studio anchor shot to flood aerial footage", user_text)
+        self.assertIn("v4_strict", user_text)
+
     def test_verify_single_source_pair_final_materializes_videos_and_scores_quality(self) -> None:
         request_holder: dict[str, object] = {}
         response_payload = {

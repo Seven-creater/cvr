@@ -1983,6 +1983,7 @@ class ComposedDataTests(unittest.TestCase):
             "EMPTY",
             "--model",
             "qwen3-omni",
+            "--audio-focused",
         ]
         with mock.patch("sys.argv", argv), mock.patch("builtins.print"), mock.patch(
             "app.composed_data.detective_annotate_clips",
@@ -1992,6 +1993,7 @@ class ComposedDataTests(unittest.TestCase):
 
         self.assertNotIn("max_accepted_pairs", detective_mock.call_args.kwargs)
         self.assertEqual(180.0, detective_mock.call_args.kwargs["timeout_seconds"])
+        self.assertTrue(detective_mock.call_args.kwargs["audio_focused"])
 
     def test_propose_pairs_outputs_schema_compliant_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -9634,6 +9636,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue((item_dir / "src_ref_images" / "001_jacket_png").exists())
             self.assertTrue((item_dir / "review_inputs" / "vace_prompt.txt").exists())
             self.assertTrue((item_dir / "metadata.json").exists())
+            self.assertTrue((item_dir / "review_metadata.json").exists())
             self.assertTrue((item_dir / "description.md").exists())
             description_text = (item_dir / "description.md").read_text(encoding="utf-8")
             self.assertIn("Reference Omni Description", description_text)
@@ -9645,6 +9648,8 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual([], metadata["review_bundle_issues"])
             self.assertIn("reference_omni_description", metadata)
             self.assertIn("target_omni_description", metadata)
+            review_metadata = json.loads((item_dir / "review_metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual("change the robot body color from black and gold to bright yellow", review_metadata["edit_text"])
             self.assertIn("sample_1", (output_dir / "index.md").read_text(encoding="utf-8"))
             self.assertIn("complete", (output_dir / "index.md").read_text(encoding="utf-8"))
 
@@ -9705,6 +9710,7 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(1, summary["bundle_count"])
             item_dir = output_dir / "0001_audio_sample"
             metadata = json.loads((item_dir / "metadata.json").read_text(encoding="utf-8"))
+            review_metadata = json.loads((item_dir / "review_metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(0.987, metadata["quality"]["audio_anchor_score"])
             self.assertEqual(0.987, metadata["audio_anchor_score"])
             self.assertTrue(metadata["audio_anchor"]["audio_anchor_required"])
@@ -9713,6 +9719,8 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual("visual_edit_audio_anchor", metadata["audio_matters_line"])
             self.assertEqual(1.0, metadata["quality"]["omni_visual_accept"])
             self.assertTrue(metadata["audio_anchor_visual_verification"]["accept"])
+            self.assertEqual("visual_edit_audio_anchor", review_metadata["line"] or metadata["audio_matters_line"])
+            self.assertEqual(0.987, review_metadata["audio_verdict"]["audio_anchor_score"])
             review_text = (item_dir / "review.md").read_text(encoding="utf-8")
             self.assertIn("audio_anchor_score", review_text)
             self.assertIn("0.987", review_text)

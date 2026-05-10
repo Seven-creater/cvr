@@ -388,8 +388,8 @@ def _clip_annotation_system_prompt() -> str:
     )
 
 
-def _detective_observation_system_prompt() -> str:
-    return (
+def _detective_observation_system_prompt(*, audio_focused: bool = False) -> str:
+    prompt = (
         "You are the observer in an Omni-Captioner style detective loop. "
         "Inspect the video and return exactly one JSON object and nothing else. "
         'Required schema: {"visual_observations": [string], "audio_observations": [string], '
@@ -400,10 +400,16 @@ def _detective_observation_system_prompt() -> str:
         "Do not collapse non-speech audio into vague phrases like audio or background sound. "
         "Do not infer unsupported identities or events."
     )
+    if audio_focused:
+        prompt += (
+            " This is an audio-dataset pass: listen carefully and separate speech/transcript, crowd reaction, applause, music, ambience, and other sound events. "
+            "If an audible claim is uncertain, mark it in uncertainties instead of inventing vague hum/click labels."
+        )
+    return prompt
 
 
-def _detective_toolbox_system_prompt() -> str:
-    return (
+def _detective_toolbox_system_prompt(*, audio_focused: bool = False) -> str:
+    prompt = (
         "You are an independent observer inside an Omni-Captioner style Tool Box. "
         "Use the supplied tool observations plus the video to answer concrete questions about the clip. "
         "Return exactly one JSON object and nothing else. "
@@ -414,10 +420,16 @@ def _detective_toolbox_system_prompt() -> str:
         "When audio is present, name non-speech sounds explicitly instead of vague placeholders. "
         "Do not hide uncertainty."
     )
+    if audio_focused:
+        prompt += (
+            " For this audio-focused pass, verify whether the sound is speech, crowd/applause/music/ambient/environment, or uncertain. "
+            "Avoid weak labels like electronic hum, click, or tone unless the video audio clearly supports them."
+        )
+    return prompt
 
 
-def _detective_final_system_prompt() -> str:
-    return (
+def _detective_final_system_prompt(*, audio_focused: bool = False) -> str:
+    prompt = (
         "You are the detective agent for composed video retrieval data construction. "
         "Use the video and prior observations to produce a low-hallucination, fine-grained annotation. "
         "Return exactly one JSON object and nothing else. "
@@ -434,6 +446,13 @@ def _detective_final_system_prompt() -> str:
         "Never fill audio_events with speech, narration, talking, or voiceover. "
         "Use 'audio' in modalities only when audible information helps distinguish the clip."
     )
+    if audio_focused:
+        prompt += (
+            " This is an audio-focused refresh for an audio retrieval dataset. "
+            "Be conservative: include speech/transcript only when you can hear language content, and include audio_events only for clear sounds such as crowd cheering, applause, music, rain, wind, machinery, or other verifiable events. "
+            "Do not use vague hum/click/tone guesses as distinguishing evidence unless they are unmistakable."
+        )
+    return prompt
 
 
 def _pair_proposal_system_prompt() -> str:
@@ -537,6 +556,8 @@ def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> 
             + " This pass is the visual_audio_anchor A line. The two clips should keep similar or continuous audio context; "
             "audio is only an anchor and must not be the edit. Accept only one clear visual delta. "
             "The edit_text must be visual-only and must not mention audio, sound, speech, music, transcript, narration, or voice. "
+            "Good A-line style: the same news/program audio context continues while the picture changes from a studio anchor shot to flood aerial footage. "
+            "Reject weak A-line cases: same scene with tiny hand/object motion, brightness shifts, camera distance changes, visible text changes, or wording-only attributes. "
             "Reject if the target only changes speech/audio/text, if the visual change is near-duplicate, or if the reference already satisfies the visual edit."
         )
     if line == "speech_audio_content":
@@ -546,6 +567,9 @@ def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> 
             "is speech content or a concrete non-speech audio event. Use difference.type=speech only for transcript-backed spoken-language content; "
             "use difference.type=audio_event only for non-language sounds such as music, applause, machinery, wind, animal sounds, or ambience. "
             "The edit_text may mention speech/audio because that is the target line, but it must be specific and evidence-backed. "
+            "Good B-line style: two visually similar sports broadcast clips where the target clearly adds crowd cheering or the spoken content changes. "
+            "Reject B-line cases where the scene, subject, shot type, or event changes so much that visuals alone retrieve the target. "
+            "Reject vague hum/click/electronic tone guesses unless the evidence is explicit and human-audible. "
             "Reject if the main change is visual, if transcript/audio evidence is vague, or if speech-only narration is mislabeled as audio_event."
         )
     return base_prompt
@@ -585,6 +609,7 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
             base_prompt
             + " For this visual_audio_anchor A line, accept only if the edit is visual and the audio/speech is not the primary change. "
             "The edit_text must not mention audio, sound, speech, music, transcript, narration, or voice. "
+            "The useful target is a large visual shot/scene/subject/action change under similar audio context, not a near-duplicate. "
             "Reject near-duplicate visual changes, order-only changes, tiny lighting/framing shifts, and any pair where reference already satisfies the visual edit."
         )
     if line == "speech_audio_content":
@@ -593,6 +618,7 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
             + " For this speech_audio_content B line, observable_delta may be an audible speech or non-speech audio delta. "
             "Accept speech only when both sides have concrete transcript-backed evidence and the edit_text names the content change. "
             "Accept audio_event only for non-speech sound/music/environment changes, not narration topic changes. "
+            "The visual context should stay similar enough that audio matters. "
             "Reject if a stronger visual difference is doing the retrieval work, if the audio evidence is generic, or if the edit could be judged without listening."
         )
     return base_prompt
@@ -748,13 +774,18 @@ def _build_clip_annotation_user_content(clip_path: str) -> list[dict[str, Any]]:
     ]
 
 
-def _build_detective_observation_user_content(clip_path: str) -> list[dict[str, Any]]:
+def _build_detective_observation_user_content(clip_path: str, *, audio_focused: bool = False) -> list[dict[str, Any]]:
     prompt = (
         "Observation pass: inspect the clip like an independent observer.\n"
         "List visible subjects, object counts, actions, scene, visible text, speech, non-speech audio events, and timeline beats.\n"
         "Name non-speech audio explicitly, for example background music, applause, electronic hum, wind, machinery, footsteps, or animal sounds.\n"
         "Also list any uncertainties that a later detective pass should be careful about."
     )
+    if audio_focused:
+        prompt += (
+            "\nAudio-focused requirement: explicitly state whether there is speech/transcript, crowd cheering, applause, music, ambience, or no reliable distinctive audio. "
+            "Do not guess low hum/click/tone as a dataset signal if it is not clearly audible."
+        )
     return [
         {"type": "video_url", "video_url": {"url": clip_path}},
         {"type": "text", "text": prompt},
@@ -765,6 +796,7 @@ def _build_detective_toolbox_user_content(
     *,
     clip_path: str,
     tool_observations: list[dict[str, Any]],
+    audio_focused: bool = False,
 ) -> list[dict[str, Any]]:
     prompt = (
         "Tool-box observation pass: inspect the clip using the structured tool observations below.\n"
@@ -772,6 +804,8 @@ def _build_detective_toolbox_user_content(
         "Return concrete evidence for visual events, non-speech audio events, visible text, speech/transcript, timeline beats, "
         "and remaining uncertainties."
     )
+    if audio_focused:
+        prompt += "\nAudio-focused requirement: prioritize transcript/crowd/applause/music/ambient evidence and flag uncertain audio instead of inventing it."
     return [
         {"type": "video_url", "video_url": {"url": clip_path}},
         {"type": "text", "text": prompt},
@@ -783,6 +817,7 @@ def _build_detective_final_user_content(
     clip_path: str,
     observations: dict[str, Any],
     tool_observations: list[dict[str, Any]] | None = None,
+    audio_focused: bool = False,
 ) -> list[dict[str, Any]]:
     tool_text = ""
     if tool_observations:
@@ -796,6 +831,11 @@ def _build_detective_final_user_content(
         "Keep speech/transcript separate from non-speech audio. "
         "Make the annotation useful for later finding pairs that differ by one clear visual/audio/text change."
     )
+    if audio_focused:
+        prompt += (
+            "\nAudio-focused requirement: make speech, speakers_and_transcript, and audio_events useful for pairing. "
+            "Use audio_events for concrete crowd/applause/music/environment sounds; put uncertain or vague sounds in detective_notes/uncertainties, not as a confident audio_event."
+        )
     return [
         {"type": "video_url", "video_url": {"url": clip_path}},
         {"type": "text", "text": prompt},
@@ -1199,20 +1239,22 @@ class OpenAIComposedDataClient:
         *,
         clip_path: str,
         tool_observations: list[dict[str, Any]] | None = None,
+        audio_focused: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if tool_observations:
             observations = self._request_json(
                 user_content=_build_detective_toolbox_user_content(
                     clip_path=clip_path,
                     tool_observations=tool_observations,
+                    audio_focused=audio_focused,
                 ),
-                system_prompt=_detective_toolbox_system_prompt(),
+                system_prompt=_detective_toolbox_system_prompt(audio_focused=audio_focused),
                 max_tokens=1400,
             )
         else:
             observations = self._request_json(
-                user_content=_build_detective_observation_user_content(clip_path),
-                system_prompt=_detective_observation_system_prompt(),
+                user_content=_build_detective_observation_user_content(clip_path, audio_focused=audio_focused),
+                system_prompt=_detective_observation_system_prompt(audio_focused=audio_focused),
                 max_tokens=1200,
             )
         final_payload = self._request_json(
@@ -1220,8 +1262,9 @@ class OpenAIComposedDataClient:
                 clip_path=clip_path,
                 observations=observations,
                 tool_observations=tool_observations,
+                audio_focused=audio_focused,
             ),
-            system_prompt=_detective_final_system_prompt(),
+            system_prompt=_detective_final_system_prompt(audio_focused=audio_focused),
             max_tokens=1800,
         )
         trajectory = list(tool_observations or []) + [

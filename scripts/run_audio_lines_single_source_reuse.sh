@@ -29,6 +29,8 @@ REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-90}
 SHARD_TIMEOUT_SECONDS=${SHARD_TIMEOUT_SECONDS:-3600}
 ANNOTATION_TIMEOUT_SECONDS=${ANNOTATION_TIMEOUT_SECONDS:-900}
 MIN_AUDIO_ANCHOR_SCORE=${MIN_AUDIO_ANCHOR_SCORE:-0.86}
+AUDIO_LINE_QUALITY_PROFILE=${AUDIO_LINE_QUALITY_PROFILE:-default}
+FORCE_AUDIO_FOCUSED_REFRESH=${FORCE_AUDIO_FOCUSED_REFRESH:-0}
 
 usage() {
   cat <<'EOF'
@@ -48,6 +50,8 @@ Options:
   --propose-parallel-jobs N
   --request-timeout-seconds N
   --shard-timeout-seconds N
+  --audio-line-quality-profile default|v4_strict
+  --force-audio-focused-refresh
   --concurrency N
   -h, --help
 EOF
@@ -68,6 +72,8 @@ while [[ $# -gt 0 ]]; do
     --propose-parallel-jobs) PROPOSE_PARALLEL_JOBS="$2"; shift 2 ;;
     --request-timeout-seconds) REQUEST_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --shard-timeout-seconds) SHARD_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --audio-line-quality-profile) AUDIO_LINE_QUALITY_PROFILE="$2"; shift 2 ;;
+    --force-audio-focused-refresh) FORCE_AUDIO_FOCUSED_REFRESH=1; shift ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[audio-lines] unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -200,7 +206,7 @@ run_line_shards() {
 mkdir -p "$RUN_ROOT" "$REPO_ROOT/logs"
 echo "[audio-lines] start $(date)"
 echo "[audio-lines] run_root=$RUN_ROOT root=$ROOT single_source_root=$SINGLE_SOURCE_ROOT line=$AUDIO_DATASET_LINE"
-echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS shard_timeout_seconds=$SHARD_TIMEOUT_SECONDS"
+echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS shard_timeout_seconds=$SHARD_TIMEOUT_SECONDS audio_line_quality_profile=$AUDIO_LINE_QUALITY_PROFILE force_audio_focused_refresh=$FORCE_AUDIO_FOCUSED_REFRESH"
 resolve_omni_model
 
 SEGMENTS_MANIFEST="$RUN_ROOT/extracted_single_source_clips.jsonl"
@@ -220,7 +226,8 @@ python3 -m app.audio_lines_single_source prepare-existing \
   --run-root "$RUN_ROOT" \
   --max-source-folders "$MAX_SOURCE_FOLDERS" \
   --annotation-search-root "$REPO_ROOT/runs" \
-  --annotation-search-root "$ROOT"
+  --annotation-search-root "$ROOT" \
+  $(if [ "$FORCE_AUDIO_FOCUSED_REFRESH" = "1" ]; then printf '%s' '--force-audio-focused-refresh'; fi)
 
 require_file "$CLIPS_TO_ANNOTATE" "clips manifest"
 python3 -m app.composed_data detective-annotate-clips \
@@ -231,7 +238,8 @@ python3 -m app.composed_data detective-annotate-clips \
   --api-key EMPTY \
   --model "$MODEL" \
   --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS" \
-  --concurrency "$CONCURRENCY"
+  --concurrency "$CONCURRENCY" \
+  $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ]; then printf '%s' '--audio-focused'; fi)
 
 if [ "$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")" -gt 0 ]; then
   echo "[audio-lines] audio refresh annotation start rows=$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")"
@@ -243,7 +251,8 @@ if [ "$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")" -gt 0 ]; then
     --api-key EMPTY \
     --model "$MODEL" \
     --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS" \
-    --concurrency "$CONCURRENCY"
+    --concurrency "$CONCURRENCY" \
+    $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ]; then printf '%s' '--audio-focused'; fi)
   python3 -m app.audio_lines_single_source merge-annotations \
     --base-annotations-path "$SEGMENT_ANNOTATIONS" \
     --refresh-annotations-path "$AUDIO_REFRESH_ANNOTATIONS" \
@@ -271,7 +280,8 @@ python3 -m app.audio_lines_single_source split-candidates \
   --summary-path "$RUN_ROOT/audio_line_candidate_summary.json" \
   --min-audio-anchor-score "$MIN_AUDIO_ANCHOR_SCORE" \
   --max-a-candidates "$MAX_A_CANDIDATES" \
-  --max-b-candidates "$MAX_B_CANDIDATES"
+  --max-b-candidates "$MAX_B_CANDIDATES" \
+  --audio-line-quality-profile "$AUDIO_LINE_QUALITY_PROFILE"
 
 if [ "$AUDIO_DATASET_LINE" = "both" ] || [ "$AUDIO_DATASET_LINE" = "visual_audio_anchor" ]; then
   python3 -m app.audio_lines_single_source shard-jsonl \

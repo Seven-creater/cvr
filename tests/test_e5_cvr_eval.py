@@ -440,9 +440,13 @@ class E5CVREvalTests(unittest.TestCase):
             trace = json.loads((root / "eval" / "traces.jsonl").read_text(encoding="utf-8").splitlines()[0])
 
             self.assertEqual("on", summary["video_audio_mode"])
+            self.assertEqual("on", summary["target_encoding_audio_mode"])
+            self.assertEqual("on", summary["query_encoding_audio_mode"])
             self.assertTrue(summary["load_audio_from_video"])
             self.assertTrue(summary["processor_video_kwargs_sanitizer"])
             self.assertEqual("on", trace["video_audio_mode"])
+            self.assertEqual("on", trace["target_encoding_audio_mode"])
+            self.assertEqual("on", trace["query_encoding_audio_mode"])
             self.assertTrue(trace["load_audio_from_video"])
             self.assertTrue(trace["processor_video_kwargs_sanitizer"])
 

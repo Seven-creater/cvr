@@ -133,6 +133,169 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual("speech", b_records[0]["difference"]["type"])
             self.assertNotIn("target_caption", a_records[0])
 
+    def test_v4_strict_a_line_prefers_large_visual_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "ann.jsonl"
+            candidates_path = root / "cand.jsonl"
+            a_path = root / "a.jsonl"
+            b_path = root / "b.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "anchor",
+                        "output_path": "clips/anchor.mp4",
+                        "summary": "news anchor in a studio speaking to camera",
+                        "subjects": ["news anchor"],
+                        "actions": ["speaking"],
+                        "scene": "studio",
+                        "attributes": ["desk", "blue backdrop"],
+                    },
+                    {
+                        "clip_id": "flood",
+                        "output_path": "clips/flood.mp4",
+                        "summary": "aerial footage of flooded streets and buildings",
+                        "subjects": ["flooded city"],
+                        "actions": ["water flowing through streets"],
+                        "scene": "outdoor flood aerial",
+                        "attributes": ["water", "buildings"],
+                    },
+                    {
+                        "clip_id": "anchor_bright",
+                        "output_path": "clips/anchor_bright.mp4",
+                        "summary": "news anchor in a studio speaking to camera",
+                        "subjects": ["news anchor"],
+                        "actions": ["speaking"],
+                        "scene": "studio",
+                        "attributes": ["slightly brighter backdrop"],
+                    },
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "scene_ok",
+                        "proposal_id": "scene_ok",
+                        "reference_clip_id": "anchor",
+                        "target_clip_id": "flood",
+                        "reference_video": "clips/anchor.mp4",
+                        "target_video": "clips/flood.mp4",
+                        "difference": {"type": "scene", "from": "studio anchor", "to": "flood aerial"},
+                    },
+                    {
+                        "candidate_id": "attribute_weak",
+                        "proposal_id": "attribute_weak",
+                        "reference_clip_id": "anchor",
+                        "target_clip_id": "anchor_bright",
+                        "reference_video": "clips/anchor.mp4",
+                        "target_video": "clips/anchor_bright.mp4",
+                        "difference": {"type": "attribute", "from": "blue backdrop", "to": "brighter blue backdrop"},
+                    },
+                ],
+            )
+
+            with mock.patch("app.audio_lines_single_source._pair_audio_anchor_score", return_value=(0.93, 0.05)):
+                summary = split_audio_line_candidates(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    a_output_path=a_path,
+                    b_output_path=b_path,
+                    summary_path=root / "summary.json",
+                    audio_line_quality_profile="v4_strict",
+                )
+
+            a_records = [json.loads(line) for line in a_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual("v4_strict", summary["audio_line_quality_profile"])
+            self.assertEqual(["scene_ok"], [record["candidate_id"] for record in a_records])
+            self.assertGreaterEqual(a_records[0]["quality"]["visual_delta_strength"], 0.45)
+
+    def test_v4_strict_b_line_requires_similar_visual_context_and_concrete_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "ann.jsonl"
+            candidates_path = root / "cand.jsonl"
+            a_path = root / "a.jsonl"
+            b_path = root / "b.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "cricket_quiet",
+                        "output_path": "clips/cricket_quiet.mp4",
+                        "summary": "cricket match broadcast showing players on the field",
+                        "subjects": ["cricket players", "field"],
+                        "actions": ["playing cricket"],
+                        "scene": "sports broadcast stadium",
+                        "audio_events": ["commentary"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "cricket_cheer",
+                        "output_path": "clips/cricket_cheer.mp4",
+                        "summary": "cricket match broadcast showing players on the field",
+                        "subjects": ["cricket players", "field"],
+                        "actions": ["playing cricket"],
+                        "scene": "sports broadcast stadium",
+                        "audio_events": ["crowd cheering", "commentary"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "kitchen_hum",
+                        "output_path": "clips/kitchen_hum.mp4",
+                        "summary": "close view of a kitchen counter and appliance",
+                        "subjects": ["kitchen appliance"],
+                        "actions": ["appliance running"],
+                        "scene": "kitchen",
+                        "audio_events": ["electronic hum"],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "cheer_ok",
+                        "proposal_id": "cheer_ok",
+                        "reference_clip_id": "cricket_quiet",
+                        "target_clip_id": "cricket_cheer",
+                        "reference_video": "clips/cricket_quiet.mp4",
+                        "target_video": "clips/cricket_cheer.mp4",
+                        "difference": {"type": "audio_event", "from": "commentary", "to": "crowd cheering"},
+                    },
+                    {
+                        "candidate_id": "visual_too_different",
+                        "proposal_id": "visual_too_different",
+                        "reference_clip_id": "cricket_quiet",
+                        "target_clip_id": "kitchen_hum",
+                        "reference_video": "clips/cricket_quiet.mp4",
+                        "target_video": "clips/kitchen_hum.mp4",
+                        "difference": {"type": "audio_event", "from": "commentary", "to": "electronic hum"},
+                    },
+                ],
+            )
+
+            summary = split_audio_line_candidates(
+                root=root,
+                clip_annotations_path=annotations_path,
+                pair_candidates_path=candidates_path,
+                a_output_path=a_path,
+                b_output_path=b_path,
+                summary_path=root / "summary.json",
+                audio_line_quality_profile="v4_strict",
+            )
+
+            b_records = [json.loads(line) for line in b_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, summary["b_candidate_count"])
+            self.assertEqual("cheer_ok", b_records[0]["candidate_id"])
+            self.assertEqual("audio_event", b_records[0]["difference"]["type"])
+            self.assertGreaterEqual(b_records[0]["quality"]["visual_context_similarity"], 0.18)
+
     def test_speech_audio_content_line_allows_speech_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
