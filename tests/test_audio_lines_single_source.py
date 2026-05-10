@@ -76,20 +76,20 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 {
                     "clip_id": "seg_1",
                     "output_path": "clips/seg_1.mp4",
-                    "summary": "speaker discusses apples without an overlay",
+                    "summary": "speaker discusses a fruit market without an overlay",
                     "subjects": ["speaker"],
-                    "speech": ["I like apples"],
-                    "speakers_and_transcript": ["speaker: I like apples"],
+                    "speech": ["I like apples from the morning market because they taste sweet today"],
+                    "speakers_and_transcript": ["speaker: I like apples from the morning market because they taste sweet today"],
                     "audio_events": [],
                     "modalities": ["audio", "visual"],
                 },
                 {
                     "clip_id": "seg_2",
                     "output_path": "clips/seg_2.mp4",
-                    "summary": "speaker discusses oranges with an overlay",
+                    "summary": "speaker discusses a fruit market with an overlay",
                     "subjects": ["speaker"],
-                    "speech": ["I like oranges"],
-                    "speakers_and_transcript": ["speaker: I like oranges"],
+                    "speech": ["I like oranges from the evening market because they taste bright today"],
+                    "speakers_and_transcript": ["speaker: I like oranges from the evening market because they taste bright today"],
                     "audio_events": [],
                     "modalities": ["audio", "visual"],
                 },
@@ -236,6 +236,7 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                     {
                         "clip_id": "cricket_quiet",
                         "output_path": "clips/cricket_quiet.mp4",
+                        "start_seconds": 0.0,
                         "summary": "cricket match broadcast showing players on the field",
                         "subjects": ["cricket players", "field"],
                         "actions": ["playing cricket"],
@@ -246,6 +247,7 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                     {
                         "clip_id": "cricket_cheer",
                         "output_path": "clips/cricket_cheer.mp4",
+                        "start_seconds": 6.0,
                         "summary": "cricket match broadcast showing players on the field",
                         "subjects": ["cricket players", "field"],
                         "actions": ["playing cricket"],
@@ -256,6 +258,7 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                     {
                         "clip_id": "kitchen_hum",
                         "output_path": "clips/kitchen_hum.mp4",
+                        "start_seconds": 12.0,
                         "summary": "close view of a kitchen counter and appliance",
                         "subjects": ["kitchen appliance"],
                         "actions": ["appliance running"],
@@ -304,6 +307,63 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual("cheer_ok", b_records[0]["candidate_id"])
             self.assertEqual("audio_event", b_records[0]["difference"]["type"])
             self.assertGreaterEqual(b_records[0]["quality"]["visual_context_similarity"], 0.18)
+
+    def test_v4_strict_b_line_mines_audio_first_pairs_from_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "ann.jsonl"
+            candidates_path = root / "cand.jsonl"
+            a_path = root / "a.jsonl"
+            b_path = root / "b.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "daily_source__single_001",
+                        "output_path": "clips/source_a/daily_source__single_001.mp4",
+                        "start_seconds": 0.0,
+                        "summary": "podium speech in a conference hall",
+                        "subjects": ["speaker", "podium"],
+                        "actions": ["speaking at podium"],
+                        "scene": "conference hall",
+                        "speech": ["the speaker explains the budget plan for local transportation improvements"],
+                        "speakers_and_transcript": ["speaker: the speaker explains the budget plan for local transportation improvements"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "daily_source__single_002",
+                        "output_path": "clips/source_a/daily_source__single_002.mp4",
+                        "start_seconds": 6.0,
+                        "summary": "podium speech in a conference hall",
+                        "subjects": ["speaker", "podium"],
+                        "actions": ["speaking at podium"],
+                        "scene": "conference hall",
+                        "speech": ["the speaker describes a public health program for neighborhood clinics"],
+                        "speakers_and_transcript": ["speaker: the speaker describes a public health program for neighborhood clinics"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(candidates_path, [])
+
+            summary = split_audio_line_candidates(
+                root=root,
+                clip_annotations_path=annotations_path,
+                pair_candidates_path=candidates_path,
+                a_output_path=a_path,
+                b_output_path=b_path,
+                summary_path=root / "summary.json",
+                audio_line_quality_profile="v4_strict",
+            )
+
+            b_records = [json.loads(line) for line in b_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, summary["b_audio_first_candidate_count"])
+            self.assertEqual(1, summary["b_candidate_count"])
+            self.assertEqual("audio_first_annotation_pair", b_records[0]["quality"]["candidate_source"])
+            self.assertEqual("speech", b_records[0]["difference"]["type"])
 
     def test_speech_audio_content_line_allows_speech_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

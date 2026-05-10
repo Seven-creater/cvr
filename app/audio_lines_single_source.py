@@ -4,7 +4,7 @@ import argparse
 import json
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -314,7 +314,8 @@ def split_audio_line_candidates(
                     reject_counts["a_audio_anchor_below_threshold"] += 1
                 else:
                     reject_counts["a_v4_visual_delta_too_weak"] += 1
-        if _speech_is_transcript_backed(reference, target) and _v4_b_candidate_allowed(
+        speech_score = _speech_evidence_score(reference, target)
+        if _speech_is_transcript_backed(reference, target) and speech_score >= 0.70 and _v4_b_candidate_allowed(
             audio_line_quality_profile=audio_line_quality_profile,
             visual_delta_strength=visual_delta_strength,
             visual_context_similarity=visual_context_similarity,
@@ -360,6 +361,15 @@ def split_audio_line_candidates(
         if index % 50 == 0:
             print(f"[audio-lines-split] processed {index}/{len(candidates)}", file=sys.stderr, flush=True)
 
+    existing_b_keys = {_b_pair_key(record) for record in b_records}
+    direct_b_records, direct_b_rejects = _mine_audio_first_b_candidates(
+        annotations_by_id=annotations_by_id,
+        existing_keys=existing_b_keys,
+        audio_line_quality_profile=audio_line_quality_profile,
+    )
+    b_records.extend(direct_b_records)
+    reject_counts.update(direct_b_rejects)
+
     a_records = sorted(a_records, key=_line_candidate_sort_key, reverse=True)
     b_records = sorted(b_records, key=_line_candidate_sort_key, reverse=True)
     if max_a_candidates and max_a_candidates > 0:
@@ -376,6 +386,7 @@ def split_audio_line_candidates(
         "candidate_count": len(candidates),
         "a_candidate_count": len(a_records),
         "b_candidate_count": len(b_records),
+        "b_audio_first_candidate_count": len(direct_b_records),
         "min_audio_anchor_score": min_audio_anchor_score,
         "audio_line_quality_profile": audio_line_quality_profile,
         "reject_counts": dict(reject_counts),
@@ -642,7 +653,7 @@ def _v4_b_candidate_allowed(
 ) -> bool:
     if audio_line_quality_profile != AUDIO_LINE_PROFILE_V4_STRICT:
         return True
-    if visual_delta_strength > 0.62 or visual_context_similarity < 0.18:
+    if visual_delta_strength > 0.62 or visual_context_similarity < 0.30:
         return False
     normalized_audio = audio_text.lower()
     if difference_type == "audio_event":
@@ -651,6 +662,131 @@ def _v4_b_candidate_allowed(
         if any(term in normalized_audio for term in V4_VAGUE_AUDIO_TERMS) and not any(term in normalized_audio for term in V4_CONCRETE_AUDIO_TERMS):
             return False
     return True
+
+
+def _mine_audio_first_b_candidates(
+    *,
+    annotations_by_id: dict[str, dict[str, Any]],
+    existing_keys: set[tuple[str, str, str]],
+    audio_line_quality_profile: str,
+) -> tuple[list[dict[str, Any]], Counter[str]]:
+    records: list[dict[str, Any]] = []
+    reject_counts: Counter[str] = Counter()
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for annotation in annotations_by_id.values():
+        group_key = _annotation_group_key(annotation)
+        if group_key:
+            groups[group_key].append(annotation)
+
+    for group_key, group_annotations in sorted(groups.items()):
+        ordered = sorted(group_annotations, key=_annotation_segment_sort_key)
+        for left_index, reference in enumerate(ordered):
+            for target in ordered[left_index + 1 :]:
+                visual_context_similarity = _visual_context_similarity(reference, target)
+                speech_score = _speech_evidence_score(reference, target)
+                if speech_score >= 0.70:
+                    candidate = _audio_first_base_candidate(reference, target, difference_type="speech", group_key=group_key)
+                    visual_delta_strength = _visual_delta_strength(candidate, reference, target)
+                    audio_text = " ".join(_speech_texts_from_annotation(reference)[:2] + _speech_texts_from_annotation(target)[:2])
+                    if _v4_b_candidate_allowed(
+                        audio_line_quality_profile=audio_line_quality_profile,
+                        visual_delta_strength=visual_delta_strength,
+                        visual_context_similarity=visual_context_similarity,
+                        audio_text=audio_text,
+                        difference_type="speech",
+                    ):
+                        key = _b_pair_key(candidate)
+                        if key not in existing_keys:
+                            records.append(
+                                _speech_line_candidate(
+                                    candidate,
+                                    reference,
+                                    target,
+                                    visual_delta_strength=visual_delta_strength,
+                                    visual_context_similarity=visual_context_similarity,
+                                    audio_line_quality_profile=audio_line_quality_profile,
+                                )
+                            )
+                            existing_keys.add(key)
+                    else:
+                        reject_counts["b_audio_first_speech_visual_gate_failed"] += 1
+                non_speech_score = _non_speech_audio_event_score(reference, target)
+                if non_speech_score >= 0.70:
+                    candidate = _audio_first_base_candidate(reference, target, difference_type="audio_event", group_key=group_key)
+                    visual_delta_strength = _visual_delta_strength(candidate, reference, target)
+                    audio_text = " ".join(_normalize_list(reference.get("audio_events", [])) + _normalize_list(target.get("audio_events", [])))
+                    if _v4_b_candidate_allowed(
+                        audio_line_quality_profile=audio_line_quality_profile,
+                        visual_delta_strength=visual_delta_strength,
+                        visual_context_similarity=visual_context_similarity,
+                        audio_text=audio_text,
+                        difference_type="audio_event",
+                    ):
+                        key = _b_pair_key(candidate)
+                        if key not in existing_keys:
+                            records.append(
+                                _audio_event_line_candidate(
+                                    candidate,
+                                    reference,
+                                    target,
+                                    non_speech_score,
+                                    visual_delta_strength=visual_delta_strength,
+                                    visual_context_similarity=visual_context_similarity,
+                                    audio_line_quality_profile=audio_line_quality_profile,
+                                )
+                            )
+                            existing_keys.add(key)
+                    else:
+                        reject_counts["b_audio_first_event_visual_gate_failed"] += 1
+    return records, reject_counts
+
+
+def _annotation_group_key(annotation: dict[str, Any]) -> str:
+    for key in ("group_id", "source_clip_id", "reuse_source_folder", "source_path"):
+        value = str(annotation.get(key, "")).strip()
+        if value:
+            return value.replace("\\", "/")
+    output_path = str(annotation.get("output_path", "")).strip().replace("\\", "/")
+    if not output_path:
+        return ""
+    return output_path.rsplit("/", 1)[0] if "/" in output_path else "unknown"
+
+
+def _annotation_segment_sort_key(annotation: dict[str, Any]) -> tuple[float, tuple[int, str]]:
+    start = _score_float(annotation.get("start_seconds", annotation.get("relative_start_seconds")))
+    return (start, _clip_sort_key(str(annotation.get("clip_id") or annotation.get("output_path") or "")))
+
+
+def _audio_first_base_candidate(reference: dict[str, Any], target: dict[str, Any], *, difference_type: str, group_key: str) -> dict[str, Any]:
+    reference_id = str(reference.get("clip_id", "")).strip()
+    target_id = str(target.get("clip_id", "")).strip()
+    reference_video = str(reference.get("output_path", "")).strip()
+    target_video = str(target.get("output_path", "")).strip()
+    candidate_id = f"audio_first_{difference_type}_{_stable_hash(reference_id + '->' + target_id)[:12]}"
+    return {
+        "candidate_id": candidate_id,
+        "proposal_id": candidate_id,
+        "single_source_pair": True,
+        "reference_clip_id": reference_id,
+        "target_clip_id": target_id,
+        "reference_video": reference_video,
+        "target_video": target_video,
+        "reference_start_seconds": reference.get("start_seconds", reference.get("relative_start_seconds")),
+        "target_start_seconds": target.get("start_seconds", target.get("relative_start_seconds")),
+        "difference": {"type": difference_type, "from": "reference audio", "to": "target audio", "description": "audio-first B-line candidate"},
+        "source_context": {"relation": "same_source_video", "single_source_pair": True, "audio_first_b_candidate": True, "group_key": group_key},
+        "quality": {"candidate_source": "audio_first_annotation_pair", "same_context_score": 0.9},
+        "risk_flags": ["audio_first_b_candidate"],
+    }
+
+
+def _b_pair_key(record: dict[str, Any]) -> tuple[str, str, str]:
+    difference = record.get("difference") if isinstance(record.get("difference"), dict) else {}
+    return (
+        str(record.get("reference_clip_id", "")).strip(),
+        str(record.get("target_clip_id", "")).strip(),
+        str(difference.get("type", "")).strip(),
+    )
 
 
 def _line_candidate(
