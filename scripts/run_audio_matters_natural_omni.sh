@@ -30,6 +30,7 @@ MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-80}
 MAX_PROPOSALS=${MAX_PROPOSALS:-160}
 PROPOSE_SHARDS=${PROPOSE_SHARDS:-1}
 PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-}
+STRICT_VISUAL_ANCHOR=${STRICT_VISUAL_ANCHOR:-1}
 MIN_AUDIO_ANCHOR_SCORE=${MIN_AUDIO_ANCHOR_SCORE:-0.86}
 MIN_AUDIO_RMS=${MIN_AUDIO_RMS:-0.001}
 MIN_DIFFERENCE_STRENGTH=${MIN_DIFFERENCE_STRENGTH:-0.60}
@@ -68,6 +69,8 @@ Options:
   --max-proposals N
   --propose-shards N
   --propose-parallel-jobs N
+  --strict-visual-anchor
+  --no-strict-visual-anchor
   --min-audio-anchor-score FLOAT
   --min-audio-rms FLOAT
   --min-difference-strength FLOAT
@@ -106,6 +109,8 @@ while [[ $# -gt 0 ]]; do
     --max-proposals) MAX_PROPOSALS="$2"; shift 2 ;;
     --propose-shards) PROPOSE_SHARDS="$2"; shift 2 ;;
     --propose-parallel-jobs) PROPOSE_PARALLEL_JOBS="$2"; shift 2 ;;
+    --strict-visual-anchor) STRICT_VISUAL_ANCHOR=1; shift ;;
+    --no-strict-visual-anchor) STRICT_VISUAL_ANCHOR=0; shift ;;
     --min-audio-anchor-score) MIN_AUDIO_ANCHOR_SCORE="$2"; shift 2 ;;
     --min-audio-rms) MIN_AUDIO_RMS="$2"; shift 2 ;;
     --min-difference-strength) MIN_DIFFERENCE_STRENGTH="$2"; shift 2 ;;
@@ -267,6 +272,11 @@ if [ -z "$PROPOSE_PARALLEL_JOBS" ]; then
   PROPOSE_PARALLEL_JOBS="$PROPOSE_SHARDS"
 fi
 
+STRICT_VISUAL_ARGS=()
+if [ "$STRICT_VISUAL_ANCHOR" != "1" ]; then
+  STRICT_VISUAL_ARGS=(--no-strict-audio-matters-visual-anchor)
+fi
+
 case "$MODEL_STAGE" in
   instruct) ;;
   captioner|thinking)
@@ -305,6 +315,7 @@ echo "[audio-matters-natural] prepare_start_stage=$PREPARE_START_STAGE"
 echo "[audio-matters-natural] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY audio_workers=$AUDIO_WORKERS"
 echo "[audio-matters-natural] max_audio_candidates=$MAX_AUDIO_CANDIDATES max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS"
 echo "[audio-matters-natural] min_audio_anchor_score=$MIN_AUDIO_ANCHOR_SCORE min_audio_rms=$MIN_AUDIO_RMS min_difference_strength=$MIN_DIFFERENCE_STRENGTH"
+echo "[audio-matters-natural] strict_visual_anchor=$STRICT_VISUAL_ANCHOR"
 
 if [ "$PREPARE_START_STAGE" != "none" ]; then
   probe_omni_model
@@ -436,6 +447,7 @@ if [ "$PROPOSE_SHARDS" -le 1 ]; then
     --output-path "$RUN_ROOT/judged_audio_matters_pair_proposals.jsonl" \
     --accepted-output-path "$RUN_ROOT/accepted_audio_matters_pairs.jsonl" \
     --accepted-progress-path "$RUN_ROOT/accepted_audio_matters_pairs.progress.jsonl" \
+    --rejected-progress-path "$RUN_ROOT/audio_matters_rejected_with_reasons.jsonl" \
     --base-url "$BASE_URL" \
     --api-key EMPTY \
     --model "$MODEL" \
@@ -444,6 +456,7 @@ if [ "$PROPOSE_SHARDS" -le 1 ]; then
     --max-proposals "$MAX_PROPOSALS" \
     --zero-accepted-stop-after "$ZERO_ACCEPTED_STOP_AFTER" \
     --acceptance-profile "$ACCEPTANCE_PROFILE" \
+    "${STRICT_VISUAL_ARGS[@]}" \
     --overwrite
 else
   if [ "$PROPOSE_PARALLEL_JOBS" -lt 1 ]; then
@@ -490,6 +503,7 @@ PY
     SHARD_OUTPUT="$SHARD_OUTPUT_DIR/judged_audio_matters_pair_proposals_${SHARD_ID}.jsonl"
     SHARD_ACCEPTED="$SHARD_OUTPUT_DIR/accepted_audio_matters_pairs_${SHARD_ID}.jsonl"
     SHARD_ACCEPTED_PROGRESS="$SHARD_OUTPUT_DIR/accepted_audio_matters_pairs_${SHARD_ID}.progress.jsonl"
+    SHARD_REJECTED_PROGRESS="$SHARD_OUTPUT_DIR/rejected_audio_matters_pairs_${SHARD_ID}.progress.jsonl"
     SHARD_LOG="$SHARD_OUTPUT_DIR/propose_${SHARD_ID}.log"
     echo "$SHARD_OUTPUT" >> "$PROPOSAL_OUTPUT_LIST"
     echo "[audio-matters-natural] launch proposal shard=$SHARD_ID path=$SHARD_PATH log=$SHARD_LOG"
@@ -507,6 +521,7 @@ PY
           --output-path "$SHARD_OUTPUT" \
           --accepted-output-path "$SHARD_ACCEPTED" \
           --accepted-progress-path "$SHARD_ACCEPTED_PROGRESS" \
+          --rejected-progress-path "$SHARD_REJECTED_PROGRESS" \
           --base-url "$BASE_URL" \
           --api-key EMPTY \
           --model "$MODEL" \
@@ -515,6 +530,7 @@ PY
           --max-proposals "$MAX_PROPOSALS" \
           --zero-accepted-stop-after "$ZERO_ACCEPTED_STOP_AFTER" \
           --acceptance-profile "$ACCEPTANCE_PROFILE" \
+          "${STRICT_VISUAL_ARGS[@]}" \
           --overwrite
       ) 2>&1 | sed -u "s/^/[audio-matters-natural][shard $SHARD_ID] /" | tee "$SHARD_LOG"
       exit "${PIPESTATUS[0]}"
@@ -547,6 +563,12 @@ PY
     cat "$SHARD_PROGRESS" >> "$RUN_ROOT/accepted_audio_matters_pairs.progress.jsonl"
   done
   echo "[audio-matters-natural] merged accepted progress log=$RUN_ROOT/accepted_audio_matters_pairs.progress.jsonl"
+  : > "$RUN_ROOT/audio_matters_rejected_with_reasons.jsonl"
+  for SHARD_REJECTED_PROGRESS in "$SHARD_OUTPUT_DIR"/rejected_audio_matters_pairs_*.progress.jsonl; do
+    [ -f "$SHARD_REJECTED_PROGRESS" ] || continue
+    cat "$SHARD_REJECTED_PROGRESS" >> "$RUN_ROOT/audio_matters_rejected_with_reasons.jsonl"
+  done
+  echo "[audio-matters-natural] merged rejected progress log=$RUN_ROOT/audio_matters_rejected_with_reasons.jsonl"
 fi
 
 ACCEPTED_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/accepted_audio_matters_pairs.jsonl")

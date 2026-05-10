@@ -924,6 +924,8 @@ ACCEPTANCE_PROFILE_CONFIGS = {
         "non_speech_audio_event_score": 0.45,
         "edit_text_quality_score": 0.55,
         "audio_anchor_score": 0.86,
+        "visual_delta_strength": 0.70,
+        "near_duplicate_risk": 0.85,
     },
 }
 SAME_TEMPLATE_CLUSTER_RELATION = "same_template_cluster"
@@ -3625,6 +3627,7 @@ def propose_group_pairs(
     output_path: str | Path | None = None,
     accepted_output_path: str | Path | None = None,
     accepted_progress_path: str | Path | None = None,
+    rejected_progress_path: str | Path | None = None,
     raw_index_path: str | Path | None = None,
     overwrite: bool = False,
     timeout_seconds: float = 180.0,
@@ -3632,6 +3635,7 @@ def propose_group_pairs(
     max_proposals: int | None = None,
     zero_accepted_stop_after: int = DEFAULT_ZERO_ACCEPTED_STOP_AFTER,
     acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
+    strict_audio_matters_visual_anchor: bool = True,
 ) -> dict[str, Any]:
     acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     layout = ensure_layout(root)
@@ -3659,6 +3663,7 @@ def propose_group_pairs(
     output = Path(output_path) if output_path else layout["pairs"] / "judged_pair_proposals.jsonl"
     accepted_output = Path(accepted_output_path) if accepted_output_path else layout["pairs"] / DEFAULT_ACCEPTED_PAIRS_NAME
     accepted_progress_output = Path(accepted_progress_path) if accepted_progress_path else None
+    rejected_progress_output = Path(rejected_progress_path) if rejected_progress_path else None
     # Long pair proposal runs are model-call heavy. Preserve already written
     # proposal rows as a resume cache even when callers pass --overwrite.
     existing_records = _load_records_by_key(output, "proposal_id")
@@ -3669,6 +3674,9 @@ def propose_group_pairs(
     if accepted_progress_output is not None:
         accepted_progress_output.parent.mkdir(parents=True, exist_ok=True)
         accepted_progress_output.write_text("", encoding="utf-8")
+    if rejected_progress_output is not None:
+        rejected_progress_output.parent.mkdir(parents=True, exist_ok=True)
+        rejected_progress_output.write_text("", encoding="utf-8")
     print("[propose-group-pairs] load raw asset index", file=sys.stderr, flush=True)
     raw_index = _load_raw_asset_index(Path(raw_index_path) if raw_index_path else layout["metadata"] / DEFAULT_RAW_INDEX_NAME)
     print(f"[propose-group-pairs] raw asset index loaded rows={len(raw_index)}", file=sys.stderr, flush=True)
@@ -3822,6 +3830,8 @@ def propose_group_pairs(
                 raw_model_output: dict[str, Any] = {}
                 judge_raw_output: dict[str, Any] = {}
                 verification_raw_output: dict[str, Any] = {}
+                audio_anchor_visual_raw_output: dict[str, Any] = {}
+                audio_anchor_visual_verification: dict[str, Any] = {}
                 verification_skipped_before_video = False
                 try:
                     model_fields, raw_model_output = client.propose_pair(
@@ -3930,6 +3940,9 @@ def propose_group_pairs(
                         "speech_specificity_score_for_speech_edits": MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE,
                         "non_speech_audio_event_score_for_audio_event_edits": _profile_threshold(acceptance_profile, "non_speech_audio_event_score"),
                         "max_visual_near_duplicate_score_for_visual_edits": MAX_ACCEPT_VISUAL_NEAR_DUPLICATE_SCORE,
+                        "audio_anchor_score_for_audio_matters": _profile_threshold(acceptance_profile, "audio_anchor_score"),
+                        "visual_delta_strength_for_audio_matters": _profile_threshold(acceptance_profile, "visual_delta_strength"),
+                        "near_duplicate_risk_for_audio_matters": _profile_threshold(acceptance_profile, "near_duplicate_risk"),
                     },
                 }
                 try:
@@ -3987,6 +4000,33 @@ def propose_group_pairs(
                 verification = _finalize_pair_verification(verification)
                 fallback_used = proposal_fallback_used or judge_fallback_used or verification_fallback_used
                 effective_quality = _effective_pair_quality(judge, verification, proposal_quality)
+                if _is_audio_matters_profile(acceptance_profile) and strict_audio_matters_visual_anchor:
+                    if _boolish(judge.get("accept")) and _boolish(judge.get("single_main_difference")):
+                        try:
+                            audio_anchor_visual_verification, audio_anchor_visual_raw_output = client.verify_audio_anchor_visual_pair(
+                                proposal=proposal_view,
+                                reference_annotation=_annotation_prompt_view(reference_annotation),
+                                target_annotation=_annotation_prompt_view(target_annotation),
+                                reference_clip_path=str(
+                                    _resolve_under_root(layout["root"], reference_annotation["output_path"])
+                                ),
+                                target_clip_path=str(_resolve_under_root(layout["root"], target_annotation["output_path"])),
+                            )
+                        except Exception as exc:
+                            audio_anchor_visual_verification = _fallback_audio_anchor_visual_verification(
+                                reason=f"{type(exc).__name__}: {exc}"
+                            )
+                            audio_anchor_visual_raw_output = {"error": f"{type(exc).__name__}: {exc}"}
+                            fallback_used = True
+                    else:
+                        audio_anchor_visual_verification = _fallback_audio_anchor_visual_verification(
+                            reason="skipped because the pair judge did not accept a single main difference"
+                        )
+                        audio_anchor_visual_raw_output = {
+                            "skipped": True,
+                            "reason": "pair judge did not accept a single main difference",
+                        }
+                    _apply_audio_anchor_visual_quality(effective_quality, audio_anchor_visual_verification)
                 accepted = _judge_accepts(judge, verification, effective_quality, acceptance_profile=acceptance_profile)
                 if accepted:
                     judge["reject_reason"] = ""
@@ -4007,6 +4047,9 @@ def propose_group_pairs(
                     "reference_caption": model_fields["reference_caption"],
                     "target_caption": model_fields["target_caption"],
                     "difference": model_fields["difference"],
+                    "audio_matters_line": "visual_edit_audio_anchor"
+                    if _is_audio_matters_profile(acceptance_profile)
+                    else "",
                     "hard_negatives": list(candidate["hard_negative_paths"]),
                     "judge_quality": {
                         "same_context_score": judge["same_context_score"],
@@ -4026,6 +4069,7 @@ def propose_group_pairs(
                     ),
                     "judge": judge,
                     "verification": verification,
+                    "audio_anchor_visual_verification": audio_anchor_visual_verification,
                     "speech_quality": speech_quality,
                     "audio_event_quality": audio_event_quality,
                     "edit_text_quality": edit_text_quality,
@@ -4037,6 +4081,7 @@ def propose_group_pairs(
                     "raw_model_output": raw_model_output,
                     "raw_judge_output": judge_raw_output,
                     "raw_verification_output": verification_raw_output,
+                    "raw_audio_anchor_visual_output": audio_anchor_visual_raw_output,
                     "verification_annotation_only_retry_used": verification_context_retry_used,
                     "verification_skipped_before_video": verification_skipped_before_video,
                 }
@@ -4115,6 +4160,9 @@ def propose_group_pairs(
                         "target_uniqueness_score": quality.get("target_uniqueness_score"),
                         "difference_strength_score": quality.get("difference_strength_score"),
                         "audio_anchor_score": quality.get("audio_anchor_score"),
+                        "omni_visual_accept": quality.get("omni_visual_accept"),
+                        "visual_delta_strength": quality.get("visual_delta_strength"),
+                        "near_duplicate_risk": quality.get("near_duplicate_risk"),
                     },
                 )
             if bool(record.get("accepted")):
@@ -4142,6 +4190,24 @@ def propose_group_pairs(
                     file=sys.stderr,
                     flush=True,
                 )
+                if rejected_progress_output is not None:
+                    _append_jsonl_record(
+                        rejected_progress_output,
+                        {
+                            "event": "rejected_sample",
+                            "proposal_index": len(output_records),
+                            "proposal_id": record.get("proposal_id", ""),
+                            "reference_video": record.get("reference_video", ""),
+                            "target_video": record.get("target_video", ""),
+                            "edit_text": record.get("edit_text", ""),
+                            "difference_type": difference.get("type", ""),
+                            "audio_anchor_score": quality.get("audio_anchor_score"),
+                            "omni_visual_accept": quality.get("omni_visual_accept"),
+                            "visual_delta_strength": quality.get("visual_delta_strength"),
+                            "near_duplicate_risk": quality.get("near_duplicate_risk"),
+                            "reject_reason": reject_preview,
+                        },
+                    )
             print(
                 "[propose-group-pairs] wrote "
                 f"proposal_count={len(output_records)} accepted_current="
@@ -4180,6 +4246,7 @@ def propose_group_pairs(
         "output_path": str(output),
         "accepted_output_path": str(accepted_output),
         "accepted_progress_path": str(accepted_progress_output or ""),
+        "rejected_progress_path": str(rejected_progress_output or ""),
         "mined_candidates_path": str(mined_path) if mined_path else "",
         "group_count": len(groups),
         "annotation_count": len(annotations),
@@ -4209,6 +4276,9 @@ def propose_group_pairs(
             "speech_evidence_score_for_speech_edits": MIN_ACCEPT_SPEECH_EVIDENCE_SCORE,
             "speech_specificity_score_for_speech_edits": MIN_ACCEPT_SPEECH_SPECIFICITY_SCORE,
             "non_speech_audio_event_score_for_audio_event_edits": _profile_threshold(acceptance_profile, "non_speech_audio_event_score"),
+            "audio_anchor_score_for_audio_matters": _profile_threshold(acceptance_profile, "audio_anchor_score"),
+            "visual_delta_strength_for_audio_matters": _profile_threshold(acceptance_profile, "visual_delta_strength"),
+            "near_duplicate_risk_for_audio_matters": _profile_threshold(acceptance_profile, "near_duplicate_risk"),
         },
         "acceptance_profile": acceptance_profile,
     }
@@ -5654,6 +5724,8 @@ def build_manual_review_bundle(
             "verification": record.get("verification", {}),
             "observable_difference": record.get("observable_difference", {}),
             "competing_difference": record.get("competing_difference", {}),
+            "audio_matters_line": str(record.get("audio_matters_line", "")).strip(),
+            "audio_anchor_visual_verification": record.get("audio_anchor_visual_verification", {}),
             "quality": quality,
             "heuristic_quality": heuristic_quality,
             "source_context": source_context,
@@ -5727,6 +5799,10 @@ def build_manual_review_bundle(
                 "incomplete_review_bundle": bool(review_bundle_issues),
                 "review_bundle_issues": review_bundle_issues,
                 "audio_anchor_score": audio_anchor.get("audio_anchor_score"),
+                "audio_matters_line": str(record.get("audio_matters_line", "")).strip(),
+                "omni_visual_accept": quality.get("omni_visual_accept"),
+                "visual_delta_strength": quality.get("visual_delta_strength"),
+                "near_duplicate_risk": quality.get("near_duplicate_risk"),
             }
         )
 
@@ -10112,6 +10188,17 @@ def _carry_local_gate_quality(target_quality: dict[str, Any], source_quality: di
         "audio_anchor_score",
         "audio_anchor_context_score",
         "audio_anchor_min_rms",
+        "audio_matters_line",
+        "omni_visual_accept",
+        "omni_reject_reason",
+        "visual_delta_type",
+        "visual_delta_strength",
+        "near_duplicate_risk",
+        "reference_satisfies_edit",
+        "target_satisfies_edit",
+        "caption_equivalent",
+        "order_only_scene_reorder",
+        "weak_synonym_or_wording_delta",
         "visual_competing_delta_score",
         "edit_primary_modality",
         "dominant_delta_decision",
@@ -11701,6 +11788,37 @@ def _fallback_pair_verification(*, reason: str) -> dict[str, Any]:
     }
 
 
+def _fallback_audio_anchor_visual_verification(*, reason: str) -> dict[str, Any]:
+    return {
+        "accept": False,
+        "reject_reason": f"audio-anchor visual verification fallback: {reason}",
+        "recommended_edit_text": "",
+        "visual_delta_type": "",
+        "visual_delta_strength": 0.0,
+        "near_duplicate_risk": 1.0,
+        "reference_satisfies_edit": False,
+        "target_satisfies_edit": False,
+        "caption_equivalent": True,
+        "order_only_scene_reorder": False,
+        "weak_synonym_or_wording_delta": False,
+        "evidence": [],
+    }
+
+
+def _apply_audio_anchor_visual_quality(quality: dict[str, Any], review: dict[str, Any]) -> None:
+    quality["audio_matters_line"] = "visual_edit_audio_anchor"
+    quality["omni_visual_accept"] = 1.0 if _boolish(review.get("accept")) else 0.0
+    quality["omni_reject_reason"] = str(review.get("reject_reason", "")).strip()
+    quality["visual_delta_type"] = str(review.get("visual_delta_type", "")).strip()
+    quality["visual_delta_strength"] = _score_float(review.get("visual_delta_strength"))
+    quality["near_duplicate_risk"] = _score_float(review.get("near_duplicate_risk"))
+    quality["reference_satisfies_edit"] = 1.0 if _boolish(review.get("reference_satisfies_edit")) else 0.0
+    quality["target_satisfies_edit"] = 1.0 if _boolish(review.get("target_satisfies_edit")) else 0.0
+    quality["caption_equivalent"] = 1.0 if _boolish(review.get("caption_equivalent")) else 0.0
+    quality["order_only_scene_reorder"] = 1.0 if _boolish(review.get("order_only_scene_reorder")) else 0.0
+    quality["weak_synonym_or_wording_delta"] = 1.0 if _boolish(review.get("weak_synonym_or_wording_delta")) else 0.0
+
+
 def _finalize_pair_verification(verification: dict[str, Any]) -> dict[str, Any]:
     caption_delta = dict(verification.get("caption_delta", {}))
     edit_projection = dict(verification.get("edit_projection", {}))
@@ -11906,10 +12024,14 @@ def _effective_pair_quality(
         "audio_anchor_context_score",
         "audio_anchor_min_rms",
         "visual_competing_delta_score",
+        "competing_difference_passed",
+        "intraclip_change_conflict",
+        "audio_event_independent_evidence_passed",
+        "audio_event_too_similar",
     ):
         if key in heuristic_quality:
             result[key] = _score_float(heuristic_quality.get(key))
-    for key in ("dominant_delta_type", "dominant_delta_decision", "edit_primary_modality"):
+    for key in ("dominant_delta_type", "dominant_delta_decision", "edit_primary_modality", "acceptance_profile"):
         if key in heuristic_quality:
             result[key] = heuristic_quality[key]
     return result
@@ -12045,6 +12167,33 @@ def _compose_reject_reason(
             failures.append(
                 f"audio_anchor_score {audio_anchor_score:.3f} is below {audio_anchor_threshold:.2f}"
             )
+        if "omni_visual_accept" in quality and _score_float(quality.get("omni_visual_accept")) < 1.0:
+            reason = str(quality.get("omni_reject_reason", "")).strip()
+            failures.append("audio-anchor visual verifier rejected the pair" + (f": {reason}" if reason else ""))
+        if _score_float(quality.get("caption_equivalent")) >= 1.0:
+            failures.append("caption_delta says reference and target are equivalent")
+        if _score_float(quality.get("order_only_scene_reorder")) >= 1.0:
+            failures.append("the proposed scene edit is only a reordered sequence of shared shots")
+        if _score_float(quality.get("weak_synonym_or_wording_delta")) >= 1.0:
+            failures.append("the proposed edit is a weak synonym or wording-only visual delta")
+        if _score_float(quality.get("reference_satisfies_edit")) >= 1.0:
+            failures.append("reference already satisfies the audio-anchor visual edit")
+        if "target_satisfies_edit" in quality and _score_float(quality.get("target_satisfies_edit")) < 1.0:
+            failures.append("target does not satisfy the audio-anchor visual edit")
+        if "visual_delta_strength" in quality:
+            visual_delta_strength = _score_float(quality.get("visual_delta_strength"))
+            visual_delta_threshold = _profile_threshold(acceptance_profile, "visual_delta_strength")
+            if visual_delta_strength < visual_delta_threshold:
+                failures.append(
+                    f"visual_delta_strength {visual_delta_strength:.3f} is below {visual_delta_threshold:.2f}"
+                )
+        if "near_duplicate_risk" in quality:
+            near_duplicate_risk = _score_float(quality.get("near_duplicate_risk"))
+            near_duplicate_threshold = _profile_threshold(acceptance_profile, "near_duplicate_risk")
+            if near_duplicate_risk > near_duplicate_threshold:
+                failures.append(
+                    f"near_duplicate_risk {near_duplicate_risk:.3f} is above {near_duplicate_threshold:.2f}"
+                )
     if verification is not None:
         failures.extend(_verification_failures(verification))
     if not judge.get("accept"):
@@ -12139,20 +12288,48 @@ def _audio_matters_verification_accepts(verification: dict[str, Any]) -> bool:
     )
 
 
+def _audio_matters_visual_review_accepts(quality: dict[str, Any]) -> bool:
+    if "omni_visual_accept" not in quality:
+        return True
+    if _score_float(quality.get("omni_visual_accept")) < 1.0:
+        return False
+    if _score_float(quality.get("reference_satisfies_edit")) >= 1.0:
+        return False
+    if _score_float(quality.get("target_satisfies_edit")) < 1.0:
+        return False
+    if _score_float(quality.get("caption_equivalent")) >= 1.0:
+        return False
+    if _score_float(quality.get("order_only_scene_reorder")) >= 1.0:
+        return False
+    if _score_float(quality.get("weak_synonym_or_wording_delta")) >= 1.0:
+        return False
+    if _score_float(quality.get("visual_delta_strength")) < _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "visual_delta_strength"):
+        return False
+    if _score_float(quality.get("near_duplicate_risk")) > _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "near_duplicate_risk"):
+        return False
+    return True
+
+
 def _audio_matters_judge_accepts(
     judge: dict[str, Any],
     verification: dict[str, Any] | None,
     quality: dict[str, Any],
 ) -> bool:
     hard_negative_quality = str(judge.get("hard_negative_quality", "")).strip().lower()
+    if not _boolish(judge.get("accept")):
+        return False
+    if not _boolish(judge.get("single_main_difference")):
+        return False
     if _boolish(judge.get("reference_satisfies_edit")) or not _boolish(judge.get("target_satisfies_edit")):
         return False
     if hard_negative_quality not in {"good", "weak"}:
         return False
     if not _audio_matters_base_quality_accepts(quality):
         return False
+    if not _audio_matters_visual_review_accepts(quality):
+        return False
     if verification is None:
-        return bool(judge.get("accept")) or _boolish(judge.get("target_satisfies_edit"))
+        return True
     return _audio_matters_verification_accepts(verification)
 
 
@@ -12161,6 +12338,10 @@ def _audio_matters_should_skip_video_verification(
     quality: dict[str, Any],
 ) -> bool:
     hard_negative_quality = str(judge.get("hard_negative_quality", "")).strip().lower()
+    if not _boolish(judge.get("accept")):
+        return True
+    if not _boolish(judge.get("single_main_difference")):
+        return True
     if _boolish(judge.get("reference_satisfies_edit")) or not _boolish(judge.get("target_satisfies_edit")):
         return True
     if hard_negative_quality not in {"good", "weak"}:
@@ -12955,6 +13136,28 @@ def _pair_record_acceptance_issues(
                 issues.append("edit_text is not an imperative edit")
             if _score_float(quality.get("intraclip_change_conflict")) >= 1.0:
                 issues.append("the proposed edit appears to describe an intra-clip transition instead of a cross-clip difference")
+            if _is_audio_matters_profile(acceptance_profile):
+                if _observable_difference_rejects(quality):
+                    issues.append("observable_difference gate found no concrete visual delta evidence")
+                if _score_float(quality.get("competing_difference_passed", 1.0)) < 1.0:
+                    issues.append("single_main_difference failed: competing stronger difference")
+                if "omni_visual_accept" in quality and _score_float(quality.get("omni_visual_accept")) < 1.0:
+                    reason = str(quality.get("omni_reject_reason", "")).strip()
+                    issues.append("audio-anchor visual verifier rejected the pair" + (f": {reason}" if reason else ""))
+                if _score_float(quality.get("caption_equivalent")) >= 1.0:
+                    issues.append("caption_delta says reference and target are equivalent")
+                if _score_float(quality.get("order_only_scene_reorder")) >= 1.0:
+                    issues.append("the proposed scene edit is only a reordered sequence of shared shots")
+                if _score_float(quality.get("weak_synonym_or_wording_delta")) >= 1.0:
+                    issues.append("the proposed edit is a weak synonym or wording-only visual delta")
+                if _score_float(quality.get("reference_satisfies_edit")) >= 1.0:
+                    issues.append("reference already satisfies the audio-anchor visual edit")
+                if "target_satisfies_edit" in quality and _score_float(quality.get("target_satisfies_edit")) < 1.0:
+                    issues.append("target does not satisfy the audio-anchor visual edit")
+                if "visual_delta_strength" in quality and _score_float(quality.get("visual_delta_strength")) < _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "visual_delta_strength"):
+                    issues.append("visual_delta_strength is below the audio-matters threshold")
+                if "near_duplicate_risk" in quality and _score_float(quality.get("near_duplicate_risk")) > _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "near_duplicate_risk"):
+                    issues.append("near_duplicate_risk is above the audio-matters threshold")
         else:
             issues.extend(_structured_edit_text_failures(quality))
             if _observable_difference_rejects(quality):
@@ -13244,6 +13447,7 @@ def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str
         "reference_caption": record["reference_caption"],
         "target_caption": record["target_caption"],
         "difference": dict(record["difference"]),
+        "audio_matters_line": str(record.get("audio_matters_line", "")).strip(),
         "hard_negatives": list(record["hard_negatives"]),
         "quality": dict(record["quality"]),
         "source": dict(record["source"]),
@@ -13253,6 +13457,7 @@ def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str
         "evidence": dict(record.get("evidence", {})),
         "judge": dict(record.get("judge", {})),
         "verification": dict(record.get("verification", {})),
+        "audio_anchor_visual_verification": dict(record.get("audio_anchor_visual_verification", {})),
         "edit_text_quality": dict(record.get("edit_text_quality", {})),
         "observable_difference": dict(record.get("observable_difference", {})),
         "dominant_delta_decision": dict(record.get("dominant_delta_decision", {})),
@@ -13424,6 +13629,13 @@ def _manual_review_item_markdown(
                 f"- audio_anchor_score: `{metadata.get('audio_anchor_score')}`",
                 f"- audio_anchor_type: `{metadata.get('audio_anchor_type', '')}`",
                 f"- audio_matters_warnings: `{json.dumps(metadata.get('audio_matters_warnings', []), ensure_ascii=False)}`",
+                f"- audio_matters_line: `{metadata.get('audio_matters_line', '')}`",
+                f"- omni_visual_accept: `{(metadata.get('quality') or {}).get('omni_visual_accept')}`",
+                f"- omni_reject_reason: `{(metadata.get('quality') or {}).get('omni_reject_reason', '')}`",
+                f"- visual_delta_strength: `{(metadata.get('quality') or {}).get('visual_delta_strength')}`",
+                f"- near_duplicate_risk: `{(metadata.get('quality') or {}).get('near_duplicate_risk')}`",
+                f"- reference_satisfies_edit: `{(metadata.get('quality') or {}).get('reference_satisfies_edit')}`",
+                f"- target_satisfies_edit: `{(metadata.get('quality') or {}).get('target_satisfies_edit')}`",
             ]
             if audio_anchor
             else []
@@ -16870,6 +17082,7 @@ def build_parser() -> argparse.ArgumentParser:
     propose_group_pairs_parser.add_argument("--output-path")
     propose_group_pairs_parser.add_argument("--accepted-output-path")
     propose_group_pairs_parser.add_argument("--accepted-progress-path")
+    propose_group_pairs_parser.add_argument("--rejected-progress-path")
     propose_group_pairs_parser.add_argument("--raw-index-path")
     propose_group_pairs_parser.add_argument("--base-url", required=True)
     propose_group_pairs_parser.add_argument("--api-key", required=True)
@@ -16879,6 +17092,7 @@ def build_parser() -> argparse.ArgumentParser:
     propose_group_pairs_parser.add_argument("--max-proposals", type=int)
     propose_group_pairs_parser.add_argument("--zero-accepted-stop-after", type=int, default=DEFAULT_ZERO_ACCEPTED_STOP_AFTER)
     propose_group_pairs_parser.add_argument("--acceptance-profile", choices=sorted(ACCEPTANCE_PROFILE_NAMES), default=DEFAULT_ACCEPTANCE_PROFILE)
+    propose_group_pairs_parser.add_argument("--no-strict-audio-matters-visual-anchor", action="store_true")
     propose_group_pairs_parser.add_argument("--overwrite", action="store_true")
 
     plan_video_edits_parser = subparsers.add_parser("plan-video-edits")
@@ -17177,6 +17391,7 @@ def main() -> None:
             output_path=args.output_path,
             accepted_output_path=args.accepted_output_path,
             accepted_progress_path=args.accepted_progress_path,
+            rejected_progress_path=args.rejected_progress_path,
             raw_index_path=args.raw_index_path,
             base_url=args.base_url,
             api_key=args.api_key,
@@ -17186,6 +17401,7 @@ def main() -> None:
             max_proposals=args.max_proposals,
             zero_accepted_stop_after=args.zero_accepted_stop_after,
             acceptance_profile=args.acceptance_profile,
+            strict_audio_matters_visual_anchor=not args.no_strict_audio_matters_visual_anchor,
             overwrite=args.overwrite,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))

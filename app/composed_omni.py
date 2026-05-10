@@ -88,6 +88,20 @@ REQUIRED_PAIR_VERIFICATION_FIELDS = (
     "edit_projection",
     "edit_necessity",
 )
+REQUIRED_AUDIO_ANCHOR_VISUAL_VERIFICATION_FIELDS = (
+    "accept",
+    "reject_reason",
+    "recommended_edit_text",
+    "visual_delta_type",
+    "visual_delta_strength",
+    "near_duplicate_risk",
+    "reference_satisfies_edit",
+    "target_satisfies_edit",
+    "caption_equivalent",
+    "order_only_scene_reorder",
+    "weak_synonym_or_wording_delta",
+    "evidence",
+)
 
 REQUIRED_SINGLE_SOURCE_PAIR_FIELDS = (
     "edit_text",
@@ -559,6 +573,28 @@ def _pair_judge_system_prompt() -> str:
     )
 
 
+def _audio_anchor_visual_verification_system_prompt() -> str:
+    return (
+        "You are the strict final verifier for the audio-anchor visual-edit line of a composed video retrieval dataset. "
+        "Return exactly one JSON object and nothing else. "
+        'Required schema: {"accept": boolean, "reject_reason": string, "recommended_edit_text": string, '
+        '"visual_delta_type": string, "visual_delta_strength": number, "near_duplicate_risk": number, '
+        '"reference_satisfies_edit": boolean, "target_satisfies_edit": boolean, '
+        '"caption_equivalent": boolean, "order_only_scene_reorder": boolean, '
+        '"weak_synonym_or_wording_delta": boolean, "evidence": [string]}. '
+        "This line is visual_edit_audio_anchor: audio is preserved context only. The edit_text must describe one clear visual change. "
+        "Accept only if the actual target video visibly satisfies the edit, the actual reference video does not, "
+        "and the difference is a useful retrieval target beyond nearly identical frames or caption wording. "
+        "Reject synonym or weak attribute edits such as bright core to luminous core, microphone clipped to shirt to receding hairline, "
+        "tiny lighting changes, closer/farther camera framing, or reordered shots of the same scenes. "
+        "Reject if the clips are effectively the same, if the reference already satisfies the edit, "
+        "if the target only changes speech/audio/text, or if multiple stronger visual changes compete with the edit. "
+        "Inspect the beginning, middle, and end of both clips before deciding. "
+        "Set visual_delta_strength from 0.0 to 1.0; values below 0.70 are not useful. "
+        "Set near_duplicate_risk from 0.0 to 1.0; values above 0.85 indicate the pair is too similar unless the visible edit is obvious."
+    )
+
+
 def _pair_verification_system_prompt() -> str:
     return (
         "You verify whether a composed retrieval pair truly needs the edit text. "
@@ -860,6 +896,37 @@ def _build_pair_judge_user_content(
         "If you reject the pair, reject_reason must be a non-empty sentence naming the main failed gate or threshold."
     )
     return [{"type": "text", "text": prompt}]
+
+
+def _build_audio_anchor_visual_verification_user_content(
+    *,
+    proposal: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    reference_clip_path: str,
+    target_clip_path: str,
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: final-check this audio-anchor visual-edit candidate.\n"
+        "Use the attached reference and target videos as primary evidence. Use annotations and audio_anchor_score only as supporting context.\n"
+        f"Pair proposal JSON:\n{json.dumps(proposal, ensure_ascii=False)}\n"
+        f"Reference annotation JSON:\n{json.dumps(reference_annotation, ensure_ascii=False)}\n"
+        f"Target annotation JSON:\n{json.dumps(target_annotation, ensure_ascii=False)}\n"
+        "Rules:\n"
+        "- Audio similarity means the clips may share context; do not use audio as the edited attribute.\n"
+        "- edit_text must be visual-only and must not mention audio, speech, sound, music, or transcript.\n"
+        "- Reject if the proposed edit is only wording, brightness, synonym phrasing, shot order, or a near-duplicate visual state.\n"
+        "- Reject if the reference already visually satisfies edit_text or the target does not clearly satisfy it.\n"
+        "- If rejecting but a cleaner visual edit exists, put it in recommended_edit_text; otherwise leave it empty.\n"
+        "- Provide concrete evidence from the videos, not only from captions."
+    )
+    return [
+        {"type": "text", "text": "Reference video for audio-anchor visual verification:"},
+        {"type": "video_url", "video_url": {"url": _materialize_video_url(reference_clip_path)}},
+        {"type": "text", "text": "Target video for audio-anchor visual verification:"},
+        {"type": "video_url", "video_url": {"url": _materialize_video_url(target_clip_path)}},
+        {"type": "text", "text": prompt},
+    ]
 
 
 def _build_pair_verification_user_content(
@@ -1235,6 +1302,28 @@ class OpenAIComposedDataClient:
             max_tokens=1300,
         )
         return _normalize_pair_verification_payload(raw_payload), raw_payload
+
+    def verify_audio_anchor_visual_pair(
+        self,
+        *,
+        proposal: dict[str, Any],
+        reference_annotation: dict[str, Any],
+        target_annotation: dict[str, Any],
+        reference_clip_path: str,
+        target_clip_path: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_audio_anchor_visual_verification_user_content(
+                proposal=proposal,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                reference_clip_path=reference_clip_path,
+                target_clip_path=target_clip_path,
+            ),
+            system_prompt=_audio_anchor_visual_verification_system_prompt(),
+            max_tokens=900,
+        )
+        return _normalize_audio_anchor_visual_verification_payload(raw_payload), raw_payload
 
     def plan_video_edit(
         self,
@@ -1626,6 +1715,37 @@ def _normalize_pair_verification_payload(payload: dict[str, Any]) -> dict[str, A
             "failure_reason": str(edit_text_quality_check.get("failure_reason", "")).strip(),
         },
     }
+
+
+def _normalize_audio_anchor_visual_verification_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_AUDIO_ANCHOR_VISUAL_VERIFICATION_FIELDS)
+    if missing_fields:
+        raise ValueError(f"audio-anchor visual verification missing fields: {missing_fields}")
+
+    visual_delta_type = str(payload.get("visual_delta_type", "")).strip().lower().replace("-", "_").replace(" ", "_")
+    visual_delta_type = DIFFERENCE_TYPE_ALIASES.get(visual_delta_type, visual_delta_type)
+    if visual_delta_type not in ALLOWED_DIFFERENCE_TYPES:
+        visual_delta_type = ""
+    accept = _bool_value(payload.get("accept"))
+    normalized = {
+        "accept": accept,
+        "reject_reason": str(payload.get("reject_reason", "")).strip(),
+        "recommended_edit_text": str(payload.get("recommended_edit_text", "")).strip(),
+        "visual_delta_type": visual_delta_type,
+        "visual_delta_strength": _score_value(payload.get("visual_delta_strength")),
+        "near_duplicate_risk": _score_value(payload.get("near_duplicate_risk")),
+        "reference_satisfies_edit": _bool_value(payload.get("reference_satisfies_edit")),
+        "target_satisfies_edit": _bool_value(payload.get("target_satisfies_edit")),
+        "caption_equivalent": _bool_value(payload.get("caption_equivalent")),
+        "order_only_scene_reorder": _bool_value(payload.get("order_only_scene_reorder")),
+        "weak_synonym_or_wording_delta": _bool_value(payload.get("weak_synonym_or_wording_delta")),
+        "evidence": _detail_list(payload.get("evidence")),
+    }
+    if normalized["accept"] and not normalized["evidence"]:
+        raise ValueError("audio-anchor visual verification evidence is required for accept=true")
+    if not normalized["accept"] and not normalized["reject_reason"]:
+        raise ValueError("audio-anchor visual verification reject_reason is required for accept=false")
+    return normalized
 
 
 def _repair_video_edit_plan_payload(

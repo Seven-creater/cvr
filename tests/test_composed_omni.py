@@ -1035,6 +1035,74 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("actual videos as the primary evidence", verification_prompt)
         self.assertIn("reference video already contains or satisfies", verification_prompt)
 
+    def test_verify_audio_anchor_visual_pair_materializes_videos_and_rejects_weak_deltas(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "accept": True,
+                                "reject_reason": "",
+                                "recommended_edit_text": "change the gray wall close-up into a classroom blackboard view",
+                                "visual_delta_type": "scene",
+                                "visual_delta_strength": 0.82,
+                                "near_duplicate_risk": 0.2,
+                                "reference_satisfies_edit": False,
+                                "target_satisfies_edit": True,
+                                "caption_equivalent": False,
+                                "order_only_scene_reorder": False,
+                                "weak_synonym_or_wording_delta": False,
+                                "evidence": ["The target shows a blackboard classroom while the reference is a gray wall close-up."],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8093/v1",
+            api_key="EMPTY",
+            model="qwen3-omni",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "reference.mp4"
+            target_path = Path(temp_dir) / "target.mp4"
+            reference_path.write_bytes(b"reference-video")
+            target_path.write_bytes(b"target-video")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.verify_audio_anchor_visual_pair(
+                    proposal={
+                        "edit_text": "change the gray wall close-up into a classroom blackboard view",
+                        "audio_anchor_score": 0.94,
+                    },
+                    reference_annotation={"clip_id": "ref", "summary": "a gray wall close-up with speech"},
+                    target_annotation={"clip_id": "target", "summary": "a classroom blackboard with the same speech"},
+                    reference_clip_path=str(reference_path),
+                    target_clip_path=str(target_path),
+                )
+
+        self.assertTrue(normalized["accept"])
+        self.assertEqual("scene", normalized["visual_delta_type"])
+        self.assertEqual(0.82, normalized["visual_delta_strength"])
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        system_prompt = request_body["messages"][0]["content"]
+        self.assertIn("visual_edit_audio_anchor", system_prompt)
+        self.assertIn("bright core", system_prompt)
+        content = request_body["messages"][1]["content"]
+        self.assertEqual("Reference video for audio-anchor visual verification:", content[0]["text"])
+        self.assertTrue(content[1]["video_url"]["url"].startswith("data:video/mp4;base64,"))
+        self.assertEqual("Target video for audio-anchor visual verification:", content[2]["text"])
+        self.assertTrue(content[3]["video_url"]["url"].startswith("data:video/mp4;base64,"))
+        self.assertIn("Audio similarity means the clips may share context", content[4]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

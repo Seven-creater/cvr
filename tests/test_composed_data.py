@@ -4925,17 +4925,17 @@ class ComposedDataTests(unittest.TestCase):
         self.assertEqual(0.9, prepared["quality"]["edit_match_score"])
         self.assertTrue(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
 
-    def test_audio_matters_profile_keeps_audio_anchor_and_softens_multi_delta_gate(self) -> None:
+    def test_audio_matters_profile_keeps_audio_anchor_with_strict_judge_accept(self) -> None:
         judge = {
             "reference_satisfies_edit": False,
             "target_satisfies_edit": True,
-            "single_main_difference": False,
+            "single_main_difference": True,
             "same_context_score": 0.70,
             "edit_match_score": 0.62,
             "target_uniqueness_score": 0.70,
             "audio_required": False,
             "hard_negative_quality": "weak",
-            "accept": False,
+            "accept": True,
         }
         verification = {
             "caption_delta": {
@@ -4976,8 +4976,16 @@ class ComposedDataTests(unittest.TestCase):
             "edit_text_single_change": 1.0,
             "edit_text_not_caption_like": 1.0,
             "edit_text_no_modality_leakage": 1.0,
-            "observable_difference_passed": 0.0,
-            "competing_difference_passed": 0.0,
+            "observable_difference_passed": 1.0,
+            "competing_difference_passed": 1.0,
+            "omni_visual_accept": 1.0,
+            "visual_delta_strength": 0.78,
+            "near_duplicate_risk": 0.30,
+            "reference_satisfies_edit": 0.0,
+            "target_satisfies_edit": 1.0,
+            "caption_equivalent": 0.0,
+            "order_only_scene_reorder": 0.0,
+            "weak_synonym_or_wording_delta": 0.0,
         }
 
         quality = _effective_pair_quality(judge, verification, heuristic_quality)
@@ -4999,7 +5007,199 @@ class ComposedDataTests(unittest.TestCase):
                 acceptance_profile=AUDIO_MATTERS_ACCEPTANCE_PROFILE,
             )
         )
-        self.assertTrue(_should_skip_pair_video_verification(judge, quality))
+        self.assertFalse(_should_skip_pair_video_verification(judge, quality))
+
+    def test_audio_matters_profile_rejects_model_judge_false_even_with_verification(self) -> None:
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.95,
+            "edit_match_score": 0.95,
+            "target_uniqueness_score": 0.95,
+            "hard_negative_quality": "good",
+            "accept": False,
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {"target_matches_projection": True, "score": 0.95},
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.95,
+            },
+            "edit_text_quality_check": {
+                "not_caption_like": True,
+                "matches_modality": True,
+                "single_primary_difference": True,
+                "reference_does_not_satisfy": True,
+                "target_satisfies": True,
+                "score": 0.95,
+            },
+        }
+        quality = {
+            "same_context_score": 0.95,
+            "edit_match_score": 0.95,
+            "target_uniqueness_score": 0.95,
+            "difference_strength_score": 0.90,
+            "difference_type": "scene",
+            "audio_anchor_required": 1.0,
+            "audio_anchor_score": 0.95,
+            "edit_primary_modality": "visual",
+            "edit_text_quality_score": 0.95,
+            "edit_text_is_imperative": 1.0,
+            "edit_text_matches_difference_type": 1.0,
+            "edit_text_single_change": 1.0,
+            "edit_text_not_caption_like": 1.0,
+            "edit_text_no_modality_leakage": 1.0,
+            "omni_visual_accept": 1.0,
+            "visual_delta_strength": 0.95,
+            "near_duplicate_risk": 0.10,
+            "reference_satisfies_edit": 0.0,
+            "target_satisfies_edit": 1.0,
+            "caption_equivalent": 0.0,
+            "order_only_scene_reorder": 0.0,
+            "weak_synonym_or_wording_delta": 0.0,
+        }
+
+        self.assertFalse(
+            _judge_accepts(
+                judge,
+                verification,
+                quality,
+                acceptance_profile=AUDIO_MATTERS_ACCEPTANCE_PROFILE,
+            )
+        )
+
+    def test_audio_matters_profile_rejects_audio_anchor_visual_verifier_failures(self) -> None:
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": True,
+            "same_context_score": 0.95,
+            "edit_match_score": 0.95,
+            "target_uniqueness_score": 0.95,
+            "hard_negative_quality": "good",
+            "accept": True,
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {"target_matches_projection": True, "score": 0.95},
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.95,
+            },
+            "edit_text_quality_check": {
+                "not_caption_like": True,
+                "matches_modality": True,
+                "single_primary_difference": True,
+                "reference_does_not_satisfy": True,
+                "target_satisfies": True,
+                "score": 0.95,
+            },
+        }
+        quality = {
+            "same_context_score": 0.95,
+            "edit_match_score": 0.95,
+            "target_uniqueness_score": 0.95,
+            "difference_strength_score": 0.90,
+            "difference_type": "attribute",
+            "acceptance_profile": AUDIO_MATTERS_ACCEPTANCE_PROFILE,
+            "audio_anchor_required": 1.0,
+            "audio_anchor_score": 0.96,
+            "edit_primary_modality": "visual",
+            "edit_text_quality_score": 0.95,
+            "edit_text_is_imperative": 1.0,
+            "edit_text_matches_difference_type": 1.0,
+            "edit_text_single_change": 1.0,
+            "edit_text_not_caption_like": 1.0,
+            "edit_text_no_modality_leakage": 1.0,
+            "omni_visual_accept": 0.0,
+            "omni_reject_reason": "weak synonym or wording-only difference",
+            "visual_delta_strength": 0.10,
+            "near_duplicate_risk": 0.95,
+            "reference_satisfies_edit": 0.0,
+            "target_satisfies_edit": 1.0,
+            "caption_equivalent": 0.0,
+            "order_only_scene_reorder": 0.0,
+            "weak_synonym_or_wording_delta": 1.0,
+        }
+
+        self.assertFalse(
+            _judge_accepts(
+                judge,
+                verification,
+                quality,
+                acceptance_profile=AUDIO_MATTERS_ACCEPTANCE_PROFILE,
+            )
+        )
+        reason = _compose_reject_reason(
+            judge,
+            verification,
+            quality,
+        )
+        self.assertIn("audio-anchor visual verifier rejected", reason)
+
+    def test_audio_matters_pair_record_acceptance_rejects_order_only_visual_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "clips").mkdir()
+            (root / "clips" / "ref.mp4").write_bytes(b"reference-video")
+            (root / "clips" / "target.mp4").write_bytes(b"target-video")
+            record = {
+                "reference_video": "clips/ref.mp4",
+                "target_video": "clips/target.mp4",
+                "edit_text": "change the close-up into the later classroom view",
+                "reference_caption": "A classroom close-up followed by a board view.",
+                "target_caption": "A board view followed by a classroom close-up.",
+                "difference": {"type": "scene", "from": "close-up first", "to": "board first"},
+                "quality": {
+                    "difference_type": "scene",
+                    "audio_anchor_required": 1.0,
+                    "audio_anchor_score": 0.96,
+                    "same_context_score": 0.90,
+                    "edit_match_score": 0.90,
+                    "target_uniqueness_score": 0.90,
+                    "difference_strength_score": 0.85,
+                    "edit_primary_modality": "visual",
+                    "edit_text_is_imperative": 1.0,
+                    "observable_difference_passed": 1.0,
+                    "competing_difference_passed": 1.0,
+                    "omni_visual_accept": 0.0,
+                    "omni_reject_reason": "order-only scene reorder",
+                    "visual_delta_strength": 0.20,
+                    "near_duplicate_risk": 0.92,
+                    "reference_satisfies_edit": 1.0,
+                    "target_satisfies_edit": 1.0,
+                    "caption_equivalent": 1.0,
+                    "order_only_scene_reorder": 1.0,
+                    "weak_synonym_or_wording_delta": 0.0,
+                },
+            }
+
+            issues = _pair_record_acceptance_issues(
+                root=root,
+                record=record,
+                reference_annotation={"summary": record["reference_caption"]},
+                target_annotation={"summary": record["target_caption"]},
+                acceptance_profile=AUDIO_MATTERS_ACCEPTANCE_PROFILE,
+            )
+
+        joined = " ".join(issues)
+        self.assertIn("audio-anchor visual verifier rejected", joined)
+        self.assertIn("reordered sequence", joined)
+        self.assertIn("reference already satisfies", joined)
 
     def test_prepare_record_syncs_observable_difference_failure_into_verification(self) -> None:
         record = {
@@ -9461,6 +9661,7 @@ class ComposedDataTests(unittest.TestCase):
                     {
                         "sample_id": "audio_sample",
                         "proposal_id": "proposal__audio",
+                        "audio_matters_line": "visual_edit_audio_anchor",
                         "reference_video": "clips/ref.mp4",
                         "target_video": "clips/target.mp4",
                         "edit_text": "replace the white stuffed animal with a panda-shaped accessory",
@@ -9474,6 +9675,16 @@ class ComposedDataTests(unittest.TestCase):
                             "audio_anchor_min_rms": 0.04,
                             "audio_matters_warnings": ["competing_difference_review"],
                             "edit_primary_modality": "visual",
+                            "omni_visual_accept": 1.0,
+                            "visual_delta_strength": 0.84,
+                            "near_duplicate_risk": 0.21,
+                            "reference_satisfies_edit": 0.0,
+                            "target_satisfies_edit": 1.0,
+                        },
+                        "audio_anchor_visual_verification": {
+                            "accept": True,
+                            "visual_delta_type": "object_presence",
+                            "evidence": ["target has the panda accessory"],
                         },
                         "source_context": {"audio_anchor_type": "similar_or_same_natural_audio"},
                         "judge": {"accept": True},
@@ -9499,9 +9710,13 @@ class ComposedDataTests(unittest.TestCase):
             self.assertTrue(metadata["audio_anchor"]["audio_anchor_required"])
             self.assertEqual("similar_or_same_natural_audio", metadata["audio_anchor_type"])
             self.assertEqual(["competing_difference_review"], metadata["audio_matters_warnings"])
+            self.assertEqual("visual_edit_audio_anchor", metadata["audio_matters_line"])
+            self.assertEqual(1.0, metadata["quality"]["omni_visual_accept"])
+            self.assertTrue(metadata["audio_anchor_visual_verification"]["accept"])
             review_text = (item_dir / "review.md").read_text(encoding="utf-8")
             self.assertIn("audio_anchor_score", review_text)
             self.assertIn("0.987", review_text)
+            self.assertIn("omni_visual_accept", review_text)
             description_text = (item_dir / "description.md").read_text(encoding="utf-8")
             self.assertIn("audio_anchor", description_text)
             index_text = (output_dir / "index.md").read_text(encoding="utf-8")
@@ -9512,6 +9727,7 @@ class ComposedDataTests(unittest.TestCase):
                 if line.strip()
             ]
             self.assertEqual(0.987, review_items[0]["audio_anchor_score"])
+            self.assertEqual(1.0, review_items[0]["omni_visual_accept"])
 
     def test_build_manual_review_bundle_marks_incomplete_visual_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
