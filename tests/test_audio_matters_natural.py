@@ -7,6 +7,7 @@ import numpy as np
 
 from app.audio_matters_natural import (
     AudioFeature,
+    _audio_signature_vector,
     export_audio_matters_triplets,
     merge_pair_proposals,
     mine_audio_matters_candidates,
@@ -71,6 +72,15 @@ class AudioMattersNaturalTests(unittest.TestCase):
                 "attributes": ["blue background"],
             },
         ]
+
+    def test_audio_signature_accepts_read_only_frombuffer_array(self) -> None:
+        samples = np.frombuffer(np.asarray([0.1, -0.2, 0.3, -0.4], dtype=np.float32).tobytes(), dtype=np.float32)
+        self.assertFalse(samples.flags.writeable)
+
+        vector = _audio_signature_vector(samples)
+
+        self.assertIsNotNone(vector)
+        self.assertAlmostEqual(float(np.linalg.norm(vector)), 1.0, places=5)
 
     def test_mines_natural_audio_anchor_visual_candidate(self) -> None:
         temp_dir, root = self._make_root()

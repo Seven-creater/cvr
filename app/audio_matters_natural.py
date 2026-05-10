@@ -88,7 +88,7 @@ def extract_audio_feature(
     samples = np.frombuffer(completed.stdout, dtype=np.float32)
     if samples.size < max(1, sample_rate // 2):
         return None
-    samples = np.nan_to_num(samples, copy=False)
+    samples = np.nan_to_num(samples)
     rms = float(np.sqrt(np.mean(np.square(samples), dtype=np.float64)))
     if not math.isfinite(rms):
         return None
@@ -675,30 +675,32 @@ def export_audio_matters_triplets(
 ) -> dict[str, Any]:
     root_path = Path(root)
     records = list(_load_jsonl(Path(accepted_pairs_path)))
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
     output_records: list[dict[str, Any]] = []
     skipped_counts: Counter[str] = Counter()
-    for index, record in enumerate(records, start=1):
-        if not bool(record.get("accepted", True)):
-            skipped_counts["not_accepted"] += 1
-            continue
-        reference_video_raw = str(record.get("reference_video", "")).strip()
-        target_video_raw = str(record.get("target_video", "")).strip()
-        edit_text = str(record.get("edit_text", "")).strip()
-        if not reference_video_raw or not target_video_raw or not edit_text:
-            skipped_counts["missing_core_field"] += 1
-            continue
-        reference_path = _resolve_under_root(root_path, reference_video_raw)
-        target_path = _resolve_under_root(root_path, target_video_raw)
-        if not reference_path.exists() or not target_path.exists():
-            skipped_counts["missing_video"] += 1
-            continue
-        difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
-        visual_delta_type = str(difference.get("type", "")).strip()
-        quality = _audio_quality_payload(record)
-        hard_negatives = _resolved_hard_negative_paths(root_path, record)
-        sample_id = str(record.get("proposal_id", "")).strip() or f"audio_matters_{index:04d}"
-        output_records.append(
-            {
+    with output.open("w", encoding="utf-8") as handle:
+        for index, record in enumerate(records, start=1):
+            if not bool(record.get("accepted", True)):
+                skipped_counts["not_accepted"] += 1
+                continue
+            reference_video_raw = str(record.get("reference_video", "")).strip()
+            target_video_raw = str(record.get("target_video", "")).strip()
+            edit_text = str(record.get("edit_text", "")).strip()
+            if not reference_video_raw or not target_video_raw or not edit_text:
+                skipped_counts["missing_core_field"] += 1
+                continue
+            reference_path = _resolve_under_root(root_path, reference_video_raw)
+            target_path = _resolve_under_root(root_path, target_video_raw)
+            if not reference_path.exists() or not target_path.exists():
+                skipped_counts["missing_video"] += 1
+                continue
+            difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+            visual_delta_type = str(difference.get("type", "")).strip()
+            quality = _audio_quality_payload(record)
+            hard_negatives = _resolved_hard_negative_paths(root_path, record)
+            sample_id = str(record.get("proposal_id", "")).strip() or f"audio_matters_{index:04d}"
+            output_record = {
                 "sample_id": sample_id,
                 "reference_video": str(reference_path),
                 "target_video": str(target_path),
@@ -718,8 +720,22 @@ def export_audio_matters_triplets(
                 "audio_anchor_type": quality["audio_anchor_type"],
                 "source_pair_proposal_id": str(record.get("proposal_id", "")).strip(),
             }
-        )
-    _write_jsonl(Path(output_path), output_records)
+            output_records.append(output_record)
+            handle.write(json.dumps(output_record, ensure_ascii=False) + "\n")
+            handle.flush()
+            edit_preview = edit_text.replace("\n", " ")
+            if len(edit_preview) > 160:
+                edit_preview = edit_preview[:157].rstrip() + "..."
+            print(
+                "[audio-matters-natural] GENERATED_TRIPLET "
+                f"index={len(output_records)} sample_id={sample_id} "
+                f"difference_type={visual_delta_type} "
+                f"audio_anchor_score={quality['audio_anchor_score']} "
+                f"reference_video={reference_path} target_video={target_path} "
+                f"edit_text={edit_preview}",
+                file=sys.stderr,
+                flush=True,
+            )
     summary = {
         "accepted_pairs_path": str(accepted_pairs_path),
         "output_path": str(output_path),

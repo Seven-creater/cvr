@@ -3588,6 +3588,7 @@ def propose_group_pairs(
     model: str,
     output_path: str | Path | None = None,
     accepted_output_path: str | Path | None = None,
+    accepted_progress_path: str | Path | None = None,
     raw_index_path: str | Path | None = None,
     overwrite: bool = False,
     timeout_seconds: float = 180.0,
@@ -3621,6 +3622,7 @@ def propose_group_pairs(
 
     output = Path(output_path) if output_path else layout["pairs"] / "judged_pair_proposals.jsonl"
     accepted_output = Path(accepted_output_path) if accepted_output_path else layout["pairs"] / DEFAULT_ACCEPTED_PAIRS_NAME
+    accepted_progress_output = Path(accepted_progress_path) if accepted_progress_path else None
     # Long pair proposal runs are model-call heavy. Preserve already written
     # proposal rows as a resume cache even when callers pass --overwrite.
     existing_records = _load_records_by_key(output, "proposal_id")
@@ -3628,6 +3630,9 @@ def propose_group_pairs(
         _write_jsonl(output, [])
     if not accepted_output.exists():
         _write_jsonl(accepted_output, [])
+    if accepted_progress_output is not None:
+        accepted_progress_output.parent.mkdir(parents=True, exist_ok=True)
+        accepted_progress_output.write_text("", encoding="utf-8")
     print("[propose-group-pairs] load raw asset index", file=sys.stderr, flush=True)
     raw_index = _load_raw_asset_index(Path(raw_index_path) if raw_index_path else layout["metadata"] / DEFAULT_RAW_INDEX_NAME)
     print(f"[propose-group-pairs] raw asset index loaded rows={len(raw_index)}", file=sys.stderr, flush=True)
@@ -4047,6 +4052,55 @@ def propose_group_pairs(
                 max_accepted_pairs=max_accepted_pairs,
                 acceptance_profile=acceptance_profile,
             )
+            edit_preview = str(record.get("edit_text", "")).replace("\n", " ").strip()
+            if len(edit_preview) > 160:
+                edit_preview = edit_preview[:157].rstrip() + "..."
+            difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+            quality = record.get("quality", {}) if isinstance(record.get("quality"), dict) else {}
+            if bool(record.get("accepted")) and accepted_progress_output is not None:
+                _append_jsonl_record(
+                    accepted_progress_output,
+                    {
+                        "event": "accepted_sample",
+                        "proposal_index": len(output_records),
+                        "accepted_current": len(current_accepted_records),
+                        "proposal_id": record.get("proposal_id", ""),
+                        "reference_video": record.get("reference_video", ""),
+                        "target_video": record.get("target_video", ""),
+                        "edit_text": record.get("edit_text", ""),
+                        "difference_type": difference.get("type", ""),
+                        "same_context_score": quality.get("same_context_score"),
+                        "edit_match_score": quality.get("edit_match_score"),
+                        "target_uniqueness_score": quality.get("target_uniqueness_score"),
+                        "difference_strength_score": quality.get("difference_strength_score"),
+                        "audio_anchor_score": quality.get("audio_anchor_score"),
+                    },
+                )
+            if bool(record.get("accepted")):
+                print(
+                    "[propose-group-pairs] ACCEPTED_SAMPLE "
+                    f"proposal_index={len(output_records)} accepted_current={len(current_accepted_records)} "
+                    f"proposal_id={record.get('proposal_id', '')} "
+                    f"difference_type={difference.get('type', '')} "
+                    f"audio_anchor_score={quality.get('audio_anchor_score', '')} "
+                    f"reference_video={record.get('reference_video', '')} "
+                    f"target_video={record.get('target_video', '')} "
+                    f"edit_text={edit_preview}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                judge_payload = record.get("judge", {}) if isinstance(record.get("judge"), dict) else {}
+                reject_preview = str(judge_payload.get("reject_reason", "")).replace("\n", " ").strip()
+                if len(reject_preview) > 160:
+                    reject_preview = reject_preview[:157].rstrip() + "..."
+                print(
+                    "[propose-group-pairs] REJECTED_PROPOSAL "
+                    f"proposal_index={len(output_records)} proposal_id={record.get('proposal_id', '')} "
+                    f"difference_type={difference.get('type', '')} reject_reason={reject_preview}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             print(
                 "[propose-group-pairs] wrote "
                 f"proposal_count={len(output_records)} accepted_current="
@@ -4084,6 +4138,7 @@ def propose_group_pairs(
         "clip_groups_path": str(groups_path),
         "output_path": str(output),
         "accepted_output_path": str(accepted_output),
+        "accepted_progress_path": str(accepted_progress_output or ""),
         "mined_candidates_path": str(mined_path) if mined_path else "",
         "group_count": len(groups),
         "annotation_count": len(annotations),
@@ -16571,6 +16626,7 @@ def build_parser() -> argparse.ArgumentParser:
     propose_group_pairs_parser.add_argument("--mined-candidates-path")
     propose_group_pairs_parser.add_argument("--output-path")
     propose_group_pairs_parser.add_argument("--accepted-output-path")
+    propose_group_pairs_parser.add_argument("--accepted-progress-path")
     propose_group_pairs_parser.add_argument("--raw-index-path")
     propose_group_pairs_parser.add_argument("--base-url", required=True)
     propose_group_pairs_parser.add_argument("--api-key", required=True)
@@ -16877,6 +16933,7 @@ def main() -> None:
             mined_candidates_path=args.mined_candidates_path,
             output_path=args.output_path,
             accepted_output_path=args.accepted_output_path,
+            accepted_progress_path=args.accepted_progress_path,
             raw_index_path=args.raw_index_path,
             base_url=args.base_url,
             api_key=args.api_key,

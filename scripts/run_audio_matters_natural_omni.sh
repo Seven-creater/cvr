@@ -435,6 +435,7 @@ if [ "$PROPOSE_SHARDS" -le 1 ]; then
     --mined-candidates-path "$RUN_ROOT/audio_matters_mined_candidates.jsonl" \
     --output-path "$RUN_ROOT/judged_audio_matters_pair_proposals.jsonl" \
     --accepted-output-path "$RUN_ROOT/accepted_audio_matters_pairs.jsonl" \
+    --accepted-progress-path "$RUN_ROOT/accepted_audio_matters_pairs.progress.jsonl" \
     --base-url "$BASE_URL" \
     --api-key EMPTY \
     --model "$MODEL" \
@@ -488,29 +489,36 @@ PY
     SHARD_ID=$(printf "%03d" "$SHARD_INDEX")
     SHARD_OUTPUT="$SHARD_OUTPUT_DIR/judged_audio_matters_pair_proposals_${SHARD_ID}.jsonl"
     SHARD_ACCEPTED="$SHARD_OUTPUT_DIR/accepted_audio_matters_pairs_${SHARD_ID}.jsonl"
+    SHARD_ACCEPTED_PROGRESS="$SHARD_OUTPUT_DIR/accepted_audio_matters_pairs_${SHARD_ID}.progress.jsonl"
     SHARD_LOG="$SHARD_OUTPUT_DIR/propose_${SHARD_ID}.log"
     echo "$SHARD_OUTPUT" >> "$PROPOSAL_OUTPUT_LIST"
     echo "[audio-matters-natural] launch proposal shard=$SHARD_ID path=$SHARD_PATH log=$SHARD_LOG"
     (
       set -euo pipefail
-      run_with_timeout "propose-audio-matters-pairs-shard-$SHARD_ID" "$PROPOSE_TIMEOUT_SECONDS" \
-      python -m app.composed_data propose-group-pairs \
-        --root "$ROOT" \
-        --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
-        --clip-groups-path "$RUN_ROOT/clip_groups.jsonl" \
-        --mined-candidates-path "$SHARD_PATH" \
-        --output-path "$SHARD_OUTPUT" \
-        --accepted-output-path "$SHARD_ACCEPTED" \
-        --base-url "$BASE_URL" \
-        --api-key EMPTY \
-        --model "$MODEL" \
-        --timeout-seconds "$PAIR_REQUEST_TIMEOUT_SECONDS" \
-        --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
-        --max-proposals "$MAX_PROPOSALS" \
-        --zero-accepted-stop-after "$ZERO_ACCEPTED_STOP_AFTER" \
-        --acceptance-profile "$ACCEPTANCE_PROFILE" \
-        --overwrite
-    ) > "$SHARD_LOG" 2>&1 &
+      set +e
+      (
+        set -euo pipefail
+        run_with_timeout "propose-audio-matters-pairs-shard-$SHARD_ID" "$PROPOSE_TIMEOUT_SECONDS" \
+        python -m app.composed_data propose-group-pairs \
+          --root "$ROOT" \
+          --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
+          --clip-groups-path "$RUN_ROOT/clip_groups.jsonl" \
+          --mined-candidates-path "$SHARD_PATH" \
+          --output-path "$SHARD_OUTPUT" \
+          --accepted-output-path "$SHARD_ACCEPTED" \
+          --accepted-progress-path "$SHARD_ACCEPTED_PROGRESS" \
+          --base-url "$BASE_URL" \
+          --api-key EMPTY \
+          --model "$MODEL" \
+          --timeout-seconds "$PAIR_REQUEST_TIMEOUT_SECONDS" \
+          --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
+          --max-proposals "$MAX_PROPOSALS" \
+          --zero-accepted-stop-after "$ZERO_ACCEPTED_STOP_AFTER" \
+          --acceptance-profile "$ACCEPTANCE_PROFILE" \
+          --overwrite
+      ) 2>&1 | sed -u "s/^/[audio-matters-natural][shard $SHARD_ID] /" | tee "$SHARD_LOG"
+      exit "${PIPESTATUS[0]}"
+    ) &
     PROPOSE_PIDS+=("$!")
     SHARD_INDEX=$((SHARD_INDEX + 1))
     while [ "${#PROPOSE_PIDS[@]}" -ge "$PROPOSE_PARALLEL_JOBS" ]; do
@@ -533,6 +541,12 @@ PY
     --summary-path "$RUN_ROOT/audio_matters_proposal_merge_summary.json" \
     --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
     --acceptance-profile "$ACCEPTANCE_PROFILE"
+  : > "$RUN_ROOT/accepted_audio_matters_pairs.progress.jsonl"
+  for SHARD_PROGRESS in "$SHARD_OUTPUT_DIR"/accepted_audio_matters_pairs_*.progress.jsonl; do
+    [ -f "$SHARD_PROGRESS" ] || continue
+    cat "$SHARD_PROGRESS" >> "$RUN_ROOT/accepted_audio_matters_pairs.progress.jsonl"
+  done
+  echo "[audio-matters-natural] merged accepted progress log=$RUN_ROOT/accepted_audio_matters_pairs.progress.jsonl"
 fi
 
 ACCEPTED_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/accepted_audio_matters_pairs.jsonl")
