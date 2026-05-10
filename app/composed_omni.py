@@ -563,14 +563,15 @@ def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> 
     if line == "speech_audio_content":
         return (
             base_prompt
-            + " This pass is the speech_audio_content B line. Prefer pairs where the visual context remains similar and the primary retrieval edit "
-            "is speech content or a concrete non-speech audio event. Use difference.type=speech only for transcript-backed spoken-language content; "
-            "use difference.type=audio_event only for non-language sounds such as music, applause, machinery, wind, animal sounds, or ambience. "
-            "The edit_text may mention speech/audio because that is the target line, but it must be specific and evidence-backed. "
-            "Good B-line style: two visually similar sports broadcast clips where the target clearly adds crowd cheering or the spoken content changes. "
-            "Reject B-line cases where the scene, subject, shot type, or event changes so much that visuals alone retrieve the target. "
-            "Reject vague hum/click/electronic tone guesses unless the evidence is explicit and human-audible. "
-            "Reject if the main change is visual, if transcript/audio evidence is vague, or if speech-only narration is mislabeled as audio_event."
+            + " This pass is the speech_audio_content B line. Visual variables are locked: the clips must keep the same scene/program/person/view type "
+            "or a very similar visual context, and visuals alone should not retrieve the target. The primary retrieval edit must be speech content "
+            "or a concrete non-speech audio event. Use difference.type=speech for transcript-backed spoken-language content, narration topic, or commentary content; "
+            "do not label narration/topic changes as audio_event. Use difference.type=audio_event only for non-language sounds such as music, applause, machinery, "
+            "wind, animal sounds, ambience, or crowd cheering. The edit_text must describe only the audible change and must not describe people, objects, scene, "
+            "color, camera, subtitles, or shot distance. Good B-line style: two visually similar sports broadcast clips where the target clearly adds crowd cheering "
+            "or the spoken content changes. Reject with reason visual_too_different_for_B if the scene, subject, shot type, major action, or event changes enough "
+            "that visuals alone retrieve the target. Reject vague hum/click/electronic tone guesses unless the evidence is explicit and human-audible. "
+            "Reject if the main change is visual, if transcript/audio evidence is vague, or if edit_text is not audio-only."
         )
     return base_prompt
 
@@ -595,7 +596,7 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
         "there is an obvious real difference, the edit_text names the main difference accurately, "
         "and the difference is stable for most of the target clip. "
         "Reject if the candidate is driven by subtitles, visible text, title cards, lower-thirds, product-label/OCR wording, or boundary-frame text. "
-        "Reject if reference and target are effectively the same, if the target does not visibly satisfy the edit, "
+        "Reject if reference and target are effectively the same, if the target does not visibly/audibly satisfy the edit, "
         "if the edit_text exaggerates the composition, or if there is a stronger unmentioned difference. "
         "Specifically reject inaccurate phrases such as 'product close-up', 'full-screen product presentation', or 'speaker replacement' "
         "unless the actual target video proves that phrase. "
@@ -616,10 +617,14 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
         return (
             base_prompt
             + " For this speech_audio_content B line, observable_delta may be an audible speech or non-speech audio delta. "
+            'Also include "audio_primary": boolean, "visual_locked": boolean, "visual_too_different_for_B": boolean, '
+            'and "edit_text_audio_only": boolean in the JSON object. '
             "Accept speech only when both sides have concrete transcript-backed evidence and the edit_text names the content change. "
             "Accept audio_event only for non-speech sound/music/environment changes, not narration topic changes. "
-            "The visual context should stay similar enough that audio matters. "
-            "Reject if a stronger visual difference is doing the retrieval work, if the audio evidence is generic, or if the edit could be judged without listening."
+            "The visual context must stay similar enough that audio matters. "
+            "Set accept=true only if audio_primary=true, visual_locked=true, visual_too_different_for_B=false, and edit_text_audio_only=true. "
+            "Reject if a stronger visual difference is doing the retrieval work, if the audio evidence is generic, if the edit_text describes visuals, "
+            "or if the edit could be judged without listening."
         )
     return base_prompt
 
@@ -914,8 +919,8 @@ def _build_single_source_pair_user_content(
         )
     elif line == "speech_audio_content":
         line_text = (
-            "B-line rule: the primary edit must be speech content or a concrete non-speech audio event. "
-            "Do not choose scene/action/object/attribute as the final difference; if audio evidence is not strong, reject.\n"
+            "B-line rule: keep visuals locked and make audio primary. The primary edit must be speech content or a concrete non-speech audio event. "
+            "Do not choose scene/action/object/attribute as the final difference; if visuals differ strongly or audio evidence is not strong, reject.\n"
         )
     prompt = (
         "Task: compare two clips from the same original 30-second video and write one evidence-backed edit.\n"
@@ -959,7 +964,10 @@ def _build_single_source_final_verification_user_content(
     if line == "visual_audio_anchor":
         line_text = "A-line final rule: accept only large visual edits; audio must not be the edit.\n"
     elif line == "speech_audio_content":
-        line_text = "B-line final rule: accept only if the audible speech/audio change is primary and visuals remain similar.\n"
+        line_text = (
+            "B-line final rule: accept only if the audible speech/audio change is primary, visuals remain locked/similar, "
+            "and edit_text describes only the audio change. Return audio_primary, visual_locked, visual_too_different_for_B, and edit_text_audio_only.\n"
+        )
     prompt = (
         "Task: final-check whether this single-source pair should be accepted.\n"
         "Use the actual videos first. Check the reference and target at approximately 0.2s, 2.5s, and 4.8s, "
@@ -970,7 +978,7 @@ def _build_single_source_final_verification_user_content(
         f"Local gate report JSON:\n{_prompt_json(local_gate_report, max_chars=1000)}\n"
         f"Reference segment annotation JSON:\n{_prompt_json(reference_annotation, max_chars=ann_char_limit)}\n"
         f"Target segment annotation JSON:\n{_prompt_json(target_annotation, max_chars=ann_char_limit)}\n"
-        "Answer the required schema exactly. The accept field must be false if the target does not visibly satisfy edit_text, "
+        "Answer the required schema exactly. The accept field must be false if the target does not visibly/audibly satisfy edit_text, "
         "if the reference already satisfies edit_text, if the pair is text/OCR-driven, or if the edit_text describes the wrong subject or composition."
     )
     return [
@@ -1727,6 +1735,19 @@ def _normalize_single_source_final_verification_payload(payload: dict[str, Any])
         "evidence": _detail_list(payload.get("evidence")),
         "recommended_edit_text": str(payload.get("recommended_edit_text", "")).strip(),
     }
+    optional_bool_fields = (
+        "audio_primary",
+        "visual_locked",
+        "visual_too_different_for_B",
+        "edit_text_audio_only",
+        "large_visual_delta",
+        "audio_context_preserved",
+    )
+    for field_name in optional_bool_fields:
+        if field_name in payload:
+            normalized[field_name] = _bool_value(payload.get(field_name))
+    if "visual_locked" not in normalized and "visual_context_sufficient" in payload:
+        normalized["visual_locked"] = _bool_value(payload.get("visual_context_sufficient"))
     if normalized["accept"] and not normalized["evidence"]:
         raise ValueError("single-source final verification evidence is required for accept=true")
     if not normalized["accept"] and not normalized["main_reject_reason"]:

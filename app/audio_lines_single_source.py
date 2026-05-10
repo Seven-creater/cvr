@@ -69,6 +69,8 @@ V4_CONCRETE_AUDIO_TERMS = {
     "footstep",
     "footsteps",
 }
+V4_B_MIN_VISUAL_CONTEXT_SIMILARITY = 0.55
+V4_B_MAX_VISUAL_DELTA_STRENGTH = 0.35
 
 
 def prepare_existing_single_source_clips(
@@ -653,7 +655,7 @@ def _v4_b_candidate_allowed(
 ) -> bool:
     if audio_line_quality_profile != AUDIO_LINE_PROFILE_V4_STRICT:
         return True
-    if visual_delta_strength > 0.62 or visual_context_similarity < 0.30:
+    if visual_delta_strength > V4_B_MAX_VISUAL_DELTA_STRENGTH or visual_context_similarity < V4_B_MIN_VISUAL_CONTEXT_SIMILARITY:
         return False
     normalized_audio = audio_text.lower()
     if difference_type == "audio_event":

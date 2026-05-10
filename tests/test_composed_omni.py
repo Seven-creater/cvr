@@ -409,6 +409,78 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("quality_score", request_body["messages"][0]["content"])
         self.assertIn("0.7 is borderline", request_body["messages"][0]["content"])
 
+    def test_verify_single_source_pair_final_b_line_requires_audio_primary_fields(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "accept": True,
+                                "confidence": 0.88,
+                                "quality_score": 0.82,
+                                "reference_satisfies_edit": False,
+                                "target_satisfies_edit": True,
+                                "observable_delta": True,
+                                "single_primary_delta": True,
+                                "text_or_ocr_driven": False,
+                                "segment_wide": True,
+                                "edit_text_accurate": True,
+                                "main_reject_reason": "",
+                                "evidence": ["the same podium shot has different spoken content"],
+                                "recommended_edit_text": "change the speech from discussing budget to discussing health",
+                                "audio_primary": True,
+                                "visual_locked": True,
+                                "visual_too_different_for_B": False,
+                                "edit_text_audio_only": True,
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8093/v1",
+            api_key="EMPTY",
+            model="qwen3-omni",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "reference.mp4"
+            target_path = Path(temp_dir) / "target.mp4"
+            reference_path.write_bytes(b"reference-video")
+            target_path.write_bytes(b"target-video")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.verify_single_source_pair_final(
+                    reference_clip_path=str(reference_path),
+                    target_clip_path=str(target_path),
+                    model_fields={
+                        "edit_text": "change the speech from discussing budget to discussing health",
+                        "dominant_delta": {"type": "speech", "from": "budget", "to": "health"},
+                    },
+                    reference_annotation={"clip_id": "ref", "summary": "speaker discusses budget"},
+                    target_annotation={"clip_id": "target", "summary": "speaker discusses health"},
+                    local_gate_report={"passed": True, "hard_reject": [], "review_required": []},
+                    audio_dataset_line="speech_audio_content",
+                )
+
+        self.assertTrue(normalized["audio_primary"])
+        self.assertTrue(normalized["visual_locked"])
+        self.assertFalse(normalized["visual_too_different_for_B"])
+        self.assertTrue(normalized["edit_text_audio_only"])
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        system_prompt = request_body["messages"][0]["content"]
+        user_text = request_body["messages"][1]["content"][-1]["text"]
+        self.assertIn("audio_primary", system_prompt)
+        self.assertIn("visual_locked", system_prompt)
+        self.assertIn("edit_text_audio_only", user_text)
+
     def test_verify_single_source_pair_final_caps_rejected_quality_score(self) -> None:
         response_payload = {
             "choices": [

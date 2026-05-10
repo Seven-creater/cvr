@@ -306,7 +306,7 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual(1, summary["b_candidate_count"])
             self.assertEqual("cheer_ok", b_records[0]["candidate_id"])
             self.assertEqual("audio_event", b_records[0]["difference"]["type"])
-            self.assertGreaterEqual(b_records[0]["quality"]["visual_context_similarity"], 0.18)
+            self.assertGreaterEqual(b_records[0]["quality"]["visual_context_similarity"], 0.55)
 
     def test_v4_strict_b_line_mines_audio_first_pairs_from_annotations(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -451,6 +451,10 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                     "main_reject_reason": "",
                     "evidence": ["the audible speech changes from hello to goodbye"],
                     "recommended_edit_text": "",
+                    "audio_primary": True,
+                    "visual_locked": True,
+                    "visual_too_different_for_B": False,
+                    "edit_text_audio_only": True,
                 },
                 {"raw": "final"},
             )
@@ -473,6 +477,209 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual(1, summary["accepted_count"])
             self.assertEqual("speech_audio_content", accepted[0]["audio_dataset_line"])
             self.assertEqual("speech", accepted[0]["difference"]["type"])
+
+    def test_speech_audio_content_line_rejects_visual_difference_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"video")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "seg_1",
+                        "output_path": "clips/seg_1.mp4",
+                        "summary": "speaker at podium",
+                        "speech": ["budget update"],
+                        "speakers_and_transcript": ["speaker: budget update"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "seg_2",
+                        "output_path": "clips/seg_2.mp4",
+                        "summary": "speaker at podium",
+                        "speech": ["health update"],
+                        "speakers_and_transcript": ["speaker: health update"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "proposal_id": "p1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "budget", "to": "health"},
+                        "quality": {"audio_line_quality_profile": "v4_strict", "visual_context_similarity": 0.9, "visual_delta_strength": 0.1},
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_single_source_pair.return_value = (
+                {
+                    "edit_text": "change the shot from a podium view to a wider room view",
+                    "modalities": ["visual"],
+                    "reference_caption": "speaker at podium",
+                    "target_caption": "speaker at podium",
+                    "difference": {"type": "scene", "from": "podium view", "to": "wide room view", "description": "visual framing changes"},
+                    "dominant_delta": {"type": "scene", "from": "podium view", "to": "wide room view", "reason": "model chose a visual change"},
+                    "reference_state": {"main_speaker": "speaker", "inset_subjects": [], "product_overlay": "", "composition": "podium", "internal_transitions": []},
+                    "target_state": {"main_speaker": "speaker", "inset_subjects": [], "product_overlay": "", "composition": "wide room", "internal_transitions": []},
+                    "delta_temporal_extent": {"reference": "podium", "target": "wide room", "target_coverage": 0.9, "evidence": "visual framing"},
+                    "subject_roles": {"main_speaker": "speaker", "inset_subjects": [], "product_overlay": ""},
+                    "is_segment_wide_delta": True,
+                    "discarded_deltas": [],
+                    "evidence": ["visual framing changed"],
+                    "confidence": 0.9,
+                    "accept": True,
+                    "reject_reason": "",
+                },
+                {"raw": "ok"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    acceptance_profile="exploration",
+                    audio_dataset_line="speech_audio_content",
+                )
+
+            ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(0, summary["accepted_count"])
+            self.assertIn("scene is not allowed for speech_audio_content", ranked[0]["judge"]["reject_reason"])
+            client.verify_single_source_pair_final.assert_not_called()
+
+    def test_speech_audio_content_line_requires_final_omni_audio_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"video")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "seg_1",
+                        "output_path": "clips/seg_1.mp4",
+                        "summary": "same podium speaker",
+                        "speech": ["budget update"],
+                        "speakers_and_transcript": ["speaker: budget update"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "seg_2",
+                        "output_path": "clips/seg_2.mp4",
+                        "summary": "same podium speaker",
+                        "speech": ["health update"],
+                        "speakers_and_transcript": ["speaker: health update"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "proposal_id": "p1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "budget", "to": "health"},
+                        "quality": {"audio_line_quality_profile": "v4_strict", "visual_context_similarity": 0.9, "visual_delta_strength": 0.1},
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_single_source_pair.return_value = (
+                {
+                    "edit_text": "change the speech from discussing the budget to discussing health",
+                    "modalities": ["audio"],
+                    "reference_caption": "same podium speaker discusses budget",
+                    "target_caption": "same podium speaker discusses health",
+                    "difference": {"type": "speech", "from": "budget", "to": "health", "description": "spoken content changes"},
+                    "dominant_delta": {"type": "speech", "from": "budget", "to": "health", "reason": "transcripts differ"},
+                    "reference_state": {"main_speaker": "speaker", "inset_subjects": [], "product_overlay": "", "composition": "podium", "internal_transitions": []},
+                    "target_state": {"main_speaker": "speaker", "inset_subjects": [], "product_overlay": "", "composition": "podium", "internal_transitions": []},
+                    "delta_temporal_extent": {"reference": "budget is spoken", "target": "health is spoken", "target_coverage": 0.9, "evidence": "target transcript says health"},
+                    "subject_roles": {"main_speaker": "speaker", "inset_subjects": [], "product_overlay": ""},
+                    "is_segment_wide_delta": True,
+                    "discarded_deltas": [],
+                    "evidence": ["speech content changes"],
+                    "confidence": 0.9,
+                    "accept": True,
+                    "reject_reason": "",
+                },
+                {"raw": "ok"},
+            )
+            client.verify_single_source_pair_final.return_value = (
+                {
+                    "accept": True,
+                    "confidence": 0.9,
+                    "quality_score": 0.9,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "observable_delta": True,
+                    "single_primary_delta": True,
+                    "text_or_ocr_driven": False,
+                    "segment_wide": True,
+                    "edit_text_accurate": True,
+                    "main_reject_reason": "",
+                    "evidence": ["the speech changes, but the model does not mark audio as primary"],
+                    "recommended_edit_text": "",
+                    "audio_primary": False,
+                    "visual_locked": True,
+                    "visual_too_different_for_B": False,
+                    "edit_text_audio_only": True,
+                },
+                {"raw": "final"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    acceptance_profile="exploration",
+                    audio_dataset_line="speech_audio_content",
+                )
+
+            ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(0, summary["accepted_count"])
+            self.assertIn("final_omni_audio_not_primary", ranked[0]["judge"]["reject_reason"])
 
     def test_propose_single_source_pairs_does_not_cache_transient_omni_failures(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

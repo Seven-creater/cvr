@@ -905,6 +905,54 @@ V4_CONCRETE_AUDIO_TERMS = (
     "footstep",
     "footsteps",
 )
+V4_B_MIN_VISUAL_CONTEXT_SIMILARITY = 0.55
+V4_B_MAX_VISUAL_DELTA_STRENGTH = 0.35
+B_LINE_AUDIO_EDIT_TERMS = (
+    "audio",
+    "sound",
+    "speech",
+    "spoken",
+    "says",
+    "say",
+    "talk",
+    "talking",
+    "discuss",
+    "discussing",
+    "commentary",
+    "commentator",
+    "narration",
+    "voice",
+    "words",
+    "transcript",
+    "cheer",
+    "cheering",
+    "applause",
+    "music",
+    "song",
+    "ambient",
+    "ambience",
+    "crowd",
+)
+B_LINE_VISUAL_EDIT_TERMS = (
+    "shot",
+    "scene",
+    "camera",
+    "view",
+    "visual",
+    "frame",
+    "background",
+    "foreground",
+    "object",
+    "person",
+    "people",
+    "man ",
+    "woman ",
+    "color",
+    "colour",
+    "text",
+    "subtitle",
+    "logo",
+)
 AUDIO_DATASET_LINE_NAMES = {
     STANDARD_AUDIO_DATASET_LINE,
     VISUAL_AUDIO_ANCHOR_LINE,
@@ -2117,6 +2165,7 @@ def propose_single_source_pairs(
             final_issues = _single_source_final_verification_issues(
                 final_omni_verification,
                 acceptance_profile=acceptance_profile,
+                audio_dataset_line=audio_dataset_line,
             )
             local_review_required = list(local_gate_report.get("review_required", []))
             blocking_issues = _dedupe_strings(
@@ -7792,6 +7841,7 @@ def _recheck_existing_single_source_pair_record(
     final_issues = _single_source_final_verification_issues(
         final_omni_verification,
         acceptance_profile=acceptance_profile,
+        audio_dataset_line=str(record.get("audio_dataset_line") or STANDARD_AUDIO_DATASET_LINE),
     )
     local_review_required = list(local_gate_report.get("review_required", []))
     blocking_issues = _dedupe_strings(
@@ -8081,6 +8131,12 @@ def _single_source_skipped_final_verification(reason: str) -> dict[str, Any]:
         "main_reject_reason": reason,
         "evidence": [],
         "recommended_edit_text": "",
+        "audio_primary": False,
+        "visual_locked": False,
+        "visual_too_different_for_B": False,
+        "edit_text_audio_only": False,
+        "large_visual_delta": False,
+        "audio_context_preserved": False,
         "skipped": True,
     }
 
@@ -8089,9 +8145,11 @@ def _single_source_final_verification_issues(
     final_verification: dict[str, Any],
     *,
     acceptance_profile: str,
+    audio_dataset_line: str = STANDARD_AUDIO_DATASET_LINE,
 ) -> list[str]:
     if not isinstance(final_verification, dict) or not final_verification:
         return ["final_omni_verification_missing"]
+    audio_dataset_line = _normalize_audio_dataset_line(audio_dataset_line)
     threshold = _profile_threshold(acceptance_profile, "edit_match_score")
     issues: list[str] = []
     confidence = _score_float(final_verification.get("confidence"))
@@ -8120,6 +8178,20 @@ def _single_source_final_verification_issues(
         issues.append("final_omni_delta_not_segment_wide")
     if not _boolish(final_verification.get("edit_text_accurate")):
         issues.append("final_omni_edit_text_inaccurate")
+    if audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE:
+        if not _boolish(final_verification.get("audio_primary")):
+            issues.append("final_omni_audio_not_primary")
+        if not _boolish(final_verification.get("visual_locked")):
+            issues.append("final_omni_visual_not_locked")
+        if _boolish(final_verification.get("visual_too_different_for_B")):
+            issues.append("final_omni_visual_too_different_for_B")
+        if not _boolish(final_verification.get("edit_text_audio_only")):
+            issues.append("final_omni_edit_text_not_audio_only")
+    elif audio_dataset_line == VISUAL_AUDIO_ANCHOR_LINE:
+        if "large_visual_delta" in final_verification and not _boolish(final_verification.get("large_visual_delta")):
+            issues.append("final_omni_visual_delta_too_small_for_A")
+        if "audio_context_preserved" in final_verification and not _boolish(final_verification.get("audio_context_preserved")):
+            issues.append("final_omni_audio_context_not_preserved_for_A")
     return _dedupe_strings(issues)
 
 
@@ -8160,6 +8232,55 @@ def _single_source_model_reject_issues(
     return _dedupe_strings(reasons)
 
 
+def _b_line_edit_text_audio_only_issues(edit_text: str, difference_type: str) -> list[str]:
+    normalized = _normalized_phrase(edit_text)
+    if not normalized:
+        return ["edit_text_not_audio_only: empty edit_text"]
+    issues: list[str] = []
+    if not any(term in normalized for term in B_LINE_AUDIO_EDIT_TERMS):
+        issues.append("edit_text_not_audio_only: missing speech/audio wording")
+    visual_terms = [term.strip() for term in B_LINE_VISUAL_EDIT_TERMS if term in normalized]
+    if visual_terms:
+        issues.append(f"edit_text_not_audio_only: visual wording {visual_terms[0]}")
+    if difference_type == "speech" and not any(
+        term in normalized
+        for term in (
+            "speech",
+            "spoken",
+            "says",
+            "say",
+            "talk",
+            "talking",
+            "discuss",
+            "discussing",
+            "commentary",
+            "commentator",
+            "narration",
+            "voice",
+            "words",
+            "transcript",
+        )
+    ):
+        issues.append("edit_text_not_audio_only: speech edit lacks speech-content wording")
+    if difference_type == "audio_event" and not any(
+        term in normalized
+        for term in (
+            "audio",
+            "sound",
+            "music",
+            "song",
+            "cheer",
+            "cheering",
+            "applause",
+            "ambient",
+            "ambience",
+            "crowd",
+        )
+    ):
+        issues.append("edit_text_not_audio_only: audio_event edit lacks concrete sound wording")
+    return _dedupe_strings(issues)
+
+
 def _single_source_audio_line_acceptance_issues(
     *,
     model_fields: dict[str, Any],
@@ -8197,6 +8318,7 @@ def _single_source_audio_line_acceptance_issues(
             issues.append(f"speech_audio_content requires speech or audio_event difference type, got {difference_type or 'missing'}")
         if "audio" not in modalities:
             issues.append("speech_audio_content edit must include audio modality")
+        issues.extend(_b_line_edit_text_audio_only_issues(edit_text, difference_type))
         if difference_type == "speech":
             if not reference_annotation or not target_annotation or not _speech_is_transcript_backed(reference_annotation, target_annotation):
                 issues.append("speech_audio_content speech edit lacks transcript-backed evidence")
@@ -8211,10 +8333,16 @@ def _single_source_audio_line_acceptance_issues(
         if profile == AUDIO_LINE_QUALITY_PROFILE_V4_STRICT:
             visual_delta_strength = _score_float(candidate_quality.get("visual_delta_strength"))
             visual_context_similarity = _score_float(candidate_quality.get("visual_context_similarity"))
-            if visual_delta_strength > 0.62:
-                issues.append(f"visual_too_different_for_B: visual_delta_strength {visual_delta_strength:.2f} > 0.62")
-            if visual_context_similarity < 0.18:
-                issues.append(f"visual_too_different_for_B: visual_context_similarity {visual_context_similarity:.2f} < 0.18")
+            if visual_delta_strength > V4_B_MAX_VISUAL_DELTA_STRENGTH:
+                issues.append(
+                    "visual_too_different_for_B: "
+                    f"visual_delta_strength {visual_delta_strength:.2f} > {V4_B_MAX_VISUAL_DELTA_STRENGTH:.2f}"
+                )
+            if visual_context_similarity < V4_B_MIN_VISUAL_CONTEXT_SIMILARITY:
+                issues.append(
+                    "visual_too_different_for_B: "
+                    f"visual_context_similarity {visual_context_similarity:.2f} < {V4_B_MIN_VISUAL_CONTEXT_SIMILARITY:.2f}"
+                )
             if difference_type == "audio_event":
                 evidence_text = _normalized_phrase(
                     " ".join(
