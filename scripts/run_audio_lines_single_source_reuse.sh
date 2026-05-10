@@ -14,7 +14,7 @@ export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 ROOT=${ROOT:-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval}
 SINGLE_SOURCE_ROOT=${SINGLE_SOURCE_ROOT:-$ROOT/clips/single_source}
 RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/audio_lines_single_source_reuse_$(date +%Y%m%d_%H%M%S)}
-MODEL=${MODEL:-qwen3-omni}
+MODEL=${MODEL:-qwen3-omni-30b-a3b-instruct}
 BASE_URL=${BASE_URL:-http://127.0.0.1:8093/v1}
 AUDIO_DATASET_LINE=${AUDIO_DATASET_LINE:-both}
 TARGET_A_COUNT=${TARGET_A_COUNT:-8}
@@ -89,10 +89,11 @@ require_file() {
   fi
 }
 
-probe_omni_model() {
+resolve_omni_model() {
   local models_json
+  local resolved_model
   models_json=$(curl -fsS "$BASE_URL/models")
-  OMNI_MODELS_JSON="$models_json" python3 - "$MODEL" <<'PY'
+  resolved_model=$(OMNI_MODELS_JSON="$models_json" python3 - "$MODEL" <<'PY'
 import json
 import os
 import sys
@@ -100,10 +101,26 @@ import sys
 wanted = sys.argv[1]
 payload = json.loads(os.environ["OMNI_MODELS_JSON"])
 served = [str(item.get("id", "")) for item in payload.get("data", []) if item.get("id")]
-print("[audio-lines] served_models=" + ",".join(served))
-if wanted not in served:
-    raise SystemExit(f"[audio-lines] model {wanted!r} is not served by {served}; use the registered service name")
+print("[audio-lines] served_models=" + ",".join(served), file=sys.stderr)
+if wanted in served:
+    print(wanted)
+    raise SystemExit(0)
+
+candidates = []
+if wanted == "qwen3-omni":
+    candidates = [item for item in served if "qwen3-omni" in item]
+if not candidates:
+    candidates = [item for item in served if wanted and (wanted in item or item in wanted)]
+if len(candidates) == 1:
+    print(f"[audio-lines] resolved_model_alias={wanted}->{candidates[0]}", file=sys.stderr)
+    print(candidates[0])
+    raise SystemExit(0)
+
+raise SystemExit(f"[audio-lines] model {wanted!r} is not served by {served}; use the registered service name")
 PY
+)
+  MODEL="$resolved_model"
+  echo "[audio-lines] model=$MODEL"
 }
 
 run_line_shards() {
@@ -160,7 +177,7 @@ mkdir -p "$RUN_ROOT" "$REPO_ROOT/logs"
 echo "[audio-lines] start $(date)"
 echo "[audio-lines] run_root=$RUN_ROOT root=$ROOT single_source_root=$SINGLE_SOURCE_ROOT line=$AUDIO_DATASET_LINE"
 echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS"
-probe_omni_model
+resolve_omni_model
 
 SEGMENTS_MANIFEST="$RUN_ROOT/extracted_single_source_clips.jsonl"
 CLIP_GROUPS="$RUN_ROOT/single_source_clip_groups.jsonl"

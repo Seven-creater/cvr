@@ -171,6 +171,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--audio-dataset-line", script)
         self.assertIn("visual_audio_anchor", script)
         self.assertIn("speech_audio_content", script)
+        self.assertIn("MODEL=${MODEL:-qwen3-omni-30b-a3b-instruct}", script)
+        self.assertIn("resolved_model_alias=", script)
         self.assertIn("PROPOSE_SHARDS=${PROPOSE_SHARDS:-16}", script)
         self.assertIn("PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-16}", script)
         self.assertIn("accepted_progress_", script)
