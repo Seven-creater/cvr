@@ -69,8 +69,8 @@ V4_CONCRETE_AUDIO_TERMS = {
     "footstep",
     "footsteps",
 }
-V4_B_MIN_VISUAL_CONTEXT_SIMILARITY = 0.55
-V4_B_MAX_VISUAL_DELTA_STRENGTH = 0.35
+V4_B_MIN_VISUAL_CONTEXT_SIMILARITY = 0.30
+V4_B_MAX_VISUAL_DELTA_STRENGTH = 0.55
 
 
 def prepare_existing_single_source_clips(

@@ -905,8 +905,8 @@ V4_CONCRETE_AUDIO_TERMS = (
     "footstep",
     "footsteps",
 )
-V4_B_MIN_VISUAL_CONTEXT_SIMILARITY = 0.55
-V4_B_MAX_VISUAL_DELTA_STRENGTH = 0.35
+V4_B_MIN_VISUAL_CONTEXT_SIMILARITY = 0.30
+V4_B_MAX_VISUAL_DELTA_STRENGTH = 0.55
 B_LINE_AUDIO_EDIT_TERMS = (
     "audio",
     "sound",
@@ -952,6 +952,20 @@ B_LINE_VISUAL_EDIT_TERMS = (
     "text",
     "subtitle",
     "logo",
+)
+A_LINE_FINAL_RESCUABLE_LOCAL_ISSUE_PREFIXES = (
+    "low_pair_video_confidence:",
+    "visual_too_similar_for_A:",
+)
+B_LINE_FINAL_RESCUABLE_LOCAL_ISSUE_PREFIXES = (
+    "low_pair_video_confidence:",
+    "speech_audio_content edit must include audio modality",
+    "speech_audio_content speech edit lacks transcript-backed evidence",
+    "speech_audio_content audio_event edit lacks non-speech audio evidence",
+    "edit_text_not_audio_only:",
+    "visual_too_different_for_B:",
+    "audio_not_primary:",
+    "vague_audio_event:",
 )
 AUDIO_DATASET_LINE_NAMES = {
     STANDARD_AUDIO_DATASET_LINE,
@@ -2124,8 +2138,23 @@ def propose_single_source_pairs(
                 and bool(local_gate_report.get("passed"))
                 and not fallback_used
             )
+            should_run_final_omni = bool(model_accepted)
+            if not should_run_final_omni:
+                should_run_final_omni = _a_line_can_run_final_rescue(
+                    audio_dataset_line=audio_dataset_line,
+                    model_fields=model_fields,
+                    fallback_used=fallback_used,
+                    reference_video_exists=reference_path.exists(),
+                    target_video_exists=target_path.exists(),
+                ) or _b_line_can_run_final_rescue(
+                    audio_dataset_line=audio_dataset_line,
+                    model_fields=model_fields,
+                    fallback_used=fallback_used,
+                    reference_video_exists=reference_path.exists(),
+                    target_video_exists=target_path.exists(),
+                )
             raw_final_omni_output: dict[str, Any] = {}
-            if model_accepted:
+            if should_run_final_omni:
                 try:
                     final_omni_verification, raw_final_omni_output = _call_omni_with_retries(
                         label=f"final_verify:{proposal_id}",
@@ -2168,10 +2197,23 @@ def propose_single_source_pairs(
                 audio_dataset_line=audio_dataset_line,
             )
             local_review_required = list(local_gate_report.get("review_required", []))
+            blocking_local_hard_rejects = list(local_hard_rejects)
+            if audio_dataset_line == VISUAL_AUDIO_ANCHOR_LINE and not final_issues:
+                blocking_local_hard_rejects = _a_line_unrescued_local_hard_rejects(
+                    blocking_local_hard_rejects,
+                    final_omni_verification,
+                )
+            elif audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE and not final_issues:
+                blocking_local_hard_rejects = _b_line_unrescued_local_hard_rejects(
+                    blocking_local_hard_rejects,
+                    final_omni_verification,
+                )
+                if not blocking_local_hard_rejects and "audio" not in list(model_fields.get("modalities", [])):
+                    model_fields["modalities"] = list(model_fields.get("modalities", [])) + ["audio"]
             blocking_issues = _dedupe_strings(
-                local_hard_rejects + (local_review_required if final_issues else []) + final_issues
+                blocking_local_hard_rejects + (local_review_required if final_issues else []) + final_issues
             )
-            final_omni_accept = bool(model_accepted and not final_issues and _boolish(final_omni_verification.get("accept")))
+            final_omni_accept = bool(should_run_final_omni and not final_issues and _boolish(final_omni_verification.get("accept")))
             accepted = bool(final_omni_accept and not blocking_issues)
             reject_reason = str(model_fields.get("reject_reason", "")).strip()
             if not accepted:
@@ -2228,7 +2270,8 @@ def propose_single_source_pairs(
                 "discarded_deltas": list(model_fields.get("discarded_deltas", [])),
                 "pair_video_evidence": list(model_fields.get("evidence", [])),
                 "confidence": confidence,
-                "model_accepted": model_accepted,
+                "model_accepted": bool(model_fields.get("accept")) and not fallback_used,
+                "local_gate_passed": bool(local_gate_report.get("passed")),
                 "final_omni_accept": final_omni_accept,
                 "final_accept_source": "local_gate_and_final_omni",
                 "local_gate_report": local_gate_report,
@@ -7844,19 +7887,32 @@ def _recheck_existing_single_source_pair_record(
         audio_dataset_line=str(record.get("audio_dataset_line") or STANDARD_AUDIO_DATASET_LINE),
     )
     local_review_required = list(local_gate_report.get("review_required", []))
+    blocking_local_hard_rejects = list(local_gate_report.get("hard_reject", []))
+    record_audio_line = _normalize_audio_dataset_line(str(record.get("audio_dataset_line") or STANDARD_AUDIO_DATASET_LINE))
+    if record_audio_line == VISUAL_AUDIO_ANCHOR_LINE and not final_issues:
+        blocking_local_hard_rejects = _a_line_unrescued_local_hard_rejects(
+            blocking_local_hard_rejects,
+            final_omni_verification,
+        )
+    elif record_audio_line == SPEECH_AUDIO_CONTENT_LINE and not final_issues:
+        blocking_local_hard_rejects = _b_line_unrescued_local_hard_rejects(
+            blocking_local_hard_rejects,
+            final_omni_verification,
+        )
     blocking_issues = _dedupe_strings(
-        list(local_gate_report.get("hard_reject", [])) + (local_review_required if final_issues else []) + final_issues
+        blocking_local_hard_rejects + (local_review_required if final_issues else []) + final_issues
     )
     record["local_gate_report"] = local_gate_report
     record["final_omni_verification"] = final_omni_verification
     record["final_omni_accept"] = bool(
-        _boolish(final_omni_verification.get("accept")) and not final_issues and bool(local_gate_report.get("passed"))
+        _boolish(final_omni_verification.get("accept")) and not final_issues and not blocking_local_hard_rejects
     )
     record["final_accept_source"] = "local_gate_and_final_omni"
     record["single_source_pair_acceptance_issues"] = blocking_issues
     record["recommended_edit_text"] = record.get("recommended_edit_text") or _single_source_recommended_edit_text(model_fields)
     record["single_source_delta_family"] = record.get("single_source_delta_family") or _single_source_delta_family_from_fields(model_fields)
-    record["model_accepted"] = bool(model_fields.get("accept")) and bool(local_gate_report.get("passed"))
+    record["model_accepted"] = bool(model_fields.get("accept")) and not bool(record.get("fallback_used"))
+    record["local_gate_passed"] = bool(local_gate_report.get("passed"))
     _set_single_source_record_acceptance(
         record,
         accepted=bool(record["model_accepted"] and record["final_omni_accept"] and not blocking_issues),
@@ -8139,6 +8195,88 @@ def _single_source_skipped_final_verification(reason: str) -> dict[str, Any]:
         "audio_context_preserved": False,
         "skipped": True,
     }
+
+
+def _a_line_can_run_final_rescue(
+    *,
+    audio_dataset_line: str,
+    model_fields: dict[str, Any],
+    fallback_used: bool,
+    reference_video_exists: bool,
+    target_video_exists: bool,
+) -> bool:
+    if _normalize_audio_dataset_line(audio_dataset_line) != VISUAL_AUDIO_ANCHOR_LINE:
+        return False
+    if fallback_used or not reference_video_exists or not target_video_exists:
+        return False
+    if not bool(model_fields.get("accept")):
+        return False
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    return str(difference.get("type", "")).strip() in DOMINANT_VISUAL_DIFFERENCE_TYPES
+
+
+def _b_line_can_run_final_rescue(
+    *,
+    audio_dataset_line: str,
+    model_fields: dict[str, Any],
+    fallback_used: bool,
+    reference_video_exists: bool,
+    target_video_exists: bool,
+) -> bool:
+    if _normalize_audio_dataset_line(audio_dataset_line) != SPEECH_AUDIO_CONTENT_LINE:
+        return False
+    if fallback_used or not reference_video_exists or not target_video_exists:
+        return False
+    if not bool(model_fields.get("accept")):
+        return False
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    return str(difference.get("type", "")).strip() in {"speech", "audio_event"}
+
+
+def _a_line_unrescued_local_hard_rejects(
+    local_hard_rejects: list[str],
+    final_verification: dict[str, Any],
+) -> list[str]:
+    if not (
+        _boolish(final_verification.get("accept"))
+        and _boolish(final_verification.get("large_visual_delta"))
+        and _boolish(final_verification.get("audio_context_preserved"))
+    ):
+        return local_hard_rejects
+
+    unrescued: list[str] = []
+    for issue in local_hard_rejects:
+        normalized = str(issue).strip()
+        if not normalized:
+            continue
+        if any(normalized.startswith(prefix) for prefix in A_LINE_FINAL_RESCUABLE_LOCAL_ISSUE_PREFIXES):
+            continue
+        unrescued.append(normalized)
+    return _dedupe_strings(unrescued)
+
+
+def _b_line_unrescued_local_hard_rejects(
+    local_hard_rejects: list[str],
+    final_verification: dict[str, Any],
+) -> list[str]:
+    if not (
+        _boolish(final_verification.get("accept"))
+        and _boolish(final_verification.get("audio_primary"))
+        and _boolish(final_verification.get("visual_locked"))
+        and not _boolish(final_verification.get("visual_too_different_for_B"))
+        and _boolish(final_verification.get("edit_text_audio_only"))
+    ):
+        return local_hard_rejects
+
+    unrescued: list[str] = []
+    for issue in local_hard_rejects:
+        normalized = str(issue).strip()
+        if not normalized:
+            continue
+        if any(normalized.startswith(prefix) for prefix in B_LINE_FINAL_RESCUABLE_LOCAL_ISSUE_PREFIXES):
+            continue
+        unrescued.append(normalized)
+    return _dedupe_strings(unrescued)
 
 
 def _single_source_final_verification_issues(

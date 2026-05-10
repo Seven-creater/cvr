@@ -609,8 +609,10 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
         return (
             base_prompt
             + " For this visual_audio_anchor A line, accept only if the edit is visual and the audio/speech is not the primary change. "
+            'Also include "large_visual_delta": boolean and "audio_context_preserved": boolean in the JSON object. '
             "The edit_text must not mention audio, sound, speech, music, transcript, narration, or voice. "
             "The useful target is a large visual shot/scene/subject/action change under similar audio context, not a near-duplicate. "
+            "Set accept=true only if large_visual_delta=true and audio_context_preserved=true. "
             "Reject near-duplicate visual changes, order-only changes, tiny lighting/framing shifts, and any pair where reference already satisfies the visual edit."
         )
     if line == "speech_audio_content":
@@ -962,7 +964,10 @@ def _build_single_source_final_verification_user_content(
         context_text = f"Whole source video context JSON:\n{_prompt_json(whole_annotation, max_chars=whole_limit)}\n"
     line_text = ""
     if line == "visual_audio_anchor":
-        line_text = "A-line final rule: accept only large visual edits; audio must not be the edit.\n"
+        line_text = (
+            "A-line final rule: accept only large visual edits; audio must not be the edit. "
+            "Return large_visual_delta and audio_context_preserved.\n"
+        )
     elif line == "speech_audio_content":
         line_text = (
             "B-line final rule: accept only if the audible speech/audio change is primary, visuals remain locked/similar, "
