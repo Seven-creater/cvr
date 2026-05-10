@@ -2000,8 +2000,8 @@ def propose_single_source_pairs(
                     func=lambda: client.propose_single_source_pair(
                         reference_clip_path=str(reference_path),
                         target_clip_path=str(target_path),
-                        reference_annotation=_annotation_prompt_view(reference_annotation),
-                        target_annotation=_annotation_prompt_view(target_annotation),
+                        reference_annotation=_single_source_line_annotation_prompt_view(reference_annotation, audio_dataset_line),
+                        target_annotation=_single_source_line_annotation_prompt_view(target_annotation, audio_dataset_line),
                         whole_annotation=_single_source_whole_prompt_view(whole_annotation) if whole_annotation else None,
                         candidate=_single_source_candidate_prompt_view(candidate),
                         audio_dataset_line=audio_dataset_line,
@@ -2087,8 +2087,8 @@ def propose_single_source_pairs(
                             reference_clip_path=str(reference_path),
                             target_clip_path=str(target_path),
                             model_fields=model_fields,
-                            reference_annotation=_annotation_prompt_view(reference_annotation),
-                            target_annotation=_annotation_prompt_view(target_annotation),
+                            reference_annotation=_single_source_line_annotation_prompt_view(reference_annotation, audio_dataset_line),
+                            target_annotation=_single_source_line_annotation_prompt_view(target_annotation, audio_dataset_line),
                             local_gate_report=local_gate_report,
                             whole_annotation=_single_source_whole_prompt_view(whole_annotation) if whole_annotation else None,
                             audio_dataset_line=audio_dataset_line,
@@ -11903,6 +11903,51 @@ def _annotation_prompt_view(annotation: dict[str, Any]) -> dict[str, Any]:
         "speakers_and_transcript": _prompt_list(annotation.get("speakers_and_transcript", []), limit=6, text_limit=220),
         "uncertainties": _prompt_list(annotation.get("uncertainties", []), limit=6, text_limit=160),
     }
+
+
+def _single_source_line_annotation_prompt_view(annotation: dict[str, Any], audio_dataset_line: str) -> dict[str, Any]:
+    line = _normalize_audio_dataset_line(audio_dataset_line)
+    base = {
+        "clip_id": annotation.get("clip_id", ""),
+        "output_path": annotation.get("output_path", ""),
+        "summary": _truncate_text(annotation.get("summary", ""), 240),
+        "scene": _truncate_text(annotation.get("scene", ""), 140),
+        "subjects": _prompt_list(annotation.get("subjects", []), limit=5, text_limit=60),
+        "actions": _prompt_list(annotation.get("actions", []), limit=5, text_limit=60),
+        "modalities": _prompt_list(annotation.get("modalities", []), limit=4, text_limit=32),
+    }
+    if line == SPEECH_AUDIO_CONTENT_LINE:
+        base.update(
+            {
+                "visual_context_only": {
+                    "attributes": _prompt_list(annotation.get("attributes", []), limit=3, text_limit=60),
+                    "visible_text": _prompt_list(annotation.get("visible_text", []), limit=2, text_limit=50),
+                },
+                "speech": _prompt_list(annotation.get("speech", []), limit=3, text_limit=160),
+                "speakers_and_transcript": _prompt_list(
+                    annotation.get("speakers_and_transcript", []), limit=3, text_limit=180
+                ),
+                "audio_events": _prompt_list(annotation.get("audio_events", []), limit=5, text_limit=80),
+                "audio_refresh_annotation": bool(annotation.get("audio_refresh_annotation")),
+            }
+        )
+        return base
+    if line == VISUAL_AUDIO_ANCHOR_LINE:
+        base.update(
+            {
+                "attributes": _prompt_list(annotation.get("attributes", []), limit=4, text_limit=70),
+                "object_counts": dict(list(annotation.get("object_counts", {}).items())[:8])
+                if isinstance(annotation.get("object_counts"), dict)
+                else {},
+                "visible_text": _prompt_list(annotation.get("visible_text", []), limit=2, text_limit=50),
+                "audio_context_hint": {
+                    "speech": _prompt_list(annotation.get("speech", []), limit=1, text_limit=80),
+                    "audio_events": _prompt_list(annotation.get("audio_events", []), limit=3, text_limit=60),
+                },
+            }
+        )
+        return base
+    return _annotation_prompt_view(annotation)
 
 
 def _truncate_text(value: Any, limit: int) -> str:

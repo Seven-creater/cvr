@@ -41,6 +41,7 @@ from app.composed_data import (
     _repair_pair_model_fields,
     _select_final_accepted_records,
     _should_skip_pair_video_verification,
+    _single_source_line_annotation_prompt_view,
     _build_fallback_edit_text,
     _speech_evidence_score,
     _speech_specificity_score,
@@ -127,6 +128,36 @@ class ComposedDataTests(unittest.TestCase):
             },
             {"raw": "final_reject"},
         )
+
+    def test_single_source_audio_line_annotation_prompt_view_is_compact(self) -> None:
+        annotation = {
+            "clip_id": "clip_001",
+            "output_path": "clips/clip_001.mp4",
+            "summary": "sports broadcast " * 80,
+            "scene": "same cricket stadium " * 50,
+            "subjects": ["batter", "bowler", "crowd", "umpire", "scoreboard", "extra subject"],
+            "actions": ["running between wickets", "crowd cheering", "commentator speaking", "camera pans", "score changes"],
+            "attributes": ["green field", "broadcast overlay", "bright sunlight", "team uniforms"],
+            "visible_text": ["scoreboard text " * 40],
+            "speech": ["commentator describes the batting change " * 40 for _ in range(6)],
+            "speakers_and_transcript": ["commentator: a long transcript about the batsman " * 40 for _ in range(6)],
+            "audio_events": ["crowd cheering", "commentary", "bat strike", "stadium ambience", "applause", "music"],
+            "storyline": ["very long storyline " * 100],
+            "events": ["very long event list " * 100],
+            "uncertainties": ["very long uncertainty " * 100],
+            "modalities": ["visual", "audio"],
+            "audio_refresh_annotation": True,
+        }
+
+        view = _single_source_line_annotation_prompt_view(annotation, "speech_audio_content")
+        encoded = json.dumps(view, ensure_ascii=False)
+
+        self.assertLess(len(encoded), 2400)
+        self.assertIn("speech", view)
+        self.assertIn("audio_events", view)
+        self.assertNotIn("storyline", view)
+        self.assertNotIn("uncertainties", view)
+        self.assertTrue(view["audio_refresh_annotation"])
 
     def test_ensure_layout_creates_expected_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -896,18 +896,34 @@ def _build_single_source_pair_user_content(
     whole_annotation: dict[str, Any] | None = None,
     candidate: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    line = _normalize_audio_dataset_line(candidate.get("audio_dataset_line") if isinstance(candidate, dict) else None)
+    ann_char_limit = 1600 if line == "speech_audio_content" else 1100 if line == "visual_audio_anchor" else 4200
+    candidate_char_limit = 1400 if line in {"visual_audio_anchor", "speech_audio_content"} else 3000
     context_text = ""
     if whole_annotation:
-        context_text = f"Whole source video context JSON:\n{json.dumps(whole_annotation, ensure_ascii=False)}\n"
+        whole_limit = 350 if line in {"visual_audio_anchor", "speech_audio_content"} else 2200
+        context_text = f"Whole source video context JSON:\n{_prompt_json(whole_annotation, max_chars=whole_limit)}\n"
     candidate_text = ""
     if candidate:
-        candidate_text = f"Chronological pair candidate JSON:\n{json.dumps(candidate, ensure_ascii=False)}\n"
+        candidate_text = f"Chronological pair candidate JSON:\n{_prompt_json(candidate, max_chars=candidate_char_limit)}\n"
+    line_text = ""
+    if line == "visual_audio_anchor":
+        line_text = (
+            "A-line rule: write a visual-only edit. Audio is preserved context. "
+            "If the visual change is not large and stable, reject instead of proposing an attribute edit.\n"
+        )
+    elif line == "speech_audio_content":
+        line_text = (
+            "B-line rule: the primary edit must be speech content or a concrete non-speech audio event. "
+            "Do not choose scene/action/object/attribute as the final difference; if audio evidence is not strong, reject.\n"
+        )
     prompt = (
         "Task: compare two clips from the same original 30-second video and write one evidence-backed edit.\n"
         "Use the actual videos as primary evidence. Use annotations only as supporting context.\n"
+        f"{line_text}"
         f"{context_text}"
-        f"Reference segment annotation JSON:\n{json.dumps(reference_annotation, ensure_ascii=False)}\n"
-        f"Target segment annotation JSON:\n{json.dumps(target_annotation, ensure_ascii=False)}\n"
+        f"Reference segment annotation JSON:\n{_prompt_json(reference_annotation, max_chars=ann_char_limit)}\n"
+        f"Target segment annotation JSON:\n{_prompt_json(target_annotation, max_chars=ann_char_limit)}\n"
         f"{candidate_text}"
         "Choose the dominant visible/audio difference that a human reviewer can verify by opening the two clips. "
         "Prefer product/overlay/object/action/composition differences over tiny clothing or hair wording changes. "
@@ -931,19 +947,29 @@ def _build_single_source_final_verification_user_content(
     target_annotation: dict[str, Any],
     local_gate_report: dict[str, Any],
     whole_annotation: dict[str, Any] | None = None,
+    audio_dataset_line: str | None = None,
 ) -> list[dict[str, Any]]:
+    line = _normalize_audio_dataset_line(audio_dataset_line)
+    ann_char_limit = 1200 if line == "speech_audio_content" else 900 if line == "visual_audio_anchor" else 3600
     context_text = ""
     if whole_annotation:
-        context_text = f"Whole source video context JSON:\n{json.dumps(whole_annotation, ensure_ascii=False)}\n"
+        whole_limit = 300 if line in {"visual_audio_anchor", "speech_audio_content"} else 1800
+        context_text = f"Whole source video context JSON:\n{_prompt_json(whole_annotation, max_chars=whole_limit)}\n"
+    line_text = ""
+    if line == "visual_audio_anchor":
+        line_text = "A-line final rule: accept only large visual edits; audio must not be the edit.\n"
+    elif line == "speech_audio_content":
+        line_text = "B-line final rule: accept only if the audible speech/audio change is primary and visuals remain similar.\n"
     prompt = (
         "Task: final-check whether this single-source pair should be accepted.\n"
         "Use the actual videos first. Check the reference and target at approximately 0.2s, 2.5s, and 4.8s, "
         "plus any other moment needed to verify the edit.\n"
+        f"{line_text}"
         f"{context_text}"
-        f"Pair proposal JSON:\n{json.dumps(model_fields, ensure_ascii=False)}\n"
-        f"Local gate report JSON:\n{json.dumps(local_gate_report, ensure_ascii=False)}\n"
-        f"Reference segment annotation JSON:\n{json.dumps(reference_annotation, ensure_ascii=False)}\n"
-        f"Target segment annotation JSON:\n{json.dumps(target_annotation, ensure_ascii=False)}\n"
+        f"Pair proposal JSON:\n{_prompt_json(model_fields, max_chars=1800)}\n"
+        f"Local gate report JSON:\n{_prompt_json(local_gate_report, max_chars=1000)}\n"
+        f"Reference segment annotation JSON:\n{_prompt_json(reference_annotation, max_chars=ann_char_limit)}\n"
+        f"Target segment annotation JSON:\n{_prompt_json(target_annotation, max_chars=ann_char_limit)}\n"
         "Answer the required schema exactly. The accept field must be false if the target does not visibly satisfy edit_text, "
         "if the reference already satisfies edit_text, if the pair is text/OCR-driven, or if the edit_text describes the wrong subject or composition."
     )
@@ -954,6 +980,13 @@ def _build_single_source_final_verification_user_content(
         {"type": "video_url", "video_url": {"url": target_clip_path}},
         {"type": "text", "text": prompt},
     ]
+
+
+def _prompt_json(payload: dict[str, Any], *, max_chars: int) -> str:
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 18)].rstrip() + "... [truncated]"
 
 
 def _build_pair_judge_user_content(
@@ -1321,7 +1354,7 @@ class OpenAIComposedDataClient:
                 candidate=candidate,
             ),
             system_prompt=_single_source_pair_system_prompt(line),
-            max_tokens=1800 if line == "speech_audio_content" else 1500,
+            max_tokens=1200 if line == "speech_audio_content" else 1100 if line == "visual_audio_anchor" else 1500,
         )
         return _normalize_single_source_pair_payload(raw_payload), raw_payload
 
@@ -1346,6 +1379,7 @@ class OpenAIComposedDataClient:
                 target_annotation=target_annotation,
                 local_gate_report=local_gate_report,
                 whole_annotation=whole_annotation,
+                audio_dataset_line=audio_dataset_line,
             ),
             system_prompt=_single_source_final_verification_system_prompt(audio_dataset_line),
             max_tokens=900,
