@@ -867,6 +867,14 @@ MIN_TEMPLATE_DIFFERENCE_STRENGTH_SCORE = 0.75
 DEFAULT_ACCEPTANCE_PROFILE = "final"
 EXPLORATION_ACCEPTANCE_PROFILE = "exploration"
 AUDIO_MATTERS_ACCEPTANCE_PROFILE = "audio_matters"
+STANDARD_AUDIO_DATASET_LINE = "standard"
+VISUAL_AUDIO_ANCHOR_LINE = "visual_audio_anchor"
+SPEECH_AUDIO_CONTENT_LINE = "speech_audio_content"
+AUDIO_DATASET_LINE_NAMES = {
+    STANDARD_AUDIO_DATASET_LINE,
+    VISUAL_AUDIO_ANCHOR_LINE,
+    SPEECH_AUDIO_CONTENT_LINE,
+}
 ACCEPTANCE_PROFILE_NAMES = {
     DEFAULT_ACCEPTANCE_PROFILE,
     EXPLORATION_ACCEPTANCE_PROFILE,
@@ -958,6 +966,16 @@ def _normalize_acceptance_profile(value: str | None) -> str:
         allowed = ", ".join(sorted(ACCEPTANCE_PROFILE_NAMES))
         raise ValueError(f"unsupported acceptance_profile={value!r}; expected one of: {allowed}")
     return profile
+
+
+def _normalize_audio_dataset_line(value: str | None) -> str:
+    line = str(value or STANDARD_AUDIO_DATASET_LINE).strip().lower().replace("-", "_")
+    if line in {"", "none"}:
+        line = STANDARD_AUDIO_DATASET_LINE
+    if line not in AUDIO_DATASET_LINE_NAMES:
+        allowed = ", ".join(sorted(AUDIO_DATASET_LINE_NAMES))
+        raise ValueError(f"unsupported audio_dataset_line={value!r}; expected one of: {allowed}")
+    return line
 
 
 def _acceptance_profile_config(acceptance_profile: str | None) -> dict[str, float]:
@@ -1756,59 +1774,64 @@ def mine_single_source_pairs(
         raise ValueError("clip groups are empty")
 
     annotations_by_id = {str(item.get("clip_id", "")).strip(): item for item in annotations if str(item.get("clip_id", "")).strip()}
-    selected_group = groups[0]
-    candidate_clip_ids = [str(value).strip() for value in selected_group.get("candidate_clip_ids", []) if str(value).strip()]
-    ordered_annotations = [
-        annotations_by_id[clip_id]
-        for clip_id in candidate_clip_ids
-        if clip_id in annotations_by_id and not bool(annotations_by_id[clip_id].get("fallback_used"))
-    ]
-    ordered_annotations.sort(key=lambda item: (_clip_start_seconds(item), str(item.get("clip_id", ""))))
-    if len(ordered_annotations) < 4:
-        raise ValueError(f"single-source pair mining needs at least 4 usable annotations; found={len(ordered_annotations)}")
-
     mined_records: list[dict[str, Any]] = []
     fallback_candidate_count = 0
-    for left_index, reference_annotation in enumerate(ordered_annotations):
-        for target_annotation in ordered_annotations[left_index + 1 :]:
-            candidate, fallback_used = _single_source_pair_candidate(
-                root=layout["root"],
-                reference_annotation=reference_annotation,
-                target_annotation=target_annotation,
-                annotations=ordered_annotations,
-                group_metadata={
-                    "group_id": str(selected_group.get("group_id", "single_source_video")),
-                    "group_reason": "single_source_video",
-                },
-                acceptance_profile=acceptance_profile,
-            )
-            fallback_candidate_count += 1 if fallback_used else 0
-            record = _mined_pair_candidate_record(
-                candidate,
-                group_metadata={
-                    "group_id": str(selected_group.get("group_id", "single_source_video")),
-                    "group_reason": "single_source_video",
-                },
-            )
-            record["candidate_index"] = len(mined_records) + 1
-            record["single_source_pair"] = True
-            record["chronological_pair"] = True
-            record["candidate_stage"] = "enumeration_only"
-            record["requires_pair_video_comparison"] = True
-            record["reference_start_seconds"] = _clip_start_seconds(reference_annotation)
-            record["target_start_seconds"] = _clip_start_seconds(target_annotation)
-            if fallback_used:
-                record["risk_flags"] = _dedupe_strings(list(record.get("risk_flags", [])) + ["fallback_single_source_difference"])
-            if record.get("difference", {}).get("type") in FINAL_DISABLED_DIFFERENCE_TYPES:
-                record["risk_flags"] = _dedupe_strings(list(record.get("risk_flags", [])) + ["diagnostic_only_final_disabled_type"])
-            mined_records.append(record)
+    usable_group_count = 0
+    skipped_group_count = 0
+    expected_pair_count = 0
+    segment_count = 0
+    report_group = groups[0]
+    for selected_group in groups:
+        candidate_clip_ids = [str(value).strip() for value in selected_group.get("candidate_clip_ids", []) if str(value).strip()]
+        ordered_annotations = [
+            annotations_by_id[clip_id]
+            for clip_id in candidate_clip_ids
+            if clip_id in annotations_by_id and not bool(annotations_by_id[clip_id].get("fallback_used"))
+        ]
+        ordered_annotations.sort(key=lambda item: (_clip_start_seconds(item), str(item.get("clip_id", ""))))
+        if len(ordered_annotations) < 4:
+            skipped_group_count += 1
+            continue
+        usable_group_count += 1
+        segment_count += len(ordered_annotations)
+        expected_pair_count += len(ordered_annotations) * (len(ordered_annotations) - 1) // 2
+        group_metadata = {
+            "group_id": str(selected_group.get("group_id", "single_source_video")),
+            "group_reason": "single_source_video",
+        }
+        for left_index, reference_annotation in enumerate(ordered_annotations):
+            for target_annotation in ordered_annotations[left_index + 1 :]:
+                candidate, fallback_used = _single_source_pair_candidate(
+                    root=layout["root"],
+                    reference_annotation=reference_annotation,
+                    target_annotation=target_annotation,
+                    annotations=ordered_annotations,
+                    group_metadata=group_metadata,
+                    acceptance_profile=acceptance_profile,
+                )
+                fallback_candidate_count += 1 if fallback_used else 0
+                record = _mined_pair_candidate_record(candidate, group_metadata=group_metadata)
+                record["candidate_index"] = len(mined_records) + 1
+                record["single_source_pair"] = True
+                record["chronological_pair"] = True
+                record["candidate_stage"] = "enumeration_only"
+                record["requires_pair_video_comparison"] = True
+                record["reference_start_seconds"] = _clip_start_seconds(reference_annotation)
+                record["target_start_seconds"] = _clip_start_seconds(target_annotation)
+                if fallback_used:
+                    record["risk_flags"] = _dedupe_strings(list(record.get("risk_flags", [])) + ["fallback_single_source_difference"])
+                if record.get("difference", {}).get("type") in FINAL_DISABLED_DIFFERENCE_TYPES:
+                    record["risk_flags"] = _dedupe_strings(list(record.get("risk_flags", [])) + ["diagnostic_only_final_disabled_type"])
+                mined_records.append(record)
+    if usable_group_count <= 0:
+        raise ValueError("single-source pair mining needs at least one group with 4 usable annotations")
 
     _write_jsonl(output, mined_records)
     report.write_text(
         _build_single_source_pair_report(
             output_path=output,
-            group=selected_group,
-            annotations=ordered_annotations,
+            group=report_group,
+            annotations=annotations,
             candidates=mined_records,
             fallback_candidate_count=fallback_candidate_count,
             acceptance_profile=acceptance_profile,
@@ -1820,10 +1843,13 @@ def mine_single_source_pairs(
         "clip_groups_path": str(groups_path),
         "output_path": str(output),
         "report_path": str(report),
-        "segment_count": len(ordered_annotations),
+        "segment_count": segment_count,
         "candidate_count": len(mined_records),
-        "expected_pair_count": len(ordered_annotations) * (len(ordered_annotations) - 1) // 2,
+        "expected_pair_count": expected_pair_count,
         "fallback_candidate_count": fallback_candidate_count,
+        "group_count": len(groups),
+        "usable_group_count": usable_group_count,
+        "skipped_group_count": skipped_group_count,
         "difference_type_counts": dict(Counter(str(item.get("difference", {}).get("type", "")) for item in mined_records)),
         "acceptance_profile": acceptance_profile,
     }
@@ -1845,13 +1871,19 @@ def propose_single_source_pairs(
     max_proposals: int | None = None,
     zero_accepted_stop_after: int = DEFAULT_ZERO_ACCEPTED_STOP_AFTER,
     acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
+    audio_dataset_line: str = STANDARD_AUDIO_DATASET_LINE,
+    accepted_progress_path: str | Path | None = None,
+    rejected_progress_path: str | Path | None = None,
 ) -> dict[str, Any]:
     acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
+    audio_dataset_line = _normalize_audio_dataset_line(audio_dataset_line)
     layout = ensure_layout(root)
     annotations_path = Path(clip_annotations_path)
     candidates_path = Path(pair_candidates_path)
     output = Path(output_path) if output_path else layout["pairs"] / "ranked_single_source_pairs.jsonl"
     accepted_output = Path(accepted_output_path) if accepted_output_path else layout["pairs"] / DEFAULT_ACCEPTED_PAIRS_NAME
+    accepted_progress_output = Path(accepted_progress_path) if accepted_progress_path else None
+    rejected_progress_output = Path(rejected_progress_path) if rejected_progress_path else None
     annotations = list(_load_jsonl(annotations_path))
     candidates = list(_load_jsonl(candidates_path))
     if not annotations:
@@ -1930,6 +1962,7 @@ def propose_single_source_pairs(
                     target_annotation=_annotation_prompt_view(target_annotation),
                     whole_annotation=_single_source_whole_prompt_view(whole_annotation) if whole_annotation else None,
                     candidate=_single_source_candidate_prompt_view(candidate),
+                    audio_dataset_line=audio_dataset_line,
                 )
             except Exception as exc:
                 model_fields = _single_source_rejected_model_fields(
@@ -1965,6 +1998,7 @@ def propose_single_source_pairs(
                 model_fields=model_fields,
                 edit_text_quality=edit_text_quality,
                 acceptance_profile=acceptance_profile,
+                audio_dataset_line=audio_dataset_line,
                 reference_annotation=reference_annotation,
                 target_annotation=target_annotation,
             )
@@ -1974,6 +2008,7 @@ def propose_single_source_pairs(
                 difference_type=difference_type,
                 confidence=confidence,
                 acceptance_profile=acceptance_profile,
+                audio_dataset_line=audio_dataset_line,
                 reference_video_exists=reference_path.exists(),
                 target_video_exists=target_path.exists(),
             )
@@ -1994,6 +2029,7 @@ def propose_single_source_pairs(
                         target_annotation=_annotation_prompt_view(target_annotation),
                         local_gate_report=local_gate_report,
                         whole_annotation=_single_source_whole_prompt_view(whole_annotation) if whole_annotation else None,
+                        audio_dataset_line=audio_dataset_line,
                     )
                 except Exception as exc:
                     final_omni_verification = _single_source_skipped_final_verification(
@@ -2060,6 +2096,8 @@ def propose_single_source_pairs(
                 "reference_caption": str(model_fields.get("reference_caption", "")).strip(),
                 "target_caption": str(model_fields.get("target_caption", "")).strip(),
                 "difference": difference,
+                "audio_dataset_line": audio_dataset_line,
+                "audio_matters_line": "visual_edit_audio_anchor" if audio_dataset_line == VISUAL_AUDIO_ANCHOR_LINE else "",
                 "dominant_delta": dict(model_fields.get("dominant_delta", {})),
                 "reference_state": dict(model_fields.get("reference_state", {})) if isinstance(model_fields.get("reference_state"), dict) else {},
                 "target_state": dict(model_fields.get("target_state", {})) if isinstance(model_fields.get("target_state"), dict) else {},
@@ -2119,6 +2157,10 @@ def propose_single_source_pairs(
             max_accepted_pairs=max_accepted_pairs,
             acceptance_profile=acceptance_profile,
         )
+        if bool(record.get("accepted")) and accepted_progress_output is not None:
+            _append_jsonl_record(accepted_progress_output, record)
+        if not bool(record.get("accepted")) and rejected_progress_output is not None:
+            _append_jsonl_record(rejected_progress_output, record)
         persist_progress()
         current_accepted = _select_single_source_quality_passed_records(output_records)
         print(
@@ -2172,6 +2214,7 @@ def propose_single_source_pairs(
         "fallback_count": fallback_count,
         "early_stop_reason": early_stop_reason,
         "acceptance_profile": acceptance_profile,
+        "audio_dataset_line": audio_dataset_line,
     }
 
 
@@ -7421,9 +7464,20 @@ def _single_source_pair_candidate(
 
 def _single_source_candidate_prompt_view(candidate: dict[str, Any]) -> dict[str, Any]:
     difference = candidate.get("difference") if isinstance(candidate.get("difference"), dict) else {}
+    audio_dataset_line = _normalize_audio_dataset_line(candidate.get("audio_dataset_line"))
+    instruction = "Do not copy the heuristic difference if the videos show a stronger product, overlay, object, action, or composition change."
+    if audio_dataset_line == VISUAL_AUDIO_ANCHOR_LINE:
+        instruction = (
+            "A-line visual_audio_anchor: audio is preserved context only. Choose a clear visual delta and do not mention audio, sound, speech, music, or transcript in edit_text."
+        )
+    elif audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE:
+        instruction = (
+            "B-line speech_audio_content: choose speech content or concrete non-speech audio_event as the primary delta; reject if visuals are the main change."
+        )
     return {
         "candidate_id": str(candidate.get("candidate_id", "")),
         "candidate_index": candidate.get("candidate_index"),
+        "audio_dataset_line": audio_dataset_line,
         "reference_clip_id": str(candidate.get("reference_clip_id", "")),
         "target_clip_id": str(candidate.get("target_clip_id", "")),
         "reference_start_seconds": candidate.get("reference_start_seconds"),
@@ -7436,7 +7490,8 @@ def _single_source_candidate_prompt_view(candidate: dict[str, Any]) -> dict[str,
             "description": str(difference.get("description", "")),
         },
         "risk_flags": list(candidate.get("risk_flags", [])) if isinstance(candidate.get("risk_flags"), list) else [],
-        "instruction": "Do not copy the heuristic difference if the videos show a stronger product, overlay, object, action, or composition change.",
+        "quality": dict(candidate.get("quality", {})) if isinstance(candidate.get("quality"), dict) else {},
+        "instruction": instruction,
     }
 
 
@@ -7623,7 +7678,7 @@ def _single_source_pair_quality(
     difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
     difference_type = str(difference.get("type", "")).strip()
     extent = model_fields.get("delta_temporal_extent") if isinstance(model_fields.get("delta_temporal_extent"), dict) else {}
-    return {
+    quality = {
         "same_context_score": max(0.65, _score_float(scores.get("same_context_score", heuristic_quality.get("same_context_score")))),
         "semantic_context_score": _score_float(scores.get("semantic_context_score", heuristic_quality.get("semantic_context_score"))),
         "edit_match_score": confidence,
@@ -7635,6 +7690,25 @@ def _single_source_pair_quality(
         "is_segment_wide_delta": 1.0 if bool(model_fields.get("is_segment_wide_delta")) else 0.0,
         "acceptance_profile": acceptance_profile,
     }
+    for key in (
+        "audio_anchor_score",
+        "audio_anchor_required",
+        "audio_anchor_type",
+        "audio_anchor_context_score",
+        "audio_anchor_min_rms",
+        "edit_primary_modality",
+        "speech_evidence_score",
+        "speech_specificity_score",
+        "speech_transcript_backed",
+        "non_speech_audio_event_score",
+        "has_audio_modality",
+        "audio_dataset_line",
+    ):
+        if key in heuristic_quality:
+            quality[key] = heuristic_quality[key]
+        elif key in scores:
+            quality[key] = scores[key]
+    return quality
 
 
 def _single_source_pair_acceptance_issues(
@@ -7642,10 +7716,16 @@ def _single_source_pair_acceptance_issues(
     model_fields: dict[str, Any],
     edit_text_quality: dict[str, Any],
     acceptance_profile: str,
+    audio_dataset_line: str = STANDARD_AUDIO_DATASET_LINE,
     reference_annotation: dict[str, Any] | None = None,
     target_annotation: dict[str, Any] | None = None,
 ) -> list[str]:
-    reasons = _single_source_model_reject_issues(model_fields, edit_text_quality)
+    audio_dataset_line = _normalize_audio_dataset_line(audio_dataset_line)
+    reasons = _single_source_model_reject_issues(
+        model_fields,
+        edit_text_quality,
+        audio_dataset_line=audio_dataset_line,
+    )
     confidence = _score_float(model_fields.get("confidence"))
     threshold = _profile_threshold(acceptance_profile, "edit_match_score")
     if confidence < threshold:
@@ -7724,6 +7804,14 @@ def _single_source_pair_acceptance_issues(
     )
     if text_driven_issue:
         reasons.append(text_driven_issue)
+    reasons.extend(
+        _single_source_audio_line_acceptance_issues(
+            model_fields=model_fields,
+            audio_dataset_line=audio_dataset_line,
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+        )
+    )
 
     return _dedupe_strings(reasons)
 
@@ -7737,7 +7825,9 @@ def _single_source_local_gate_report(
     acceptance_profile: str,
     reference_video_exists: bool,
     target_video_exists: bool,
+    audio_dataset_line: str = STANDARD_AUDIO_DATASET_LINE,
 ) -> dict[str, Any]:
+    audio_dataset_line = _normalize_audio_dataset_line(audio_dataset_line)
     hard_rejects: list[str] = []
     review_required: list[str] = []
     threshold = _profile_threshold(acceptance_profile, "edit_match_score")
@@ -7748,8 +7838,15 @@ def _single_source_local_gate_report(
         hard_rejects.append("reference_video_missing")
     if not target_video_exists:
         hard_rejects.append("target_video_missing")
-    if difference_type in FINAL_DISABLED_DIFFERENCE_TYPES:
+    disabled_difference_types = set(FINAL_DISABLED_DIFFERENCE_TYPES)
+    if audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE:
+        disabled_difference_types.discard("speech")
+    if difference_type in disabled_difference_types:
         hard_rejects.append(f"{difference_type} is diagnostic-only for single-source accepted pairs")
+    if audio_dataset_line == VISUAL_AUDIO_ANCHOR_LINE and difference_type not in DOMINANT_VISUAL_DIFFERENCE_TYPES:
+        hard_rejects.append(f"{difference_type} is not allowed for visual_audio_anchor")
+    if audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE and difference_type not in {"speech", "audio_event"}:
+        hard_rejects.append(f"{difference_type} is not allowed for speech_audio_content")
     if confidence < threshold:
         hard_rejects.append(f"low_pair_video_confidence: {confidence:.2f} < {threshold:.2f}")
 
@@ -7842,14 +7939,20 @@ def _single_source_final_verification_issues(
 def _single_source_model_reject_issues(
     model_fields: dict[str, Any],
     edit_text_quality: dict[str, Any],
+    *,
+    audio_dataset_line: str = STANDARD_AUDIO_DATASET_LINE,
 ) -> list[str]:
+    audio_dataset_line = _normalize_audio_dataset_line(audio_dataset_line)
     difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
     difference_type = str(difference.get("type", "")).strip()
     from_value = str(difference.get("from", "")).strip()
     to_value = str(difference.get("to", "")).strip()
     edit_text = str(model_fields.get("edit_text", "")).strip()
     reasons: list[str] = []
-    if difference_type in FINAL_DISABLED_DIFFERENCE_TYPES:
+    disabled_difference_types = set(FINAL_DISABLED_DIFFERENCE_TYPES)
+    if audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE:
+        disabled_difference_types.discard("speech")
+    if difference_type in disabled_difference_types:
         reasons.append(f"{difference_type} is diagnostic-only for single-source accepted pairs")
     if difference_type == "attribute":
         normalized_edit = _normalized_phrase(edit_text)
@@ -7868,6 +7971,48 @@ def _single_source_model_reject_issues(
     if _score_float(edit_text_quality.get("score")) < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "edit_text_quality_score"):
         reasons.append("bad_edit_text_quality")
     return _dedupe_strings(reasons)
+
+
+def _single_source_audio_line_acceptance_issues(
+    *,
+    model_fields: dict[str, Any],
+    audio_dataset_line: str,
+    reference_annotation: dict[str, Any] | None,
+    target_annotation: dict[str, Any] | None,
+) -> list[str]:
+    line = _normalize_audio_dataset_line(audio_dataset_line)
+    if line == STANDARD_AUDIO_DATASET_LINE:
+        return []
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
+    modalities = {str(item).strip().lower() for item in _normalize_list(model_fields.get("modalities", []))}
+    edit_text = _normalized_phrase(str(model_fields.get("edit_text", "")))
+    issues: list[str] = []
+    audio_words = ("audio", "sound", "speech", "music", "transcript", "narration", "voice")
+    if line == VISUAL_AUDIO_ANCHOR_LINE:
+        if difference_type not in DOMINANT_VISUAL_DIFFERENCE_TYPES:
+            issues.append(f"visual_audio_anchor requires visual difference type, got {difference_type or 'missing'}")
+        if "audio" in modalities:
+            issues.append("visual_audio_anchor edit must not require audio modality")
+        if any(word in edit_text for word in audio_words):
+            issues.append("visual_audio_anchor edit_text mentions audio/speech terms")
+    elif line == SPEECH_AUDIO_CONTENT_LINE:
+        if difference_type not in {"speech", "audio_event"}:
+            issues.append(f"speech_audio_content requires speech or audio_event difference type, got {difference_type or 'missing'}")
+        if "audio" not in modalities:
+            issues.append("speech_audio_content edit must include audio modality")
+        if difference_type == "speech":
+            if not reference_annotation or not target_annotation or not _speech_is_transcript_backed(reference_annotation, target_annotation):
+                issues.append("speech_audio_content speech edit lacks transcript-backed evidence")
+        if difference_type == "audio_event":
+            score = (
+                _non_speech_audio_event_score(reference_annotation, target_annotation)
+                if reference_annotation and target_annotation
+                else 0.0
+            )
+            if score < _profile_threshold(EXPLORATION_ACCEPTANCE_PROFILE, "non_speech_audio_event_score"):
+                issues.append("speech_audio_content audio_event edit lacks non-speech audio evidence")
+    return _dedupe_strings(issues)
 
 
 def _single_source_model_reject_reason(
@@ -13447,6 +13592,7 @@ def _accepted_sample_from_record(record: dict[str, Any], index: int) -> dict[str
         "reference_caption": record["reference_caption"],
         "target_caption": record["target_caption"],
         "difference": dict(record["difference"]),
+        "audio_dataset_line": str(record.get("audio_dataset_line", "")).strip(),
         "audio_matters_line": str(record.get("audio_matters_line", "")).strip(),
         "hard_negatives": list(record["hard_negatives"]),
         "quality": dict(record["quality"]),
@@ -17062,6 +17208,9 @@ def build_parser() -> argparse.ArgumentParser:
     propose_single_source_parser.add_argument("--max-proposals", type=int)
     propose_single_source_parser.add_argument("--zero-accepted-stop-after", type=int, default=DEFAULT_ZERO_ACCEPTED_STOP_AFTER)
     propose_single_source_parser.add_argument("--acceptance-profile", choices=sorted(ACCEPTANCE_PROFILE_NAMES), default=DEFAULT_ACCEPTANCE_PROFILE)
+    propose_single_source_parser.add_argument("--audio-dataset-line", choices=sorted(AUDIO_DATASET_LINE_NAMES), default=STANDARD_AUDIO_DATASET_LINE)
+    propose_single_source_parser.add_argument("--accepted-progress-path")
+    propose_single_source_parser.add_argument("--rejected-progress-path")
 
     propose_pairs_parser = subparsers.add_parser("propose-pairs")
     propose_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -17362,6 +17511,9 @@ def main() -> None:
             max_proposals=args.max_proposals,
             zero_accepted_stop_after=args.zero_accepted_stop_after,
             acceptance_profile=args.acceptance_profile,
+            audio_dataset_line=args.audio_dataset_line,
+            accepted_progress_path=args.accepted_progress_path,
+            rejected_progress_path=args.rejected_progress_path,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

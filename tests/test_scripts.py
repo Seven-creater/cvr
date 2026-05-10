@@ -160,6 +160,28 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("served_models=", script)
         self.assertIn("is not served by", script)
 
+    def test_audio_lines_single_source_reuse_script_is_safe_and_parallel(self) -> None:
+        script = Path("scripts/run_audio_lines_single_source_reuse.sh").read_text(encoding="utf-8")
+
+        self.assertIn("app.audio_lines_single_source prepare-existing", script)
+        self.assertIn("clips/single_source", script)
+        self.assertIn("detective-annotate-clips", script)
+        self.assertIn("mine-single-source-pairs", script)
+        self.assertIn("propose-single-source-pairs", script)
+        self.assertIn("--audio-dataset-line", script)
+        self.assertIn("visual_audio_anchor", script)
+        self.assertIn("speech_audio_content", script)
+        self.assertIn("PROPOSE_SHARDS=${PROPOSE_SHARDS:-16}", script)
+        self.assertIn("PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-16}", script)
+        self.assertIn("accepted_progress_", script)
+        self.assertIn("rejected_progress_", script)
+        self.assertIn("manual_review/A", script)
+        self.assertIn("manual_review/B", script)
+        self.assertNotIn("VACE", script)
+        self.assertNotIn("modelscope download", script)
+        self.assertNotIn("vllm", script)
+        self.assertNotIn("8092", script)
+
     def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
         script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")
 

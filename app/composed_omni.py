@@ -479,9 +479,19 @@ def _pair_proposal_system_prompt() -> str:
     )
 
 
-def _single_source_pair_system_prompt() -> str:
+def _normalize_audio_dataset_line(value: str | None) -> str:
+    line = str(value or "standard").strip().lower().replace("-", "_")
+    if line in {"", "none"}:
+        return "standard"
+    if line not in {"standard", "visual_audio_anchor", "speech_audio_content"}:
+        return "standard"
+    return line
+
+
+def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> str:
     difference_types = ", ".join(sorted(ALLOWED_DIFFERENCE_TYPES))
-    return (
+    line = _normalize_audio_dataset_line(audio_dataset_line)
+    base_prompt = (
         "You compare two short clips cut from the same original video for composed video retrieval. "
         "Follow an Omni-Captioner/Omni-Detective style: inspect both videos, use the segment annotations as evidence, "
         "then choose the single clearest change from reference to target. "
@@ -521,10 +531,29 @@ def _single_source_pair_system_prompt() -> str:
         "a transient final-moment overlay, an internally changing segment, or multiple equally strong unrelated changes. "
         "When rejecting, still fill the best tentative edit_text and evidence, set accept=false, and explain reject_reason."
     )
+    if line == "visual_audio_anchor":
+        return (
+            base_prompt
+            + " This pass is the visual_audio_anchor A line. The two clips should keep similar or continuous audio context; "
+            "audio is only an anchor and must not be the edit. Accept only one clear visual delta. "
+            "The edit_text must be visual-only and must not mention audio, sound, speech, music, transcript, narration, or voice. "
+            "Reject if the target only changes speech/audio/text, if the visual change is near-duplicate, or if the reference already satisfies the visual edit."
+        )
+    if line == "speech_audio_content":
+        return (
+            base_prompt
+            + " This pass is the speech_audio_content B line. Prefer pairs where the visual context remains similar and the primary retrieval edit "
+            "is speech content or a concrete non-speech audio event. Use difference.type=speech only for transcript-backed spoken-language content; "
+            "use difference.type=audio_event only for non-language sounds such as music, applause, machinery, wind, animal sounds, or ambience. "
+            "The edit_text may mention speech/audio because that is the target line, but it must be specific and evidence-backed. "
+            "Reject if the main change is visual, if transcript/audio evidence is vague, or if speech-only narration is mislabeled as audio_event."
+        )
+    return base_prompt
 
 
-def _single_source_final_verification_system_prompt() -> str:
-    return (
+def _single_source_final_verification_system_prompt(audio_dataset_line: str | None = None) -> str:
+    line = _normalize_audio_dataset_line(audio_dataset_line)
+    base_prompt = (
         "You are the final strict verifier for a single-source composed video retrieval pair. "
         "The candidate has already passed an initial pair-comparison step and local gates; your job is to decide whether it should enter human review as an accepted sample. "
         "Use the attached reference and target videos as primary evidence. Use captions, dominant_delta, and local_gate_report only as supporting evidence. "
@@ -551,6 +580,22 @@ def _single_source_final_verification_system_prompt() -> str:
         "If any of text_or_ocr_driven=true, observable_delta=false, target_satisfies_edit=false, "
         "or edit_text_accurate=false, set accept=false and explain main_reject_reason."
     )
+    if line == "visual_audio_anchor":
+        return (
+            base_prompt
+            + " For this visual_audio_anchor A line, accept only if the edit is visual and the audio/speech is not the primary change. "
+            "The edit_text must not mention audio, sound, speech, music, transcript, narration, or voice. "
+            "Reject near-duplicate visual changes, order-only changes, tiny lighting/framing shifts, and any pair where reference already satisfies the visual edit."
+        )
+    if line == "speech_audio_content":
+        return (
+            base_prompt
+            + " For this speech_audio_content B line, observable_delta may be an audible speech or non-speech audio delta. "
+            "Accept speech only when both sides have concrete transcript-backed evidence and the edit_text names the content change. "
+            "Accept audio_event only for non-speech sound/music/environment changes, not narration topic changes. "
+            "Reject if a stronger visual difference is doing the retrieval work, if the audio evidence is generic, or if the edit could be judged without listening."
+        )
+    return base_prompt
 
 
 def _pair_judge_system_prompt() -> str:
@@ -1220,6 +1265,7 @@ class OpenAIComposedDataClient:
         target_annotation: dict[str, Any],
         whole_annotation: dict[str, Any] | None = None,
         candidate: dict[str, Any] | None = None,
+        audio_dataset_line: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         raw_payload = self._request_json(
             user_content=_build_single_source_pair_user_content(
@@ -1230,7 +1276,7 @@ class OpenAIComposedDataClient:
                 whole_annotation=whole_annotation,
                 candidate=candidate,
             ),
-            system_prompt=_single_source_pair_system_prompt(),
+            system_prompt=_single_source_pair_system_prompt(audio_dataset_line),
             max_tokens=1500,
         )
         return _normalize_single_source_pair_payload(raw_payload), raw_payload
@@ -1245,6 +1291,7 @@ class OpenAIComposedDataClient:
         target_annotation: dict[str, Any],
         local_gate_report: dict[str, Any],
         whole_annotation: dict[str, Any] | None = None,
+        audio_dataset_line: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         raw_payload = self._request_json(
             user_content=_build_single_source_final_verification_user_content(
@@ -1256,7 +1303,7 @@ class OpenAIComposedDataClient:
                 local_gate_report=local_gate_report,
                 whole_annotation=whole_annotation,
             ),
-            system_prompt=_single_source_final_verification_system_prompt(),
+            system_prompt=_single_source_final_verification_system_prompt(audio_dataset_line),
             max_tokens=900,
         )
         return _normalize_single_source_final_verification_payload(raw_payload), raw_payload
