@@ -627,7 +627,9 @@ def _visual_delta_strength(candidate: dict[str, Any], reference: dict[str, Any],
 def _v4_a_candidate_allowed(*, audio_line_quality_profile: str, difference_type: str, visual_delta_strength: float) -> bool:
     if audio_line_quality_profile != AUDIO_LINE_PROFILE_V4_STRICT:
         return True
-    return difference_type in V4_A_STRONG_VISUAL_TYPES and visual_delta_strength >= 0.45
+    if difference_type == "visible_text":
+        return False
+    return (difference_type in V4_A_STRONG_VISUAL_TYPES and visual_delta_strength >= 0.45) or visual_delta_strength >= 0.72
 
 
 def _v4_b_candidate_allowed(

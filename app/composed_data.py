@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -1908,6 +1909,8 @@ def propose_single_source_pairs(
     audio_dataset_line: str = STANDARD_AUDIO_DATASET_LINE,
     accepted_progress_path: str | Path | None = None,
     rejected_progress_path: str | Path | None = None,
+    omni_retries: int = 0,
+    fail_on_transient_omni_errors: bool = False,
 ) -> dict[str, Any]:
     acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     audio_dataset_line = _normalize_audio_dataset_line(audio_dataset_line)
@@ -1956,6 +1959,7 @@ def propose_single_source_pairs(
     rejected_count = 0
     fallback_count = 0
     early_stop_reason = ""
+    omni_retries = max(0, int(omni_retries or 0))
 
     def persist_progress() -> None:
         current_accepted = _select_single_source_quality_passed_records(output_records)
@@ -1989,16 +1993,35 @@ def propose_single_source_pairs(
             raw_model_output: dict[str, Any]
             fallback_used = False
             try:
-                model_fields, raw_model_output = client.propose_single_source_pair(
-                    reference_clip_path=str(reference_path),
-                    target_clip_path=str(target_path),
-                    reference_annotation=_annotation_prompt_view(reference_annotation),
-                    target_annotation=_annotation_prompt_view(target_annotation),
-                    whole_annotation=_single_source_whole_prompt_view(whole_annotation) if whole_annotation else None,
-                    candidate=_single_source_candidate_prompt_view(candidate),
-                    audio_dataset_line=audio_dataset_line,
+                model_fields, raw_model_output = _call_omni_with_retries(
+                    label=f"proposal:{proposal_id}",
+                    retries=omni_retries,
+                    fail_on_transient=fail_on_transient_omni_errors,
+                    func=lambda: client.propose_single_source_pair(
+                        reference_clip_path=str(reference_path),
+                        target_clip_path=str(target_path),
+                        reference_annotation=_annotation_prompt_view(reference_annotation),
+                        target_annotation=_annotation_prompt_view(target_annotation),
+                        whole_annotation=_single_source_whole_prompt_view(whole_annotation) if whole_annotation else None,
+                        candidate=_single_source_candidate_prompt_view(candidate),
+                        audio_dataset_line=audio_dataset_line,
+                    ),
                 )
             except Exception as exc:
+                if fail_on_transient_omni_errors and _is_transient_omni_exception(exc):
+                    print(
+                        "[propose-single-source-pairs] transient omni error; shard will fail for retry "
+                        f"proposal_id={proposal_id} error={type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    raise
+                print(
+                    "[propose-single-source-pairs] fallback after omni proposal error "
+                    f"proposal_id={proposal_id} error={type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 model_fields = _single_source_rejected_model_fields(
                     candidate=candidate,
                     reason=f"{type(exc).__name__}: {exc}",
@@ -2056,17 +2079,30 @@ def propose_single_source_pairs(
             raw_final_omni_output: dict[str, Any] = {}
             if model_accepted:
                 try:
-                    final_omni_verification, raw_final_omni_output = client.verify_single_source_pair_final(
-                        reference_clip_path=str(reference_path),
-                        target_clip_path=str(target_path),
-                        model_fields=model_fields,
-                        reference_annotation=_annotation_prompt_view(reference_annotation),
-                        target_annotation=_annotation_prompt_view(target_annotation),
-                        local_gate_report=local_gate_report,
-                        whole_annotation=_single_source_whole_prompt_view(whole_annotation) if whole_annotation else None,
-                        audio_dataset_line=audio_dataset_line,
+                    final_omni_verification, raw_final_omni_output = _call_omni_with_retries(
+                        label=f"final_verify:{proposal_id}",
+                        retries=omni_retries,
+                        fail_on_transient=fail_on_transient_omni_errors,
+                        func=lambda: client.verify_single_source_pair_final(
+                            reference_clip_path=str(reference_path),
+                            target_clip_path=str(target_path),
+                            model_fields=model_fields,
+                            reference_annotation=_annotation_prompt_view(reference_annotation),
+                            target_annotation=_annotation_prompt_view(target_annotation),
+                            local_gate_report=local_gate_report,
+                            whole_annotation=_single_source_whole_prompt_view(whole_annotation) if whole_annotation else None,
+                            audio_dataset_line=audio_dataset_line,
+                        ),
                     )
                 except Exception as exc:
+                    if fail_on_transient_omni_errors and _is_transient_omni_exception(exc):
+                        print(
+                            "[propose-single-source-pairs] transient final verify error; shard will fail for retry "
+                            f"proposal_id={proposal_id} error={type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        raise
                     final_omni_verification = _single_source_skipped_final_verification(
                         f"final_omni_verification_error: {type(exc).__name__}: {exc}"
                     )
@@ -2251,7 +2287,57 @@ def propose_single_source_pairs(
         "early_stop_reason": early_stop_reason,
         "acceptance_profile": acceptance_profile,
         "audio_dataset_line": audio_dataset_line,
+        "omni_retries": omni_retries,
+        "fail_on_transient_omni_errors": bool(fail_on_transient_omni_errors),
     }
+
+
+def _call_omni_with_retries(*, label: str, retries: int, fail_on_transient: bool, func: Any) -> Any:
+    attempts = max(0, int(retries or 0)) + 1
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return func()
+        except Exception as exc:
+            last_exc = exc
+            transient = _is_transient_omni_exception(exc)
+            if not transient or attempt >= attempts:
+                raise
+            wait_seconds = min(30.0, 2.0 * attempt)
+            print(
+                "[omni-retry] transient error "
+                f"label={label} attempt={attempt}/{attempts} wait={wait_seconds:.1f}s "
+                f"error={type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(wait_seconds)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"omni call {label} did not run")
+
+
+def _is_transient_omni_exception(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    transient_markers = (
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "remote end closed",
+        "remotedisconnected",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "http error 502",
+        "http error 503",
+        "http error 504",
+        "max retries exceeded",
+        "no route to host",
+    )
+    return any(marker in text for marker in transient_markers)
 
 
 def annotate_clips(
@@ -17348,6 +17434,8 @@ def build_parser() -> argparse.ArgumentParser:
     propose_single_source_parser.add_argument("--audio-dataset-line", choices=sorted(AUDIO_DATASET_LINE_NAMES), default=STANDARD_AUDIO_DATASET_LINE)
     propose_single_source_parser.add_argument("--accepted-progress-path")
     propose_single_source_parser.add_argument("--rejected-progress-path")
+    propose_single_source_parser.add_argument("--omni-retries", type=int, default=0)
+    propose_single_source_parser.add_argument("--fail-on-transient-omni-errors", action="store_true")
 
     propose_pairs_parser = subparsers.add_parser("propose-pairs")
     propose_pairs_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -17652,6 +17740,8 @@ def main() -> None:
             audio_dataset_line=args.audio_dataset_line,
             accepted_progress_path=args.accepted_progress_path,
             rejected_progress_path=args.rejected_progress_path,
+            omni_retries=args.omni_retries,
+            fail_on_transient_omni_errors=args.fail_on_transient_omni_errors,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

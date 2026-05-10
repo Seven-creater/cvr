@@ -1310,6 +1310,7 @@ class OpenAIComposedDataClient:
         candidate: dict[str, Any] | None = None,
         audio_dataset_line: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        line = _normalize_audio_dataset_line(audio_dataset_line)
         raw_payload = self._request_json(
             user_content=_build_single_source_pair_user_content(
                 reference_clip_path=reference_clip_path,
@@ -1319,8 +1320,8 @@ class OpenAIComposedDataClient:
                 whole_annotation=whole_annotation,
                 candidate=candidate,
             ),
-            system_prompt=_single_source_pair_system_prompt(audio_dataset_line),
-            max_tokens=1500,
+            system_prompt=_single_source_pair_system_prompt(line),
+            max_tokens=1800 if line == "speech_audio_content" else 1500,
         )
         return _normalize_single_source_pair_payload(raw_payload), raw_payload
 
@@ -1534,7 +1535,7 @@ class OpenAIComposedDataClient:
                 raw_response = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"composed data request failed: {detail}") from exc
+            raise RuntimeError(f"composed data request failed: HTTP {exc.code}: {detail}") from exc
         content = raw_response["choices"][0]["message"]["content"]
         payload = _extract_json(content)
         if not isinstance(payload, dict):

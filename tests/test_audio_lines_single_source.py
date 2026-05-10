@@ -194,6 +194,15 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                         "target_video": "clips/anchor_bright.mp4",
                         "difference": {"type": "attribute", "from": "blue backdrop", "to": "brighter blue backdrop"},
                     },
+                    {
+                        "candidate_id": "attribute_mislabeled_high",
+                        "proposal_id": "attribute_mislabeled_high",
+                        "reference_clip_id": "anchor",
+                        "target_clip_id": "flood",
+                        "reference_video": "clips/anchor.mp4",
+                        "target_video": "clips/flood.mp4",
+                        "difference": {"type": "attribute", "from": "studio anchor", "to": "flood aerial"},
+                    },
                 ],
             )
 
@@ -210,7 +219,7 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
 
             a_records = [json.loads(line) for line in a_path.read_text(encoding="utf-8").splitlines() if line.strip()]
             self.assertEqual("v4_strict", summary["audio_line_quality_profile"])
-            self.assertEqual(["scene_ok"], [record["candidate_id"] for record in a_records])
+            self.assertEqual({"scene_ok", "attribute_mislabeled_high"}, {record["candidate_id"] for record in a_records})
             self.assertGreaterEqual(a_records[0]["quality"]["visual_delta_strength"], 0.45)
 
     def test_v4_strict_b_line_requires_similar_visual_context_and_concrete_audio(self) -> None:
@@ -404,6 +413,79 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual(1, summary["accepted_count"])
             self.assertEqual("speech_audio_content", accepted[0]["audio_dataset_line"])
             self.assertEqual("speech", accepted[0]["difference"]["type"])
+
+    def test_propose_single_source_pairs_does_not_cache_transient_omni_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"video")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            ranked_path = root / "pairs" / "ranked.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "seg_1",
+                        "output_path": "clips/seg_1.mp4",
+                        "summary": "cricket match with commentary",
+                        "speech": ["commentary about the first batter"],
+                        "speakers_and_transcript": ["commentator: first batter"],
+                        "audio_events": ["commentary"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "seg_2",
+                        "output_path": "clips/seg_2.mp4",
+                        "summary": "cricket match with crowd cheering",
+                        "speech": ["commentary about the second batter"],
+                        "speakers_and_transcript": ["commentator: second batter"],
+                        "audio_events": ["crowd cheering", "commentary"],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "b1",
+                        "proposal_id": "b1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "first batter", "to": "second batter"},
+                        "quality": {"audio_line_quality_profile": "v4_strict", "visual_context_similarity": 0.5},
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_single_source_pair.side_effect = ConnectionRefusedError("Connection refused")
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                with self.assertRaises(ConnectionRefusedError):
+                    propose_single_source_pairs(
+                        root=root,
+                        clip_annotations_path=annotations_path,
+                        pair_candidates_path=candidates_path,
+                        output_path=ranked_path,
+                        accepted_output_path=root / "pairs" / "accepted.jsonl",
+                        base_url="http://127.0.0.1:8093/v1",
+                        api_key="EMPTY",
+                        model="qwen3-omni",
+                        acceptance_profile="exploration",
+                        audio_dataset_line="speech_audio_content",
+                        omni_retries=1,
+                        fail_on_transient_omni_errors=True,
+                    )
+
+            ranked_rows = [line for line in ranked_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual([], ranked_rows)
 
     def test_merge_line_results_uses_progress_when_ranked_file_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

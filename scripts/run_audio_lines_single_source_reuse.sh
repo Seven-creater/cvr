@@ -31,6 +31,8 @@ ANNOTATION_TIMEOUT_SECONDS=${ANNOTATION_TIMEOUT_SECONDS:-900}
 MIN_AUDIO_ANCHOR_SCORE=${MIN_AUDIO_ANCHOR_SCORE:-0.86}
 AUDIO_LINE_QUALITY_PROFILE=${AUDIO_LINE_QUALITY_PROFILE:-default}
 FORCE_AUDIO_FOCUSED_REFRESH=${FORCE_AUDIO_FOCUSED_REFRESH:-0}
+OMNI_TRANSIENT_RETRIES=${OMNI_TRANSIENT_RETRIES:-2}
+FAIL_ON_TRANSIENT_OMNI_ERRORS=${FAIL_ON_TRANSIENT_OMNI_ERRORS:-1}
 
 usage() {
   cat <<'EOF'
@@ -52,6 +54,8 @@ Options:
   --shard-timeout-seconds N
   --audio-line-quality-profile default|v4_strict
   --force-audio-focused-refresh
+  --omni-transient-retries N
+  --allow-transient-omni-fallback
   --concurrency N
   -h, --help
 EOF
@@ -74,6 +78,8 @@ while [[ $# -gt 0 ]]; do
     --shard-timeout-seconds) SHARD_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --audio-line-quality-profile) AUDIO_LINE_QUALITY_PROFILE="$2"; shift 2 ;;
     --force-audio-focused-refresh) FORCE_AUDIO_FOCUSED_REFRESH=1; shift ;;
+    --omni-transient-retries) OMNI_TRANSIENT_RETRIES="$2"; shift 2 ;;
+    --allow-transient-omni-fallback) FAIL_ON_TRANSIENT_OMNI_ERRORS=0; shift ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[audio-lines] unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -171,7 +177,9 @@ run_line_shards() {
         --max-accepted-pairs "$max_accepted" \
         --zero-accepted-stop-after 0 \
         --acceptance-profile "$acceptance_profile" \
-        --audio-dataset-line "$line_mode"
+        --audio-dataset-line "$line_mode" \
+        --omni-retries "$OMNI_TRANSIENT_RETRIES" \
+        $(if [ "$FAIL_ON_TRANSIENT_OMNI_ERRORS" = "1" ]; then printf '%s' '--fail-on-transient-omni-errors'; fi)
       status=$?
       set -e
       if [ "$status" -eq 0 ]; then
@@ -206,7 +214,7 @@ run_line_shards() {
 mkdir -p "$RUN_ROOT" "$REPO_ROOT/logs"
 echo "[audio-lines] start $(date)"
 echo "[audio-lines] run_root=$RUN_ROOT root=$ROOT single_source_root=$SINGLE_SOURCE_ROOT line=$AUDIO_DATASET_LINE"
-echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS shard_timeout_seconds=$SHARD_TIMEOUT_SECONDS audio_line_quality_profile=$AUDIO_LINE_QUALITY_PROFILE force_audio_focused_refresh=$FORCE_AUDIO_FOCUSED_REFRESH"
+echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS shard_timeout_seconds=$SHARD_TIMEOUT_SECONDS audio_line_quality_profile=$AUDIO_LINE_QUALITY_PROFILE force_audio_focused_refresh=$FORCE_AUDIO_FOCUSED_REFRESH omni_transient_retries=$OMNI_TRANSIENT_RETRIES fail_on_transient_omni_errors=$FAIL_ON_TRANSIENT_OMNI_ERRORS"
 resolve_omni_model
 
 SEGMENTS_MANIFEST="$RUN_ROOT/extracted_single_source_clips.jsonl"
