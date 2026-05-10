@@ -26,6 +26,7 @@ PROPOSE_SHARDS=${PROPOSE_SHARDS:-16}
 PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-16}
 CONCURRENCY=${CONCURRENCY:-8}
 REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-90}
+SHARD_TIMEOUT_SECONDS=${SHARD_TIMEOUT_SECONDS:-3600}
 ANNOTATION_TIMEOUT_SECONDS=${ANNOTATION_TIMEOUT_SECONDS:-900}
 MIN_AUDIO_ANCHOR_SCORE=${MIN_AUDIO_ANCHOR_SCORE:-0.86}
 
@@ -46,6 +47,7 @@ Options:
   --propose-shards N
   --propose-parallel-jobs N
   --request-timeout-seconds N
+  --shard-timeout-seconds N
   --concurrency N
   -h, --help
 EOF
@@ -65,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     --propose-shards) PROPOSE_SHARDS="$2"; shift 2 ;;
     --propose-parallel-jobs) PROPOSE_PARALLEL_JOBS="$2"; shift 2 ;;
     --request-timeout-seconds) REQUEST_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --shard-timeout-seconds) SHARD_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[audio-lines] unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -133,6 +136,7 @@ run_line_shards() {
   local max_accepted="$7"
   mkdir -p "$shard_dir/logs"
   local active=0
+  local failed=0
   shopt -s nullglob
   for shard in "$shard_dir"/"${ranked_prefix}"_shard_*.jsonl; do
     local rows
@@ -144,7 +148,8 @@ run_line_shards() {
     shard_id=$(basename "$shard" .jsonl | sed "s/${ranked_prefix}_shard_//")
     (
       echo "[audio-lines] $line_name shard=$shard_id rows=$rows start $(date)"
-      python3 -m app.composed_data propose-single-source-pairs \
+      set +e
+      timeout "$SHARD_TIMEOUT_SECONDS" python3 -m app.composed_data propose-single-source-pairs \
         --root "$ROOT" \
         --clip-annotations-path "$SEGMENT_ANNOTATIONS" \
         --pair-candidates-path "$shard" \
@@ -161,22 +166,41 @@ run_line_shards() {
         --zero-accepted-stop-after 0 \
         --acceptance-profile "$acceptance_profile" \
         --audio-dataset-line "$line_mode"
-      echo "[audio-lines] $line_name shard=$shard_id done $(date)"
+      status=$?
+      set -e
+      if [ "$status" -eq 0 ]; then
+        echo "[audio-lines] $line_name shard=$shard_id done $(date)"
+      elif [ "$status" -eq 124 ]; then
+        echo "[audio-lines] WARN $line_name shard=$shard_id timed out after ${SHARD_TIMEOUT_SECONDS}s $(date)" >&2
+      else
+        echo "[audio-lines] WARN $line_name shard=$shard_id failed status=$status $(date)" >&2
+      fi
+      exit "$status"
     ) > "$shard_dir/logs/${line_name}_${shard_id}.log" 2>&1 &
     active=$((active + 1))
     if [ "$active" -ge "$PROPOSE_PARALLEL_JOBS" ]; then
-      wait -n
+      if ! wait -n; then
+        failed=$((failed + 1))
+      fi
       active=$((active - 1))
     fi
   done
   shopt -u nullglob
-  wait
+  while [ "$active" -gt 0 ]; do
+    if ! wait -n; then
+      failed=$((failed + 1))
+    fi
+    active=$((active - 1))
+  done
+  if [ "$failed" -gt 0 ]; then
+    echo "[audio-lines] WARN $line_name completed with failed_or_timed_out_shards=$failed; continuing with progress files" >&2
+  fi
 }
 
 mkdir -p "$RUN_ROOT" "$REPO_ROOT/logs"
 echo "[audio-lines] start $(date)"
 echo "[audio-lines] run_root=$RUN_ROOT root=$ROOT single_source_root=$SINGLE_SOURCE_ROOT line=$AUDIO_DATASET_LINE"
-echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS"
+echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS shard_timeout_seconds=$SHARD_TIMEOUT_SECONDS"
 resolve_omni_model
 
 SEGMENTS_MANIFEST="$RUN_ROOT/extracted_single_source_clips.jsonl"

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from app.audio_lines_single_source import (
+    merge_line_results,
     prepare_existing_single_source_clips,
     split_audio_line_candidates,
 )
@@ -240,6 +241,48 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual(1, summary["accepted_count"])
             self.assertEqual("speech_audio_content", accepted[0]["audio_dataset_line"])
             self.assertEqual("speech", accepted[0]["difference"]["type"])
+
+    def test_merge_line_results_uses_progress_when_ranked_file_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_root = root / "runs" / "audio_lines"
+            self._write_jsonl(
+                run_root / "a_shards" / "accepted_progress_01.jsonl",
+                [
+                    {
+                        "proposal_id": "a1",
+                        "accepted": True,
+                        "edit_text": "add a red sign",
+                        "reference_clip_id": "a_ref",
+                        "target_clip_id": "a_target",
+                    }
+                ],
+            )
+            self._write_jsonl(
+                run_root / "a_shards" / "rejected_progress_01.jsonl",
+                [{"proposal_id": "a2", "accepted": False, "judge": {"reject_reason": "weak visual delta"}}],
+            )
+            self._write_jsonl(
+                run_root / "b_shards" / "accepted_progress_01.jsonl",
+                [
+                    {
+                        "proposal_id": "b1",
+                        "accepted": True,
+                        "edit_text": "change the spoken sentence",
+                        "reference_clip_id": "b_ref",
+                        "target_clip_id": "b_target",
+                    }
+                ],
+            )
+
+            summary = merge_line_results(run_root=run_root, target_a_count=8, target_b_count=8)
+
+            a_exported = [json.loads(line) for line in (run_root / "a_visual_audio_anchor_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            b_exported = [json.loads(line) for line in (run_root / "b_speech_audio_content_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(2, summary["a_ranked_count"])
+            self.assertEqual(1, summary["b_ranked_count"])
+            self.assertEqual(["a1"], [record["proposal_id"] for record in a_exported])
+            self.assertEqual(["b1"], [record["proposal_id"] for record in b_exported])
 
 
 if __name__ == "__main__":

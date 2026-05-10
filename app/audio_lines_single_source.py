@@ -316,8 +316,12 @@ def merge_line_results(
     target_b_count: int = 8,
 ) -> dict[str, Any]:
     root = Path(run_root)
-    a_ranked = _load_many_jsonl(root / "a_shards", "ranked_*.jsonl")
-    b_ranked = _load_many_jsonl(root / "b_shards", "ranked_*.jsonl")
+    a_accepted_progress = _load_many_jsonl(root / "a_shards", "accepted_progress_*.jsonl")
+    a_rejected_progress = _load_many_jsonl(root / "a_shards", "rejected_progress_*.jsonl")
+    b_accepted_progress = _load_many_jsonl(root / "b_shards", "accepted_progress_*.jsonl")
+    b_rejected_progress = _load_many_jsonl(root / "b_shards", "rejected_progress_*.jsonl")
+    a_ranked = _dedupe_line_records(_load_many_jsonl(root / "a_shards", "ranked_*.jsonl") + a_accepted_progress + a_rejected_progress)
+    b_ranked = _dedupe_line_records(_load_many_jsonl(root / "b_shards", "ranked_*.jsonl") + b_accepted_progress + b_rejected_progress)
     a_accepted_all = [record for record in a_ranked if bool(record.get("accepted"))]
     b_accepted_all = [record for record in b_ranked if bool(record.get("accepted"))]
     a_selected = a_accepted_all[: max(0, target_a_count)]
@@ -326,10 +330,10 @@ def merge_line_results(
     _write_jsonl(root / "b_ranked_single_source_pairs.jsonl", b_ranked)
     _write_jsonl(root / "a_visual_audio_anchor_triplets.jsonl", a_selected)
     _write_jsonl(root / "b_speech_audio_content_triplets.jsonl", b_selected)
-    _write_jsonl(root / "a_accepted.progress.jsonl", _load_many_jsonl(root / "a_shards", "accepted_progress_*.jsonl"))
-    _write_jsonl(root / "a_rejected.progress.jsonl", _load_many_jsonl(root / "a_shards", "rejected_progress_*.jsonl"))
-    _write_jsonl(root / "b_accepted.progress.jsonl", _load_many_jsonl(root / "b_shards", "accepted_progress_*.jsonl"))
-    _write_jsonl(root / "b_rejected.progress.jsonl", _load_many_jsonl(root / "b_shards", "rejected_progress_*.jsonl"))
+    _write_jsonl(root / "a_accepted.progress.jsonl", a_accepted_progress)
+    _write_jsonl(root / "a_rejected.progress.jsonl", a_rejected_progress)
+    _write_jsonl(root / "b_accepted.progress.jsonl", b_accepted_progress)
+    _write_jsonl(root / "b_rejected.progress.jsonl", b_rejected_progress)
     summary = {
         "run_root": str(root),
         "a_ranked_count": len(a_ranked),
@@ -345,6 +349,23 @@ def merge_line_results(
     }
     (root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return summary
+
+
+def _dedupe_line_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, record in enumerate(records):
+        key = str(
+            record.get("proposal_id")
+            or record.get("candidate_id")
+            or record.get("sample_id")
+            or f"{record.get('reference_clip_id', '')}->{record.get('target_clip_id', '')}:{index}"
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(record)
+    return selected
 
 
 def _run_paths(root: Path) -> dict[str, Path]:
