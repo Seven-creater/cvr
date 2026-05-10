@@ -9448,6 +9448,71 @@ class ComposedDataTests(unittest.TestCase):
             self.assertIn("sample_1", (output_dir / "index.md").read_text(encoding="utf-8"))
             self.assertIn("complete", (output_dir / "index.md").read_text(encoding="utf-8"))
 
+    def test_build_manual_review_bundle_includes_audio_anchor_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "clips").mkdir(parents=True)
+            (root / "clips" / "ref.mp4").write_bytes(b"reference-video")
+            (root / "clips" / "target.mp4").write_bytes(b"target-video")
+            pairs_path = root / "accepted_audio_matters.jsonl"
+            self._write_jsonl(
+                pairs_path,
+                [
+                    {
+                        "sample_id": "audio_sample",
+                        "proposal_id": "proposal__audio",
+                        "reference_video": "clips/ref.mp4",
+                        "target_video": "clips/target.mp4",
+                        "edit_text": "replace the white stuffed animal with a panda-shaped accessory",
+                        "difference": {"type": "object_presence", "from": "white stuffed animal", "to": "panda accessory"},
+                        "reference_caption": "A girl sits with a white stuffed animal in the frame.",
+                        "target_caption": "A girl appears with a panda-shaped accessory in the frame.",
+                        "quality": {
+                            "audio_anchor_required": 1.0,
+                            "audio_anchor_score": 0.987,
+                            "audio_anchor_context_score": 0.91,
+                            "audio_anchor_min_rms": 0.04,
+                            "audio_matters_warnings": ["competing_difference_review"],
+                            "edit_primary_modality": "visual",
+                        },
+                        "source_context": {"audio_anchor_type": "similar_or_same_natural_audio"},
+                        "judge": {"accept": True},
+                        "verification": {"passed": True},
+                        "observable_difference": {"passed": True},
+                        "competing_difference": {"passed": False},
+                    }
+                ],
+            )
+            output_dir = root / "manual_review"
+
+            summary = build_manual_review_bundle(
+                root=root,
+                pairs_path=pairs_path,
+                output_dir=output_dir,
+            )
+
+            self.assertEqual(1, summary["bundle_count"])
+            item_dir = output_dir / "0001_audio_sample"
+            metadata = json.loads((item_dir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(0.987, metadata["quality"]["audio_anchor_score"])
+            self.assertEqual(0.987, metadata["audio_anchor_score"])
+            self.assertTrue(metadata["audio_anchor"]["audio_anchor_required"])
+            self.assertEqual("similar_or_same_natural_audio", metadata["audio_anchor_type"])
+            self.assertEqual(["competing_difference_review"], metadata["audio_matters_warnings"])
+            review_text = (item_dir / "review.md").read_text(encoding="utf-8")
+            self.assertIn("audio_anchor_score", review_text)
+            self.assertIn("0.987", review_text)
+            description_text = (item_dir / "description.md").read_text(encoding="utf-8")
+            self.assertIn("audio_anchor", description_text)
+            index_text = (output_dir / "index.md").read_text(encoding="utf-8")
+            self.assertIn("0.987", index_text)
+            review_items = [
+                json.loads(line)
+                for line in (output_dir / "review_items.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(0.987, review_items[0]["audio_anchor_score"])
+
     def test_build_manual_review_bundle_marks_incomplete_visual_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

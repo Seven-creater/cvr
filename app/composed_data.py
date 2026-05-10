@@ -5465,6 +5465,45 @@ def _manual_review_bundle_issues(metadata: dict[str, Any]) -> list[str]:
     return issues
 
 
+def _audio_anchor_review_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    quality = record.get("quality", {}) if isinstance(record.get("quality"), dict) else {}
+    heuristic_quality = record.get("heuristic_quality", {}) if isinstance(record.get("heuristic_quality"), dict) else {}
+    source_context = record.get("source_context", {}) if isinstance(record.get("source_context"), dict) else {}
+    containers = [quality, heuristic_quality, source_context]
+
+    def first_present(key: str) -> Any:
+        for container in containers:
+            value = container.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            return value
+        return None
+
+    raw_score = first_present("audio_anchor_score")
+    raw_required = first_present("audio_anchor_required")
+    raw_type = first_present("audio_anchor_type")
+    if raw_score is None and raw_required is None and raw_type is None:
+        return {}
+
+    audio_anchor: dict[str, Any] = {
+        "audio_anchor_score": _score_float(raw_score) if raw_score is not None else None,
+        "audio_anchor_required": (_score_float(raw_required) >= 1.0) if raw_required is not None else bool(raw_score is not None),
+        "audio_anchor_type": str(raw_type or "similar_or_same_natural_audio").strip(),
+        "edit_primary_modality": str(first_present("edit_primary_modality") or "").strip(),
+    }
+    for key in ("audio_anchor_context_score", "audio_anchor_min_rms"):
+        value = first_present(key)
+        if value is not None:
+            audio_anchor[key] = _score_float(value)
+    warnings = first_present("audio_matters_warnings")
+    if warnings is None:
+        warnings = first_present("exploration_warnings")
+    audio_anchor["audio_matters_warnings"] = _normalize_list(warnings)
+    return audio_anchor
+
+
 def build_manual_review_bundle(
     *,
     root: str | Path,
@@ -5588,6 +5627,12 @@ def build_manual_review_bundle(
             else:
                 missing_videos.append(str(review_inputs_path or review_inputs_dir))
 
+        quality = record.get("quality", {}) if isinstance(record.get("quality"), dict) else {}
+        heuristic_quality = record.get("heuristic_quality", {}) if isinstance(record.get("heuristic_quality"), dict) else {}
+        source_context = record.get("source_context", {}) if isinstance(record.get("source_context"), dict) else {}
+        judge = record.get("judge", {}) if isinstance(record.get("judge"), dict) else {}
+        audio_anchor = _audio_anchor_review_metadata(record)
+
         metadata = {
             "index": index,
             "sample_id": sample_id,
@@ -5609,6 +5654,14 @@ def build_manual_review_bundle(
             "verification": record.get("verification", {}),
             "observable_difference": record.get("observable_difference", {}),
             "competing_difference": record.get("competing_difference", {}),
+            "quality": quality,
+            "heuristic_quality": heuristic_quality,
+            "source_context": source_context,
+            "judge": judge,
+            "audio_anchor": audio_anchor,
+            "audio_anchor_score": audio_anchor.get("audio_anchor_score"),
+            "audio_anchor_type": audio_anchor.get("audio_anchor_type", ""),
+            "audio_matters_warnings": audio_anchor.get("audio_matters_warnings", []),
             "generation": generation,
             "src_ref_images": src_ref_images,
             "copied_src_ref_images": copied_src_ref_images,
@@ -5673,6 +5726,7 @@ def build_manual_review_bundle(
                 "target_video": str(target_copy if copy_videos and target_copy.exists() else target_path),
                 "incomplete_review_bundle": bool(review_bundle_issues),
                 "review_bundle_issues": review_bundle_issues,
+                "audio_anchor_score": audio_anchor.get("audio_anchor_score"),
             }
         )
 
@@ -13352,6 +13406,7 @@ def _manual_review_item_markdown(
     verification = metadata.get("verification") if isinstance(metadata.get("verification"), dict) else {}
     observable = metadata.get("observable_difference") if isinstance(metadata.get("observable_difference"), dict) else {}
     competing = metadata.get("competing_difference") if isinstance(metadata.get("competing_difference"), dict) else {}
+    audio_anchor = metadata.get("audio_anchor") if isinstance(metadata.get("audio_anchor"), dict) else {}
     lines = [
         f"# {metadata.get('index')}. {metadata.get('sample_id')} | {difference.get('type', '')}",
         "",
@@ -13364,6 +13419,15 @@ def _manual_review_item_markdown(
         f"- verification.passed: `{verification.get('passed')}`",
         f"- observable_difference.passed: `{observable.get('passed')}`",
         f"- competing_difference.passed: `{competing.get('passed')}`",
+        *(
+            [
+                f"- audio_anchor_score: `{metadata.get('audio_anchor_score')}`",
+                f"- audio_anchor_type: `{metadata.get('audio_anchor_type', '')}`",
+                f"- audio_matters_warnings: `{json.dumps(metadata.get('audio_matters_warnings', []), ensure_ascii=False)}`",
+            ]
+            if audio_anchor
+            else []
+        ),
         f"- src_ref_images: `{json.dumps(metadata.get('src_ref_images', []), ensure_ascii=False)}`",
         f"- src_mask: `{metadata.get('src_mask', '')}`",
         f"- src_video_for_vace: `{metadata.get('src_video_for_vace', '')}`",
@@ -13444,6 +13508,7 @@ def _manual_review_description_markdown(metadata: dict[str, Any]) -> str:
     target_description = metadata.get("target_omni_description", {})
     dominant_delta = metadata.get("dominant_delta_decision", {})
     difference = metadata.get("difference") if isinstance(metadata.get("difference"), dict) else {}
+    audio_anchor = metadata.get("audio_anchor") if isinstance(metadata.get("audio_anchor"), dict) else {}
     lines = [
         f"# Pair Description: {metadata.get('sample_id', '')}",
         "",
@@ -13451,6 +13516,11 @@ def _manual_review_description_markdown(metadata: dict[str, Any]) -> str:
         f"- difference: `{json.dumps(difference, ensure_ascii=False)}`",
         f"- dominant_delta_decision: `{json.dumps(dominant_delta, ensure_ascii=False)}`",
         f"- secondary_deltas: `{json.dumps(metadata.get('secondary_deltas', []), ensure_ascii=False)}`",
+        *(
+            [f"- audio_anchor: `{json.dumps(audio_anchor, ensure_ascii=False)}`"]
+            if audio_anchor
+            else []
+        ),
         "",
         "## Reference Omni Description",
         "",
@@ -13486,13 +13556,15 @@ def _manual_review_index_markdown(
         "",
         "## Samples",
         "",
-        "| # | sample_id | type | status | edit_text | folder |",
-        "|---|-----------|------|--------|-----------|--------|",
+        "| # | sample_id | type | audio | status | edit_text | folder |",
+        "|---|-----------|------|-------|--------|-----------|--------|",
     ]
     for item in items:
         status = "incomplete" if item.get("incomplete_review_bundle") else "complete"
+        audio_score = item.get("audio_anchor_score")
+        audio_text = "" if audio_score is None else f"{_score_float(audio_score):.3f}"
         lines.append(
-            f"| {item['index']} | `{item['sample_id']}` | `{item.get('difference_type', '')}` | "
+            f"| {item['index']} | `{item['sample_id']}` | `{item.get('difference_type', '')}` | {audio_text} | "
             f"{status} | {item.get('edit_text', '')} | `{Path(item['item_dir']).name}` |"
         )
     if missing_videos:
