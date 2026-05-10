@@ -15,7 +15,7 @@ from typing import Any, Callable
 import numpy as np
 
 from app.composed_data import (
-    DEFAULT_ACCEPTANCE_PROFILE,
+    AUDIO_MATTERS_ACCEPTANCE_PROFILE,
     _action_evidence_score,
     _build_proposal_id,
     _candidate_composite_score,
@@ -161,7 +161,7 @@ def mine_audio_matters_candidates(
     ffmpeg: str = "ffmpeg",
     sample_rate: int = 16000,
     max_audio_seconds: float = 8.0,
-    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
+    acceptance_profile: str = AUDIO_MATTERS_ACCEPTANCE_PROFILE,
     audio_workers: int = 1,
     audio_feature_loader: Callable[[Path], AudioFeature | None] | None = None,
 ) -> dict[str, Any]:
@@ -815,7 +815,7 @@ def merge_pair_proposals(
     accepted_output_path: str | Path,
     summary_path: str | Path | None = None,
     max_accepted_pairs: int = 80,
-    acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
+    acceptance_profile: str = AUDIO_MATTERS_ACCEPTANCE_PROFILE,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -916,7 +916,7 @@ def _build_parser() -> argparse.ArgumentParser:
     mine_parser.add_argument("--ffmpeg", default="ffmpeg")
     mine_parser.add_argument("--sample-rate", type=int, default=16000)
     mine_parser.add_argument("--max-audio-seconds", type=float, default=8.0)
-    mine_parser.add_argument("--acceptance-profile", default=DEFAULT_ACCEPTANCE_PROFILE)
+    mine_parser.add_argument("--acceptance-profile", default=AUDIO_MATTERS_ACCEPTANCE_PROFILE)
     mine_parser.add_argument("--audio-workers", type=int, default=1)
 
     export_parser = subparsers.add_parser("export-triplets")
@@ -939,7 +939,7 @@ def _build_parser() -> argparse.ArgumentParser:
     merge_parser.add_argument("--accepted-output-path", required=True)
     merge_parser.add_argument("--summary-path", required=True)
     merge_parser.add_argument("--max-accepted-pairs", type=int, default=80)
-    merge_parser.add_argument("--acceptance-profile", default=DEFAULT_ACCEPTANCE_PROFILE)
+    merge_parser.add_argument("--acceptance-profile", default=AUDIO_MATTERS_ACCEPTANCE_PROFILE)
     return parser
 
 

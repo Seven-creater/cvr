@@ -34,7 +34,7 @@ MIN_AUDIO_ANCHOR_SCORE=${MIN_AUDIO_ANCHOR_SCORE:-0.86}
 MIN_AUDIO_RMS=${MIN_AUDIO_RMS:-0.001}
 MIN_DIFFERENCE_STRENGTH=${MIN_DIFFERENCE_STRENGTH:-0.60}
 MAX_LOCAL_COMPARISONS=${MAX_LOCAL_COMPARISONS:-20000}
-ACCEPTANCE_PROFILE=${ACCEPTANCE_PROFILE:-final}
+ACCEPTANCE_PROFILE=${ACCEPTANCE_PROFILE:-audio_matters}
 ALLOW_PARTIAL_ANNOTATIONS=${ALLOW_PARTIAL_ANNOTATIONS:-0}
 SKIP_REVIEW_BUNDLE=${SKIP_REVIEW_BUNDLE:-0}
 MODEL_STAGE=${MODEL_STAGE:-instruct}
@@ -72,7 +72,7 @@ Options:
   --min-audio-rms FLOAT
   --min-difference-strength FLOAT
   --max-local-comparisons N
-  --acceptance-profile exploration|final
+  --acceptance-profile audio_matters|exploration|final
   --allow-partial-annotations
   --skip-review-bundle
   --model-stage VALUE

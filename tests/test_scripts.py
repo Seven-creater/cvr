@@ -718,6 +718,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("merge-proposals", script)
         self.assertIn("--propose-shards", script)
         self.assertIn("--propose-parallel-jobs", script)
+        self.assertIn("ACCEPTANCE_PROFILE=${ACCEPTANCE_PROFILE:-audio_matters}", script)
         self.assertIn("--accepted-progress-path", script)
         self.assertIn("accepted_audio_matters_pairs.progress.jsonl", script)
         self.assertIn("ACCEPTED_SAMPLE", Path("app/composed_data.py").read_text(encoding="utf-8"))

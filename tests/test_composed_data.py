@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from app.composed_data import (
+    AUDIO_MATTERS_ACCEPTANCE_PROFILE,
     _accepted_sample_from_record,
     _action_evidence_score,
     _annotation_prompt_view,
@@ -39,6 +40,7 @@ from app.composed_data import (
     _prepare_record_for_acceptance,
     _repair_pair_model_fields,
     _select_final_accepted_records,
+    _should_skip_pair_video_verification,
     _build_fallback_edit_text,
     _speech_evidence_score,
     _speech_specificity_score,
@@ -4922,6 +4924,82 @@ class ComposedDataTests(unittest.TestCase):
         self.assertTrue(prepared["verification"]["passed"])
         self.assertEqual(0.9, prepared["quality"]["edit_match_score"])
         self.assertTrue(_judge_accepts(prepared["judge"], prepared["verification"], prepared["quality"]))
+
+    def test_audio_matters_profile_keeps_audio_anchor_and_softens_multi_delta_gate(self) -> None:
+        judge = {
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "single_main_difference": False,
+            "same_context_score": 0.70,
+            "edit_match_score": 0.62,
+            "target_uniqueness_score": 0.70,
+            "audio_required": False,
+            "hard_negative_quality": "weak",
+            "accept": False,
+        }
+        verification = {
+            "caption_delta": {
+                "caption_equivalent": False,
+                "has_concrete_difference": True,
+                "difference_matches_edit": True,
+            },
+            "edit_projection": {"target_matches_projection": True, "score": 0.62},
+            "edit_necessity": {
+                "edit_needed": True,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "score": 0.62,
+            },
+            "edit_text_quality_check": {
+                "not_caption_like": True,
+                "matches_modality": True,
+                "single_primary_difference": True,
+                "reference_does_not_satisfy": True,
+                "target_satisfies": True,
+                "score": 0.80,
+            },
+        }
+        heuristic_quality = {
+            "same_context_score": 0.70,
+            "edit_match_score": 0.62,
+            "target_uniqueness_score": 0.70,
+            "difference_strength_score": 0.68,
+            "difference_type": "object_presence",
+            "audio_anchor_required": 1.0,
+            "audio_anchor_score": 0.93,
+            "audio_anchor_context_score": 0.91,
+            "audio_anchor_min_rms": 0.04,
+            "edit_primary_modality": "visual",
+            "edit_text_quality_score": 0.80,
+            "edit_text_is_imperative": 1.0,
+            "edit_text_matches_difference_type": 1.0,
+            "edit_text_single_change": 1.0,
+            "edit_text_not_caption_like": 1.0,
+            "edit_text_no_modality_leakage": 1.0,
+            "observable_difference_passed": 0.0,
+            "competing_difference_passed": 0.0,
+        }
+
+        quality = _effective_pair_quality(judge, verification, heuristic_quality)
+
+        self.assertEqual(0.93, quality["audio_anchor_score"])
+        self.assertTrue(
+            _judge_accepts(
+                judge,
+                verification,
+                quality,
+                acceptance_profile=AUDIO_MATTERS_ACCEPTANCE_PROFILE,
+            )
+        )
+        self.assertFalse(_judge_accepts(judge, verification, quality))
+        self.assertFalse(
+            _should_skip_pair_video_verification(
+                judge,
+                quality,
+                acceptance_profile=AUDIO_MATTERS_ACCEPTANCE_PROFILE,
+            )
+        )
+        self.assertTrue(_should_skip_pair_video_verification(judge, quality))
 
     def test_prepare_record_syncs_observable_difference_failure_into_verification(self) -> None:
         record = {

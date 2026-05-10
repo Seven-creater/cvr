@@ -866,7 +866,12 @@ MIN_TEMPLATE_TARGET_UNIQUENESS_SCORE = 0.75
 MIN_TEMPLATE_DIFFERENCE_STRENGTH_SCORE = 0.75
 DEFAULT_ACCEPTANCE_PROFILE = "final"
 EXPLORATION_ACCEPTANCE_PROFILE = "exploration"
-ACCEPTANCE_PROFILE_NAMES = {DEFAULT_ACCEPTANCE_PROFILE, EXPLORATION_ACCEPTANCE_PROFILE}
+AUDIO_MATTERS_ACCEPTANCE_PROFILE = "audio_matters"
+ACCEPTANCE_PROFILE_NAMES = {
+    DEFAULT_ACCEPTANCE_PROFILE,
+    EXPLORATION_ACCEPTANCE_PROFILE,
+    AUDIO_MATTERS_ACCEPTANCE_PROFILE,
+}
 ACCEPTANCE_PROFILE_CONFIGS = {
     DEFAULT_ACCEPTANCE_PROFILE: {
         "template_semantic_context_score": MIN_TEMPLATE_SEMANTIC_CONTEXT_SCORE,
@@ -901,6 +906,24 @@ ACCEPTANCE_PROFILE_CONFIGS = {
         "action_evidence_score": 0.45,
         "non_speech_audio_event_score": 0.45,
         "edit_text_quality_score": 0.55,
+    },
+    AUDIO_MATTERS_ACCEPTANCE_PROFILE: {
+        "template_semantic_context_score": 0.25,
+        "template_compatibility_score": 0.55,
+        "template_clean_stability_score": 0.55,
+        "template_single_delta_bundle_score": 0.40,
+        "template_target_uniqueness_score": 0.40,
+        "template_difference_strength_score": 0.50,
+        "same_context_score": 0.45,
+        "edit_match_score": 0.45,
+        "target_uniqueness_score": 0.40,
+        "difference_strength_score": 0.50,
+        "edit_necessity_score": 0.50,
+        "edit_target_alignment_score": 0.50,
+        "action_evidence_score": 0.40,
+        "non_speech_audio_event_score": 0.45,
+        "edit_text_quality_score": 0.55,
+        "audio_anchor_score": 0.86,
     },
 }
 SAME_TEMPLATE_CLUSTER_RELATION = "same_template_cluster"
@@ -945,6 +968,15 @@ def _profile_threshold(acceptance_profile: str | None, key: str) -> float:
 
 def _is_exploration_profile(acceptance_profile: str | None) -> bool:
     return _normalize_acceptance_profile(acceptance_profile) == EXPLORATION_ACCEPTANCE_PROFILE
+
+
+def _is_audio_matters_profile(acceptance_profile: str | None) -> bool:
+    return _normalize_acceptance_profile(acceptance_profile) == AUDIO_MATTERS_ACCEPTANCE_PROFILE
+
+
+def _uses_soft_local_gate_profile(acceptance_profile: str | None) -> bool:
+    profile = _normalize_acceptance_profile(acceptance_profile)
+    return profile in {EXPLORATION_ACCEPTANCE_PROFILE, AUDIO_MATTERS_ACCEPTANCE_PROFILE}
 SUBJECT_SIGNATURE_MARKER_TOKENS = {
     "bald",
     "beard",
@@ -3522,6 +3554,9 @@ def _candidate_from_mined_record(
         ("template_compatibility_score", "template_compatibility_score"),
         ("clean_stability_score", "clean_stability_score"),
         ("single_delta_bundle_score", "single_delta_bundle_score"),
+        ("audio_anchor_score", "audio_anchor_score"),
+        ("audio_anchor_context_score", "audio_anchor_context_score"),
+        ("audio_anchor_min_rms", "audio_anchor_min_rms"),
     ):
         if target_key not in quality and source_key in scores:
             quality[target_key] = _score_float(scores.get(source_key))
@@ -3570,6 +3605,7 @@ def _candidate_from_mined_record(
         "hard_negative_paths": hard_negative_paths,
         "mined_candidate": {
             "candidate_id": mined.get("candidate_id", ""),
+            "candidate_kind": mined.get("candidate_kind", ""),
             "risk_flags": list(mined.get("risk_flags", [])) if isinstance(mined.get("risk_flags"), list) else [],
             "scores": dict(scores),
         },
@@ -3952,7 +3988,9 @@ def propose_group_pairs(
                 fallback_used = proposal_fallback_used or judge_fallback_used or verification_fallback_used
                 effective_quality = _effective_pair_quality(judge, verification, proposal_quality)
                 accepted = _judge_accepts(judge, verification, effective_quality, acceptance_profile=acceptance_profile)
-                if not accepted:
+                if accepted:
+                    judge["reject_reason"] = ""
+                else:
                     judge["reject_reason"] = _compose_reject_reason(judge, verification, effective_quality)
                 speech_quality = _speech_quality_payload(effective_quality)
                 audio_event_quality = _audio_event_quality_payload(effective_quality)
@@ -4022,7 +4060,10 @@ def propose_group_pairs(
             verification = record.get("verification", {})
             quality = record.get("quality", {})
             record["accepted"] = _judge_accepts(judge, verification, quality, acceptance_profile=acceptance_profile)
-            if not bool(record.get("accepted")):
+            if bool(record.get("accepted")):
+                judge["reject_reason"] = ""
+                record["judge"] = judge
+            else:
                 judge["accept"] = False
                 judge["reject_reason"] = _compose_reject_reason(judge, verification, quality)
                 record["judge"] = judge
@@ -9809,13 +9850,16 @@ def _ensure_structured_gate_fields(
             verification=verification,
             audio_event_evidence=audio_event_evidence,
         )
-        if _is_exploration_profile(acceptance_profile):
-            quality["exploration_warnings"] = _dedupe_strings(
+        if _uses_soft_local_gate_profile(acceptance_profile):
+            soft_gate_warnings = _dedupe_strings(
                 _normalize_list(quality.get("exploration_warnings", []))
                 + _normalize_list(natural_pair_gate.get("failure_codes", []))
                 + ([] if bool(competing_difference.get("passed", True)) else ["competing_difference"])
                 + ([] if bool(audio_event_evidence.get("passed", True)) else ["audio_event_weak_evidence"])
             )
+            quality["exploration_warnings"] = soft_gate_warnings
+            if _is_audio_matters_profile(acceptance_profile):
+                quality["audio_matters_warnings"] = soft_gate_warnings
         else:
             _sync_local_gate_failure(
                 verification,
@@ -10006,10 +10050,16 @@ def _carry_local_gate_quality(target_quality: dict[str, Any], source_quality: di
         "synthetic_context_override",
         "acceptance_profile",
         "exploration_warnings",
+        "audio_matters_warnings",
         "exploration_verification_passed",
         "dominant_delta_type",
         "audio_primary_allowed",
+        "audio_anchor_required",
+        "audio_anchor_score",
+        "audio_anchor_context_score",
+        "audio_anchor_min_rms",
         "visual_competing_delta_score",
+        "edit_primary_modality",
         "dominant_delta_decision",
     ):
         if key in source_quality:
@@ -11797,11 +11847,15 @@ def _effective_pair_quality(
         "near_duplicate_without_delta",
         "synthetic_context_override",
         "audio_primary_allowed",
+        "audio_anchor_required",
+        "audio_anchor_score",
+        "audio_anchor_context_score",
+        "audio_anchor_min_rms",
         "visual_competing_delta_score",
     ):
         if key in heuristic_quality:
             result[key] = _score_float(heuristic_quality.get(key))
-    for key in ("dominant_delta_type", "dominant_delta_decision"):
+    for key in ("dominant_delta_type", "dominant_delta_decision", "edit_primary_modality"):
         if key in heuristic_quality:
             result[key] = heuristic_quality[key]
     return result
@@ -11922,13 +11976,21 @@ def _compose_reject_reason(
     if _score_float(quality.get("intraclip_change_conflict")) >= 1.0:
         failures.append("the proposed edit appears to describe an intra-clip transition instead of a cross-clip difference")
     failures.extend(_structured_edit_text_failures(quality))
-    if _observable_difference_rejects(quality):
-        failures.append("observable_difference gate found no concrete visual delta evidence")
-    failures.extend(_natural_pair_quality_failures(quality))
-    if _score_float(quality.get("competing_difference_passed", 1.0)) < 1.0:
-        failures.append("single_main_difference failed: competing stronger difference")
-    if _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0:
-        failures.append("audio_event lacks independent non-speech audio evidence")
+    if not _uses_soft_local_gate_profile(acceptance_profile):
+        if _observable_difference_rejects(quality):
+            failures.append("observable_difference gate found no concrete visual delta evidence")
+        failures.extend(_natural_pair_quality_failures(quality))
+        if _score_float(quality.get("competing_difference_passed", 1.0)) < 1.0:
+            failures.append("single_main_difference failed: competing stronger difference")
+        if _score_float(quality.get("audio_event_independent_evidence_passed", 1.0)) < 1.0:
+            failures.append("audio_event lacks independent non-speech audio evidence")
+    elif _is_audio_matters_profile(acceptance_profile):
+        audio_anchor_score = _score_float(quality.get("audio_anchor_score"))
+        audio_anchor_threshold = _profile_threshold(acceptance_profile, "audio_anchor_score")
+        if audio_anchor_score < audio_anchor_threshold:
+            failures.append(
+                f"audio_anchor_score {audio_anchor_score:.3f} is below {audio_anchor_threshold:.2f}"
+            )
     if verification is not None:
         failures.extend(_verification_failures(verification))
     if not judge.get("accept"):
@@ -11947,6 +12009,111 @@ def _compose_reject_reason(
     return "the pair was rejected without a structured reason from the judge"
 
 
+def _audio_matters_visual_difference_type(quality: dict[str, Any]) -> str:
+    difference_type = str(quality.get("difference_type", "")).strip()
+    if difference_type:
+        return difference_type
+    dominant_delta_type = str(quality.get("dominant_delta_type", "")).strip()
+    return dominant_delta_type
+
+
+def _audio_matters_base_quality_accepts(quality: dict[str, Any]) -> bool:
+    difference_type = _audio_matters_visual_difference_type(quality)
+    if difference_type not in DOMINANT_VISUAL_DIFFERENCE_TYPES:
+        return False
+    if difference_type in FINAL_DISABLED_DIFFERENCE_TYPES:
+        return False
+    if _score_float(quality.get("audio_anchor_required")) < 1.0:
+        return False
+    if _score_float(quality.get("audio_anchor_score")) < _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "audio_anchor_score"):
+        return False
+    if str(quality.get("edit_primary_modality", "visual")).strip() not in {"", "visual"}:
+        return False
+    if _score_float(quality.get("same_context_score")) < _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "same_context_score"):
+        return False
+    if _score_float(quality.get("edit_match_score")) < _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "edit_match_score"):
+        return False
+    if _score_float(quality.get("target_uniqueness_score")) < _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "target_uniqueness_score"):
+        return False
+    if (
+        "difference_strength_score" in quality
+        and _score_float(quality.get("difference_strength_score")) < _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "difference_strength_score")
+    ):
+        return False
+    if difference_type == "action" and _score_float(quality.get("action_evidence_score")) < _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "action_evidence_score"):
+        return False
+    if _visual_near_duplicate_rejects(
+        _score_float(quality.get("visual_near_duplicate_score")),
+        difference_type,
+    ):
+        return False
+    if _score_float(quality.get("intraclip_change_conflict")) >= 1.0:
+        return False
+    if _structured_edit_text_failures(quality):
+        return False
+    return True
+
+
+def _audio_matters_verification_accepts(verification: dict[str, Any]) -> bool:
+    caption_delta = verification.get("caption_delta", {})
+    edit_projection = verification.get("edit_projection", {})
+    edit_necessity = verification.get("edit_necessity", {})
+    edit_text_quality_check = verification.get("edit_text_quality_check", {})
+    edit_threshold = _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "edit_target_alignment_score")
+    necessity_threshold = _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "edit_necessity_score")
+    if not bool(
+        not _boolish(caption_delta.get("caption_equivalent"))
+        and _boolish(caption_delta.get("has_concrete_difference"))
+        and _boolish(caption_delta.get("difference_matches_edit"))
+        and _boolish(edit_projection.get("target_matches_projection"))
+        and _score_float(edit_projection.get("score")) >= edit_threshold
+        and _boolish(edit_necessity.get("edit_needed"))
+        and not _boolish(edit_necessity.get("reference_satisfies_edit"))
+        and _boolish(edit_necessity.get("target_satisfies_edit"))
+        and _score_float(edit_necessity.get("score")) >= necessity_threshold
+    ):
+        return False
+    if not isinstance(edit_text_quality_check, dict) or not edit_text_quality_check:
+        return True
+    return bool(
+        _boolish(edit_text_quality_check.get("not_caption_like"))
+        and _boolish(edit_text_quality_check.get("matches_modality"))
+        and _boolish(edit_text_quality_check.get("single_primary_difference"))
+        and _boolish(edit_text_quality_check.get("reference_does_not_satisfy"))
+        and _boolish(edit_text_quality_check.get("target_satisfies"))
+        and _score_float(edit_text_quality_check.get("score")) >= _profile_threshold(AUDIO_MATTERS_ACCEPTANCE_PROFILE, "edit_text_quality_score")
+    )
+
+
+def _audio_matters_judge_accepts(
+    judge: dict[str, Any],
+    verification: dict[str, Any] | None,
+    quality: dict[str, Any],
+) -> bool:
+    hard_negative_quality = str(judge.get("hard_negative_quality", "")).strip().lower()
+    if _boolish(judge.get("reference_satisfies_edit")) or not _boolish(judge.get("target_satisfies_edit")):
+        return False
+    if hard_negative_quality not in {"good", "weak"}:
+        return False
+    if not _audio_matters_base_quality_accepts(quality):
+        return False
+    if verification is None:
+        return bool(judge.get("accept")) or _boolish(judge.get("target_satisfies_edit"))
+    return _audio_matters_verification_accepts(verification)
+
+
+def _audio_matters_should_skip_video_verification(
+    judge: dict[str, Any],
+    quality: dict[str, Any],
+) -> bool:
+    hard_negative_quality = str(judge.get("hard_negative_quality", "")).strip().lower()
+    if _boolish(judge.get("reference_satisfies_edit")) or not _boolish(judge.get("target_satisfies_edit")):
+        return True
+    if hard_negative_quality not in {"good", "weak"}:
+        return True
+    return not _audio_matters_base_quality_accepts(quality)
+
+
 def _judge_accepts(
     judge: dict[str, Any],
     verification: dict[str, Any] | None = None,
@@ -11955,6 +12122,8 @@ def _judge_accepts(
 ) -> bool:
     acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
     quality = effective_quality or judge
+    if _is_audio_matters_profile(acceptance_profile):
+        return _audio_matters_judge_accepts(judge, verification, quality)
     if _is_exploration_profile(acceptance_profile):
         return _exploration_judge_accepts(judge, verification, quality)
     judge_accepted = bool(
@@ -12055,6 +12224,8 @@ def _should_skip_pair_video_verification(
     acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
 ) -> bool:
     acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
+    if _is_audio_matters_profile(acceptance_profile):
+        return _audio_matters_should_skip_video_verification(judge, quality)
     hard_negative_quality = str(judge.get("hard_negative_quality", "")).strip().lower()
     if (
         not bool(judge.get("accept"))
@@ -12725,7 +12896,7 @@ def _pair_record_acceptance_issues(
                 suffix += f" ({visual_types})"
             issues.append(f"audio_event cannot be the primary edit for this pair{suffix}")
     if isinstance(quality, dict):
-        if _is_exploration_profile(acceptance_profile):
+        if _uses_soft_local_gate_profile(acceptance_profile):
             if "edit_text_is_imperative" in quality and _score_float(quality.get("edit_text_is_imperative")) < 1.0:
                 issues.append("edit_text is not an imperative edit")
             if _score_float(quality.get("intraclip_change_conflict")) >= 1.0:
