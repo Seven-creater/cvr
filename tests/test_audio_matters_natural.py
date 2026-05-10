@@ -8,7 +8,9 @@ import numpy as np
 from app.audio_matters_natural import (
     AudioFeature,
     export_audio_matters_triplets,
+    merge_pair_proposals,
     mine_audio_matters_candidates,
+    split_mined_candidates,
 )
 
 
@@ -104,11 +106,17 @@ class AudioMattersNaturalTests(unittest.TestCase):
                 report_path=report_path,
                 max_candidates=10,
                 min_audio_anchor_score=0.95,
+                audio_workers=2,
                 audio_feature_loader=loader,
             )
 
             records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
             self.assertEqual(1, summary["selected_count"])
+            self.assertEqual(2, summary["audio_workers"])
+            self.assertEqual("actual_extracted_clip_audio_via_ffmpeg", summary["audio_source"])
+            self.assertEqual(4, summary["actual_audio_feature_summary"]["checked_clip_count"])
+            self.assertEqual(4, summary["actual_audio_feature_summary"]["feature_ok_count"])
+            self.assertEqual(4, summary["annotation_audio_signal_summary"]["audio_events_nonempty_count"])
             self.assertEqual(1, len(records))
             self.assertEqual("ref", records[0]["reference_clip_id"])
             self.assertEqual("target", records[0]["target_clip_id"])
@@ -206,6 +214,75 @@ class AudioMattersNaturalTests(unittest.TestCase):
             self.assertFalse(summary_payload["contains_target_caption"])
             self.assertTrue(summary_payload["contains_visual_delta_type"])
             self.assertTrue(summary_payload["contains_hard_negatives"])
+
+    def test_split_and_merge_proposal_shards(self) -> None:
+        temp_dir, root = self._make_root()
+        with temp_dir:
+            mined_path = root / "audio_matters_mined_candidates.jsonl"
+            shard_dir = root / "shards"
+            split_summary_path = root / "split_summary.json"
+            self._write_jsonl(
+                mined_path,
+                [
+                    {"candidate_id": f"candidate_{index}", "proposal_id": f"pair_{index}"}
+                    for index in range(5)
+                ],
+            )
+
+            split_summary = split_mined_candidates(
+                input_path=mined_path,
+                output_dir=shard_dir,
+                shard_count=3,
+                summary_path=split_summary_path,
+            )
+
+            self.assertEqual(5, split_summary["input_count"])
+            self.assertEqual([2, 2, 1], split_summary["shard_counts"])
+
+            shard_outputs = []
+            for shard_index, shard_path in enumerate(split_summary["shard_paths"]):
+                output_path = root / f"proposal_shard_{shard_index}.jsonl"
+                shard_rows = [
+                    {
+                        "proposal_id": f"pair_{shard_index}_{row_index}",
+                        "accepted": row_index == 0,
+                        "reference_video": f"clips/ref_{shard_index}_{row_index}.mp4",
+                        "target_video": f"clips/target_{shard_index}_{row_index}.mp4",
+                        "edit_text": "add a product beside the speaker",
+                        "modalities": ["visual"],
+                        "reference_caption": "speaker at a desk",
+                        "target_caption": "speaker at a desk with a product",
+                        "hard_negatives": ["clips/neg1.mp4", "clips/neg2.mp4"],
+                        "source": {
+                            "platform": "daily_omni",
+                            "url": "local",
+                            "license_note": "internal research pilot only",
+                        },
+                        "difference": {"type": "object_presence", "from": "no product", "to": "product"},
+                        "quality": {
+                            "difference_strength_score": 0.9,
+                            "same_context_score": 0.9,
+                            "target_uniqueness_score": 0.9,
+                            "edit_match_score": 0.9,
+                        },
+                    }
+                    for row_index, _ in enumerate(
+                        [json.loads(line) for line in Path(shard_path).read_text(encoding="utf-8").splitlines() if line.strip()]
+                    )
+                ]
+                self._write_jsonl(output_path, shard_rows)
+                shard_outputs.append(output_path)
+
+            merge_summary = merge_pair_proposals(
+                input_paths=shard_outputs,
+                output_path=root / "judged_audio_matters_pair_proposals.jsonl",
+                accepted_output_path=root / "accepted_audio_matters_pairs.jsonl",
+                summary_path=root / "merge_summary.json",
+                max_accepted_pairs=10,
+            )
+
+            self.assertEqual(5, merge_summary["proposal_count"])
+            self.assertEqual(3, merge_summary["accepted_count"])
 
 
 if __name__ == "__main__":

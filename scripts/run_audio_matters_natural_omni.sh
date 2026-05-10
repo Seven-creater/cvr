@@ -10,6 +10,7 @@ export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 ROOT=${ROOT:-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval}
 RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/audio_matters_natural_omni_$(date +%Y%m%d_%H%M%S)}
+REUSE_RUN_ROOT=${REUSE_RUN_ROOT:-}
 MODEL=${MODEL:-qwen3-omni}
 BASE_URL=${BASE_URL:-http://127.0.0.1:8093/v1}
 SOURCE_CLIPS=${SOURCE_CLIPS:-$ROOT/metadata/source_clips_all.jsonl}
@@ -17,6 +18,7 @@ PREPARE_START_STAGE=${PREPARE_START_STAGE:-plan}
 MAX_SOURCE_VIDEOS=${MAX_SOURCE_VIDEOS:-80}
 SEGMENT_SECONDS=${SEGMENT_SECONDS:-8}
 CONCURRENCY=${CONCURRENCY:-1}
+AUDIO_WORKERS=${AUDIO_WORKERS:-8}
 ANNOTATION_MAX_PASSES=${ANNOTATION_MAX_PASSES:-3}
 ANNOTATION_PASS_TIMEOUT_SECONDS=${ANNOTATION_PASS_TIMEOUT_SECONDS:-900}
 MINE_AUDIO_TIMEOUT_SECONDS=${MINE_AUDIO_TIMEOUT_SECONDS:-600}
@@ -26,12 +28,15 @@ ZERO_ACCEPTED_STOP_AFTER=${ZERO_ACCEPTED_STOP_AFTER:-0}
 MAX_AUDIO_CANDIDATES=${MAX_AUDIO_CANDIDATES:-240}
 MAX_ACCEPTED_PAIRS=${MAX_ACCEPTED_PAIRS:-80}
 MAX_PROPOSALS=${MAX_PROPOSALS:-160}
+PROPOSE_SHARDS=${PROPOSE_SHARDS:-1}
+PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-}
 MIN_AUDIO_ANCHOR_SCORE=${MIN_AUDIO_ANCHOR_SCORE:-0.86}
 MIN_AUDIO_RMS=${MIN_AUDIO_RMS:-0.001}
 MIN_DIFFERENCE_STRENGTH=${MIN_DIFFERENCE_STRENGTH:-0.60}
 MAX_LOCAL_COMPARISONS=${MAX_LOCAL_COMPARISONS:-20000}
 ACCEPTANCE_PROFILE=${ACCEPTANCE_PROFILE:-final}
 ALLOW_PARTIAL_ANNOTATIONS=${ALLOW_PARTIAL_ANNOTATIONS:-0}
+SKIP_REVIEW_BUNDLE=${SKIP_REVIEW_BUNDLE:-0}
 MODEL_STAGE=${MODEL_STAGE:-instruct}
 GPU_IDS=${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-}}
 MAX_GPUS=${MAX_GPUS:-6}
@@ -43,13 +48,15 @@ Usage: run_audio_matters_natural_omni.sh [options]
 Options:
   --root PATH
   --run-root PATH
+  --reuse-run-root PATH
   --model NAME
   --base-url URL
   --source-clips PATH
-  --prepare-start-stage plan|extract|annotate|mine-candidates|none
+  --prepare-start-stage plan|extract|annotate|none
   --max-source-videos N
   --segment-seconds N
   --concurrency N
+  --audio-workers N
   --annotation-max-passes N
   --annotation-pass-timeout-seconds N
   --mine-audio-timeout-seconds N
@@ -59,12 +66,15 @@ Options:
   --max-audio-candidates N
   --max-accepted-pairs N
   --max-proposals N
+  --propose-shards N
+  --propose-parallel-jobs N
   --min-audio-anchor-score FLOAT
   --min-audio-rms FLOAT
   --min-difference-strength FLOAT
   --max-local-comparisons N
   --acceptance-profile exploration|final
   --allow-partial-annotations
+  --skip-review-bundle
   --model-stage VALUE
   --gpu-ids IDS
   --max-gpus N
@@ -76,6 +86,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --root) ROOT="$2"; shift 2 ;;
     --run-root) RUN_ROOT="$2"; shift 2 ;;
+    --reuse-run-root) REUSE_RUN_ROOT="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
     --base-url) BASE_URL="$2"; shift 2 ;;
     --source-clips) SOURCE_CLIPS="$2"; shift 2 ;;
@@ -83,6 +94,7 @@ while [[ $# -gt 0 ]]; do
     --max-source-videos) MAX_SOURCE_VIDEOS="$2"; shift 2 ;;
     --segment-seconds) SEGMENT_SECONDS="$2"; shift 2 ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
+    --audio-workers) AUDIO_WORKERS="$2"; shift 2 ;;
     --annotation-max-passes) ANNOTATION_MAX_PASSES="$2"; shift 2 ;;
     --annotation-pass-timeout-seconds) ANNOTATION_PASS_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --mine-audio-timeout-seconds) MINE_AUDIO_TIMEOUT_SECONDS="$2"; shift 2 ;;
@@ -92,12 +104,15 @@ while [[ $# -gt 0 ]]; do
     --max-audio-candidates) MAX_AUDIO_CANDIDATES="$2"; shift 2 ;;
     --max-accepted-pairs) MAX_ACCEPTED_PAIRS="$2"; shift 2 ;;
     --max-proposals) MAX_PROPOSALS="$2"; shift 2 ;;
+    --propose-shards) PROPOSE_SHARDS="$2"; shift 2 ;;
+    --propose-parallel-jobs) PROPOSE_PARALLEL_JOBS="$2"; shift 2 ;;
     --min-audio-anchor-score) MIN_AUDIO_ANCHOR_SCORE="$2"; shift 2 ;;
     --min-audio-rms) MIN_AUDIO_RMS="$2"; shift 2 ;;
     --min-difference-strength) MIN_DIFFERENCE_STRENGTH="$2"; shift 2 ;;
     --max-local-comparisons) MAX_LOCAL_COMPARISONS="$2"; shift 2 ;;
     --acceptance-profile) ACCEPTANCE_PROFILE="$2"; shift 2 ;;
     --allow-partial-annotations) ALLOW_PARTIAL_ANNOTATIONS=1; shift ;;
+    --skip-review-bundle) SKIP_REVIEW_BUNDLE=1; shift ;;
     --model-stage) MODEL_STAGE="$2"; shift 2 ;;
     --gpu-ids) GPU_IDS="$2"; shift 2 ;;
     --max-gpus) MAX_GPUS="$2"; shift 2 ;;
@@ -148,6 +163,17 @@ require_file() {
     echo "[audio-matters-natural] missing required $label: $path" >&2
     exit 2
   fi
+}
+
+copy_reuse_artifact() {
+  local filename="$1"
+  require_file "$REUSE_RUN_ROOT/$filename" "reusable $filename"
+  if [ -e "$RUN_ROOT/$filename" ]; then
+    echo "[audio-matters-natural] reuse target already exists, keep: $RUN_ROOT/$filename"
+    return
+  fi
+  cp "$REUSE_RUN_ROOT/$filename" "$RUN_ROOT/$filename"
+  echo "[audio-matters-natural] reused $filename from $REUSE_RUN_ROOT"
 }
 
 jsonl_row_count() {
@@ -237,6 +263,10 @@ if (( GPU_COUNT > MAX_GPUS )); then
   exit 2
 fi
 
+if [ -z "$PROPOSE_PARALLEL_JOBS" ]; then
+  PROPOSE_PARALLEL_JOBS="$PROPOSE_SHARDS"
+fi
+
 case "$MODEL_STAGE" in
   instruct) ;;
   captioner|thinking)
@@ -251,15 +281,29 @@ esac
 
 mkdir -p "$RUN_ROOT"
 
+if [ -n "$REUSE_RUN_ROOT" ]; then
+  require_file "$REUSE_RUN_ROOT/clip_groups.jsonl" "reusable clip groups"
+  require_file "$REUSE_RUN_ROOT/extracted_event_clips.jsonl" "reusable extracted clips manifest"
+  require_file "$REUSE_RUN_ROOT/detective_annotations.jsonl" "reusable detective annotations"
+  copy_reuse_artifact "clip_groups.jsonl"
+  copy_reuse_artifact "extracted_event_clips.jsonl"
+  copy_reuse_artifact "detective_annotations.jsonl"
+  if [ -s "$REUSE_RUN_ROOT/clip_plan_detective.jsonl" ]; then
+    copy_reuse_artifact "clip_plan_detective.jsonl"
+  fi
+  PREPARE_START_STAGE=none
+fi
+
 echo "[audio-matters-natural] start $(date)"
 echo "[audio-matters-natural] root=$ROOT"
 echo "[audio-matters-natural] run_root=$RUN_ROOT"
+echo "[audio-matters-natural] reuse_run_root=${REUSE_RUN_ROOT:-}"
 echo "[audio-matters-natural] source_clips=$SOURCE_CLIPS"
 echo "[audio-matters-natural] base_url=$BASE_URL"
 echo "[audio-matters-natural] model=$MODEL"
 echo "[audio-matters-natural] prepare_start_stage=$PREPARE_START_STAGE"
-echo "[audio-matters-natural] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY"
-echo "[audio-matters-natural] max_audio_candidates=$MAX_AUDIO_CANDIDATES max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS"
+echo "[audio-matters-natural] max_source_videos=$MAX_SOURCE_VIDEOS segment_seconds=$SEGMENT_SECONDS concurrency=$CONCURRENCY audio_workers=$AUDIO_WORKERS"
+echo "[audio-matters-natural] max_audio_candidates=$MAX_AUDIO_CANDIDATES max_accepted_pairs=$MAX_ACCEPTED_PAIRS max_proposals=$MAX_PROPOSALS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS"
 echo "[audio-matters-natural] min_audio_anchor_score=$MIN_AUDIO_ANCHOR_SCORE min_audio_rms=$MIN_AUDIO_RMS min_difference_strength=$MIN_DIFFERENCE_STRENGTH"
 
 if [ "$PREPARE_START_STAGE" != "none" ]; then
@@ -370,7 +414,8 @@ python -m app.audio_matters_natural mine-candidates \
   --min-audio-rms "$MIN_AUDIO_RMS" \
   --min-difference-strength "$MIN_DIFFERENCE_STRENGTH" \
   --max-local-comparisons "$MAX_LOCAL_COMPARISONS" \
-  --acceptance-profile "$ACCEPTANCE_PROFILE"
+  --acceptance-profile "$ACCEPTANCE_PROFILE" \
+  --audio-workers "$AUDIO_WORKERS"
 
 MINED_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/audio_matters_mined_candidates.jsonl")
 echo "[audio-matters-natural] mined audio candidates rows=$MINED_ROW_COUNT"
@@ -380,23 +425,115 @@ if [ "$MINED_ROW_COUNT" -eq 0 ]; then
 fi
 
 probe_omni_model
-run_with_timeout "propose-audio-matters-pairs" "$PROPOSE_TIMEOUT_SECONDS" \
-python -m app.composed_data propose-group-pairs \
-  --root "$ROOT" \
-  --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
-  --clip-groups-path "$RUN_ROOT/clip_groups.jsonl" \
-  --mined-candidates-path "$RUN_ROOT/audio_matters_mined_candidates.jsonl" \
-  --output-path "$RUN_ROOT/judged_audio_matters_pair_proposals.jsonl" \
-  --accepted-output-path "$RUN_ROOT/accepted_audio_matters_pairs.jsonl" \
-  --base-url "$BASE_URL" \
-  --api-key EMPTY \
-  --model "$MODEL" \
-  --timeout-seconds "$PAIR_REQUEST_TIMEOUT_SECONDS" \
-  --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
-  --max-proposals "$MAX_PROPOSALS" \
-  --zero-accepted-stop-after "$ZERO_ACCEPTED_STOP_AFTER" \
-  --acceptance-profile "$ACCEPTANCE_PROFILE" \
-  --overwrite
+
+if [ "$PROPOSE_SHARDS" -le 1 ]; then
+  run_with_timeout "propose-audio-matters-pairs" "$PROPOSE_TIMEOUT_SECONDS" \
+  python -m app.composed_data propose-group-pairs \
+    --root "$ROOT" \
+    --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
+    --clip-groups-path "$RUN_ROOT/clip_groups.jsonl" \
+    --mined-candidates-path "$RUN_ROOT/audio_matters_mined_candidates.jsonl" \
+    --output-path "$RUN_ROOT/judged_audio_matters_pair_proposals.jsonl" \
+    --accepted-output-path "$RUN_ROOT/accepted_audio_matters_pairs.jsonl" \
+    --base-url "$BASE_URL" \
+    --api-key EMPTY \
+    --model "$MODEL" \
+    --timeout-seconds "$PAIR_REQUEST_TIMEOUT_SECONDS" \
+    --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
+    --max-proposals "$MAX_PROPOSALS" \
+    --zero-accepted-stop-after "$ZERO_ACCEPTED_STOP_AFTER" \
+    --acceptance-profile "$ACCEPTANCE_PROFILE" \
+    --overwrite
+else
+  if [ "$PROPOSE_PARALLEL_JOBS" -lt 1 ]; then
+    PROPOSE_PARALLEL_JOBS=1
+  fi
+  SHARD_DIR="$RUN_ROOT/audio_matters_candidate_shards"
+  SHARD_OUTPUT_DIR="$RUN_ROOT/audio_matters_proposal_shards"
+  mkdir -p "$SHARD_DIR" "$SHARD_OUTPUT_DIR"
+
+  python -m app.audio_matters_natural split-candidates \
+    --input-path "$RUN_ROOT/audio_matters_mined_candidates.jsonl" \
+    --output-dir "$SHARD_DIR" \
+    --shard-count "$PROPOSE_SHARDS" \
+    --summary-path "$RUN_ROOT/audio_matters_candidate_shards_summary.json" \
+    --max-records "$MAX_PROPOSALS"
+
+  mapfile -t SHARD_PATHS < <(python - "$RUN_ROOT/audio_matters_candidate_shards_summary.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for path, count in zip(payload["shard_paths"], payload["shard_counts"]):
+    if int(count) > 0:
+        print(path)
+PY
+)
+
+  PROPOSE_PIDS=()
+  PROPOSE_FAIL=0
+  PROPOSAL_OUTPUT_LIST="$RUN_ROOT/audio_matters_proposal_shard_outputs.txt"
+  : > "$PROPOSAL_OUTPUT_LIST"
+
+  wait_for_one_shard() {
+    local pid="${PROPOSE_PIDS[0]}"
+    if ! wait "$pid"; then
+      PROPOSE_FAIL=1
+    fi
+    PROPOSE_PIDS=("${PROPOSE_PIDS[@]:1}")
+  }
+
+  SHARD_INDEX=0
+  for SHARD_PATH in "${SHARD_PATHS[@]}"; do
+    SHARD_ID=$(printf "%03d" "$SHARD_INDEX")
+    SHARD_OUTPUT="$SHARD_OUTPUT_DIR/judged_audio_matters_pair_proposals_${SHARD_ID}.jsonl"
+    SHARD_ACCEPTED="$SHARD_OUTPUT_DIR/accepted_audio_matters_pairs_${SHARD_ID}.jsonl"
+    SHARD_LOG="$SHARD_OUTPUT_DIR/propose_${SHARD_ID}.log"
+    echo "$SHARD_OUTPUT" >> "$PROPOSAL_OUTPUT_LIST"
+    echo "[audio-matters-natural] launch proposal shard=$SHARD_ID path=$SHARD_PATH log=$SHARD_LOG"
+    (
+      set -euo pipefail
+      run_with_timeout "propose-audio-matters-pairs-shard-$SHARD_ID" "$PROPOSE_TIMEOUT_SECONDS" \
+      python -m app.composed_data propose-group-pairs \
+        --root "$ROOT" \
+        --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
+        --clip-groups-path "$RUN_ROOT/clip_groups.jsonl" \
+        --mined-candidates-path "$SHARD_PATH" \
+        --output-path "$SHARD_OUTPUT" \
+        --accepted-output-path "$SHARD_ACCEPTED" \
+        --base-url "$BASE_URL" \
+        --api-key EMPTY \
+        --model "$MODEL" \
+        --timeout-seconds "$PAIR_REQUEST_TIMEOUT_SECONDS" \
+        --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
+        --max-proposals "$MAX_PROPOSALS" \
+        --zero-accepted-stop-after "$ZERO_ACCEPTED_STOP_AFTER" \
+        --acceptance-profile "$ACCEPTANCE_PROFILE" \
+        --overwrite
+    ) > "$SHARD_LOG" 2>&1 &
+    PROPOSE_PIDS+=("$!")
+    SHARD_INDEX=$((SHARD_INDEX + 1))
+    while [ "${#PROPOSE_PIDS[@]}" -ge "$PROPOSE_PARALLEL_JOBS" ]; do
+      wait_for_one_shard
+    done
+  done
+
+  while [ "${#PROPOSE_PIDS[@]}" -gt 0 ]; do
+    wait_for_one_shard
+  done
+  if [ "$PROPOSE_FAIL" -ne 0 ]; then
+    echo "[audio-matters-natural] one or more proposal shards failed; inspect $SHARD_OUTPUT_DIR/propose_*.log" >&2
+    exit 5
+  fi
+
+  python -m app.audio_matters_natural merge-proposals \
+    --input-list-path "$PROPOSAL_OUTPUT_LIST" \
+    --output-path "$RUN_ROOT/judged_audio_matters_pair_proposals.jsonl" \
+    --accepted-output-path "$RUN_ROOT/accepted_audio_matters_pairs.jsonl" \
+    --summary-path "$RUN_ROOT/audio_matters_proposal_merge_summary.json" \
+    --max-accepted-pairs "$MAX_ACCEPTED_PAIRS" \
+    --acceptance-profile "$ACCEPTANCE_PROFILE"
+fi
 
 ACCEPTED_ROW_COUNT=$(jsonl_row_count "$RUN_ROOT/accepted_audio_matters_pairs.jsonl")
 echo "[audio-matters-natural] accepted audio pairs rows=$ACCEPTED_ROW_COUNT"
@@ -414,11 +551,15 @@ if [ "$ACCEPTED_ROW_COUNT" -gt 0 ]; then
     --gallery-output-path "$RUN_ROOT/audio_matters_gallery.jsonl" \
     --report-output-path "$RUN_ROOT/audio_matters_pilot_review.md"
 
-  python -m app.composed_data build-review-bundle \
-    --root "$ROOT" \
-    --pairs-path "$RUN_ROOT/accepted_audio_matters_pairs.jsonl" \
-    --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
-    --output-dir "$RUN_ROOT/audio_matters_manual_review_bundle"
+  if [ "$SKIP_REVIEW_BUNDLE" = "1" ]; then
+    echo "[audio-matters-natural] skip review bundle"
+  else
+    python -m app.composed_data build-review-bundle \
+      --root "$ROOT" \
+      --pairs-path "$RUN_ROOT/accepted_audio_matters_pairs.jsonl" \
+      --clip-annotations-path "$RUN_ROOT/detective_annotations.jsonl" \
+      --output-dir "$RUN_ROOT/audio_matters_manual_review_bundle"
+  fi
 else
   echo "[audio-matters-natural] no accepted audio pairs; skip export and review bundle"
 fi
