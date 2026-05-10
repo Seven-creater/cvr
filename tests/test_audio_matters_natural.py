@@ -176,6 +176,7 @@ class AudioMattersNaturalTests(unittest.TestCase):
                         "accepted": True,
                         "reference_clip_id": "ref",
                         "target_clip_id": "target",
+                        "hard_negatives": ["clips/neg1.mp4", "clips/neg2.mp4"],
                         "heuristic_quality": {
                             "audio_anchor_score": 0.98,
                             "audio_anchor_type": "similar_or_same_natural_audio",
@@ -197,8 +198,14 @@ class AudioMattersNaturalTests(unittest.TestCase):
             self.assertTrue(Path(records[0]["reference_video"]).is_absolute())
             self.assertTrue(Path(records[0]["target_video"]).is_absolute())
             self.assertEqual(0.98, records[0]["audio_anchor_score"])
+            self.assertEqual("object_presence", records[0]["visual_delta_type"])
+            self.assertEqual(2, len(records[0]["hard_negatives"]))
+            self.assertTrue(all(Path(path).is_absolute() for path in records[0]["hard_negatives"]))
             self.assertNotIn("target_caption", records[0])
-            self.assertFalse(json.loads(summary_path.read_text(encoding="utf-8"))["contains_target_caption"])
+            summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertFalse(summary_payload["contains_target_caption"])
+            self.assertTrue(summary_payload["contains_visual_delta_type"])
+            self.assertTrue(summary_payload["contains_hard_negatives"])
 
 
 if __name__ == "__main__":

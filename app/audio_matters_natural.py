@@ -598,7 +598,9 @@ def export_audio_matters_triplets(
             skipped_counts["missing_video"] += 1
             continue
         difference = record.get("difference", {}) if isinstance(record.get("difference"), dict) else {}
+        visual_delta_type = str(difference.get("type", "")).strip()
         quality = _audio_quality_payload(record)
+        hard_negatives = _resolved_hard_negative_paths(root_path, record)
         sample_id = str(record.get("proposal_id", "")).strip() or f"audio_matters_{index:04d}"
         output_records.append(
             {
@@ -608,12 +610,14 @@ def export_audio_matters_triplets(
                 "edit_text": edit_text,
                 "reference_caption": str(record.get("reference_caption", "")).strip(),
                 "source": record.get("source", {}),
-                "difference_type": str(difference.get("type", "")).strip(),
+                "difference_type": visual_delta_type,
+                "visual_delta_type": visual_delta_type,
                 "accepted": bool(record.get("accepted", True)),
                 "final_omni_accept": bool(record.get("accepted", True)),
                 "final_omni_quality_score": _score_float(record.get("quality", {}).get("final_omni_quality_score")),
                 "reference_clip_id": str(record.get("reference_clip_id", "")).strip(),
                 "target_clip_id": str(record.get("target_clip_id", "")).strip(),
+                "hard_negatives": hard_negatives,
                 "audio_anchor_required": True,
                 "audio_anchor_score": quality["audio_anchor_score"],
                 "audio_anchor_type": quality["audio_anchor_type"],
@@ -629,6 +633,8 @@ def export_audio_matters_triplets(
         "skipped_counts": dict(skipped_counts),
         "difference_type_counts": dict(Counter(item["difference_type"] for item in output_records)),
         "contains_target_caption": False,
+        "contains_visual_delta_type": True,
+        "contains_hard_negatives": True,
     }
     if summary_path:
         Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
@@ -639,6 +645,21 @@ def export_audio_matters_triplets(
         flush=True,
     )
     return summary
+
+
+def _resolved_hard_negative_paths(root: Path, record: dict[str, Any]) -> list[str]:
+    raw_values = record.get("hard_negatives")
+    if not isinstance(raw_values, list):
+        raw_values = record.get("hard_negative_paths")
+    if not isinstance(raw_values, list):
+        return []
+    paths: list[str] = []
+    for raw_value in raw_values:
+        raw_path = str(raw_value).strip()
+        if not raw_path:
+            continue
+        paths.append(str(_resolve_under_root(root, raw_path)))
+    return paths
 
 
 def _audio_quality_payload(record: dict[str, Any]) -> dict[str, Any]:
