@@ -440,6 +440,13 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     run_root.mkdir(parents=True, exist_ok=True)
     triplets_path = Path(args.triplets_jsonl) if args.triplets_jsonl else find_latest_triplets(args.runs_root)
     triplets = load_triplets_jsonl(triplets_path, expected_count=args.expected_count)
+    gallery_triplets_path = Path(args.gallery_triplets_jsonl) if args.gallery_triplets_jsonl else triplets_path
+    gallery_expected_count = args.gallery_expected_count if args.gallery_triplets_jsonl else args.expected_count
+    gallery_triplets = (
+        load_triplets_jsonl(gallery_triplets_path, expected_count=gallery_expected_count)
+        if gallery_triplets_path != triplets_path
+        else list(triplets)
+    )
     triplets, reference_audio_summary = prepare_reference_audio_triplets(
         triplets=triplets,
         reference_audio_mode=reference_audio_mode,
@@ -460,7 +467,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         video_audio_mode=video_audio_mode,
     )
     index = build_or_load_target_index(
-        triplets=triplets,
+        triplets=gallery_triplets,
         encoder=encoder,
         index_dir=Path(args.target_index_dir) if args.target_index_dir else run_root / "target_index",
         runtime_info=runtime_info,
@@ -470,6 +477,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     target_index_dir = Path(args.target_index_dir) if args.target_index_dir else run_root / "target_index"
     target_index_reference = {
         "target_index_dir": str(target_index_dir),
+        "gallery_triplets_jsonl": str(gallery_triplets_path),
         "gallery_count": len(index.records),
         "target_index": index.metadata,
     }
@@ -508,6 +516,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     comparison = {
         "run_root": str(run_root),
         "triplets_jsonl": str(triplets_path),
+        "gallery_triplets_jsonl": str(gallery_triplets_path),
+        "query_count": len(triplets),
+        "gallery_count": len(index.records),
         "query_mode": query_mode,
         "query_input": _query_input_label(query_mode),
         "uses_edit_text_for_embedding": _query_uses_text(query_mode),
@@ -535,10 +546,12 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run e5-omni only composed video retrieval evaluation")
     parser.add_argument("--triplets-jsonl")
+    parser.add_argument("--gallery-triplets-jsonl")
     parser.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
     parser.add_argument("--run-root")
     parser.add_argument("--target-index-dir")
     parser.add_argument("--expected-count", type=int, default=DEFAULT_EXPECTED_COUNT)
+    parser.add_argument("--gallery-expected-count", type=int, default=DEFAULT_EXPECTED_COUNT)
     parser.add_argument("--e5-model", default=DEFAULT_E5_MODEL)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--torch-dtype", default="bfloat16")

@@ -10,6 +10,7 @@ import numpy as np
 from app.e5_cvr_eval import (
     E5CVRTriplet,
     _configure_video_processing,
+    build_parser,
     build_or_load_target_index,
     load_triplets_jsonl,
     prepare_reference_audio_triplets,
@@ -200,6 +201,26 @@ class E5CVREvalTests(unittest.TestCase):
             self.assertNotIn("target_caption", traces[0])
             self.assertTrue(any("query 1/2 start" in message for message in progress))
             self.assertTrue(any("query 2/2 done rank=1" in message for message in progress))
+
+    def test_parser_accepts_separate_gallery_triplets_without_changing_default(self) -> None:
+        default_args = build_parser().parse_args([])
+        gallery_args = build_parser().parse_args(
+            [
+                "--triplets-jsonl",
+                "query.jsonl",
+                "--gallery-triplets-jsonl",
+                "gallery.jsonl",
+                "--expected-count",
+                "7",
+                "--gallery-expected-count",
+                "943",
+            ]
+        )
+
+        self.assertIsNone(default_args.gallery_triplets_jsonl)
+        self.assertEqual("gallery.jsonl", gallery_args.gallery_triplets_jsonl)
+        self.assertEqual(7, gallery_args.expected_count)
+        self.assertEqual(943, gallery_args.gallery_expected_count)
 
     def test_query_mode_composed_passes_video_and_text_to_encoder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

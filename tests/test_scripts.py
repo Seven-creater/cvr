@@ -263,6 +263,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("e5-omni-7B", script)
         self.assertIn("require_path \"e5 config\" \"$E5_MODEL/config.json\"", script)
         self.assertIn("--triplets-jsonl \"$TRIPLETS_JSONL\"", script)
+        self.assertIn("--gallery-triplets-jsonl \"$GALLERY_TRIPLETS_JSONL\"", script)
+        self.assertIn("GALLERY_EXPECTED_COUNT=${GALLERY_EXPECTED_COUNT:-943}", script)
         self.assertIn("QUERY_MODE=${QUERY_MODE:-composed}", script)
         self.assertIn("--query-mode \"$QUERY_MODE\"", script)
         self.assertIn("REFERENCE_AUDIO_MODE=${REFERENCE_AUDIO_MODE:-original}", script)
@@ -282,6 +284,24 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("modelscope download", script)
         self.assertNotIn("vllm.entrypoints.openai.api_server", script)
         self.assertNotIn("8092", script)
+
+    def test_audio_matters_scripts_are_read_only_e5_pipeline(self) -> None:
+        build_script = Path("scripts/build_audio_matters_filter.sh").read_text(encoding="utf-8")
+        eval_script = Path("scripts/run_e5_audio_matters_eval.sh").read_text(encoding="utf-8")
+        combined = build_script + "\n" + eval_script
+
+        self.assertIn("app.audio_matters_filter", build_script)
+        self.assertIn("audio_matters_filter_", build_script)
+        self.assertIn("run_e5_cvr_eval.sh", eval_script)
+        self.assertIn("--gallery-triplets-jsonl \"$FULL_GALLERY_TRIPLETS\"", eval_script)
+        self.assertIn("audio_on", eval_script)
+        self.assertIn("audio_off", eval_script)
+        self.assertIn("ref_muted", eval_script)
+        self.assertIn("comparison.md", eval_script)
+        self.assertNotIn("modelscope download", combined)
+        self.assertNotIn("vllm.entrypoints.openai.api_server", combined)
+        self.assertNotIn("8092", combined)
+        self.assertNotIn("vace", combined.lower())
 
     def test_vace_visual_synthetic_smoke_uses_plan_and_remuxes_audio(self) -> None:
         script = Path("scripts/run_vace_visual_synthetic_smoke.sh").read_text(encoding="utf-8")

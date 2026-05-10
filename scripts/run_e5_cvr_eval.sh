@@ -15,9 +15,11 @@ RUNS_ROOT=${RUNS_ROOT:-/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs}
 RUN_ROOT=${RUN_ROOT:-}
 TARGET_INDEX_DIR=${TARGET_INDEX_DIR:-}
 TRIPLETS_JSONL=${TRIPLETS_JSONL:-}
+GALLERY_TRIPLETS_JSONL=${GALLERY_TRIPLETS_JSONL:-}
 E5_MODEL=${E5_MODEL:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/e5-omni-7B}
 GPU_ID=${GPU_ID:-4}
 EXPECTED_COUNT=${EXPECTED_COUNT:-943}
+GALLERY_EXPECTED_COUNT=${GALLERY_EXPECTED_COUNT:-943}
 SMOKE_SIZE=${SMOKE_SIZE:-20}
 QUERY_MODE=${QUERY_MODE:-composed}
 REFERENCE_AUDIO_MODE=${REFERENCE_AUDIO_MODE:-original}
@@ -44,12 +46,14 @@ any Omni service.
 
 Options:
   --triplets-jsonl PATH
+  --gallery-triplets-jsonl PATH
   --run-root PATH
   --runs-root PATH
   --target-index-dir PATH
   --e5-model PATH
   --gpu-id ID
   --expected-count N
+  --gallery-expected-count N
   --smoke-size N
   --query-mode composed|video-only
   --reference-audio-mode original|muted|silent
@@ -72,12 +76,14 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --triplets-jsonl) TRIPLETS_JSONL="$2"; shift 2 ;;
+    --gallery-triplets-jsonl) GALLERY_TRIPLETS_JSONL="$2"; shift 2 ;;
     --run-root) RUN_ROOT="$2"; shift 2 ;;
     --runs-root) RUNS_ROOT="$2"; shift 2 ;;
     --target-index-dir) TARGET_INDEX_DIR="$2"; shift 2 ;;
     --e5-model) E5_MODEL="$2"; shift 2 ;;
     --gpu-id) GPU_ID="$2"; shift 2 ;;
     --expected-count) EXPECTED_COUNT="$2"; shift 2 ;;
+    --gallery-expected-count) GALLERY_EXPECTED_COUNT="$2"; shift 2 ;;
     --smoke-size) SMOKE_SIZE="$2"; shift 2 ;;
     --query-mode) QUERY_MODE="$2"; shift 2 ;;
     --reference-audio-mode) REFERENCE_AUDIO_MODE="$2"; shift 2 ;;
@@ -149,7 +155,10 @@ require_path "e5 model dir" "$E5_MODEL"
 require_path "e5 config" "$E5_MODEL/config.json"
 require_path "triplets jsonl" "$TRIPLETS_JSONL"
 if [ -n "$TARGET_INDEX_DIR" ]; then
-  require_path "target index dir" "$TARGET_INDEX_DIR"
+  mkdir -p "$TARGET_INDEX_DIR"
+fi
+if [ -n "$GALLERY_TRIPLETS_JSONL" ]; then
+  require_path "gallery triplets jsonl" "$GALLERY_TRIPLETS_JSONL"
 fi
 if [ "$REFERENCE_AUDIO_MODE" != "original" ]; then
   command -v "$FFMPEG" >/dev/null || { echo "[e5-cvr] missing ffmpeg: $FFMPEG" >&2; exit 1; }
@@ -168,6 +177,13 @@ if [ "$TRIPLET_COUNT" -ne "$EXPECTED_COUNT" ]; then
   echo "[e5-cvr] expected $EXPECTED_COUNT triplets, got $TRIPLET_COUNT: $TRIPLETS_JSONL" >&2
   exit 1
 fi
+if [ -n "$GALLERY_TRIPLETS_JSONL" ]; then
+  GALLERY_TRIPLET_COUNT=$(wc -l < "$GALLERY_TRIPLETS_JSONL")
+  if [ "$GALLERY_TRIPLET_COUNT" -ne "$GALLERY_EXPECTED_COUNT" ]; then
+    echo "[e5-cvr] expected $GALLERY_EXPECTED_COUNT gallery triplets, got $GALLERY_TRIPLET_COUNT: $GALLERY_TRIPLETS_JSONL" >&2
+    exit 1
+  fi
+fi
 
 mkdir -p "$RUN_ROOT"
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
@@ -175,6 +191,7 @@ export CUDA_VISIBLE_DEVICES="$GPU_ID"
 echo "[e5-cvr] repo=$REPO_ROOT"
 echo "[e5-cvr] run_root=$RUN_ROOT"
 echo "[e5-cvr] triplets_jsonl=$TRIPLETS_JSONL"
+echo "[e5-cvr] gallery_triplets_jsonl=${GALLERY_TRIPLETS_JSONL:-$TRIPLETS_JSONL}"
 echo "[e5-cvr] e5_model=$E5_MODEL"
 echo "[e5-cvr] cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
 echo "[e5-cvr] query_mode=$QUERY_MODE"
@@ -195,6 +212,7 @@ ARGS=(
   --run-root "$RUN_ROOT"
   --runs-root "$RUNS_ROOT"
   --expected-count "$EXPECTED_COUNT"
+  --gallery-expected-count "$GALLERY_EXPECTED_COUNT"
   --query-mode "$QUERY_MODE"
   --reference-audio-mode "$REFERENCE_AUDIO_MODE"
   --reference-audio-cache-dir "$REFERENCE_AUDIO_CACHE_DIR"
@@ -212,6 +230,10 @@ ARGS=(
   --topk "$TOPK"
   --topk-trace "$TOPK_TRACE"
 )
+
+if [ -n "$GALLERY_TRIPLETS_JSONL" ]; then
+  ARGS+=(--gallery-triplets-jsonl "$GALLERY_TRIPLETS_JSONL")
+fi
 
 if [ -n "$TARGET_INDEX_DIR" ]; then
   ARGS+=(--target-index-dir "$TARGET_INDEX_DIR")
