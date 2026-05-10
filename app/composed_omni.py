@@ -563,14 +563,16 @@ def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> 
     if line == "speech_audio_content":
         return (
             base_prompt
-            + " This pass is the speech_audio_content B line. Visual variables are locked: the clips must keep the same scene/program/person/view type "
-            "or a very similar visual context, and visuals alone should not retrieve the target. The primary retrieval edit must be speech content "
+            + " This pass is the speech_audio_content B line. Visual variables are locked in a practical dataset sense: the clips should keep the same scene, "
+            "same person/speaker, same program, or same kind of broadcast/view context. They do not need to be pixel-identical. Moderate framing, pose, "
+            "gesture, camera, or minor action changes are acceptable when the same scene/person/context is still obvious and audio is the primary retrieval cue. "
+            "The primary retrieval edit must be speech content "
             "or a concrete non-speech audio event. Use difference.type=speech for transcript-backed spoken-language content, narration topic, or commentary content; "
             "do not label narration/topic changes as audio_event. Use difference.type=audio_event only for non-language sounds such as music, applause, machinery, "
             "wind, animal sounds, ambience, or crowd cheering. The edit_text must describe only the audible change and must not describe people, objects, scene, "
             "color, camera, subtitles, or shot distance. Good B-line style: two visually similar sports broadcast clips where the target clearly adds crowd cheering "
-            "or the spoken content changes. Reject with reason visual_too_different_for_B if the scene, subject, shot type, major action, or event changes enough "
-            "that visuals alone retrieve the target. Reject vague hum/click/electronic tone guesses unless the evidence is explicit and human-audible. "
+            "or the spoken content changes. Reject with reason visual_too_different_for_B only if the person/scene/program/domain clearly changes, or if the visual "
+            "change is so dominant that listening is unnecessary. Reject vague hum/click/electronic tone guesses unless the evidence is explicit and human-audible. "
             "Reject if the main change is visual, if transcript/audio evidence is vague, or if edit_text is not audio-only."
         )
     return base_prompt
@@ -623,7 +625,9 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
             'and "edit_text_audio_only": boolean in the JSON object. '
             "Accept speech only when both sides have concrete transcript-backed evidence and the edit_text names the content change. "
             "Accept audio_event only for non-speech sound/music/environment changes, not narration topic changes. "
-            "The visual context must stay similar enough that audio matters. "
+            "Set visual_locked=true when the clips share the same person/speaker, same scene, same program, or same broadcast/view context, even if framing, pose, "
+            "gesture, camera, or minor action changes. Set visual_too_different_for_B=true only when the person/scene/program/domain changes enough that visuals alone "
+            "would identify the target. "
             "Set accept=true only if audio_primary=true, visual_locked=true, visual_too_different_for_B=false, and edit_text_audio_only=true. "
             "Reject if a stronger visual difference is doing the retrieval work, if the audio evidence is generic, if the edit_text describes visuals, "
             "or if the edit could be judged without listening."
@@ -921,8 +925,9 @@ def _build_single_source_pair_user_content(
         )
     elif line == "speech_audio_content":
         line_text = (
-            "B-line rule: keep visuals locked and make audio primary. The primary edit must be speech content or a concrete non-speech audio event. "
-            "Do not choose scene/action/object/attribute as the final difference; if visuals differ strongly or audio evidence is not strong, reject.\n"
+            "B-line rule: keep visuals locked in a practical sense and make audio primary. Same person, same scene, same program, or same broadcast/view context is enough; "
+            "minor framing, pose, camera, or action differences are okay. The primary edit must be speech content or a concrete non-speech audio event. "
+            "Do not choose scene/action/object/attribute as the final difference; if the person/scene/program clearly changes or audio evidence is not strong, reject.\n"
         )
     prompt = (
         "Task: compare two clips from the same original 30-second video and write one evidence-backed edit.\n"
@@ -970,8 +975,9 @@ def _build_single_source_final_verification_user_content(
         )
     elif line == "speech_audio_content":
         line_text = (
-            "B-line final rule: accept only if the audible speech/audio change is primary, visuals remain locked/similar, "
-            "and edit_text describes only the audio change. Return audio_primary, visual_locked, visual_too_different_for_B, and edit_text_audio_only.\n"
+            "B-line final rule: accept if the audible speech/audio change is primary and visuals share the same person, same scene, same program, "
+            "or same broadcast/view context. Minor framing, pose, camera, or action changes are acceptable. "
+            "Reject only when visual changes are dominant enough that listening is unnecessary. Return audio_primary, visual_locked, visual_too_different_for_B, and edit_text_audio_only.\n"
         )
     prompt = (
         "Task: final-check whether this single-source pair should be accepted.\n"
