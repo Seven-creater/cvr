@@ -11,7 +11,12 @@ from app.audio_lines_single_source import (
     prepare_existing_single_source_clips,
     split_audio_line_candidates,
 )
-from app.composed_data import ensure_layout, propose_single_source_pairs, _is_transient_omni_exception
+from app.composed_data import (
+    ensure_layout,
+    propose_single_source_pairs,
+    _is_transient_omni_exception,
+    _single_source_final_verification_issues,
+)
 
 
 class AudioLinesSingleSourceTests(unittest.TestCase):
@@ -23,6 +28,58 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
 
     def test_json_decode_errors_are_retried_as_transient_omni_failures(self) -> None:
         self.assertTrue(_is_transient_omni_exception(ValueError("JSONDecodeError: Expecting ',' delimiter")))
+
+    def test_b_audio_review_final_issues_keep_quality_and_visual_boundaries(self) -> None:
+        base = {
+            "accept": True,
+            "confidence": 0.9,
+            "quality_score": 0.65,
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "observable_delta": True,
+            "single_primary_delta": True,
+            "text_or_ocr_driven": False,
+            "segment_wide": False,
+            "edit_text_accurate": True,
+            "main_reject_reason": "",
+            "evidence": ["target contains the requested speech"],
+            "recommended_edit_text": "",
+            "audio_primary": True,
+            "visual_locked": True,
+            "visual_too_different_for_B": False,
+            "edit_text_audio_only": True,
+        }
+        model_fields = {"difference": {"type": "speech"}}
+        self.assertNotIn(
+            "final_omni_delta_not_segment_wide",
+            _single_source_final_verification_issues(
+                base,
+                acceptance_profile="b_audio_review",
+                audio_dataset_line="speech_audio_content",
+                model_fields=model_fields,
+            ),
+        )
+
+        low_quality = {**base, "quality_score": 0.59}
+        self.assertIn(
+            "final_omni_quality_score_below_threshold: 0.59 < 0.60",
+            _single_source_final_verification_issues(
+                low_quality,
+                acceptance_profile="b_audio_review",
+                audio_dataset_line="speech_audio_content",
+                model_fields=model_fields,
+            ),
+        )
+
+        visual_too_different = {**base, "visual_too_different_for_B": True, "audio_primary": False, "visual_locked": False}
+        issues = _single_source_final_verification_issues(
+            visual_too_different,
+            acceptance_profile="b_audio_review",
+            audio_dataset_line="speech_audio_content",
+            model_fields=model_fields,
+        )
+        self.assertIn("final_omni_visual_too_different_for_B", issues)
+        self.assertIn("final_omni_audio_not_primary", issues)
 
     def test_prepare_existing_single_source_reconstructs_groups_and_reuses_annotations(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -957,7 +1014,6 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 },
                 {"raw": "ok"},
             )
-
             with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
                 summary = propose_single_source_pairs(
                     root=root,
@@ -1088,6 +1144,215 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
             self.assertEqual(0, summary["accepted_count"])
             self.assertIn("final_omni_audio_not_primary", ranked[0]["judge"]["reject_reason"])
+
+    def test_b_audio_review_accepts_partial_clip_audio_delta_for_manual_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"video")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "seg_1",
+                        "output_path": "clips/seg_1.mp4",
+                        "summary": "same host in the studio",
+                        "speech": ["sports update"],
+                        "speakers_and_transcript": ["host: sports update"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "seg_2",
+                        "output_path": "clips/seg_2.mp4",
+                        "summary": "same host in the studio",
+                        "speech": ["weather update"],
+                        "speakers_and_transcript": ["host: weather update"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "proposal_id": "p1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "sports update", "to": "weather update"},
+                        "quality": {"speech_transcript_backed": 1.0, "speech_evidence_score": 0.9, "speech_specificity_score": 0.9, "has_audio_modality": 1.0},
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_single_source_pair.return_value = (
+                {
+                    "edit_text": "change the speech from discussing sports to discussing weather",
+                    "modalities": ["audio"],
+                    "reference_caption": "same host in studio discusses sports",
+                    "target_caption": "same host in studio discusses weather",
+                    "difference": {"type": "speech", "from": "sports", "to": "weather", "description": "spoken topic changes"},
+                    "dominant_delta": {"type": "speech", "from": "sports", "to": "weather", "reason": "speech topic differs"},
+                    "reference_state": {"main_speaker": "host", "inset_subjects": [], "product_overlay": "", "composition": "studio host", "internal_transitions": []},
+                    "target_state": {"main_speaker": "host", "inset_subjects": [], "product_overlay": "", "composition": "studio host", "internal_transitions": []},
+                    "delta_temporal_extent": {"reference": "sports is spoken", "target": "weather is spoken", "target_coverage": 0.4, "evidence": "target includes a weather sentence"},
+                    "subject_roles": {"main_speaker": "host", "inset_subjects": [], "product_overlay": ""},
+                    "is_segment_wide_delta": False,
+                    "discarded_deltas": ["minor hand movement"],
+                    "evidence": ["target speech includes weather"],
+                    "confidence": 0.9,
+                    "accept": True,
+                    "reject_reason": "",
+                },
+                {"raw": "ok"},
+            )
+            client.verify_single_source_pair_final.return_value = (
+                {
+                    "accept": True,
+                    "confidence": 0.9,
+                    "quality_score": 0.65,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "observable_delta": True,
+                    "single_primary_delta": True,
+                    "text_or_ocr_driven": False,
+                    "segment_wide": False,
+                    "edit_text_accurate": True,
+                    "main_reject_reason": "",
+                    "evidence": ["the target contains the requested weather speech, but not for the entire clip"],
+                    "recommended_edit_text": "",
+                    "audio_primary": True,
+                    "visual_locked": True,
+                    "visual_too_different_for_B": False,
+                    "edit_text_audio_only": True,
+                },
+                {"raw": "final"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    acceptance_profile="b_audio_review",
+                    audio_dataset_line="speech_audio_content",
+                )
+
+            ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, summary["accepted_count"])
+            self.assertEqual([], ranked[0]["single_source_pair_acceptance_issues"])
+            self.assertIn("final_omni_delta_not_segment_wide", ranked[0]["single_source_pair_review_required"])
+
+    def test_b_audio_review_still_rejects_low_quality_visual_or_hollow_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"video")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {"clip_id": "seg_1", "output_path": "clips/seg_1.mp4", "summary": "speaker", "speech": ["budget"], "speakers_and_transcript": ["speaker: budget"], "audio_events": ["speech"], "modalities": ["audio", "visual"]},
+                    {"clip_id": "seg_2", "output_path": "clips/seg_2.mp4", "summary": "speaker", "speech": ["budget"], "speakers_and_transcript": ["speaker: budget"], "audio_events": ["speech"], "modalities": ["audio", "visual"]},
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "proposal_id": "p1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "budget", "to": "budget"},
+                        "quality": {"speech_transcript_backed": 1.0, "speech_evidence_score": 0.9, "speech_specificity_score": 0.9, "has_audio_modality": 1.0},
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_single_source_pair.return_value = (
+                {
+                    "edit_text": "change the speech from discussing budget to discussing budget",
+                    "modalities": ["audio"],
+                    "reference_caption": "speaker says budget",
+                    "target_caption": "speaker says budget",
+                    "difference": {"type": "speech", "from": "budget", "to": "budget", "description": "same speech"},
+                    "dominant_delta": {"type": "speech", "from": "budget", "to": "budget", "reason": "same speech"},
+                    "reference_state": {"main_speaker": "speaker", "inset_subjects": [], "product_overlay": "", "composition": "podium", "internal_transitions": []},
+                    "target_state": {"main_speaker": "speaker", "inset_subjects": [], "product_overlay": "", "composition": "podium", "internal_transitions": []},
+                    "delta_temporal_extent": {"reference": "budget", "target": "budget", "target_coverage": 0.9, "evidence": "same speech"},
+                    "subject_roles": {"main_speaker": "speaker", "inset_subjects": [], "product_overlay": ""},
+                    "is_segment_wide_delta": True,
+                    "discarded_deltas": [],
+                    "evidence": ["same speech"],
+                    "confidence": 0.9,
+                    "accept": True,
+                    "reject_reason": "",
+                },
+                {"raw": "ok"},
+            )
+            client.verify_single_source_pair_final.return_value = (
+                {
+                    "accept": True,
+                    "confidence": 0.9,
+                    "quality_score": 0.9,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "observable_delta": True,
+                    "single_primary_delta": True,
+                    "text_or_ocr_driven": False,
+                    "segment_wide": True,
+                    "edit_text_accurate": True,
+                    "main_reject_reason": "",
+                    "evidence": ["even a permissive final verifier cannot rescue identical endpoints"],
+                    "recommended_edit_text": "",
+                    "audio_primary": True,
+                    "visual_locked": True,
+                    "visual_too_different_for_B": False,
+                    "edit_text_audio_only": True,
+                },
+                {"raw": "final"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    acceptance_profile="b_audio_review",
+                    audio_dataset_line="speech_audio_content",
+                )
+
+            ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(0, summary["accepted_count"])
+            self.assertIn("edit_text_not_audio_only: identical audio endpoints", ranked[0]["judge"]["reject_reason"])
 
     def test_speech_audio_content_line_final_omni_can_rescue_local_visual_thresholds(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -868,6 +868,7 @@ MIN_TEMPLATE_DIFFERENCE_STRENGTH_SCORE = 0.75
 DEFAULT_ACCEPTANCE_PROFILE = "final"
 EXPLORATION_ACCEPTANCE_PROFILE = "exploration"
 AUDIO_MATTERS_ACCEPTANCE_PROFILE = "audio_matters"
+B_AUDIO_REVIEW_ACCEPTANCE_PROFILE = "b_audio_review"
 STANDARD_AUDIO_DATASET_LINE = "standard"
 VISUAL_AUDIO_ANCHOR_LINE = "visual_audio_anchor"
 SPEECH_AUDIO_CONTENT_LINE = "speech_audio_content"
@@ -976,6 +977,7 @@ ACCEPTANCE_PROFILE_NAMES = {
     DEFAULT_ACCEPTANCE_PROFILE,
     EXPLORATION_ACCEPTANCE_PROFILE,
     AUDIO_MATTERS_ACCEPTANCE_PROFILE,
+    B_AUDIO_REVIEW_ACCEPTANCE_PROFILE,
 }
 ACCEPTANCE_PROFILE_CONFIGS = {
     DEFAULT_ACCEPTANCE_PROFILE: {
@@ -1031,6 +1033,23 @@ ACCEPTANCE_PROFILE_CONFIGS = {
         "audio_anchor_score": 0.86,
         "visual_delta_strength": 0.70,
         "near_duplicate_risk": 0.85,
+    },
+    B_AUDIO_REVIEW_ACCEPTANCE_PROFILE: {
+        "template_semantic_context_score": 0.25,
+        "template_compatibility_score": 0.55,
+        "template_clean_stability_score": 0.55,
+        "template_single_delta_bundle_score": 0.50,
+        "template_target_uniqueness_score": 0.40,
+        "template_difference_strength_score": 0.45,
+        "same_context_score": 0.40,
+        "edit_match_score": 0.45,
+        "target_uniqueness_score": 0.40,
+        "difference_strength_score": 0.45,
+        "edit_necessity_score": 0.50,
+        "edit_target_alignment_score": 0.50,
+        "action_evidence_score": 0.40,
+        "non_speech_audio_event_score": 0.40,
+        "edit_text_quality_score": 0.50,
     },
 }
 SAME_TEMPLATE_CLUSTER_RELATION = "same_template_cluster"
@@ -1091,9 +1110,13 @@ def _is_audio_matters_profile(acceptance_profile: str | None) -> bool:
     return _normalize_acceptance_profile(acceptance_profile) == AUDIO_MATTERS_ACCEPTANCE_PROFILE
 
 
+def _is_b_audio_review_profile(acceptance_profile: str | None) -> bool:
+    return _normalize_acceptance_profile(acceptance_profile) == B_AUDIO_REVIEW_ACCEPTANCE_PROFILE
+
+
 def _uses_soft_local_gate_profile(acceptance_profile: str | None) -> bool:
     profile = _normalize_acceptance_profile(acceptance_profile)
-    return profile in {EXPLORATION_ACCEPTANCE_PROFILE, AUDIO_MATTERS_ACCEPTANCE_PROFILE}
+    return profile in {EXPLORATION_ACCEPTANCE_PROFILE, AUDIO_MATTERS_ACCEPTANCE_PROFILE, B_AUDIO_REVIEW_ACCEPTANCE_PROFILE}
 SUBJECT_SIGNATURE_MARKER_TOKENS = {
     "bald",
     "beard",
@@ -2201,6 +2224,12 @@ def propose_single_source_pairs(
                 final_omni_verification,
                 acceptance_profile=acceptance_profile,
                 audio_dataset_line=audio_dataset_line,
+                model_fields=model_fields,
+            )
+            final_review_required = _single_source_final_verification_review_required(
+                final_omni_verification,
+                acceptance_profile=acceptance_profile,
+                audio_dataset_line=audio_dataset_line,
             )
             local_review_required = list(local_gate_report.get("review_required", []))
             blocking_local_hard_rejects = list(local_hard_rejects)
@@ -2284,6 +2313,7 @@ def propose_single_source_pairs(
                 "final_omni_verification": final_omni_verification,
                 "single_source_delta_family": _single_source_delta_family_from_fields(model_fields),
                 "single_source_pair_acceptance_issues": blocking_issues,
+                "single_source_pair_review_required": _dedupe_strings(local_review_required + final_review_required),
                 "b_line_edit_text_repaired": bool(model_fields.get("b_line_edit_text_repaired")),
                 "b_line_original_edit_text": str(model_fields.get("b_line_original_edit_text", "")).strip(),
                 "recommended_edit_text": str(final_omni_verification.get("recommended_edit_text", "")).strip()
@@ -7905,6 +7935,12 @@ def _recheck_existing_single_source_pair_record(
         final_omni_verification,
         acceptance_profile=acceptance_profile,
         audio_dataset_line=str(record.get("audio_dataset_line") or STANDARD_AUDIO_DATASET_LINE),
+        model_fields=model_fields,
+    )
+    final_review_required = _single_source_final_verification_review_required(
+        final_omni_verification,
+        acceptance_profile=acceptance_profile,
+        audio_dataset_line=str(record.get("audio_dataset_line") or STANDARD_AUDIO_DATASET_LINE),
     )
     local_review_required = list(local_gate_report.get("review_required", []))
     blocking_local_hard_rejects = list(local_gate_report.get("hard_reject", []))
@@ -7929,6 +7965,7 @@ def _recheck_existing_single_source_pair_record(
     )
     record["final_accept_source"] = "local_gate_and_final_omni"
     record["single_source_pair_acceptance_issues"] = blocking_issues
+    record["single_source_pair_review_required"] = _dedupe_strings(local_review_required + final_review_required)
     record["recommended_edit_text"] = record.get("recommended_edit_text") or _single_source_recommended_edit_text(model_fields)
     record["single_source_delta_family"] = record.get("single_source_delta_family") or _single_source_delta_family_from_fields(model_fields)
     record["model_accepted"] = bool(model_fields.get("accept")) and not bool(record.get("fallback_used"))
@@ -8293,6 +8330,11 @@ def _b_line_unrescued_local_hard_rejects(
         normalized = str(issue).strip()
         if not normalized:
             continue
+        if normalized.startswith("edit_text_not_audio_only: identical audio endpoints") or normalized.startswith(
+            "edit_text_not_audio_only: hollow speech target"
+        ):
+            unrescued.append(normalized)
+            continue
         if any(normalized.startswith(prefix) for prefix in B_LINE_FINAL_RESCUABLE_LOCAL_ISSUE_PREFIXES):
             continue
         unrescued.append(normalized)
@@ -8304,23 +8346,31 @@ def _single_source_final_verification_issues(
     *,
     acceptance_profile: str,
     audio_dataset_line: str = STANDARD_AUDIO_DATASET_LINE,
+    model_fields: dict[str, Any] | None = None,
 ) -> list[str]:
     if not isinstance(final_verification, dict) or not final_verification:
         return ["final_omni_verification_missing"]
     audio_dataset_line = _normalize_audio_dataset_line(audio_dataset_line)
+    b_audio_review = audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE and _is_b_audio_review_profile(acceptance_profile)
+    difference = model_fields.get("difference") if isinstance(model_fields, dict) and isinstance(model_fields.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
     threshold = _profile_threshold(acceptance_profile, "edit_match_score")
     issues: list[str] = []
     confidence = _score_float(final_verification.get("confidence"))
     quality_score = _score_float(final_verification.get("quality_score"))
+    quality_threshold = _single_source_final_omni_quality_threshold(
+        acceptance_profile=acceptance_profile,
+        audio_dataset_line=audio_dataset_line,
+    )
     reason = str(final_verification.get("main_reject_reason", "")).strip()
     if not _boolish(final_verification.get("accept")):
         issues.append("final_omni_reject" + (f": {reason}" if reason else ""))
     if confidence < threshold:
         issues.append(f"final_omni_low_confidence: {confidence:.2f} < {threshold:.2f}")
-    if quality_score < MIN_SINGLE_SOURCE_FINAL_OMNI_QUALITY_SCORE:
+    if quality_score < quality_threshold:
         issues.append(
             "final_omni_quality_score_below_threshold: "
-            f"{quality_score:.2f} < {MIN_SINGLE_SOURCE_FINAL_OMNI_QUALITY_SCORE:.2f}"
+            f"{quality_score:.2f} < {quality_threshold:.2f}"
         )
     if _boolish(final_verification.get("reference_satisfies_edit")):
         issues.append("final_omni_reference_satisfies_edit")
@@ -8332,14 +8382,20 @@ def _single_source_final_verification_issues(
         issues.append("final_omni_not_single_primary_delta")
     if _boolish(final_verification.get("text_or_ocr_driven")):
         issues.append("final_omni_text_or_ocr_driven")
-    if not _boolish(final_verification.get("segment_wide")):
+    if not _boolish(final_verification.get("segment_wide")) and not b_audio_review:
         issues.append("final_omni_delta_not_segment_wide")
     if not _boolish(final_verification.get("edit_text_accurate")):
         issues.append("final_omni_edit_text_inaccurate")
     if audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE:
-        if not _boolish(final_verification.get("audio_primary")):
+        if (
+            not _boolish(final_verification.get("audio_primary"))
+            and (not b_audio_review or _boolish(final_verification.get("visual_too_different_for_B")) or difference_type not in {"speech", "audio_event"})
+        ):
             issues.append("final_omni_audio_not_primary")
-        if not _boolish(final_verification.get("visual_locked")):
+        if (
+            not _boolish(final_verification.get("visual_locked"))
+            and (not b_audio_review or _boolish(final_verification.get("visual_too_different_for_B")))
+        ):
             issues.append("final_omni_visual_not_locked")
         if _boolish(final_verification.get("visual_too_different_for_B")):
             issues.append("final_omni_visual_too_different_for_B")
@@ -8351,6 +8407,39 @@ def _single_source_final_verification_issues(
         if "audio_context_preserved" in final_verification and not _boolish(final_verification.get("audio_context_preserved")):
             issues.append("final_omni_audio_context_not_preserved_for_A")
     return _dedupe_strings(issues)
+
+
+def _single_source_final_omni_quality_threshold(
+    *,
+    acceptance_profile: str,
+    audio_dataset_line: str,
+) -> float:
+    if _normalize_audio_dataset_line(audio_dataset_line) == SPEECH_AUDIO_CONTENT_LINE and _is_b_audio_review_profile(acceptance_profile):
+        return 0.60
+    return MIN_SINGLE_SOURCE_FINAL_OMNI_QUALITY_SCORE
+
+
+def _single_source_final_verification_review_required(
+    final_verification: dict[str, Any],
+    *,
+    acceptance_profile: str,
+    audio_dataset_line: str = STANDARD_AUDIO_DATASET_LINE,
+) -> list[str]:
+    if not isinstance(final_verification, dict) or not final_verification:
+        return []
+    if not (
+        _normalize_audio_dataset_line(audio_dataset_line) == SPEECH_AUDIO_CONTENT_LINE
+        and _is_b_audio_review_profile(acceptance_profile)
+    ):
+        return []
+    review: list[str] = []
+    if not _boolish(final_verification.get("segment_wide")):
+        review.append("final_omni_delta_not_segment_wide")
+    if not _boolish(final_verification.get("audio_primary")):
+        review.append("final_omni_audio_not_primary")
+    if not _boolish(final_verification.get("visual_locked")):
+        review.append("final_omni_visual_not_locked")
+    return _dedupe_strings(review)
 
 
 def _single_source_model_reject_issues(
@@ -8477,6 +8566,9 @@ def _single_source_audio_line_acceptance_issues(
         if "audio" not in modalities:
             issues.append("speech_audio_content edit must include audio modality")
         issues.extend(_b_line_edit_text_audio_only_issues(edit_text, difference_type))
+        endpoint_issue = _b_line_difference_endpoint_issue(difference, difference_type)
+        if endpoint_issue:
+            issues.append(endpoint_issue)
         if difference_type == "speech":
             if not reference_annotation or not target_annotation or not _speech_is_transcript_backed(reference_annotation, target_annotation):
                 issues.append("speech_audio_content speech edit lacks transcript-backed evidence")
@@ -8521,6 +8613,28 @@ def _single_source_audio_line_acceptance_issues(
                 if has_vague_audio and not has_concrete_audio:
                     issues.append("vague_audio_event: vague hum/click/tone without explicit evidence")
     return _dedupe_strings(issues)
+
+
+def _b_line_difference_endpoint_issue(difference: dict[str, Any], difference_type: str) -> str:
+    if difference_type not in {"speech", "audio_event"}:
+        return ""
+    from_value = _clean_b_line_audio_phrase(str(difference.get("from", "")).strip(), difference_type=difference_type)
+    to_value = _clean_b_line_audio_phrase(str(difference.get("to", "")).strip(), difference_type=difference_type)
+    if from_value and to_value and _normalized_phrase(from_value) == _normalized_phrase(to_value):
+        return "edit_text_not_audio_only: identical audio endpoints"
+    hollow_markers = (
+        "not transcribed",
+        "not described",
+        "unclear",
+        "unknown",
+        "speaking",
+        "speech",
+        "audio",
+        "sound",
+    )
+    if difference_type == "speech" and to_value and _normalized_phrase(to_value) in hollow_markers:
+        return "edit_text_not_audio_only: hollow speech target"
+    return ""
 
 
 def _single_source_model_reject_reason(

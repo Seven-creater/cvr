@@ -641,6 +641,7 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
             '"visual_too_different_for_B": boolean, "edit_text_audio_only": boolean}. '
             "Accept if the audible speech/audio change is primary, edit_text is audio-only, reference does not satisfy it, target satisfies it, "
             "and visuals stay practically locked: same person/speaker, same scene, same program, same match, or same broadcast/view context. "
+            "Do not reject only because the speech/audio change covers part of the 6s target clip; segment_wide=false is acceptable when the target clearly contains the requested audio evidence. "
             "Minor framing, pose, camera, gesture, or action changes are okay. Set visual_too_different_for_B=true only when visuals dominate enough that listening is unnecessary. "
             "Reject vague audio guesses, visual edit_text, or cases where target can be found without audio. "
             "If accept=false, set quality_score below 0.7 and explain main_reject_reason."
@@ -693,6 +694,7 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
             "Set visual_locked=true when the clips share the same person/speaker, same scene, same program, or same broadcast/view context, even if framing, pose, "
             "gesture, camera, or minor action changes. Set visual_too_different_for_B=true only when the person/scene/program/domain changes enough that visuals alone "
             "would identify the target. "
+            "For B-line review, do not reject only because the audible delta is not present for the full 6 seconds; segment_wide=false should be reported but can still be acceptable. "
             "Set accept=true only if audio_primary=true, visual_locked=true, visual_too_different_for_B=false, and edit_text_audio_only=true. "
             "Reject if a stronger visual difference is doing the retrieval work, if the audio evidence is generic, if the edit_text describes visuals, "
             "or if the edit could be judged without listening."
@@ -1044,6 +1046,7 @@ def _build_single_source_final_verification_user_content(
         line_text = (
             "B-line final rule: accept if the audible speech/audio change is primary and visuals share the same person, same scene, same program, "
             "or same broadcast/view context. Minor framing, pose, camera, or action changes are acceptable. "
+            "Do not reject only because the audio evidence covers part of the 6s clip; report segment_wide=false but accept when target clearly contains the requested audio. "
             "Reject only when visual changes are dominant enough that listening is unnecessary. Return audio_primary, visual_locked, visual_too_different_for_B, and edit_text_audio_only.\n"
         )
     prompt = (
