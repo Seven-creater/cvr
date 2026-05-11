@@ -1234,6 +1234,100 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("edit-required difference", request_body["messages"][1]["content"][0]["text"])
         self.assertIn("edit_text_quality_check", request_body["messages"][1]["content"][0]["text"])
 
+    def test_audio_line_single_source_pair_repairs_missing_auxiliary_schema_fields(self) -> None:
+        requests: list[object] = []
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "edit_text": "change the speech from discussing budgets to discussing healthcare",
+                                "difference": {
+                                    "type": "speech",
+                                    "from": "discussing budgets",
+                                    "to": "discussing healthcare",
+                                    "description": "the spoken topic changes while the scene remains the same",
+                                },
+                                "modalities": ["audio"],
+                                "confidence": 0.84,
+                                "accept": True,
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            requests.append(request)
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-composed-omni-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            ref_path = tmp_dir / "ref.mp4"
+            tgt_path = tmp_dir / "tgt.mp4"
+            ref_path.write_bytes(b"fake-reference")
+            tgt_path.write_bytes(b"fake-target")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+            )
+
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.propose_single_source_pair(
+                    reference_clip_path=str(ref_path),
+                    target_clip_path=str(tgt_path),
+                    reference_annotation={
+                        "clip_id": "ref",
+                        "summary": "a presenter speaks at a podium about budgets",
+                        "scene": "podium speech",
+                        "subjects": ["presenter"],
+                        "actions": ["speaking"],
+                        "speech": ["budget policy comments"],
+                        "audio_events": [],
+                        "modalities": ["visual", "audio"],
+                    },
+                    target_annotation={
+                        "clip_id": "tgt",
+                        "summary": "the same presenter speaks at the podium about healthcare",
+                        "scene": "podium speech",
+                        "subjects": ["presenter"],
+                        "actions": ["speaking"],
+                        "speech": ["healthcare policy comments"],
+                        "audio_events": [],
+                        "modalities": ["visual", "audio"],
+                    },
+                    whole_annotation=None,
+                    candidate={
+                        "audio_dataset_line": "speech_audio_content",
+                        "heuristic_difference": {
+                            "type": "speech",
+                            "from": "budget policy comments",
+                            "to": "healthcare policy comments",
+                            "description": "spoken topic changes",
+                        },
+                    },
+                    audio_dataset_line="speech_audio_content",
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual(1, len(requests))
+        self.assertEqual("speech", normalized["difference"]["type"])
+        self.assertEqual("speech", normalized["dominant_delta"]["type"])
+        self.assertEqual("a presenter speaks at a podium about budgets", normalized["reference_caption"])
+        self.assertEqual("the same presenter speaks at the podium about healthcare", normalized["target_caption"])
+        self.assertGreaterEqual(normalized["delta_temporal_extent"]["target_coverage"], 0.55)
+        self.assertTrue(normalized["is_segment_wide_delta"])
+        self.assertIn("dominant_delta", normalized["schema_repaired_fields"])
+        self.assertIn("reference_state", normalized["schema_repaired_fields"])
+        self.assertIn("target_state", normalized["schema_repaired_fields"])
+
     def test_verify_pair_difference_materializes_reference_and_target_videos(self) -> None:
         request_holder: dict[str, object] = {}
         response_payload = {

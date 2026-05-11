@@ -1442,6 +1442,14 @@ class OpenAIComposedDataClient:
             system_prompt=_single_source_pair_system_prompt(line),
             max_tokens=1200 if line == "speech_audio_content" else 1100 if line == "visual_audio_anchor" else 1500,
         )
+        if line in {"visual_audio_anchor", "speech_audio_content"}:
+            raw_payload = _repair_audio_line_single_source_pair_payload(
+                raw_payload,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                candidate=candidate,
+                audio_dataset_line=line,
+            )
         return _normalize_single_source_pair_payload(raw_payload), raw_payload
 
     def verify_single_source_pair_final(
@@ -1839,6 +1847,7 @@ def _normalize_single_source_pair_payload(payload: dict[str, Any]) -> dict[str, 
         "confidence": _score_value(payload.get("confidence")),
         "accept": _bool_value(payload.get("accept")),
         "reject_reason": str(payload.get("reject_reason", "")).strip(),
+        "schema_repaired_fields": _detail_list(payload.get("schema_repaired_fields")),
     }
     for field_name in ("edit_text", "reference_caption", "target_caption"):
         if not normalized[field_name]:
@@ -1850,6 +1859,309 @@ def _normalize_single_source_pair_payload(payload: dict[str, Any]) -> dict[str, 
     if not normalized["delta_temporal_extent"]["evidence"]:
         raise ValueError("single-source pair delta_temporal_extent evidence is required")
     return normalized
+
+
+def _repair_audio_line_single_source_pair_payload(
+    payload: dict[str, Any],
+    *,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    candidate: dict[str, Any] | None,
+    audio_dataset_line: str,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+
+    repaired = dict(payload)
+    repaired_fields = _detail_list(repaired.get("schema_repaired_fields"))
+    line = _normalize_audio_dataset_line(audio_dataset_line)
+    candidate_payload = candidate if isinstance(candidate, dict) else {}
+    heuristic_difference = candidate_payload.get("heuristic_difference")
+    if not isinstance(heuristic_difference, dict):
+        heuristic_difference = candidate_payload.get("difference")
+    if not isinstance(heuristic_difference, dict):
+        heuristic_difference = {}
+
+    difference = _coerce_single_source_difference(repaired.get("difference"))
+    dominant_delta = repaired.get("dominant_delta") if isinstance(repaired.get("dominant_delta"), dict) else {}
+    if difference is None:
+        difference = _coerce_single_source_difference(dominant_delta)
+    if difference is None:
+        difference = _coerce_single_source_difference(heuristic_difference)
+    if difference is not None:
+        existing_difference = repaired.get("difference") if isinstance(repaired.get("difference"), dict) else {}
+        merged_difference = {
+            "type": difference["type"],
+            "from": str(existing_difference.get("from", difference.get("from", ""))).strip(),
+            "to": str(existing_difference.get("to", difference.get("to", ""))).strip(),
+            "description": str(existing_difference.get("description", difference.get("description", ""))).strip(),
+        }
+        if not merged_difference["description"]:
+            merged_difference["description"] = _single_source_difference_description(merged_difference)
+        repaired["difference"] = merged_difference
+        if "difference" in _missing_fields(payload, ("difference",)):
+            repaired_fields.append("difference")
+
+    diff = repaired.get("difference") if isinstance(repaired.get("difference"), dict) else {}
+    diff_type = str(diff.get("type", "")).strip()
+    edit_text = str(repaired.get("edit_text", "")).strip()
+    if not edit_text:
+        edit_text = str(repaired.get("recommended_edit_text", "")).strip()
+    if not edit_text and diff_type:
+        edit_text = _single_source_edit_text_from_difference(diff, line)
+    if edit_text and not str(repaired.get("edit_text", "")).strip():
+        repaired["edit_text"] = edit_text
+        repaired_fields.append("edit_text")
+
+    modalities = _normalize_modalities(repaired.get("modalities"))
+    if not modalities:
+        modalities = ["audio"] if diff_type in {"speech", "audio_event"} or line == "speech_audio_content" else ["visual"]
+        repaired["modalities"] = modalities
+        repaired_fields.append("modalities")
+
+    if not str(repaired.get("reference_caption", "")).strip():
+        repaired["reference_caption"] = _single_source_caption_from_annotation(reference_annotation, fallback="reference clip")
+        repaired_fields.append("reference_caption")
+    if not str(repaired.get("target_caption", "")).strip():
+        repaired["target_caption"] = _single_source_caption_from_annotation(target_annotation, fallback="target clip")
+        repaired_fields.append("target_caption")
+
+    repaired["dominant_delta"] = _repair_single_source_dominant_delta(
+        repaired.get("dominant_delta"),
+        difference=diff,
+        evidence=repaired.get("evidence"),
+    )
+    if not isinstance(payload.get("dominant_delta"), dict):
+        repaired_fields.append("dominant_delta")
+
+    repaired["reference_state"] = _repair_single_source_state_payload(
+        repaired.get("reference_state"),
+        annotation=reference_annotation,
+    )
+    if not isinstance(payload.get("reference_state"), dict):
+        repaired_fields.append("reference_state")
+    repaired["target_state"] = _repair_single_source_state_payload(
+        repaired.get("target_state"),
+        annotation=target_annotation,
+    )
+    if not isinstance(payload.get("target_state"), dict):
+        repaired_fields.append("target_state")
+
+    if "accept" not in repaired and edit_text and diff_type:
+        repaired["accept"] = True
+        repaired_fields.append("accept")
+
+    confidence = _score_value(repaired.get("confidence"))
+    if confidence <= 0.0 and _bool_value(repaired.get("accept")):
+        repaired["confidence"] = 0.72
+        repaired_fields.append("confidence")
+        confidence = 0.72
+
+    repaired["delta_temporal_extent"] = _repair_single_source_delta_extent(
+        repaired.get("delta_temporal_extent"),
+        difference=diff,
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+        confidence=confidence,
+        accepted=_bool_value(repaired.get("accept")),
+    )
+    if not isinstance(payload.get("delta_temporal_extent"), dict):
+        repaired_fields.append("delta_temporal_extent")
+
+    repaired["subject_roles"] = _repair_single_source_subject_roles_payload(
+        repaired.get("subject_roles"),
+        target_state=repaired["target_state"],
+    )
+    if not isinstance(payload.get("subject_roles"), dict):
+        repaired_fields.append("subject_roles")
+
+    if "is_segment_wide_delta" not in repaired:
+        repaired["is_segment_wide_delta"] = bool(_bool_value(repaired.get("accept")) and confidence >= 0.55)
+        repaired_fields.append("is_segment_wide_delta")
+    if "discarded_deltas" not in repaired or not isinstance(repaired.get("discarded_deltas"), list):
+        repaired["discarded_deltas"] = _detail_list(repaired.get("discarded_deltas"))
+        repaired_fields.append("discarded_deltas")
+
+    evidence = _detail_list(repaired.get("evidence"))
+    if not evidence:
+        evidence = _single_source_repair_evidence(
+            difference=diff,
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+            dominant_delta=repaired["dominant_delta"],
+        )
+        if evidence:
+            repaired["evidence"] = evidence
+            repaired_fields.append("evidence")
+
+    if not str(repaired.get("reject_reason", "")).strip():
+        repaired["reject_reason"] = "" if _bool_value(repaired.get("accept")) else "model did not accept the pair"
+        if not _bool_value(repaired.get("accept")):
+            repaired_fields.append("reject_reason")
+
+    if repaired_fields:
+        repaired["schema_repaired_fields"] = sorted(set(repaired_fields))
+    return repaired
+
+
+def _coerce_single_source_difference(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    difference_type = str(value.get("type", "")).strip().lower().replace("-", "_").replace(" ", "_")
+    difference_type = DIFFERENCE_TYPE_ALIASES.get(difference_type, difference_type)
+    if difference_type not in ALLOWED_DIFFERENCE_TYPES:
+        return None
+    result = {
+        "type": difference_type,
+        "from": str(value.get("from", "")).strip(),
+        "to": str(value.get("to", "")).strip(),
+        "description": str(value.get("description", value.get("reason", ""))).strip(),
+    }
+    if not (result["from"] or result["to"] or result["description"]):
+        return None
+    if not result["description"]:
+        result["description"] = _single_source_difference_description(result)
+    return result
+
+
+def _single_source_difference_description(difference: dict[str, Any]) -> str:
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    if from_value and to_value:
+        return f"changes from {from_value} to {to_value}"
+    if to_value:
+        return f"target changes to {to_value}"
+    if from_value:
+        return f"reference starts from {from_value}"
+    return "single-source pair has one proposed difference"
+
+
+def _single_source_edit_text_from_difference(difference: dict[str, Any], audio_dataset_line: str) -> str:
+    difference_type = str(difference.get("type", "")).strip()
+    from_value = str(difference.get("from", "")).strip()
+    to_value = str(difference.get("to", "")).strip()
+    if difference_type == "speech":
+        if from_value and to_value:
+            return f"change the speech from {from_value} to {to_value}"
+        if to_value:
+            return f"change the speech to {to_value}"
+    if difference_type == "audio_event":
+        if from_value and to_value:
+            return f"replace {from_value} in the audio with {to_value}"
+        if to_value:
+            return f"add {to_value} to the audio"
+    if audio_dataset_line == "speech_audio_content":
+        return ""
+    if difference_type == "object_presence" and to_value:
+        return f"add {to_value}" if not from_value or from_value.lower() in {"none", "absent", "missing", "no"} else f"replace {from_value} with {to_value}"
+    if difference_type == "object_count" and from_value and to_value:
+        return f"change the count from {from_value} to {to_value}"
+    if difference_type == "scene" and from_value and to_value:
+        return f"change the scene from {from_value} to {to_value}"
+    if difference_type == "action" and from_value and to_value:
+        return f"change the action from {from_value} to {to_value}"
+    if difference_type == "attribute" and from_value and to_value:
+        return f"change {from_value} to {to_value}"
+    return ""
+
+
+def _single_source_caption_from_annotation(annotation: dict[str, Any], *, fallback: str) -> str:
+    summary = str(annotation.get("summary", "")).strip()
+    if summary:
+        return summary
+    scene = str(annotation.get("scene", "")).strip()
+    subjects = _detail_list(annotation.get("subjects"))
+    actions = _detail_list(annotation.get("actions"))
+    parts = subjects[:2] + actions[:2]
+    if scene:
+        parts.append(scene)
+    return ", ".join(parts) if parts else fallback
+
+
+def _repair_single_source_dominant_delta(value: Any, *, difference: dict[str, Any], evidence: Any) -> dict[str, Any]:
+    dominant = dict(value) if isinstance(value, dict) else {}
+    reason = str(dominant.get("reason", "")).strip()
+    if not reason:
+        evidence_items = _detail_list(evidence)
+        reason = evidence_items[0] if evidence_items else str(difference.get("description", "")).strip()
+    return {
+        "type": str(dominant.get("type", difference.get("type", ""))).strip(),
+        "from": str(dominant.get("from", difference.get("from", ""))).strip(),
+        "to": str(dominant.get("to", difference.get("to", ""))).strip(),
+        "reason": reason or "dominant delta inferred from the proposed difference",
+    }
+
+
+def _repair_single_source_state_payload(value: Any, *, annotation: dict[str, Any]) -> dict[str, Any]:
+    state = dict(value) if isinstance(value, dict) else {}
+    transcript = _detail_list(annotation.get("speakers_and_transcript")) or _detail_list(annotation.get("speech"))
+    subjects = _detail_list(annotation.get("subjects"))
+    actions = _detail_list(annotation.get("actions"))
+    scene = str(annotation.get("scene", "")).strip()
+    composition = str(state.get("composition", "")).strip() or ", ".join([item for item in [scene, *subjects[:2], *actions[:2]] if item])
+    return {
+        "main_speaker": str(state.get("main_speaker", "")).strip() or (subjects[0] if subjects else ""),
+        "inset_subjects": _detail_list(state.get("inset_subjects")),
+        "product_overlay": str(state.get("product_overlay", "")).strip(),
+        "composition": composition or str(annotation.get("summary", "")).strip(),
+        "internal_transitions": _detail_list(state.get("internal_transitions")) or transcript[:2],
+    }
+
+
+def _repair_single_source_delta_extent(
+    value: Any,
+    *,
+    difference: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    confidence: float,
+    accepted: bool,
+) -> dict[str, Any]:
+    extent = dict(value) if isinstance(value, dict) else {}
+    coverage = _score_value(extent.get("target_coverage"))
+    if coverage <= 0.0 and accepted:
+        coverage = max(0.6, min(0.9, confidence or 0.72))
+    evidence = str(extent.get("evidence", "")).strip()
+    if not evidence:
+        evidence = str(difference.get("description", "")).strip() or _single_source_difference_description(difference)
+    return {
+        "reference": str(extent.get("reference", "")).strip()
+        or _single_source_caption_from_annotation(reference_annotation, fallback="reference clip"),
+        "target": str(extent.get("target", "")).strip()
+        or _single_source_caption_from_annotation(target_annotation, fallback="target clip"),
+        "target_coverage": coverage,
+        "evidence": evidence,
+    }
+
+
+def _repair_single_source_subject_roles_payload(value: Any, *, target_state: dict[str, Any]) -> dict[str, Any]:
+    roles = dict(value) if isinstance(value, dict) else {}
+    return {
+        "main_speaker": str(roles.get("main_speaker", target_state.get("main_speaker", ""))).strip(),
+        "inset_subjects": _detail_list(roles.get("inset_subjects", target_state.get("inset_subjects", []))),
+        "product_overlay": str(roles.get("product_overlay", target_state.get("product_overlay", ""))).strip(),
+    }
+
+
+def _single_source_repair_evidence(
+    *,
+    difference: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    dominant_delta: dict[str, Any],
+) -> list[str]:
+    evidence: list[str] = []
+    reason = str(dominant_delta.get("reason", "")).strip()
+    if reason:
+        evidence.append(reason)
+    description = str(difference.get("description", "")).strip()
+    if description and description not in evidence:
+        evidence.append(description)
+    ref_caption = _single_source_caption_from_annotation(reference_annotation, fallback="")
+    tgt_caption = _single_source_caption_from_annotation(target_annotation, fallback="")
+    if ref_caption and tgt_caption:
+        evidence.append(f"reference: {ref_caption}; target: {tgt_caption}")
+    return evidence[:3]
 
 
 def _normalize_single_source_final_verification_payload(payload: dict[str, Any]) -> dict[str, Any]:
