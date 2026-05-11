@@ -173,6 +173,75 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("include both from/to text", system_prompt)
         self.assertEqual(22.0, request_holder["timeout"])
 
+    def test_refine_b_line_edit_text_requires_specific_audio_instruction(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "refined_edit_text": "change the speech from discussing the bakery opening to discussing the mayor's remarks",
+                                "edit_text_specificity_score": 0.91,
+                                "reject_if_unspecific": False,
+                                "edit_text_reject_reason": "",
+                                "speech_or_audio_evidence": [
+                                    "reference speech mentions a bakery opening",
+                                    "target speech mentions the mayor's remarks",
+                                ],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            request_holder["timeout"] = timeout
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-composed-omni-refine-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            ref_path = tmp_dir / "ref.mp4"
+            tgt_path = tmp_dir / "tgt.mp4"
+            ref_path.write_bytes(b"fake-ref")
+            tgt_path.write_bytes(b"fake-tgt")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8092/v1",
+                api_key="EMPTY",
+                model="instruct-model",
+                timeout_seconds=44.0,
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.refine_b_line_edit_text(
+                    reference_clip_path=str(ref_path),
+                    target_clip_path=str(tgt_path),
+                    model_fields={"edit_text": "speech content has been altered", "difference": {"type": "speech"}},
+                    final_verification={"audio_primary": True, "visual_locked": True},
+                    reference_annotation={"speech": ["bakery opening"], "summary": "same speaker"},
+                    target_annotation={"speech": ["mayor remarks"], "summary": "same speaker"},
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual(
+            "change the speech from discussing the bakery opening to discussing the mayor's remarks",
+            normalized["refined_edit_text"],
+        )
+        self.assertAlmostEqual(0.91, normalized["edit_text_specificity_score"])
+        request = request_holder["request"]
+        request_body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual({"type": "json_object"}, request_body["response_format"])
+        system_prompt = request_body["messages"][0]["content"]
+        self.assertIn("Reject vague wording such as unintelligible speech", system_prompt)
+        self.assertIn("not transcribed", system_prompt)
+        self.assertIn("target audio", system_prompt)
+        self.assertEqual(44.0, request_holder["timeout"])
+
     def test_request_json_repairs_malformed_json_response(self) -> None:
         requests: list[object] = []
         repaired_payload = {

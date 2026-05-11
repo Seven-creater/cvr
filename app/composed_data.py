@@ -947,7 +947,15 @@ B_LINE_VISUAL_EDIT_TERMS = (
     "person",
     "people",
     "man ",
+    "men ",
     "woman ",
+    "women ",
+    "shirt",
+    "boat",
+    "river",
+    "fishing",
+    "podium",
+    "microphone",
     "color",
     "colour",
     "text",
@@ -2250,6 +2258,51 @@ def propose_single_source_pairs(
             )
             final_omni_accept = bool(should_run_final_omni and not final_issues and _boolish(final_omni_verification.get("accept")))
             accepted = bool(final_omni_accept and not blocking_issues)
+            edit_text_refinement: dict[str, Any] = {}
+            raw_edit_text_refinement: dict[str, Any] = {}
+            if accepted and audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE and _is_b_audio_review_profile(acceptance_profile):
+                try:
+                    edit_text_refinement, raw_edit_text_refinement = _call_omni_with_retries(
+                        label=f"edit_refine:{proposal_id}",
+                        retries=omni_retries,
+                        fail_on_transient=fail_on_transient_omni_errors,
+                        func=lambda: client.refine_b_line_edit_text(
+                            reference_clip_path=str(reference_path),
+                            target_clip_path=str(target_path),
+                            model_fields=model_fields,
+                            final_verification=final_omni_verification,
+                            reference_annotation=_single_source_line_annotation_prompt_view(reference_annotation, audio_dataset_line),
+                            target_annotation=_single_source_line_annotation_prompt_view(target_annotation, audio_dataset_line),
+                        ),
+                    )
+                except Exception as exc:
+                    if fail_on_transient_omni_errors and _is_transient_omni_exception(exc):
+                        print(
+                            "[propose-single-source-pairs] transient edit refinement error; shard will fail for retry "
+                            f"proposal_id={proposal_id} error={type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        raise
+                    edit_text_refinement = {
+                        "refined_edit_text": "",
+                        "edit_text_specificity_score": 0.0,
+                        "reject_if_unspecific": True,
+                        "edit_text_reject_reason": f"edit_text_refinement_error: {type(exc).__name__}: {exc}",
+                        "speech_or_audio_evidence": [],
+                    }
+                    raw_edit_text_refinement = {"error": f"{type(exc).__name__}: {exc}"}
+                refinement_issues = _b_line_edit_text_refinement_issues(edit_text_refinement)
+                if refinement_issues:
+                    accepted = False
+                    final_omni_accept = False
+                    blocking_issues = _dedupe_strings(blocking_issues + refinement_issues)
+                else:
+                    refined_edit = str(edit_text_refinement.get("refined_edit_text", "")).strip()
+                    if refined_edit:
+                        if not model_fields.get("b_line_original_edit_text"):
+                            model_fields["b_line_original_edit_text"] = str(model_fields.get("edit_text", "")).strip()
+                        model_fields["edit_text"] = refined_edit
             reject_reason = str(model_fields.get("reject_reason", "")).strip()
             if not accepted:
                 reject_reason = "; ".join([item for item in [reject_reason, *blocking_issues] if item]).strip()
@@ -2316,6 +2369,15 @@ def propose_single_source_pairs(
                 "single_source_pair_review_required": _dedupe_strings(local_review_required + final_review_required),
                 "b_line_edit_text_repaired": bool(model_fields.get("b_line_edit_text_repaired")),
                 "b_line_original_edit_text": str(model_fields.get("b_line_original_edit_text", "")).strip(),
+                "raw_proposed_edit_text": str(model_fields.get("b_line_original_edit_text") or raw_model_output.get("edit_text") or "").strip()
+                if isinstance(raw_model_output, dict)
+                else str(model_fields.get("b_line_original_edit_text", "")).strip(),
+                "edit_text_refinement": edit_text_refinement,
+                "raw_edit_text_refinement": raw_edit_text_refinement,
+                "refined_edit_text": str(edit_text_refinement.get("refined_edit_text", "")).strip(),
+                "edit_text_specificity_score": _score_float(edit_text_refinement.get("edit_text_specificity_score")),
+                "edit_text_reject_reason": str(edit_text_refinement.get("edit_text_reject_reason", "")).strip(),
+                "speech_or_audio_evidence": _normalize_list(edit_text_refinement.get("speech_or_audio_evidence", [])),
                 "recommended_edit_text": str(final_omni_verification.get("recommended_edit_text", "")).strip()
                 or _single_source_recommended_edit_text(model_fields),
                 "hard_negatives": hard_negative_paths,
@@ -8442,6 +8504,21 @@ def _single_source_final_verification_review_required(
     return _dedupe_strings(review)
 
 
+def _b_line_edit_text_refinement_issues(refinement: dict[str, Any]) -> list[str]:
+    if not isinstance(refinement, dict) or not refinement:
+        return ["edit_text_refinement_missing"]
+    refined_edit = str(refinement.get("refined_edit_text", "")).strip()
+    difference_type = "audio_event" if any(term in _normalized_phrase(refined_edit) for term in ("audio", "sound", "music", "cheer", "applause", "ambient")) else "speech"
+    issues = _b_line_edit_text_audio_only_issues(refined_edit, difference_type)
+    score = _score_float(refinement.get("edit_text_specificity_score"))
+    if score < 0.70:
+        issues.append(f"edit_text_specificity_score_below_threshold: {score:.2f} < 0.70")
+    if _boolish(refinement.get("reject_if_unspecific")):
+        reason = str(refinement.get("edit_text_reject_reason", "")).strip()
+        issues.append("edit_text_refinement_reject" + (f": {reason}" if reason else ""))
+    return _dedupe_strings(issues)
+
+
 def _single_source_model_reject_issues(
     model_fields: dict[str, Any],
     edit_text_quality: dict[str, Any],
@@ -8484,6 +8561,7 @@ def _b_line_edit_text_audio_only_issues(edit_text: str, difference_type: str) ->
     if not normalized:
         return ["edit_text_not_audio_only: empty edit_text"]
     issues: list[str] = []
+    issues.extend(_b_line_edit_text_specificity_issues(edit_text, difference_type))
     if not any(term in normalized for term in B_LINE_AUDIO_EDIT_TERMS):
         issues.append("edit_text_not_audio_only: missing speech/audio wording")
     visual_terms = [term.strip() for term in B_LINE_VISUAL_EDIT_TERMS if term in normalized]
@@ -8525,6 +8603,52 @@ def _b_line_edit_text_audio_only_issues(edit_text: str, difference_type: str) ->
         )
     ):
         issues.append("edit_text_not_audio_only: audio_event edit lacks concrete sound wording")
+    return _dedupe_strings(issues)
+
+
+def _b_line_edit_text_specificity_issues(edit_text: str, difference_type: str) -> list[str]:
+    normalized = _normalized_phrase(edit_text)
+    issues: list[str] = []
+    generic_phrases = (
+        "speech content has been altered",
+        "audio content differs",
+        "audio content has been altered",
+        "the audio content differs",
+        "target audio",
+        "reference audio",
+        "add target audio to the audio",
+        "replace reference audio",
+    )
+    hollow_markers = (
+        "unintelligible",
+        "inaudible",
+        "not transcribed",
+        "not clearly transcribed",
+        "not clear enough",
+        "not clearly discernible",
+        "not clearly intelligible",
+        "content is not clear",
+        "content not clear",
+        "content is unspecified",
+        "specific content is not",
+        "speech is present but",
+        "unknown",
+        "unspecified",
+    )
+    if any(phrase in normalized for phrase in generic_phrases):
+        issues.append("edit_text_not_audio_only: generic audio placeholder")
+    if any(marker in normalized for marker in hollow_markers):
+        issues.append("edit_text_not_audio_only: hollow audio wording")
+    clauses = [clause.strip() for clause in re.split(r"[;\n]+", edit_text) if clause.strip()]
+    for clause in clauses[1:]:
+        clause_norm = _normalized_phrase(clause)
+        has_audio_word = any(term in clause_norm for term in B_LINE_AUDIO_EDIT_TERMS)
+        has_visual_word = any(term.strip() in clause_norm for term in B_LINE_VISUAL_EDIT_TERMS)
+        if has_visual_word and not has_audio_word:
+            issues.append("edit_text_not_audio_only: visual clause in audio edit")
+            break
+    if difference_type == "speech" and normalized in {"speech", "speaking", "audio", "sound", "voice"}:
+        issues.append("edit_text_not_audio_only: hollow speech edit")
     return _dedupe_strings(issues)
 
 
@@ -8702,6 +8826,8 @@ def _repair_single_source_audio_line_model_fields(
         reference_caption=str(reference_annotation.get("summary", "")),
         target_caption=str(target_annotation.get("summary", "")),
     )
+    if _b_line_difference_endpoint_issue(difference, difference_type):
+        return repaired
     should_replace = bool(current_issues and not candidate_issues) or (
         _score_float(candidate_quality.get("score")) > _score_float(current_quality.get("score"))
         and not candidate_issues
@@ -8734,11 +8860,15 @@ def _b_line_audio_only_edit_text_from_difference(
             from_value = _clean_b_line_audio_phrase(_first_speech_phrase(reference_annotation), difference_type=difference_type)
         if not to_value:
             to_value = _clean_b_line_audio_phrase(_first_speech_phrase(target_annotation), difference_type=difference_type)
+        if _b_line_audio_phrase_is_hollow(from_value) or _b_line_audio_phrase_is_hollow(to_value):
+            return ""
         if from_value and to_value:
             return f"change the speech from {from_value} to {to_value}"
         if to_value:
             return f"change the speech to {to_value}"
     if difference_type == "audio_event":
+        if _b_line_audio_phrase_is_hollow(from_value) or _b_line_audio_phrase_is_hollow(to_value):
+            return ""
         if from_value and to_value:
             return f"replace {from_value} in the audio with {to_value}"
         if to_value:
@@ -8746,6 +8876,43 @@ def _b_line_audio_only_edit_text_from_difference(
         if from_value:
             return f"remove {from_value} from the audio"
     return ""
+
+
+def _b_line_audio_phrase_is_hollow(value: str) -> bool:
+    normalized = _normalized_phrase(value)
+    if not normalized:
+        return False
+    hollow_exact = {
+        "speech",
+        "speaking",
+        "discussing speaking",
+        "audio",
+        "sound",
+        "voice",
+        "unknown",
+        "unspecified",
+        "target audio",
+        "reference audio",
+    }
+    if normalized in hollow_exact:
+        return True
+    return bool(
+        any(
+            marker in normalized
+            for marker in (
+                "unintelligible",
+                "inaudible",
+                "not transcribed",
+                "not clearly",
+                "not clear",
+                "not discernible",
+                "not intelligible",
+                "content is not",
+                "content not",
+                "specific content is not",
+            )
+        )
+    )
 
 
 def _clean_b_line_audio_phrase(value: str, *, difference_type: str) -> str:

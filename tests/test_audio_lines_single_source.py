@@ -14,6 +14,7 @@ from app.audio_lines_single_source import (
 from app.composed_data import (
     ensure_layout,
     propose_single_source_pairs,
+    _b_line_edit_text_audio_only_issues,
     _is_transient_omni_exception,
     _single_source_final_verification_issues,
 )
@@ -80,6 +81,31 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
         )
         self.assertIn("final_omni_visual_too_different_for_B", issues)
         self.assertIn("final_omni_audio_not_primary", issues)
+
+    def test_b_line_rejects_hollow_or_visual_leaky_audio_edit_text(self) -> None:
+        bad_cases = [
+            ("The speech content has been altered.", "speech", "generic audio placeholder"),
+            ("change the speech from unintelligible speech to not transcribed speech", "speech", "hollow audio wording"),
+            ("add target audio to the audio", "audio_event", "generic audio placeholder"),
+            ("replace fishing reel sound; Two men are fishing near the river.", "audio_event", "visual clause in audio edit"),
+        ]
+        for edit_text, difference_type, expected in bad_cases:
+            with self.subTest(edit_text=edit_text):
+                issues = _b_line_edit_text_audio_only_issues(edit_text, difference_type)
+                self.assertTrue(any(expected in issue for issue in issues), issues)
+
+        self.assertEqual(
+            [],
+            _b_line_edit_text_audio_only_issues(
+                "change the speech from discussing the bakery opening to discussing the mayor's remarks",
+                "speech",
+            ),
+        )
+        self.assertEqual(
+            [],
+            _b_line_edit_text_audio_only_issues("replace a continuous electronic hum with classical music", "audio_event"),
+        )
+        self.assertEqual([], _b_line_edit_text_audio_only_issues("add crowd cheering to the audio", "audio_event"))
 
     def test_prepare_existing_single_source_reconstructs_groups_and_reuses_annotations(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -682,6 +708,16 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 },
                 {"raw": "final"},
             )
+            client.refine_b_line_edit_text.return_value = (
+                {
+                    "refined_edit_text": "change the speech from discussing sports to discussing weather",
+                    "edit_text_specificity_score": 0.9,
+                    "reject_if_unspecific": False,
+                    "edit_text_reject_reason": "",
+                    "speech_or_audio_evidence": ["reference discusses sports", "target discusses weather"],
+                },
+                {"raw": "refine"},
+            )
 
             with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
                 summary = propose_single_source_pairs(
@@ -805,6 +841,16 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 },
                 {"raw": "final"},
             )
+            client.refine_b_line_edit_text.return_value = (
+                {
+                    "refined_edit_text": "change the speech from discussing sports to discussing weather",
+                    "edit_text_specificity_score": 0.9,
+                    "reject_if_unspecific": False,
+                    "edit_text_reject_reason": "",
+                    "speech_or_audio_evidence": ["reference discusses sports", "target discusses weather"],
+                },
+                {"raw": "refine"},
+            )
 
             with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
                 summary = propose_single_source_pairs(
@@ -921,6 +967,16 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                     "audio_context_preserved": True,
                 },
                 {"raw": "final"},
+            )
+            client.refine_b_line_edit_text.return_value = (
+                {
+                    "refined_edit_text": "change the speech from discussing sports to discussing weather",
+                    "edit_text_specificity_score": 0.9,
+                    "reject_if_unspecific": False,
+                    "edit_text_reject_reason": "",
+                    "speech_or_audio_evidence": ["reference discusses sports", "target discusses weather"],
+                },
+                {"raw": "refine"},
             )
 
             with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
@@ -1237,6 +1293,16 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                     "edit_text_audio_only": True,
                 },
                 {"raw": "final"},
+            )
+            client.refine_b_line_edit_text.return_value = (
+                {
+                    "refined_edit_text": "change the speech from discussing sports to discussing weather",
+                    "edit_text_specificity_score": 0.9,
+                    "reject_if_unspecific": False,
+                    "edit_text_reject_reason": "",
+                    "speech_or_audio_evidence": ["reference discusses sports", "target discusses weather"],
+                },
+                {"raw": "refine"},
             )
 
             with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):

@@ -138,6 +138,14 @@ REQUIRED_SINGLE_SOURCE_FINAL_VERIFICATION_FIELDS = (
     "recommended_edit_text",
 )
 
+REQUIRED_B_LINE_EDIT_TEXT_REFINEMENT_FIELDS = (
+    "refined_edit_text",
+    "edit_text_specificity_score",
+    "reject_if_unspecific",
+    "edit_text_reject_reason",
+    "speech_or_audio_evidence",
+)
+
 REQUIRED_VIDEO_EDIT_PLAN_FIELDS = (
     "should_generate",
     "source_prompt",
@@ -543,6 +551,10 @@ def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> 
             "Minor framing, pose, camera, gesture, or action changes are allowed when listening is still needed. "
             "The edit must be audio-only: use difference.type=speech for spoken content/topic/transcript changes, or audio_event only for concrete non-speech sounds such as cheering, applause, music, machinery, ambience, rain, or crowd noise. "
             "Do not label narration/topic changes as audio_event. edit_text must not describe people, objects, scene, color, subtitles, camera, shot distance, or visual action. "
+            "Only accept speech if you can name a concrete topic, keyword, phrase, lyric, or spoken semantic content. If speech is unintelligible, not transcribed, unspecified, or merely present, set accept=false. "
+            "Never write generic edit_text such as 'speech content changed', 'target audio', 'unintelligible speech', or 'speaking but not transcribed'. "
+            "For speech, write exactly like: 'change the speech from discussing {specific topic A} to discussing {specific topic B}' or 'change the voice from saying \"{phrase A}\" to saying \"{phrase B}\"'. "
+            "For audio events, write exactly like: 'replace {specific sound A} with {specific sound B}', 'add {specific sound/event} to the audio', or 'remove {specific sound/event} from the audio'. "
             "Reject only when visuals dominate, audio evidence is vague, or the target can be found without listening."
         )
     base_prompt = (
@@ -608,6 +620,10 @@ def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> 
             "color, camera, subtitles, or shot distance. Good B-line style: two visually similar sports broadcast clips where the target clearly adds crowd cheering "
             "or the spoken content changes. Reject with reason visual_too_different_for_B only if the person/scene/program/domain clearly changes, or if the visual "
             "change is so dominant that listening is unnecessary. Reject vague hum/click/electronic tone guesses unless the evidence is explicit and human-audible. "
+            "Reject speech pairs when you cannot name the concrete spoken topic, keyword, phrase, or lyric. Do not output 'unintelligible speech', 'not transcribed', "
+            "'target audio', 'reference audio', or generic 'audio content differs' edit_text. "
+            "Speech edit_text must use a concrete form such as 'change the speech from discussing the bakery opening to discussing the mayor remarks'. "
+            "Audio-event edit_text must use concrete sound names such as 'replace a continuous electronic hum with classical music' or 'add crowd cheering to the audio'. "
             "Reject if the main change is visual, if transcript/audio evidence is vague, or if edit_text is not audio-only."
         )
     return base_prompt
@@ -700,6 +716,24 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
             "or if the edit could be judged without listening."
         )
     return base_prompt
+
+
+def _b_line_edit_text_refinement_system_prompt() -> str:
+    return (
+        "You refine B-line speech_audio_content edit_text for an audio-sensitive CVR dataset. "
+        "Use the attached videos as primary evidence and return exactly one JSON object. "
+        'Schema: {"refined_edit_text": string, "edit_text_specificity_score": number, '
+        '"reject_if_unspecific": boolean, "edit_text_reject_reason": string, "speech_or_audio_evidence": [string]}. '
+        "The edit_text must be audio-only and specific enough for retrieval. "
+        "Acceptable speech forms: 'change the speech from discussing {specific topic A} to discussing {specific topic B}', "
+        "'change the voice from saying \"{short phrase A}\" to saying \"{short phrase B}\"', or "
+        "'change the singing from {specific vocal content/style A} to {specific vocal content/style B}'. "
+        "Acceptable audio-event forms: 'replace {specific sound A} with {specific sound B}', "
+        "'add {specific sound/event} to the audio', or 'remove {specific sound/event} from the audio'. "
+        "Reject vague wording such as unintelligible speech, not transcribed, unclear content, unknown sound, target audio, reference audio, or generic audio differs. "
+        "Reject if the text describes people, objects, scenes, camera, frame, subtitles, clothing, fishing, boats, rivers, or other visual content. "
+        "If you cannot name the concrete speech topic/phrase or concrete sound event, set reject_if_unspecific=true."
+    )
 
 
 def _pair_judge_system_prompt() -> str:
@@ -1066,6 +1100,33 @@ def _build_single_source_final_verification_user_content(
         {"type": "text", "text": "Reference clip for final verification:"},
         {"type": "video_url", "video_url": {"url": reference_clip_path}},
         {"type": "text", "text": "Target clip for final verification:"},
+        {"type": "video_url", "video_url": {"url": target_clip_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
+def _build_b_line_edit_text_refinement_user_content(
+    *,
+    reference_clip_path: str,
+    target_clip_path: str,
+    model_fields: dict[str, Any],
+    final_verification: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: refine the B-line edit_text only. Do not change the pair decision except by rejecting unspecific audio text.\n"
+        f"Pair proposal JSON:\n{_prompt_json(model_fields, max_chars=900)}\n"
+        f"Final verification JSON:\n{_prompt_json(final_verification, max_chars=600)}\n"
+        f"Reference audio-focused annotation JSON:\n{_prompt_json(reference_annotation, max_chars=520)}\n"
+        f"Target audio-focused annotation JSON:\n{_prompt_json(target_annotation, max_chars=520)}\n"
+        "Return the required JSON schema. The refined_edit_text must not mention visual content. "
+        "If the audio evidence is only 'speech present', 'not transcribed', 'unintelligible', or a generic sound, reject it."
+    )
+    return [
+        {"type": "text", "text": "Reference clip for edit-text refinement:"},
+        {"type": "video_url", "video_url": {"url": reference_clip_path}},
+        {"type": "text", "text": "Target clip for edit-text refinement:"},
         {"type": "video_url", "video_url": {"url": target_clip_path}},
         {"type": "text", "text": prompt},
     ]
@@ -1492,6 +1553,30 @@ class OpenAIComposedDataClient:
                 audio_dataset_line=line,
             )
         return _normalize_single_source_final_verification_payload(raw_payload), raw_payload
+
+    def refine_b_line_edit_text(
+        self,
+        *,
+        reference_clip_path: str,
+        target_clip_path: str,
+        model_fields: dict[str, Any],
+        final_verification: dict[str, Any],
+        reference_annotation: dict[str, Any],
+        target_annotation: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_b_line_edit_text_refinement_user_content(
+                reference_clip_path=reference_clip_path,
+                target_clip_path=target_clip_path,
+                model_fields=model_fields,
+                final_verification=final_verification,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            ),
+            system_prompt=_b_line_edit_text_refinement_system_prompt(),
+            max_tokens=700,
+        )
+        return _normalize_b_line_edit_text_refinement_payload(raw_payload), raw_payload
 
     def judge_pair(
         self,
@@ -2220,6 +2305,29 @@ def _normalize_single_source_final_verification_payload(payload: dict[str, Any])
     if not normalized["accept"] and not normalized["main_reject_reason"]:
         raise ValueError("single-source final verification reject reason is required for accept=false")
     return normalized
+
+
+def _normalize_b_line_edit_text_refinement_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_B_LINE_EDIT_TEXT_REFINEMENT_FIELDS)
+    if missing_fields:
+        raise ValueError(f"B-line edit-text refinement missing fields: {missing_fields}")
+    refined = str(payload.get("refined_edit_text", "")).strip()
+    reject = _bool_value(payload.get("reject_if_unspecific"))
+    score = _score_value(payload.get("edit_text_specificity_score"))
+    reason = str(payload.get("edit_text_reject_reason", "")).strip()
+    evidence = _detail_list(payload.get("speech_or_audio_evidence"))
+    if not reject and (not refined or score < 0.70):
+        reject = True
+        reason = reason or "refined edit_text is not specific enough"
+    if reject and not reason:
+        reason = "B-line edit_text is not specific enough"
+    return {
+        "refined_edit_text": refined,
+        "edit_text_specificity_score": score,
+        "reject_if_unspecific": reject,
+        "edit_text_reject_reason": reason,
+        "speech_or_audio_evidence": evidence,
+    }
 
 
 def _repair_audio_line_single_source_final_verification_payload(
