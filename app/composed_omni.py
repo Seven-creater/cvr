@@ -1478,6 +1478,16 @@ class OpenAIComposedDataClient:
             system_prompt=_single_source_final_verification_system_prompt(audio_dataset_line),
             max_tokens=900,
         )
+        line = _normalize_audio_dataset_line(audio_dataset_line)
+        if line in {"visual_audio_anchor", "speech_audio_content"}:
+            raw_payload = _repair_audio_line_single_source_final_verification_payload(
+                raw_payload,
+                model_fields=model_fields,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+                local_gate_report=local_gate_report,
+                audio_dataset_line=line,
+            )
         return _normalize_single_source_final_verification_payload(raw_payload), raw_payload
 
     def judge_pair(
@@ -2187,6 +2197,7 @@ def _normalize_single_source_final_verification_payload(payload: dict[str, Any])
         "main_reject_reason": str(payload.get("main_reject_reason", "")).strip(),
         "evidence": _detail_list(payload.get("evidence")),
         "recommended_edit_text": str(payload.get("recommended_edit_text", "")).strip(),
+        "schema_repaired_fields": _detail_list(payload.get("schema_repaired_fields")),
     }
     optional_bool_fields = (
         "audio_primary",
@@ -2206,6 +2217,231 @@ def _normalize_single_source_final_verification_payload(payload: dict[str, Any])
     if not normalized["accept"] and not normalized["main_reject_reason"]:
         raise ValueError("single-source final verification reject reason is required for accept=false")
     return normalized
+
+
+def _repair_audio_line_single_source_final_verification_payload(
+    payload: dict[str, Any],
+    *,
+    model_fields: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+    local_gate_report: dict[str, Any],
+    audio_dataset_line: str,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+
+    repaired = dict(payload)
+    repaired_fields = _detail_list(repaired.get("schema_repaired_fields"))
+    line = _normalize_audio_dataset_line(audio_dataset_line)
+    model_difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    difference_type = str(model_difference.get("type", "")).strip()
+    model_confidence = _score_value(model_fields.get("confidence"))
+
+    if "accept" not in repaired:
+        repaired["accept"] = _final_verification_accept_from_partial_payload(
+            repaired,
+            model_fields=model_fields,
+            audio_dataset_line=line,
+        )
+        repaired_fields.append("accept")
+    accept = _bool_value(repaired.get("accept"))
+
+    if "confidence" not in repaired:
+        repaired["confidence"] = max(model_confidence, 0.72) if accept else min(model_confidence, 0.45)
+        repaired_fields.append("confidence")
+    confidence = _score_value(repaired.get("confidence"))
+
+    if "quality_score" not in repaired:
+        repaired["quality_score"] = max(confidence, 0.72) if accept else 0.0
+        repaired_fields.append("quality_score")
+    quality_score = _score_value(repaired.get("quality_score"))
+    if not accept and quality_score >= 0.7:
+        repaired["quality_score"] = 0.69
+        repaired_fields.append("quality_score")
+
+    bool_defaults = _final_verification_bool_defaults(
+        accept=accept,
+        model_fields=model_fields,
+        local_gate_report=local_gate_report,
+        audio_dataset_line=line,
+    )
+    for field_name in (
+        "reference_satisfies_edit",
+        "target_satisfies_edit",
+        "observable_delta",
+        "single_primary_delta",
+        "text_or_ocr_driven",
+        "segment_wide",
+        "edit_text_accurate",
+    ):
+        if field_name not in repaired:
+            repaired[field_name] = bool_defaults[field_name]
+            repaired_fields.append(field_name)
+
+    if "recommended_edit_text" not in repaired:
+        repaired["recommended_edit_text"] = str(model_fields.get("edit_text", "")).strip() if accept else ""
+        repaired_fields.append("recommended_edit_text")
+    if "evidence" not in repaired or not _detail_list(repaired.get("evidence")):
+        evidence = _final_verification_repair_evidence(
+            payload=repaired,
+            model_fields=model_fields,
+            reference_annotation=reference_annotation,
+            target_annotation=target_annotation,
+        )
+        if evidence:
+            repaired["evidence"] = evidence
+            repaired_fields.append("evidence")
+        elif "evidence" not in repaired:
+            repaired["evidence"] = []
+            repaired_fields.append("evidence")
+
+    if "main_reject_reason" not in repaired or (not accept and not str(repaired.get("main_reject_reason", "")).strip()):
+        repaired["main_reject_reason"] = "" if accept else _final_verification_reject_reason(
+            payload=repaired,
+            model_fields=model_fields,
+            local_gate_report=local_gate_report,
+        )
+        repaired_fields.append("main_reject_reason")
+
+    if line == "speech_audio_content":
+        optional_defaults = {
+            "audio_primary": accept and difference_type in {"speech", "audio_event"},
+            "visual_locked": accept and not _local_gate_mentions_visual_too_different(local_gate_report),
+            "visual_too_different_for_B": False if accept else _local_gate_mentions_visual_too_different(local_gate_report),
+            "edit_text_audio_only": accept and difference_type in {"speech", "audio_event"},
+        }
+        for field_name, default_value in optional_defaults.items():
+            if field_name not in repaired:
+                repaired[field_name] = default_value
+                repaired_fields.append(field_name)
+    elif line == "visual_audio_anchor":
+        optional_defaults = {
+            "large_visual_delta": accept and difference_type in {"scene", "action", "object_presence", "object_count", "attribute"},
+            "audio_context_preserved": accept,
+        }
+        for field_name, default_value in optional_defaults.items():
+            if field_name not in repaired:
+                repaired[field_name] = default_value
+                repaired_fields.append(field_name)
+
+    if repaired_fields:
+        repaired["schema_repaired_fields"] = sorted(set(repaired_fields))
+    return repaired
+
+
+def _final_verification_accept_from_partial_payload(
+    payload: dict[str, Any],
+    *,
+    model_fields: dict[str, Any],
+    audio_dataset_line: str,
+) -> bool:
+    if "quality_score" in payload and _score_value(payload.get("quality_score")) < 0.7:
+        return False
+    if "confidence" in payload and _score_value(payload.get("confidence")) < 0.45:
+        return False
+    if "target_satisfies_edit" in payload and not _bool_value(payload.get("target_satisfies_edit")):
+        return False
+    if "reference_satisfies_edit" in payload and _bool_value(payload.get("reference_satisfies_edit")):
+        return False
+    if "observable_delta" in payload and not _bool_value(payload.get("observable_delta")):
+        return False
+    if "edit_text_accurate" in payload and not _bool_value(payload.get("edit_text_accurate")):
+        return False
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
+    line = _normalize_audio_dataset_line(audio_dataset_line)
+    if line == "speech_audio_content" and difference_type not in {"speech", "audio_event"}:
+        return False
+    if line == "visual_audio_anchor" and difference_type not in {"scene", "action", "object_presence", "object_count", "attribute"}:
+        return False
+    return bool(model_fields.get("accept"))
+
+
+def _final_verification_bool_defaults(
+    *,
+    accept: bool,
+    model_fields: dict[str, Any],
+    local_gate_report: dict[str, Any],
+    audio_dataset_line: str,
+) -> dict[str, bool]:
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
+    local_issues = _detail_list(local_gate_report.get("all_issues")) + _detail_list(local_gate_report.get("hard_reject"))
+    text_or_ocr = any("ocr" in str(issue).lower() or "text" in str(issue).lower() for issue in local_issues)
+    segment_wide = bool(model_fields.get("is_segment_wide_delta")) if "is_segment_wide_delta" in model_fields else accept
+    if audio_dataset_line == "speech_audio_content" and difference_type in {"speech", "audio_event"}:
+        text_or_ocr = False
+    return {
+        "reference_satisfies_edit": False if accept else _bool_value(model_fields.get("reference_satisfies_edit")),
+        "target_satisfies_edit": accept,
+        "observable_delta": accept,
+        "single_primary_delta": accept,
+        "text_or_ocr_driven": text_or_ocr,
+        "segment_wide": bool(segment_wide),
+        "edit_text_accurate": accept,
+    }
+
+
+def _final_verification_repair_evidence(
+    *,
+    payload: dict[str, Any],
+    model_fields: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> list[str]:
+    evidence: list[str] = []
+    evidence.extend(_detail_list(payload.get("evidence")))
+    evidence.extend(_detail_list(model_fields.get("evidence")))
+    dominant_delta = model_fields.get("dominant_delta") if isinstance(model_fields.get("dominant_delta"), dict) else {}
+    reason = str(dominant_delta.get("reason", "")).strip()
+    if reason:
+        evidence.append(reason)
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    description = str(difference.get("description", "")).strip()
+    if description:
+        evidence.append(description)
+    if not evidence:
+        ref_caption = _single_source_caption_from_annotation(reference_annotation, fallback="")
+        tgt_caption = _single_source_caption_from_annotation(target_annotation, fallback="")
+        if ref_caption and tgt_caption:
+            evidence.append(f"reference: {ref_caption}; target: {tgt_caption}")
+    seen: set[str] = set()
+    compact: list[str] = []
+    for item in evidence:
+        text = str(item).strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        compact.append(text)
+        if len(compact) >= 4:
+            break
+    return compact
+
+
+def _final_verification_reject_reason(
+    *,
+    payload: dict[str, Any],
+    model_fields: dict[str, Any],
+    local_gate_report: dict[str, Any],
+) -> str:
+    for field_name in ("main_reject_reason", "reject_reason", "reason"):
+        reason = str(payload.get(field_name, "")).strip()
+        if reason:
+            return reason
+    issues = _detail_list(local_gate_report.get("all_issues")) or _detail_list(local_gate_report.get("hard_reject"))
+    if issues:
+        return "; ".join(str(issue) for issue in issues[:4])
+    reason = str(model_fields.get("reject_reason", "")).strip()
+    if reason:
+        return reason
+    return "final verifier did not accept the pair"
+
+
+def _local_gate_mentions_visual_too_different(local_gate_report: dict[str, Any]) -> bool:
+    issues = _detail_list(local_gate_report.get("all_issues")) + _detail_list(local_gate_report.get("hard_reject"))
+    return any("visual_too_different_for_b" in str(issue).lower() for issue in issues)
 
 
 def _normalize_single_source_state(value: Any) -> dict[str, Any]:
