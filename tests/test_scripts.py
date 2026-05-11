@@ -183,6 +183,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--no-annotation-reuse", script)
         self.assertIn("MAX_CLIPS=${MAX_CLIPS:-0}", script)
         self.assertIn("--max-clips", script)
+        self.assertIn("A_CANDIDATE_MODE=${A_CANDIDATE_MODE:-hybrid}", script)
+        self.assertIn("--a-candidate-mode \"$A_CANDIDATE_MODE\"", script)
         self.assertIn("B_CANDIDATE_MODE=${B_CANDIDATE_MODE:-hybrid}", script)
         self.assertIn("--b-candidate-mode \"$B_CANDIDATE_MODE\"", script)
         self.assertIn("v5_audio_primary", script)

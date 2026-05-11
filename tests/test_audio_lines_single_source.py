@@ -462,6 +462,73 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual("speech", b_records[0]["difference"]["type"])
             self.assertGreaterEqual(b_records[0]["quality"]["speech_evidence_score"], 0.45)
 
+    def test_a_omni_first_keeps_audio_anchor_pairs_for_omni_visual_judging(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "ann.jsonl"
+            candidates_path = root / "cand.jsonl"
+            a_path = root / "a.jsonl"
+            b_path = root / "b.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "source__single_001",
+                        "output_path": "clips/source/source__single_001.mp4",
+                        "start_seconds": 0.0,
+                        "summary": "a host speaking in a studio",
+                        "subjects": ["host"],
+                        "actions": ["speaking"],
+                        "scene": "studio",
+                        "attributes": ["desk"],
+                    },
+                    {
+                        "clip_id": "source__single_002",
+                        "output_path": "clips/source/source__single_002.mp4",
+                        "start_seconds": 6.0,
+                        "summary": "field footage of flooded streets",
+                        "subjects": ["flooded streets"],
+                        "actions": ["water moving"],
+                        "scene": "outdoor flood scene",
+                        "attributes": ["water", "buildings"],
+                    },
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "speech_hint_but_visual_possible",
+                        "proposal_id": "speech_hint_but_visual_possible",
+                        "reference_clip_id": "source__single_001",
+                        "target_clip_id": "source__single_002",
+                        "reference_video": "clips/source/source__single_001.mp4",
+                        "target_video": "clips/source/source__single_002.mp4",
+                        "difference": {"type": "speech", "from": "studio speech", "to": "field report speech"},
+                    }
+                ],
+            )
+
+            with mock.patch("app.audio_lines_single_source._pair_audio_anchor_score", return_value=(0.92, 0.08)):
+                summary = split_audio_line_candidates(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    a_output_path=a_path,
+                    b_output_path=b_path,
+                    summary_path=root / "summary.json",
+                    audio_line_quality_profile="v5_audio_primary",
+                    a_candidate_mode="omni_first",
+                )
+
+            a_records = [json.loads(line) for line in a_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual("omni_first", summary["a_candidate_mode"])
+            self.assertEqual(1, summary["a_candidate_count"])
+            self.assertEqual("visual_audio_anchor", a_records[0]["audio_dataset_line"])
+            self.assertEqual("speech", a_records[0]["quality"]["visual_hint_difference_type"])
+            self.assertEqual("v5_audio_primary", a_records[0]["audio_line_quality_profile"])
+
     def test_speech_audio_content_line_allows_speech_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -40,6 +40,9 @@ AUDIO_LINE_PROFILES = {AUDIO_LINE_PROFILE_DEFAULT, AUDIO_LINE_PROFILE_V4_STRICT,
 B_CANDIDATE_MODE_HYBRID = "hybrid"
 B_CANDIDATE_MODE_AUDIO_FIRST = "audio_first"
 B_CANDIDATE_MODES = {B_CANDIDATE_MODE_HYBRID, B_CANDIDATE_MODE_AUDIO_FIRST}
+A_CANDIDATE_MODE_HYBRID = "hybrid"
+A_CANDIDATE_MODE_OMNI_FIRST = "omni_first"
+A_CANDIDATE_MODES = {A_CANDIDATE_MODE_HYBRID, A_CANDIDATE_MODE_OMNI_FIRST}
 V4_A_STRONG_VISUAL_TYPES = {"scene", "action", "object_presence"}
 V4_VAGUE_AUDIO_TERMS = {
     "buzz",
@@ -289,9 +292,11 @@ def split_audio_line_candidates(
     max_a_candidates: int | None = None,
     max_b_candidates: int | None = None,
     audio_line_quality_profile: str = AUDIO_LINE_PROFILE_DEFAULT,
+    a_candidate_mode: str = A_CANDIDATE_MODE_HYBRID,
     b_candidate_mode: str = B_CANDIDATE_MODE_HYBRID,
 ) -> dict[str, Any]:
     audio_line_quality_profile = _normalize_audio_line_quality_profile(audio_line_quality_profile)
+    a_candidate_mode = _normalize_a_candidate_mode(a_candidate_mode)
     b_candidate_mode = _normalize_b_candidate_mode(b_candidate_mode)
     root_path = Path(root)
     annotations = list(_load_jsonl(Path(clip_annotations_path)))
@@ -312,13 +317,18 @@ def split_audio_line_candidates(
         difference_type = str(difference.get("type", "")).strip()
         visual_delta_strength = _visual_delta_strength(candidate, reference, target)
         visual_context_similarity = _visual_context_similarity(reference, target)
-        if difference_type in VISUAL_LINE_TYPES:
+        should_score_a = difference_type in VISUAL_LINE_TYPES or a_candidate_mode == A_CANDIDATE_MODE_OMNI_FIRST
+        if should_score_a:
             score, min_rms = _pair_audio_anchor_score(root_path, reference, target, audio_features)
-            if score >= min_audio_anchor_score and _v4_a_candidate_allowed(
-                audio_line_quality_profile=audio_line_quality_profile,
-                difference_type=difference_type,
-                visual_delta_strength=visual_delta_strength,
-            ):
+            if a_candidate_mode == A_CANDIDATE_MODE_OMNI_FIRST:
+                a_gate_passed = score >= min_audio_anchor_score
+            else:
+                a_gate_passed = _v4_a_candidate_allowed(
+                    audio_line_quality_profile=audio_line_quality_profile,
+                    difference_type=difference_type,
+                    visual_delta_strength=visual_delta_strength,
+                )
+            if score >= min_audio_anchor_score and a_gate_passed:
                 a_records.append(
                     _line_candidate(
                         candidate,
@@ -333,6 +343,8 @@ def split_audio_line_candidates(
             else:
                 if score < min_audio_anchor_score:
                     reject_counts["a_audio_anchor_below_threshold"] += 1
+                elif difference_type not in VISUAL_LINE_TYPES:
+                    reject_counts["a_non_visual_hint_rejected"] += 1
                 else:
                     reject_counts["a_v4_visual_delta_too_weak"] += 1
         if b_candidate_mode == B_CANDIDATE_MODE_HYBRID:
@@ -411,6 +423,7 @@ def split_audio_line_candidates(
         "b_audio_first_candidate_count": len(direct_b_records),
         "min_audio_anchor_score": min_audio_anchor_score,
         "audio_line_quality_profile": audio_line_quality_profile,
+        "a_candidate_mode": a_candidate_mode,
         "b_candidate_mode": b_candidate_mode,
         "reject_counts": dict(reject_counts),
         "a_output_path": str(a_output_path),
@@ -603,6 +616,15 @@ def _normalize_audio_line_quality_profile(value: str | None) -> str:
     if profile not in AUDIO_LINE_PROFILES:
         raise ValueError(f"unsupported audio_line_quality_profile={value!r}; expected one of {sorted(AUDIO_LINE_PROFILES)}")
     return profile
+
+
+def _normalize_a_candidate_mode(value: str | None) -> str:
+    mode = str(value or A_CANDIDATE_MODE_HYBRID).strip().lower().replace("-", "_")
+    if mode in {"", "default"}:
+        return A_CANDIDATE_MODE_HYBRID
+    if mode not in A_CANDIDATE_MODES:
+        raise ValueError(f"unsupported a_candidate_mode={value!r}; expected one of {sorted(A_CANDIDATE_MODES)}")
+    return mode
 
 
 def _normalize_b_candidate_mode(value: str | None) -> str:
@@ -959,7 +981,8 @@ def _audio_event_line_candidate(
 
 def _line_candidate_sort_key(record: dict[str, Any]) -> tuple[Any, ...]:
     quality = record.get("quality", {}) if isinstance(record.get("quality"), dict) else {}
-    if str(quality.get("audio_line_quality_profile", "")) == AUDIO_LINE_PROFILE_V4_STRICT:
+    profile = str(quality.get("audio_line_quality_profile", ""))
+    if profile in {AUDIO_LINE_PROFILE_V4_STRICT, AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY}:
         if str(record.get("audio_dataset_line", "")) == VISUAL_AUDIO_ANCHOR_LINE:
             return (
                 _score_float(quality.get("visual_delta_strength")),
@@ -1031,6 +1054,7 @@ def build_parser() -> argparse.ArgumentParser:
     split.add_argument("--max-a-candidates", type=int)
     split.add_argument("--max-b-candidates", type=int)
     split.add_argument("--audio-line-quality-profile", default=AUDIO_LINE_PROFILE_DEFAULT)
+    split.add_argument("--a-candidate-mode", choices=sorted(A_CANDIDATE_MODES), default=A_CANDIDATE_MODE_HYBRID)
     split.add_argument("--b-candidate-mode", choices=sorted(B_CANDIDATE_MODES), default=B_CANDIDATE_MODE_HYBRID)
 
     shard = subparsers.add_parser("shard-jsonl")
@@ -1077,6 +1101,7 @@ def main() -> None:
             max_a_candidates=args.max_a_candidates,
             max_b_candidates=args.max_b_candidates,
             audio_line_quality_profile=args.audio_line_quality_profile,
+            a_candidate_mode=args.a_candidate_mode,
             b_candidate_mode=args.b_candidate_mode,
         )
     elif args.command == "shard-jsonl":
