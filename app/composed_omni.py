@@ -513,6 +513,38 @@ def _normalize_audio_dataset_line(value: str | None) -> str:
 def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> str:
     difference_types = ", ".join(sorted(ALLOWED_DIFFERENCE_TYPES))
     line = _normalize_audio_dataset_line(audio_dataset_line)
+    if line == "visual_audio_anchor":
+        return (
+            "You compare two 6s clips from the same source video for A-line visual_audio_anchor. "
+            "Use attached videos as primary evidence; annotations and candidate JSON are hints only. Return exactly one JSON object. "
+            'Schema: {"edit_text": string, "modalities": [string], "reference_caption": string, "target_caption": string, '
+            '"difference": {"type": string, "from": string, "to": string, "description": string}, '
+            '"dominant_delta": {"type": string, "from": string, "to": string, "reason": string}, '
+            '"reference_state": object, "target_state": object, "delta_temporal_extent": object, "subject_roles": object, '
+            '"is_segment_wide_delta": boolean, "discarded_deltas": [string], "evidence": [string], '
+            '"confidence": number, "accept": boolean, "reject_reason": string}. '
+            "Audio is preserved news/program audio context only; edit_text must be visual-only and must not mention audio, sound, speech, music, transcript, narration, or voice. "
+            "Good A style: same news/program audio context while the picture changes from a studio anchor shot to flood aerial footage. "
+            "Accept one large stable visual delta: scene, action, object presence/count, or clear subject/composition change. "
+            "Reject near-duplicate visuals, tiny hand/object motion, brightness/framing changes, visible-text-only changes, speech/audio-only changes, or multiple competing visual changes. "
+            "If rejecting, still return the best tentative visual edit and clear reject_reason."
+        )
+    if line == "speech_audio_content":
+        return (
+            "You compare two 6s clips from the same source video for B-line speech_audio_content. "
+            "Use attached videos as primary evidence; annotations and candidate JSON are hints only. Return exactly one JSON object. "
+            'Schema: {"edit_text": string, "modalities": [string], "reference_caption": string, "target_caption": string, '
+            '"difference": {"type": string, "from": string, "to": string, "description": string}, '
+            '"dominant_delta": {"type": string, "from": string, "to": string, "reason": string}, '
+            '"reference_state": object, "target_state": object, "delta_temporal_extent": object, "subject_roles": object, '
+            '"is_segment_wide_delta": boolean, "discarded_deltas": [string], "evidence": [string], '
+            '"confidence": number, "accept": boolean, "reject_reason": string}. '
+            "Visual context should stay practically locked: same person/speaker, same scene, same program, same match, or same broadcast/view context is enough. "
+            "Minor framing, pose, camera, gesture, or action changes are allowed when listening is still needed. "
+            "The edit must be audio-only: use difference.type=speech for spoken content/topic/transcript changes, or audio_event only for concrete non-speech sounds such as cheering, applause, music, machinery, ambience, rain, or crowd noise. "
+            "Do not label narration/topic changes as audio_event. edit_text must not describe people, objects, scene, color, subtitles, camera, shot distance, or visual action. "
+            "Reject only when visuals dominate, audio evidence is vague, or the target can be found without listening."
+        )
     base_prompt = (
         "You compare two short clips cut from the same original video for composed video retrieval. "
         "Follow an Omni-Captioner/Omni-Detective style: inspect both videos, use the segment annotations as evidence, "
@@ -583,6 +615,36 @@ def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> 
 
 def _single_source_final_verification_system_prompt(audio_dataset_line: str | None = None) -> str:
     line = _normalize_audio_dataset_line(audio_dataset_line)
+    if line == "visual_audio_anchor":
+        return (
+            "You are the final verifier for A-line visual_audio_anchor. Use attached videos as primary evidence; local_gate_report is diagnostic only. "
+            "Return exactly one JSON object with schema: "
+            '{"accept": boolean, "confidence": number, "quality_score": number, '
+            '"reference_satisfies_edit": boolean, "target_satisfies_edit": boolean, "observable_delta": boolean, '
+            '"single_primary_delta": boolean, "text_or_ocr_driven": boolean, "segment_wide": boolean, '
+            '"edit_text_accurate": boolean, "main_reject_reason": string, "evidence": [string], '
+            '"recommended_edit_text": string, "large_visual_delta": boolean, "audio_context_preserved": boolean}. '
+            "Accept only if edit_text is visual-only, reference does not satisfy it, target clearly satisfies it, large_visual_delta=true, "
+            "audio_context_preserved=true, and the target difference is stable for most of the clip. "
+            "Reject near-duplicates, tiny lighting/framing/gesture changes, OCR/text edits, speech/audio edits, or inaccurate edit_text. "
+            "If accept=false, set quality_score below 0.7 and explain main_reject_reason."
+        )
+    if line == "speech_audio_content":
+        return (
+            "You are the final verifier for B-line speech_audio_content. Use attached videos as primary evidence; local_gate_report is diagnostic only. "
+            "Return exactly one JSON object with schema: "
+            '{"accept": boolean, "confidence": number, "quality_score": number, '
+            '"reference_satisfies_edit": boolean, "target_satisfies_edit": boolean, "observable_delta": boolean, '
+            '"single_primary_delta": boolean, "text_or_ocr_driven": boolean, "segment_wide": boolean, '
+            '"edit_text_accurate": boolean, "main_reject_reason": string, "evidence": [string], '
+            '"recommended_edit_text": string, "audio_primary": boolean, "visual_locked": boolean, '
+            '"visual_too_different_for_B": boolean, "edit_text_audio_only": boolean}. '
+            "Accept if the audible speech/audio change is primary, edit_text is audio-only, reference does not satisfy it, target satisfies it, "
+            "and visuals stay practically locked: same person/speaker, same scene, same program, same match, or same broadcast/view context. "
+            "Minor framing, pose, camera, gesture, or action changes are okay. Set visual_too_different_for_B=true only when visuals dominate enough that listening is unnecessary. "
+            "Reject vague audio guesses, visual edit_text, or cases where target can be found without audio. "
+            "If accept=false, set quality_score below 0.7 and explain main_reject_reason."
+        )
     base_prompt = (
         "You are the final strict verifier for a single-source composed video retrieval pair. "
         "The candidate has already passed an initial pair-comparison step and local gates; your job is to decide whether it should enter human review as an accepted sample. "
@@ -913,11 +975,11 @@ def _build_single_source_pair_user_content(
     candidate: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     line = _normalize_audio_dataset_line(candidate.get("audio_dataset_line") if isinstance(candidate, dict) else None)
-    ann_char_limit = 1600 if line == "speech_audio_content" else 1100 if line == "visual_audio_anchor" else 4200
-    candidate_char_limit = 1400 if line in {"visual_audio_anchor", "speech_audio_content"} else 3000
+    ann_char_limit = 650 if line == "speech_audio_content" else 520 if line == "visual_audio_anchor" else 4200
+    candidate_char_limit = 650 if line in {"visual_audio_anchor", "speech_audio_content"} else 3000
     context_text = ""
     if whole_annotation:
-        whole_limit = 350 if line in {"visual_audio_anchor", "speech_audio_content"} else 2200
+        whole_limit = 140 if line in {"visual_audio_anchor", "speech_audio_content"} else 2200
         context_text = f"Whole source video context JSON:\n{_prompt_json(whole_annotation, max_chars=whole_limit)}\n"
     candidate_text = ""
     if candidate:
@@ -967,10 +1029,10 @@ def _build_single_source_final_verification_user_content(
     audio_dataset_line: str | None = None,
 ) -> list[dict[str, Any]]:
     line = _normalize_audio_dataset_line(audio_dataset_line)
-    ann_char_limit = 1200 if line == "speech_audio_content" else 900 if line == "visual_audio_anchor" else 3600
+    ann_char_limit = 520 if line == "speech_audio_content" else 440 if line == "visual_audio_anchor" else 3600
     context_text = ""
     if whole_annotation:
-        whole_limit = 300 if line in {"visual_audio_anchor", "speech_audio_content"} else 1800
+        whole_limit = 120 if line in {"visual_audio_anchor", "speech_audio_content"} else 1800
         context_text = f"Whole source video context JSON:\n{_prompt_json(whole_annotation, max_chars=whole_limit)}\n"
     line_text = ""
     if line == "visual_audio_anchor":
@@ -990,8 +1052,8 @@ def _build_single_source_final_verification_user_content(
         "plus any other moment needed to verify the edit.\n"
         f"{line_text}"
         f"{context_text}"
-        f"Pair proposal JSON:\n{_prompt_json(model_fields, max_chars=1800)}\n"
-        f"Local gate report JSON:\n{_prompt_json(local_gate_report, max_chars=1000)}\n"
+        f"Pair proposal JSON:\n{_prompt_json(model_fields, max_chars=900 if line in {'visual_audio_anchor', 'speech_audio_content'} else 1800)}\n"
+        f"Local gate report JSON:\n{_prompt_json(local_gate_report, max_chars=450 if line in {'visual_audio_anchor', 'speech_audio_content'} else 1000)}\n"
         f"Reference segment annotation JSON:\n{_prompt_json(reference_annotation, max_chars=ann_char_limit)}\n"
         f"Target segment annotation JSON:\n{_prompt_json(target_annotation, max_chars=ann_char_limit)}\n"
         "Answer the required schema exactly. The accept field must be false if the target does not visibly/audibly satisfy edit_text, "

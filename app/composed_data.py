@@ -12182,24 +12182,24 @@ def _single_source_line_annotation_prompt_view(annotation: dict[str, Any], audio
     base = {
         "clip_id": annotation.get("clip_id", ""),
         "output_path": annotation.get("output_path", ""),
-        "summary": _truncate_text(annotation.get("summary", ""), 240),
-        "scene": _truncate_text(annotation.get("scene", ""), 140),
-        "subjects": _prompt_list(annotation.get("subjects", []), limit=5, text_limit=60),
-        "actions": _prompt_list(annotation.get("actions", []), limit=5, text_limit=60),
+        "summary": _truncate_text(annotation.get("summary", ""), 160),
+        "scene": _truncate_text(annotation.get("scene", ""), 90),
+        "subjects": _prompt_list(annotation.get("subjects", []), limit=4, text_limit=45),
+        "actions": _prompt_list(annotation.get("actions", []), limit=4, text_limit=45),
         "modalities": _prompt_list(annotation.get("modalities", []), limit=4, text_limit=32),
     }
     if line == SPEECH_AUDIO_CONTENT_LINE:
         base.update(
             {
                 "visual_context_only": {
-                    "attributes": _prompt_list(annotation.get("attributes", []), limit=3, text_limit=60),
-                    "visible_text": _prompt_list(annotation.get("visible_text", []), limit=2, text_limit=50),
+                    "attributes": _prompt_list(annotation.get("attributes", []), limit=2, text_limit=45),
+                    "visible_text": _prompt_list(annotation.get("visible_text", []), limit=1, text_limit=40),
                 },
-                "speech": _prompt_list(annotation.get("speech", []), limit=3, text_limit=160),
+                "speech": _prompt_list(annotation.get("speech", []), limit=2, text_limit=110),
                 "speakers_and_transcript": _prompt_list(
-                    annotation.get("speakers_and_transcript", []), limit=3, text_limit=180
+                    annotation.get("speakers_and_transcript", []), limit=2, text_limit=120
                 ),
-                "audio_events": _prompt_list(annotation.get("audio_events", []), limit=5, text_limit=80),
+                "audio_events": _prompt_list(annotation.get("audio_events", []), limit=4, text_limit=55),
                 "audio_refresh_annotation": bool(annotation.get("audio_refresh_annotation")),
             }
         )
@@ -12207,14 +12207,14 @@ def _single_source_line_annotation_prompt_view(annotation: dict[str, Any], audio
     if line == VISUAL_AUDIO_ANCHOR_LINE:
         base.update(
             {
-                "attributes": _prompt_list(annotation.get("attributes", []), limit=4, text_limit=70),
-                "object_counts": dict(list(annotation.get("object_counts", {}).items())[:8])
+                "attributes": _prompt_list(annotation.get("attributes", []), limit=3, text_limit=50),
+                "object_counts": dict(list(annotation.get("object_counts", {}).items())[:6])
                 if isinstance(annotation.get("object_counts"), dict)
                 else {},
-                "visible_text": _prompt_list(annotation.get("visible_text", []), limit=2, text_limit=50),
+                "visible_text": _prompt_list(annotation.get("visible_text", []), limit=1, text_limit=40),
                 "audio_context_hint": {
-                    "speech": _prompt_list(annotation.get("speech", []), limit=1, text_limit=80),
-                    "audio_events": _prompt_list(annotation.get("audio_events", []), limit=3, text_limit=60),
+                    "speech": _prompt_list(annotation.get("speech", []), limit=1, text_limit=55),
+                    "audio_events": _prompt_list(annotation.get("audio_events", []), limit=2, text_limit=45),
                 },
             }
         )

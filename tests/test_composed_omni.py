@@ -341,6 +341,86 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("studio anchor shot to flood aerial footage", user_text)
         self.assertIn("v4_strict", user_text)
 
+    def test_audio_line_single_source_prompts_stay_compact(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "edit_text": "change the speech from discussing budget plans to discussing health services",
+                                "modalities": ["audio"],
+                                "reference_caption": "a speaker talks at a desk",
+                                "target_caption": "the same speaker talks at a desk",
+                                "difference": {"type": "speech", "from": "budget plans", "to": "health services", "description": "speech topic changes"},
+                                "dominant_delta": {"type": "speech", "from": "budget", "to": "health", "reason": "spoken content differs"},
+                                "reference_state": {},
+                                "target_state": {},
+                                "delta_temporal_extent": {"reference": "whole clip", "target": "whole clip", "target_coverage": 0.9, "evidence": "speech evidence"},
+                                "subject_roles": {},
+                                "is_segment_wide_delta": True,
+                                "discarded_deltas": [],
+                                "evidence": ["the spoken topic changes"],
+                                "confidence": 0.9,
+                                "accept": True,
+                                "reject_reason": "",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        long_annotation = {
+            "clip_id": "clip",
+            "summary": "same livestream speaker at a desk " * 80,
+            "scene": "indoor livestream desk " * 60,
+            "subjects": ["speaker at desk"] * 20,
+            "actions": ["speaking to camera"] * 20,
+            "speech": ["the speaker talks about budget planning and transportation funding " * 20 for _ in range(8)],
+            "speakers_and_transcript": ["speaker: a long transcript about policy funding " * 25 for _ in range(8)],
+            "audio_events": ["speech", "room ambience", "chair noise"] * 10,
+            "modalities": ["visual", "audio"],
+        }
+        candidate = {
+            "audio_dataset_line": "speech_audio_content",
+            "quality": {"audio_line_quality_profile": "v5_audio_primary"},
+            "instruction": "B-line speech content candidate " * 80,
+        }
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8093/v1",
+            api_key="EMPTY",
+            model="qwen3-omni",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "reference.mp4"
+            target_path = Path(temp_dir) / "target.mp4"
+            reference_path.write_bytes(b"reference-video")
+            target_path.write_bytes(b"target-video")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                client.propose_single_source_pair(
+                    reference_clip_path=str(reference_path),
+                    target_clip_path=str(target_path),
+                    reference_annotation=long_annotation,
+                    target_annotation=long_annotation,
+                    candidate=candidate,
+                    audio_dataset_line="speech_audio_content",
+                )
+
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        system_prompt = request_body["messages"][0]["content"]
+        user_text = request_body["messages"][1]["content"][-1]["text"]
+        self.assertLess(len(system_prompt), 2300)
+        self.assertLess(len(user_text), 3200)
+        self.assertIn("speech_audio_content", system_prompt)
+        self.assertIn("B-line", user_text)
+
     def test_verify_single_source_pair_final_materializes_videos_and_scores_quality(self) -> None:
         request_holder: dict[str, object] = {}
         response_payload = {
