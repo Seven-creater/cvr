@@ -236,7 +236,7 @@ LOG=logs/audio_ab_fresh200_omni_first_$(date +%Y%m%d_%H%M%S).log
 
 MAX_A_CANDIDATES=400 \
 MAX_B_CANDIDATES=400 \
-CONCURRENCY=8 \
+CONCURRENCY=4 \
 ANNOTATION_TIMEOUT_SECONDS=900 \
 setsid nohup bash scripts/run_audio_lines_single_source_reuse.sh \
   --single-source-root /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/single_source \
@@ -248,6 +248,7 @@ setsid nohup bash scripts/run_audio_lines_single_source_reuse.sh \
   --target-b-count 16 \
   --max-source-folders 80 \
   --max-clips 200 \
+  --annotation-search-root /data02/usr/wangqihao/Demo/test/cvr_clean_main/runs/audio_ab_fresh200_omni_first_20260511_085645 \
   --propose-shards 16 \
   --propose-parallel-jobs 8 \
   --request-timeout-seconds 120 \
@@ -255,7 +256,6 @@ setsid nohup bash scripts/run_audio_lines_single_source_reuse.sh \
   --audio-line-quality-profile v5_audio_primary \
   --a-candidate-mode omni_first \
   --b-candidate-mode audio_first \
-  --fresh-annotations \
   --omni-transient-retries 2 \
   > "$LOG" 2>&1 < /dev/null &
 
@@ -265,7 +265,8 @@ echo "$LOG"
 
 ## 10. 大规模运行命令
 
-如果 8093 的 Qwen3-Omni 服务健康，下一步可以直接扩大到更多 source folders。建议先用 800 clips 作为中大规模缓存/样本生成，再根据质量扩到全量。
+如果 8093 的 Qwen3-Omni 服务健康，下一步可以直接扩大到更多 source folders。建议先用 800 clips 作为中大规模缓存/样本生成，再根据质量扩到全量。  
+这里复用上一次 fresh 200 run 里产出的 200 条新 audio-focused annotation，不使用旧的历史 Omni 描述。
 
 ```bash
 cd /data02/usr/wangqihao/Demo/test/cvr_clean_main
@@ -276,7 +277,7 @@ LOG=logs/audio_ab_fresh800_omni_first_$(date +%Y%m%d_%H%M%S).log
 
 MAX_A_CANDIDATES=1600 \
 MAX_B_CANDIDATES=2400 \
-CONCURRENCY=8 \
+CONCURRENCY=4 \
 ANNOTATION_TIMEOUT_SECONDS=900 \
 setsid nohup bash scripts/run_audio_lines_single_source_reuse.sh \
   --single-source-root /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/single_source \
@@ -288,14 +289,14 @@ setsid nohup bash scripts/run_audio_lines_single_source_reuse.sh \
   --target-b-count 128 \
   --max-source-folders 240 \
   --max-clips 800 \
+  --annotation-search-root /data02/usr/wangqihao/Demo/test/cvr_clean_main/runs/audio_ab_fresh200_omni_first_20260511_085645 \
   --propose-shards 32 \
-  --propose-parallel-jobs 12 \
+  --propose-parallel-jobs 8 \
   --request-timeout-seconds 120 \
   --shard-timeout-seconds 7200 \
   --audio-line-quality-profile v5_audio_primary \
   --a-candidate-mode omni_first \
   --b-candidate-mode audio_first \
-  --fresh-annotations \
   --omni-transient-retries 2 \
   > "$LOG" 2>&1 < /dev/null &
 

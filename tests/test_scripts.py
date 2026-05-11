@@ -163,7 +163,8 @@ class ScriptTests(unittest.TestCase):
     def test_audio_lines_single_source_reuse_script_is_safe_and_parallel(self) -> None:
         script = Path("scripts/run_audio_lines_single_source_reuse.sh").read_text(encoding="utf-8")
 
-        self.assertIn("app.audio_lines_single_source prepare-existing", script)
+        self.assertIn("prepare_existing_args=(", script)
+        self.assertIn("prepare-existing", script)
         self.assertIn("clips/single_source", script)
         self.assertIn("detective-annotate-clips", script)
         self.assertIn("mine-single-source-pairs", script)
@@ -183,6 +184,15 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--no-annotation-reuse", script)
         self.assertIn("MAX_CLIPS=${MAX_CLIPS:-0}", script)
         self.assertIn("--max-clips", script)
+        self.assertIn("ANNOTATION_SEARCH_ROOTS=${ANNOTATION_SEARCH_ROOTS:-}", script)
+        self.assertIn("--annotation-search-root PATH", script)
+        self.assertIn('if [ "${#annotation_search_args[@]}" -gt 0 ]; then', script)
+        self.assertIn('prepare_existing_args+=("${annotation_search_args[@]}")', script)
+        self.assertLess(
+            script.index('if [ "${#annotation_search_args[@]}" -gt 0 ]; then'),
+            script.index('elif [ "$FRESH_ANNOTATIONS" = "1" ]; then'),
+        )
+        self.assertNotIn("$(if [ \"$FRESH_ANNOTATIONS\" = \"1\" ]; then printf '%s' '--no-annotation-reuse'; fi)", script)
         self.assertIn("A_CANDIDATE_MODE=${A_CANDIDATE_MODE:-hybrid}", script)
         self.assertIn("--a-candidate-mode \"$A_CANDIDATE_MODE\"", script)
         self.assertIn("B_CANDIDATE_MODE=${B_CANDIDATE_MODE:-hybrid}", script)
@@ -193,7 +203,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--omni-retries \"$OMNI_TRANSIENT_RETRIES\"", script)
         self.assertIn("--fail-on-transient-omni-errors", script)
         self.assertIn("PROPOSE_SHARDS=${PROPOSE_SHARDS:-16}", script)
-        self.assertIn("PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-16}", script)
+        self.assertIn("PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-8}", script)
+        self.assertIn("CONCURRENCY=${CONCURRENCY:-4}", script)
         self.assertIn("accepted_progress_", script)
         self.assertIn("rejected_progress_", script)
         self.assertIn("manual_review/A", script)
