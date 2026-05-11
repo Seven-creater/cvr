@@ -403,6 +403,7 @@ def _detective_observation_system_prompt(*, audio_focused: bool = False) -> str:
     if audio_focused:
         prompt += (
             " This is an audio-dataset pass: listen carefully and separate speech/transcript, crowd reaction, applause, music, ambience, and other sound events. "
+            "If a person is speaking, summarize what they are saying with specific topic words or short paraphrases; do not write only 'speech' or 'talking'. "
             "If an audible claim is uncertain, mark it in uncertainties instead of inventing vague hum/click labels."
         )
     return prompt
@@ -423,6 +424,7 @@ def _detective_toolbox_system_prompt(*, audio_focused: bool = False) -> str:
     if audio_focused:
         prompt += (
             " For this audio-focused pass, verify whether the sound is speech, crowd/applause/music/ambient/environment, or uncertain. "
+            "For speech, capture speaker role and content/topic changes that could distinguish adjacent 6-second clips. "
             "Avoid weak labels like electronic hum, click, or tone unless the video audio clearly supports them."
         )
     return prompt
@@ -450,6 +452,7 @@ def _detective_final_system_prompt(*, audio_focused: bool = False) -> str:
         prompt += (
             " This is an audio-focused refresh for an audio retrieval dataset. "
             "Be conservative: include speech/transcript only when you can hear language content, and include audio_events only for clear sounds such as crowd cheering, applause, music, rain, wind, machinery, or other verifiable events. "
+            "For speech, write a short transcript/paraphrase or topic-specific summary in speech and speakers_and_transcript, so adjacent clips from the same speaker can be paired by changed spoken content. "
             "Do not use vague hum/click/tone guesses as distinguishing evidence unless they are unmistakable."
         )
     return prompt
@@ -795,6 +798,7 @@ def _build_detective_observation_user_content(clip_path: str, *, audio_focused: 
     if audio_focused:
         prompt += (
             "\nAudio-focused requirement: explicitly state whether there is speech/transcript, crowd cheering, applause, music, ambience, or no reliable distinctive audio. "
+            "If speech is present, capture what is being said as a short transcript/paraphrase or topic summary. "
             "Do not guess low hum/click/tone as a dataset signal if it is not clearly audible."
         )
     return [
@@ -816,7 +820,7 @@ def _build_detective_toolbox_user_content(
         "and remaining uncertainties."
     )
     if audio_focused:
-        prompt += "\nAudio-focused requirement: prioritize transcript/crowd/applause/music/ambient evidence and flag uncertain audio instead of inventing it."
+        prompt += "\nAudio-focused requirement: prioritize transcript/paraphrase/topic, crowd, applause, music, and ambient evidence; flag uncertain audio instead of inventing it."
     return [
         {"type": "video_url", "video_url": {"url": clip_path}},
         {"type": "text", "text": prompt},
@@ -845,6 +849,7 @@ def _build_detective_final_user_content(
     if audio_focused:
         prompt += (
             "\nAudio-focused requirement: make speech, speakers_and_transcript, and audio_events useful for pairing. "
+            "For one-person speech or livestream clips, write the actual spoken topic/content for this 6-second segment, not a generic label. "
             "Use audio_events for concrete crowd/applause/music/environment sounds; put uncertain or vague sounds in detective_notes/uncertainties, not as a confident audio_event."
         )
     return [

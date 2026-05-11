@@ -68,6 +68,45 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual("daily_source_001__single_001", annotations[0]["clip_id"])
             self.assertTrue(summary["outputs"]["clips_to_annotate"].endswith("clips_to_annotate.jsonl"))
 
+    def test_prepare_existing_single_source_can_force_fresh_limited_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for folder_index in range(1, 4):
+                folder = root / "clips" / "single_source" / f"daily_source_{folder_index:03d}"
+                folder.mkdir(parents=True)
+                for index in range(1, 6):
+                    (folder / f"daily_source_{folder_index:03d}__single_{index:03d}.mp4").write_bytes(b"video")
+            annotation_root = root / "runs" / "old"
+            self._write_jsonl(
+                annotation_root / "single_source_annotations.jsonl",
+                [
+                    {
+                        "clip_id": "daily_source_001__single_001",
+                        "output_path": "clips/single_source/daily_source_001/daily_source_001__single_001.mp4",
+                        "summary": "old reusable annotation",
+                    }
+                ],
+            )
+
+            summary = prepare_existing_single_source_clips(
+                root=root,
+                single_source_root=root / "clips" / "single_source",
+                run_root=root / "runs" / "fresh_audio_lines",
+                max_clips=9,
+                annotation_search_roots=[annotation_root],
+                reuse_annotations=False,
+            )
+
+            annotations_path = root / "runs" / "fresh_audio_lines" / "single_source_annotations.jsonl"
+            clips_path = root / "runs" / "fresh_audio_lines" / "clips_to_annotate.jsonl"
+            annotations = [line for line in annotations_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            clips = [line for line in clips_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(0, len(annotations))
+            self.assertEqual(9, len(clips))
+            self.assertFalse(summary["reuse_annotations"])
+            self.assertEqual(9, summary["segment_count"])
+
     def test_split_candidates_builds_a_and_b_lines_without_caption_answers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -364,6 +403,64 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual(1, summary["b_candidate_count"])
             self.assertEqual("audio_first_annotation_pair", b_records[0]["quality"]["candidate_source"])
             self.assertEqual("speech", b_records[0]["difference"]["type"])
+
+    def test_v5_audio_primary_b_line_mines_speech_topic_pairs_without_transcript_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "ann.jsonl"
+            candidates_path = root / "cand.jsonl"
+            a_path = root / "a.jsonl"
+            b_path = root / "b.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "live__single_001",
+                        "output_path": "clips/live/live__single_001.mp4",
+                        "start_seconds": 0.0,
+                        "summary": "same livestream speaker at a desk",
+                        "subjects": ["speaker", "desk"],
+                        "actions": ["speaking to camera"],
+                        "scene": "indoor livestream desk",
+                        "speech": ["the speaker talks about budget planning and transportation funding"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "live__single_002",
+                        "output_path": "clips/live/live__single_002.mp4",
+                        "start_seconds": 6.0,
+                        "summary": "same livestream speaker at a desk",
+                        "subjects": ["speaker", "desk"],
+                        "actions": ["speaking to camera"],
+                        "scene": "indoor livestream desk",
+                        "speech": ["the speaker talks about clinic staffing and public health services"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(candidates_path, [])
+
+            summary = split_audio_line_candidates(
+                root=root,
+                clip_annotations_path=annotations_path,
+                pair_candidates_path=candidates_path,
+                a_output_path=a_path,
+                b_output_path=b_path,
+                summary_path=root / "summary.json",
+                audio_line_quality_profile="v5_audio_primary",
+                b_candidate_mode="audio_first",
+            )
+
+            b_records = [json.loads(line) for line in b_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual("v5_audio_primary", summary["audio_line_quality_profile"])
+            self.assertEqual("audio_first", summary["b_candidate_mode"])
+            self.assertEqual(1, summary["b_audio_first_candidate_count"])
+            self.assertEqual(1, summary["b_candidate_count"])
+            self.assertEqual("speech", b_records[0]["difference"]["type"])
+            self.assertGreaterEqual(b_records[0]["quality"]["speech_evidence_score"], 0.45)
 
     def test_speech_audio_content_line_allows_speech_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

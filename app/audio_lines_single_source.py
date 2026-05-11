@@ -35,7 +35,11 @@ VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"
 VISUAL_LINE_TYPES = {"attribute", "object_presence", "object_count", "action", "scene"}
 AUDIO_LINE_PROFILE_DEFAULT = "default"
 AUDIO_LINE_PROFILE_V4_STRICT = "v4_strict"
-AUDIO_LINE_PROFILES = {AUDIO_LINE_PROFILE_DEFAULT, AUDIO_LINE_PROFILE_V4_STRICT}
+AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY = "v5_audio_primary"
+AUDIO_LINE_PROFILES = {AUDIO_LINE_PROFILE_DEFAULT, AUDIO_LINE_PROFILE_V4_STRICT, AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY}
+B_CANDIDATE_MODE_HYBRID = "hybrid"
+B_CANDIDATE_MODE_AUDIO_FIRST = "audio_first"
+B_CANDIDATE_MODES = {B_CANDIDATE_MODE_HYBRID, B_CANDIDATE_MODE_AUDIO_FIRST}
 V4_A_STRONG_VISUAL_TYPES = {"scene", "action", "object_presence"}
 V4_VAGUE_AUDIO_TERMS = {
     "buzz",
@@ -79,8 +83,10 @@ def prepare_existing_single_source_clips(
     single_source_root: str | Path,
     run_root: str | Path,
     max_source_folders: int | None = None,
+    max_clips: int | None = None,
     annotation_search_roots: list[str | Path] | None = None,
     force_audio_focused_refresh: bool = False,
+    reuse_annotations: bool = True,
 ) -> dict[str, Any]:
     root_path = Path(root)
     source_root = Path(single_source_root)
@@ -93,10 +99,12 @@ def prepare_existing_single_source_clips(
     if max_source_folders and max_source_folders > 0:
         folders = folders[:max_source_folders]
 
-    annotation_index, annotation_sources = _build_annotation_reuse_index(
-        root=root_path,
-        search_roots=annotation_search_roots or [],
-    )
+    annotation_index, annotation_sources = ({}, [])
+    if reuse_annotations:
+        annotation_index, annotation_sources = _build_annotation_reuse_index(
+            root=root_path,
+            search_roots=annotation_search_roots or [],
+        )
     segments: list[dict[str, Any]] = []
     whole_records: list[dict[str, Any]] = []
     groups: list[dict[str, Any]] = []
@@ -107,6 +115,8 @@ def prepare_existing_single_source_clips(
     skipped_folders: list[dict[str, Any]] = []
 
     for folder_index, folder in enumerate(folders, start=1):
+        if max_clips and max_clips > 0 and len(segments) >= max_clips:
+            break
         media_files = [path for path in sorted(folder.iterdir(), key=lambda item: _clip_sort_key(item.name)) if path.suffix.lower() in VIDEO_SUFFIXES]
         whole = next((path for path in media_files if "whole" in path.stem.lower()), None)
         single_files = [path for path in media_files if path != whole and "single" in path.stem.lower()]
@@ -115,6 +125,11 @@ def prepare_existing_single_source_clips(
         if len(single_files) < 4:
             skipped_folders.append({"folder": str(folder), "reason": f"too_few_segments:{len(single_files)}"})
             continue
+        if max_clips and max_clips > 0:
+            remaining = max_clips - len(segments)
+            if remaining < 4:
+                break
+            single_files = single_files[:remaining]
 
         dataset = _infer_dataset(folder)
         source_clip_id = _safe_source_id(folder.name)
@@ -227,6 +242,8 @@ def prepare_existing_single_source_clips(
         "missing_annotation_count": len(missing_annotation_manifest),
         "audio_refresh_needed_count": len(audio_refresh_manifest),
         "force_audio_focused_refresh": bool(force_audio_focused_refresh),
+        "reuse_annotations": bool(reuse_annotations),
+        "max_clips": int(max_clips or 0),
         "annotation_sources": annotation_sources,
         "outputs": {key: str(value) for key, value in paths.items()},
         "skipped_folders": skipped_folders[:50],
@@ -272,8 +289,10 @@ def split_audio_line_candidates(
     max_a_candidates: int | None = None,
     max_b_candidates: int | None = None,
     audio_line_quality_profile: str = AUDIO_LINE_PROFILE_DEFAULT,
+    b_candidate_mode: str = B_CANDIDATE_MODE_HYBRID,
 ) -> dict[str, Any]:
     audio_line_quality_profile = _normalize_audio_line_quality_profile(audio_line_quality_profile)
+    b_candidate_mode = _normalize_b_candidate_mode(b_candidate_mode)
     root_path = Path(root)
     annotations = list(_load_jsonl(Path(clip_annotations_path)))
     candidates = list(_load_jsonl(Path(pair_candidates_path)))
@@ -316,50 +335,51 @@ def split_audio_line_candidates(
                     reject_counts["a_audio_anchor_below_threshold"] += 1
                 else:
                     reject_counts["a_v4_visual_delta_too_weak"] += 1
-        speech_score = _speech_evidence_score(reference, target)
-        if _speech_is_transcript_backed(reference, target) and speech_score >= 0.70 and _v4_b_candidate_allowed(
-            audio_line_quality_profile=audio_line_quality_profile,
-            visual_delta_strength=visual_delta_strength,
-            visual_context_similarity=visual_context_similarity,
-            audio_text=" ".join(_speech_texts_from_annotation(reference)[:2] + _speech_texts_from_annotation(target)[:2]),
-            difference_type="speech",
-        ):
-            b_records.append(
-                _speech_line_candidate(
-                    candidate,
-                    reference,
-                    target,
-                    visual_delta_strength=visual_delta_strength,
-                    visual_context_similarity=visual_context_similarity,
-                    audio_line_quality_profile=audio_line_quality_profile,
-                )
-            )
-        else:
-            non_speech_score = _non_speech_audio_event_score(reference, target)
-            audio_text = " ".join(_normalize_list(reference.get("audio_events", [])) + _normalize_list(target.get("audio_events", [])))
-            if non_speech_score >= 0.45 and _v4_b_candidate_allowed(
+        if b_candidate_mode == B_CANDIDATE_MODE_HYBRID:
+            speech_score = _speech_evidence_score(reference, target)
+            if _speech_is_transcript_backed(reference, target) and speech_score >= 0.70 and _v4_b_candidate_allowed(
                 audio_line_quality_profile=audio_line_quality_profile,
                 visual_delta_strength=visual_delta_strength,
                 visual_context_similarity=visual_context_similarity,
-                audio_text=audio_text,
-                difference_type="audio_event",
+                audio_text=" ".join(_speech_texts_from_annotation(reference)[:2] + _speech_texts_from_annotation(target)[:2]),
+                difference_type="speech",
             ):
                 b_records.append(
-                    _audio_event_line_candidate(
+                    _speech_line_candidate(
                         candidate,
                         reference,
                         target,
-                        non_speech_score,
                         visual_delta_strength=visual_delta_strength,
                         visual_context_similarity=visual_context_similarity,
                         audio_line_quality_profile=audio_line_quality_profile,
                     )
                 )
             else:
-                if non_speech_score < 0.45:
-                    reject_counts["b_missing_audio_evidence"] += 1
+                non_speech_score = _non_speech_audio_event_score(reference, target)
+                audio_text = " ".join(_normalize_list(reference.get("audio_events", [])) + _normalize_list(target.get("audio_events", [])))
+                if non_speech_score >= 0.45 and _v4_b_candidate_allowed(
+                    audio_line_quality_profile=audio_line_quality_profile,
+                    visual_delta_strength=visual_delta_strength,
+                    visual_context_similarity=visual_context_similarity,
+                    audio_text=audio_text,
+                    difference_type="audio_event",
+                ):
+                    b_records.append(
+                        _audio_event_line_candidate(
+                            candidate,
+                            reference,
+                            target,
+                            non_speech_score,
+                            visual_delta_strength=visual_delta_strength,
+                            visual_context_similarity=visual_context_similarity,
+                            audio_line_quality_profile=audio_line_quality_profile,
+                        )
+                    )
                 else:
-                    reject_counts["b_v4_visual_or_audio_gate_failed"] += 1
+                    if non_speech_score < 0.45:
+                        reject_counts["b_missing_audio_evidence"] += 1
+                    else:
+                        reject_counts["b_v4_visual_or_audio_gate_failed"] += 1
         if index % 50 == 0:
             print(f"[audio-lines-split] processed {index}/{len(candidates)}", file=sys.stderr, flush=True)
 
@@ -391,6 +411,7 @@ def split_audio_line_candidates(
         "b_audio_first_candidate_count": len(direct_b_records),
         "min_audio_anchor_score": min_audio_anchor_score,
         "audio_line_quality_profile": audio_line_quality_profile,
+        "b_candidate_mode": b_candidate_mode,
         "reject_counts": dict(reject_counts),
         "a_output_path": str(a_output_path),
         "b_output_path": str(b_output_path),
@@ -584,6 +605,15 @@ def _normalize_audio_line_quality_profile(value: str | None) -> str:
     return profile
 
 
+def _normalize_b_candidate_mode(value: str | None) -> str:
+    mode = str(value or B_CANDIDATE_MODE_HYBRID).strip().lower().replace("-", "_")
+    if mode in {"", "default"}:
+        return B_CANDIDATE_MODE_HYBRID
+    if mode not in B_CANDIDATE_MODES:
+        raise ValueError(f"unsupported b_candidate_mode={value!r}; expected one of {sorted(B_CANDIDATE_MODES)}")
+    return mode
+
+
 def _annotation_text(annotation: dict[str, Any], fields: tuple[str, ...]) -> str:
     parts: list[str] = []
     for field in fields:
@@ -653,6 +683,11 @@ def _v4_b_candidate_allowed(
     audio_text: str,
     difference_type: str,
 ) -> bool:
+    if audio_line_quality_profile == AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY:
+        normalized_audio = audio_text.lower()
+        if difference_type == "audio_event":
+            return any(term in normalized_audio for term in V4_CONCRETE_AUDIO_TERMS)
+        return bool(normalized_audio.strip())
     if audio_line_quality_profile != AUDIO_LINE_PROFILE_V4_STRICT:
         return True
     if visual_delta_strength > V4_B_MAX_VISUAL_DELTA_STRENGTH or visual_context_similarity < V4_B_MIN_VISUAL_CONTEXT_SIMILARITY:
@@ -666,12 +701,32 @@ def _v4_b_candidate_allowed(
     return True
 
 
+def _speech_content_delta_score(reference: dict[str, Any], target: dict[str, Any]) -> float:
+    reference_texts = _speech_texts_from_annotation(reference)
+    target_texts = _speech_texts_from_annotation(target)
+    if not reference_texts or not target_texts:
+        return 0.0
+    reference_tokens = _token_set(" ".join(reference_texts))
+    target_tokens = _token_set(" ".join(target_texts))
+    if not reference_tokens or not target_tokens:
+        return 0.0
+    if reference_tokens == target_tokens:
+        return 0.0
+    lexical_delta = 1.0 - _jaccard(reference_tokens, target_tokens)
+    specificity = _speech_specificity_score(reference, target)
+    if specificity <= 0.0:
+        return 0.0
+    score = 0.35 + lexical_delta * 0.45 + specificity * 0.20
+    return round(max(0.0, min(1.0, score)), 3)
+
+
 def _mine_audio_first_b_candidates(
     *,
     annotations_by_id: dict[str, dict[str, Any]],
     existing_keys: set[tuple[str, str, str]],
     audio_line_quality_profile: str,
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
+    audio_line_quality_profile = _normalize_audio_line_quality_profile(audio_line_quality_profile)
     records: list[dict[str, Any]] = []
     reject_counts: Counter[str] = Counter()
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -686,7 +741,12 @@ def _mine_audio_first_b_candidates(
             for target in ordered[left_index + 1 :]:
                 visual_context_similarity = _visual_context_similarity(reference, target)
                 speech_score = _speech_evidence_score(reference, target)
-                if speech_score >= 0.70:
+                if audio_line_quality_profile == AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY:
+                    speech_score = max(speech_score, _speech_content_delta_score(reference, target))
+                    speech_threshold = 0.45
+                else:
+                    speech_threshold = 0.70
+                if speech_score >= speech_threshold:
                     candidate = _audio_first_base_candidate(reference, target, difference_type="speech", group_key=group_key)
                     visual_delta_strength = _visual_delta_strength(candidate, reference, target)
                     audio_text = " ".join(_speech_texts_from_annotation(reference)[:2] + _speech_texts_from_annotation(target)[:2])
@@ -713,7 +773,8 @@ def _mine_audio_first_b_candidates(
                     else:
                         reject_counts["b_audio_first_speech_visual_gate_failed"] += 1
                 non_speech_score = _non_speech_audio_event_score(reference, target)
-                if non_speech_score >= 0.70:
+                non_speech_threshold = 0.55 if audio_line_quality_profile == AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY else 0.70
+                if non_speech_score >= non_speech_threshold:
                     candidate = _audio_first_base_candidate(reference, target, difference_type="audio_event", group_key=group_key)
                     visual_delta_strength = _visual_delta_strength(candidate, reference, target)
                     audio_text = " ".join(_normalize_list(reference.get("audio_events", [])) + _normalize_list(target.get("audio_events", [])))
@@ -852,14 +913,15 @@ def _speech_line_candidate(
         "description": "the spoken-language content differs between the reference and target clips",
     }
     quality = dict(record.get("quality", {}))
+    speech_score = max(_speech_evidence_score(reference, target), _speech_content_delta_score(reference, target))
     quality.update(
         {
             "difference_type": "speech",
             "has_audio_modality": 1.0,
-            "speech_evidence_score": _speech_evidence_score(reference, target),
+            "speech_evidence_score": speech_score,
             "speech_specificity_score": _speech_specificity_score(reference, target),
-            "speech_transcript_backed": 1.0,
-            "audio_content_delta_strength": max(_speech_evidence_score(reference, target), _speech_specificity_score(reference, target)),
+            "speech_transcript_backed": 1.0 if _speech_is_transcript_backed(reference, target) else 0.0,
+            "audio_content_delta_strength": max(speech_score, _speech_specificity_score(reference, target)),
         }
     )
     record["quality"] = quality
@@ -948,8 +1010,10 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--single-source-root", required=True)
     prepare.add_argument("--run-root", required=True)
     prepare.add_argument("--max-source-folders", type=int)
+    prepare.add_argument("--max-clips", type=int)
     prepare.add_argument("--annotation-search-root", action="append", default=[])
     prepare.add_argument("--force-audio-focused-refresh", action="store_true")
+    prepare.add_argument("--no-annotation-reuse", action="store_true")
 
     merge_ann = subparsers.add_parser("merge-annotations")
     merge_ann.add_argument("--base-annotations-path", required=True)
@@ -967,6 +1031,7 @@ def build_parser() -> argparse.ArgumentParser:
     split.add_argument("--max-a-candidates", type=int)
     split.add_argument("--max-b-candidates", type=int)
     split.add_argument("--audio-line-quality-profile", default=AUDIO_LINE_PROFILE_DEFAULT)
+    split.add_argument("--b-candidate-mode", choices=sorted(B_CANDIDATE_MODES), default=B_CANDIDATE_MODE_HYBRID)
 
     shard = subparsers.add_parser("shard-jsonl")
     shard.add_argument("--input-path", required=True)
@@ -989,8 +1054,10 @@ def main() -> None:
             single_source_root=args.single_source_root,
             run_root=args.run_root,
             max_source_folders=args.max_source_folders,
+            max_clips=args.max_clips,
             annotation_search_roots=args.annotation_search_root,
             force_audio_focused_refresh=args.force_audio_focused_refresh,
+            reuse_annotations=not args.no_annotation_reuse,
         )
     elif args.command == "merge-annotations":
         result = merge_annotations(
@@ -1010,6 +1077,7 @@ def main() -> None:
             max_a_candidates=args.max_a_candidates,
             max_b_candidates=args.max_b_candidates,
             audio_line_quality_profile=args.audio_line_quality_profile,
+            b_candidate_mode=args.b_candidate_mode,
         )
     elif args.command == "shard-jsonl":
         result = shard_jsonl(input_path=args.input_path, output_dir=args.output_dir, shards=args.shards, prefix=args.prefix)

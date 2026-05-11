@@ -7744,6 +7744,12 @@ def _single_source_candidate_prompt_view(candidate: dict[str, Any]) -> dict[str,
                 " v4_strict: the visual context must stay similar, like two cricket broadcast clips where crowd cheering or speech content changes. "
                 "Reject pairs with large visual scene/subject changes and reject vague hum/click/tone guesses unless there is explicit evidence."
             )
+        elif profile == "v5_audio_primary":
+            instruction += (
+                " v5_audio_primary: prioritize speech content differences in same-source clips, such as the same speaker or livestream moving from one topic to another. "
+                "Use speech when spoken words, transcript, paraphrase, or topic changes are the main difference. Use audio_event only for concrete non-speech sound changes. "
+                "Keep edit_text audio-only; visual differences are warnings unless they make listening unnecessary."
+            )
     return {
         "candidate_id": str(candidate.get("candidate_id", "")),
         "candidate_index": candidate.get("candidate_index"),
