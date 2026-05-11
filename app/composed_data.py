@@ -2260,6 +2260,9 @@ def propose_single_source_pairs(
             accepted = bool(final_omni_accept and not blocking_issues)
             edit_text_refinement: dict[str, Any] = {}
             raw_edit_text_refinement: dict[str, Any] = {}
+            speech_rewrite: dict[str, Any] = {}
+            raw_speech_rewrite: dict[str, Any] = {}
+            speech_rewrite_used = False
             if accepted and audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE and _is_b_audio_review_profile(acceptance_profile):
                 try:
                     edit_text_refinement, raw_edit_text_refinement = _call_omni_with_retries(
@@ -2293,7 +2296,60 @@ def propose_single_source_pairs(
                     }
                     raw_edit_text_refinement = {"error": f"{type(exc).__name__}: {exc}"}
                 refinement_issues = _b_line_edit_text_refinement_issues(edit_text_refinement)
-                if refinement_issues:
+                should_run_speech_rewrite = _b_line_should_run_speech_rewrite(
+                    model_fields=model_fields,
+                    final_verification=final_omni_verification,
+                    edit_text_refinement=edit_text_refinement,
+                    refinement_issues=refinement_issues,
+                )
+                if should_run_speech_rewrite:
+                    try:
+                        speech_rewrite, raw_speech_rewrite = _call_omni_with_retries(
+                            label=f"speech_rewrite:{proposal_id}",
+                            retries=omni_retries,
+                            fail_on_transient=fail_on_transient_omni_errors,
+                            func=lambda: client.refine_b_line_speech_content(
+                                reference_clip_path=str(reference_path),
+                                target_clip_path=str(target_path),
+                                model_fields=model_fields,
+                                final_verification=final_omni_verification,
+                                edit_text_refinement=edit_text_refinement,
+                                reference_annotation=_single_source_line_annotation_prompt_view(reference_annotation, audio_dataset_line),
+                                target_annotation=_single_source_line_annotation_prompt_view(target_annotation, audio_dataset_line),
+                            ),
+                        )
+                    except Exception as exc:
+                        if fail_on_transient_omni_errors and _is_transient_omni_exception(exc):
+                            print(
+                                "[propose-single-source-pairs] transient speech rewrite error; shard will fail for retry "
+                                f"proposal_id={proposal_id} error={type(exc).__name__}: {exc}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            raise
+                        speech_rewrite = {
+                            "reference_speech_content": "",
+                            "target_speech_content": "",
+                            "speech_transcription_confidence": 0.0,
+                            "speech_language": "",
+                            "refined_edit_text": "",
+                            "reject_if_still_unclear": True,
+                            "speech_rewrite_reject_reason": f"speech_rewrite_error: {type(exc).__name__}: {exc}",
+                        }
+                        raw_speech_rewrite = {"error": f"{type(exc).__name__}: {exc}"}
+                    speech_rewrite_issues = _b_line_speech_rewrite_issues(speech_rewrite)
+                    if speech_rewrite_issues:
+                        accepted = False
+                        final_omni_accept = False
+                        blocking_issues = _dedupe_strings(blocking_issues + refinement_issues + speech_rewrite_issues)
+                    else:
+                        refined_edit = str(speech_rewrite.get("refined_edit_text", "")).strip()
+                        if refined_edit:
+                            if not model_fields.get("b_line_original_edit_text"):
+                                model_fields["b_line_original_edit_text"] = str(model_fields.get("edit_text", "")).strip()
+                            model_fields["edit_text"] = refined_edit
+                            speech_rewrite_used = True
+                elif refinement_issues:
                     accepted = False
                     final_omni_accept = False
                     blocking_issues = _dedupe_strings(blocking_issues + refinement_issues)
@@ -2378,6 +2434,12 @@ def propose_single_source_pairs(
                 "edit_text_specificity_score": _score_float(edit_text_refinement.get("edit_text_specificity_score")),
                 "edit_text_reject_reason": str(edit_text_refinement.get("edit_text_reject_reason", "")).strip(),
                 "speech_or_audio_evidence": _normalize_list(edit_text_refinement.get("speech_or_audio_evidence", [])),
+                "speech_rewrite": speech_rewrite,
+                "raw_speech_rewrite": raw_speech_rewrite,
+                "speech_rewrite_refined_edit_text": str(speech_rewrite.get("refined_edit_text", "")).strip(),
+                "speech_rewrite_confidence": _score_float(speech_rewrite.get("speech_transcription_confidence")),
+                "speech_rewrite_reject_reason": str(speech_rewrite.get("speech_rewrite_reject_reason", "")).strip(),
+                "speech_rewrite_used": bool(speech_rewrite_used),
                 "recommended_edit_text": str(final_omni_verification.get("recommended_edit_text", "")).strip()
                 or _single_source_recommended_edit_text(model_fields),
                 "hard_negatives": hard_negative_paths,
@@ -8519,6 +8581,48 @@ def _b_line_edit_text_refinement_issues(refinement: dict[str, Any]) -> list[str]
     return _dedupe_strings(issues)
 
 
+def _b_line_should_run_speech_rewrite(
+    *,
+    model_fields: dict[str, Any],
+    final_verification: dict[str, Any],
+    edit_text_refinement: dict[str, Any],
+    refinement_issues: list[str],
+) -> bool:
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    if str(difference.get("type", "")).strip() != "speech":
+        return False
+    if _boolish(final_verification.get("visual_too_different_for_B")):
+        return False
+    if not _boolish(final_verification.get("target_satisfies_edit")):
+        return False
+    refined_edit = str(edit_text_refinement.get("refined_edit_text") or model_fields.get("edit_text") or "").strip()
+    specificity_issues = _b_line_edit_text_specificity_issues(refined_edit, "speech")
+    if refinement_issues or specificity_issues:
+        return True
+    return _score_float(model_fields.get("confidence")) < MIN_ACCEPT_EDIT_TARGET_ALIGNMENT_SCORE
+
+
+def _b_line_speech_rewrite_issues(rewrite: dict[str, Any]) -> list[str]:
+    if not isinstance(rewrite, dict) or not rewrite:
+        return ["speech_rewrite_missing"]
+    issues: list[str] = []
+    refined_edit = str(rewrite.get("refined_edit_text", "")).strip()
+    reference_content = str(rewrite.get("reference_speech_content", "")).strip()
+    target_content = str(rewrite.get("target_speech_content", "")).strip()
+    issues.extend(_b_line_edit_text_audio_only_issues(refined_edit, "speech"))
+    confidence = _score_float(rewrite.get("speech_transcription_confidence"))
+    if confidence < 0.70:
+        issues.append(f"speech_rewrite_confidence_below_threshold: {confidence:.2f} < 0.70")
+    if _boolish(rewrite.get("reject_if_still_unclear")):
+        reason = str(rewrite.get("speech_rewrite_reject_reason", "")).strip()
+        issues.append("speech_rewrite_reject" + (f": {reason}" if reason else ""))
+    if _b_line_audio_phrase_is_hollow(reference_content) or _b_line_audio_phrase_is_hollow(target_content):
+        issues.append("speech_rewrite_hollow_content")
+    if reference_content and target_content and _normalized_phrase(reference_content) == _normalized_phrase(target_content):
+        issues.append("speech_rewrite_identical_content")
+    return _dedupe_strings(issues)
+
+
 def _single_source_model_reject_issues(
     model_fields: dict[str, Any],
     edit_text_quality: dict[str, Any],
@@ -8619,6 +8723,17 @@ def _b_line_edit_text_specificity_issues(edit_text: str, difference_type: str) -
         "add target audio to the audio",
         "replace reference audio",
     )
+    placeholder_patterns = (
+        r"\bfrom discussing a to discussing b\b",
+        r"\bfrom topic a to topic b\b",
+        r"\bfrom content a to content b\b",
+        r"\bfrom phrase a to phrase b\b",
+        r"\bfrom saying a to saying b\b",
+        r"\bspecific topic a\b",
+        r"\bspecific topic b\b",
+        r"\bspecific sound a\b",
+        r"\bspecific sound b\b",
+    )
     hollow_markers = (
         "unintelligible",
         "inaudible",
@@ -8637,6 +8752,8 @@ def _b_line_edit_text_specificity_issues(edit_text: str, difference_type: str) -
     )
     if any(phrase in normalized for phrase in generic_phrases):
         issues.append("edit_text_not_audio_only: generic audio placeholder")
+    if any(re.search(pattern, normalized) for pattern in placeholder_patterns):
+        issues.append("edit_text_not_audio_only: placeholder audio wording")
     if any(marker in normalized for marker in hollow_markers):
         issues.append("edit_text_not_audio_only: hollow audio wording")
     clauses = [clause.strip() for clause in re.split(r"[;\n]+", edit_text) if clause.strip()]
@@ -8883,9 +9000,17 @@ def _b_line_audio_phrase_is_hollow(value: str) -> bool:
     if not normalized:
         return False
     hollow_exact = {
+        "a",
+        "b",
         "speech",
         "speaking",
         "discussing speaking",
+        "discussing a",
+        "discussing b",
+        "topic a",
+        "topic b",
+        "content a",
+        "content b",
         "audio",
         "sound",
         "voice",

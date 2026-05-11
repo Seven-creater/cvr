@@ -146,6 +146,16 @@ REQUIRED_B_LINE_EDIT_TEXT_REFINEMENT_FIELDS = (
     "speech_or_audio_evidence",
 )
 
+REQUIRED_B_LINE_SPEECH_REWRITE_FIELDS = (
+    "reference_speech_content",
+    "target_speech_content",
+    "speech_transcription_confidence",
+    "speech_language",
+    "refined_edit_text",
+    "reject_if_still_unclear",
+    "speech_rewrite_reject_reason",
+)
+
 REQUIRED_VIDEO_EDIT_PLAN_FIELDS = (
     "should_generate",
     "source_prompt",
@@ -713,6 +723,23 @@ def _b_line_edit_text_refinement_system_prompt() -> str:
     )
 
 
+def _b_line_speech_rewrite_system_prompt() -> str:
+    return (
+        "You are the speech-listening repair step for B-line speech_audio_content CVR data. "
+        "Ignore visual differences except for sanity; listen to the reference and target clips and identify concrete spoken or sung content. "
+        "Return exactly one JSON object with schema: "
+        '{"reference_speech_content": string, "target_speech_content": string, '
+        '"speech_transcription_confidence": number, "speech_language": string, '
+        '"refined_edit_text": string, "reject_if_still_unclear": boolean, "speech_rewrite_reject_reason": string}. '
+        "Paraphrase is allowed when exact transcription is hard, but it must name a real topic, phrase, lyric, or semantic content on each side. "
+        "Do not output placeholders such as A/B, topic A/topic B, unknown, unintelligible, not transcribed, speech content changed, target audio, or reference audio. "
+        "Use forms like 'change the speech from discussing budget planning to discussing health services', "
+        "'change the voice from saying \"the crazy one\" to saying \"our generation\"', or "
+        "'change the singing from \"morning light\" to \"our generation\"'. "
+        "If you cannot hear specific content for both clips, set reject_if_still_unclear=true."
+    )
+
+
 def _pair_judge_system_prompt() -> str:
     return (
         "You are a strict judge for composed video retrieval dataset construction. "
@@ -1100,6 +1127,35 @@ def _build_b_line_edit_text_refinement_user_content(
         {"type": "text", "text": "Reference clip for edit-text refinement:"},
         {"type": "video_url", "video_url": {"url": reference_clip_path}},
         {"type": "text", "text": "Target clip for edit-text refinement:"},
+        {"type": "video_url", "video_url": {"url": target_clip_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
+def _build_b_line_speech_rewrite_user_content(
+    *,
+    reference_clip_path: str,
+    target_clip_path: str,
+    model_fields: dict[str, Any],
+    final_verification: dict[str, Any],
+    edit_text_refinement: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: repair a B-line speech edit_text by listening to the audio only.\n"
+        f"Current pair proposal JSON:\n{_prompt_json(model_fields, max_chars=650)}\n"
+        f"Final verification JSON:\n{_prompt_json(final_verification, max_chars=420)}\n"
+        f"Prior edit-text refinement JSON:\n{_prompt_json(edit_text_refinement, max_chars=360)}\n"
+        f"Reference audio annotation JSON:\n{_prompt_json(reference_annotation, max_chars=420)}\n"
+        f"Target audio annotation JSON:\n{_prompt_json(target_annotation, max_chars=420)}\n"
+        "Return only the required JSON. The refined edit_text must be specific and audio-only. "
+        "Reject if both clips are only generic speaking/talking, if the content is unclear, or if the two sides have the same spoken content."
+    )
+    return [
+        {"type": "text", "text": "Reference clip for speech rewrite:"},
+        {"type": "video_url", "video_url": {"url": reference_clip_path}},
+        {"type": "text", "text": "Target clip for speech rewrite:"},
         {"type": "video_url", "video_url": {"url": target_clip_path}},
         {"type": "text", "text": prompt},
     ]
@@ -1550,6 +1606,32 @@ class OpenAIComposedDataClient:
             max_tokens=700,
         )
         return _normalize_b_line_edit_text_refinement_payload(raw_payload), raw_payload
+
+    def refine_b_line_speech_content(
+        self,
+        *,
+        reference_clip_path: str,
+        target_clip_path: str,
+        model_fields: dict[str, Any],
+        final_verification: dict[str, Any],
+        edit_text_refinement: dict[str, Any],
+        reference_annotation: dict[str, Any],
+        target_annotation: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_b_line_speech_rewrite_user_content(
+                reference_clip_path=reference_clip_path,
+                target_clip_path=target_clip_path,
+                model_fields=model_fields,
+                final_verification=final_verification,
+                edit_text_refinement=edit_text_refinement,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            ),
+            system_prompt=_b_line_speech_rewrite_system_prompt(),
+            max_tokens=700,
+        )
+        return _normalize_b_line_speech_rewrite_payload(raw_payload), raw_payload
 
     def judge_pair(
         self,
@@ -2300,6 +2382,32 @@ def _normalize_b_line_edit_text_refinement_payload(payload: dict[str, Any]) -> d
         "reject_if_unspecific": reject,
         "edit_text_reject_reason": reason,
         "speech_or_audio_evidence": evidence,
+    }
+
+
+def _normalize_b_line_speech_rewrite_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_B_LINE_SPEECH_REWRITE_FIELDS)
+    if missing_fields:
+        raise ValueError(f"B-line speech rewrite missing fields: {missing_fields}")
+    reference_content = str(payload.get("reference_speech_content", "")).strip()
+    target_content = str(payload.get("target_speech_content", "")).strip()
+    refined = str(payload.get("refined_edit_text", "")).strip()
+    reject = _bool_value(payload.get("reject_if_still_unclear"))
+    confidence = _score_value(payload.get("speech_transcription_confidence"))
+    reason = str(payload.get("speech_rewrite_reject_reason", "")).strip()
+    if not reject and (not reference_content or not target_content or not refined or confidence < 0.70):
+        reject = True
+        reason = reason or "speech rewrite is not specific enough"
+    if reject and not reason:
+        reason = "speech content is still unclear"
+    return {
+        "reference_speech_content": reference_content,
+        "target_speech_content": target_content,
+        "speech_transcription_confidence": confidence,
+        "speech_language": str(payload.get("speech_language", "")).strip(),
+        "refined_edit_text": refined,
+        "reject_if_still_unclear": reject,
+        "speech_rewrite_reject_reason": reason,
     }
 
 

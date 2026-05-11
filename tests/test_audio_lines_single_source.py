@@ -86,6 +86,8 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
         bad_cases = [
             ("The speech content has been altered.", "speech", "generic audio placeholder"),
             ("change the speech from unintelligible speech to not transcribed speech", "speech", "hollow audio wording"),
+            ("change the speech from discussing A to discussing B", "speech", "placeholder audio wording"),
+            ("change the voice from saying \"A\" to saying \"B\"", "speech", "placeholder audio wording"),
             ("add target audio to the audio", "audio_event", "generic audio placeholder"),
             ("replace fishing reel sound; Two men are fishing near the river.", "audio_event", "visual clause in audio edit"),
         ]
@@ -1323,6 +1325,246 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual(1, summary["accepted_count"])
             self.assertEqual([], ranked[0]["single_source_pair_acceptance_issues"])
             self.assertIn("final_omni_delta_not_segment_wide", ranked[0]["single_source_pair_review_required"])
+
+    def test_b_audio_review_rescues_placeholder_speech_edit_with_speech_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"video")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {"clip_id": "seg_1", "output_path": "clips/seg_1.mp4", "summary": "same speaker", "speech": ["speaker talks"], "speakers_and_transcript": ["speaker talks"], "audio_events": ["speech"], "modalities": ["audio", "visual"]},
+                    {"clip_id": "seg_2", "output_path": "clips/seg_2.mp4", "summary": "same speaker", "speech": ["speaker talks"], "speakers_and_transcript": ["speaker talks"], "audio_events": ["speech"], "modalities": ["audio", "visual"]},
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "proposal_id": "p1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "speech", "to": "speech"},
+                        "quality": {"speech_transcript_backed": 1.0, "speech_evidence_score": 0.9, "speech_specificity_score": 0.8, "has_audio_modality": 1.0},
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_single_source_pair.return_value = (
+                {
+                    "edit_text": "change the speech from discussing A to discussing B",
+                    "modalities": ["audio"],
+                    "reference_caption": "same speaker talks",
+                    "target_caption": "same speaker talks",
+                    "difference": {"type": "speech", "from": "A", "to": "B", "description": "spoken content changes"},
+                    "dominant_delta": {"type": "speech", "from": "A", "to": "B", "reason": "speech topic differs"},
+                    "reference_state": {},
+                    "target_state": {},
+                    "delta_temporal_extent": {"reference": "speech", "target": "speech", "target_coverage": 0.4, "evidence": "speech changes"},
+                    "subject_roles": {},
+                    "is_segment_wide_delta": False,
+                    "discarded_deltas": [],
+                    "evidence": ["speech content changes"],
+                    "confidence": 0.72,
+                    "accept": True,
+                    "reject_reason": "",
+                },
+                {"raw": "ok"},
+            )
+            client.verify_single_source_pair_final.return_value = (
+                {
+                    "accept": True,
+                    "confidence": 0.9,
+                    "quality_score": 0.8,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "observable_delta": True,
+                    "single_primary_delta": True,
+                    "text_or_ocr_driven": False,
+                    "segment_wide": False,
+                    "edit_text_accurate": True,
+                    "main_reject_reason": "",
+                    "evidence": ["target has the requested speech change"],
+                    "recommended_edit_text": "",
+                    "audio_primary": True,
+                    "visual_locked": True,
+                    "visual_too_different_for_B": False,
+                    "edit_text_audio_only": True,
+                },
+                {"raw": "final"},
+            )
+            client.refine_b_line_edit_text.return_value = (
+                {
+                    "refined_edit_text": "change the speech from discussing A to discussing B",
+                    "edit_text_specificity_score": 0.95,
+                    "reject_if_unspecific": False,
+                    "edit_text_reject_reason": "",
+                    "speech_or_audio_evidence": ["speech changes"],
+                },
+                {"raw": "refine"},
+            )
+            client.refine_b_line_speech_content.return_value = (
+                {
+                    "reference_speech_content": "budget planning",
+                    "target_speech_content": "health services",
+                    "speech_transcription_confidence": 0.88,
+                    "speech_language": "English",
+                    "refined_edit_text": "change the speech from discussing budget planning to discussing health services",
+                    "reject_if_still_unclear": False,
+                    "speech_rewrite_reject_reason": "",
+                },
+                {"raw": "rewrite"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    acceptance_profile="b_audio_review",
+                    audio_dataset_line="speech_audio_content",
+                )
+
+            ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, summary["accepted_count"])
+            self.assertTrue(ranked[0]["speech_rewrite_used"])
+            self.assertEqual(
+                "change the speech from discussing budget planning to discussing health services",
+                ranked[0]["edit_text"],
+            )
+
+    def test_b_audio_review_rejects_placeholder_speech_when_rewrite_is_unclear(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"video")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {"clip_id": "seg_1", "output_path": "clips/seg_1.mp4", "summary": "same speaker", "speech": ["speech"], "speakers_and_transcript": ["speech"], "audio_events": ["speech"], "modalities": ["audio", "visual"]},
+                    {"clip_id": "seg_2", "output_path": "clips/seg_2.mp4", "summary": "same speaker", "speech": ["speech"], "speakers_and_transcript": ["speech"], "audio_events": ["speech"], "modalities": ["audio", "visual"]},
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "proposal_id": "p1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "speech", "to": "speech"},
+                        "quality": {"speech_transcript_backed": 1.0, "speech_evidence_score": 0.9, "speech_specificity_score": 0.8, "has_audio_modality": 1.0},
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_single_source_pair.return_value = (
+                {
+                    "edit_text": "change the speech from discussing A to discussing B",
+                    "modalities": ["audio"],
+                    "reference_caption": "speaker talks",
+                    "target_caption": "speaker talks",
+                    "difference": {"type": "speech", "from": "A", "to": "B", "description": "spoken content changes"},
+                    "dominant_delta": {"type": "speech", "from": "A", "to": "B", "reason": "speech topic differs"},
+                    "reference_state": {},
+                    "target_state": {},
+                    "delta_temporal_extent": {"reference": "speech", "target": "speech", "target_coverage": 0.4, "evidence": "speech changes"},
+                    "subject_roles": {},
+                    "is_segment_wide_delta": False,
+                    "discarded_deltas": [],
+                    "evidence": ["speech content changes"],
+                    "confidence": 0.9,
+                    "accept": True,
+                    "reject_reason": "",
+                },
+                {"raw": "ok"},
+            )
+            client.verify_single_source_pair_final.return_value = (
+                {
+                    "accept": True,
+                    "confidence": 0.9,
+                    "quality_score": 0.8,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "observable_delta": True,
+                    "single_primary_delta": True,
+                    "text_or_ocr_driven": False,
+                    "segment_wide": False,
+                    "edit_text_accurate": True,
+                    "main_reject_reason": "",
+                    "evidence": ["target has the requested speech change"],
+                    "recommended_edit_text": "",
+                    "audio_primary": True,
+                    "visual_locked": True,
+                    "visual_too_different_for_B": False,
+                    "edit_text_audio_only": True,
+                },
+                {"raw": "final"},
+            )
+            client.refine_b_line_edit_text.return_value = (
+                {
+                    "refined_edit_text": "change the speech from discussing A to discussing B",
+                    "edit_text_specificity_score": 0.95,
+                    "reject_if_unspecific": False,
+                    "edit_text_reject_reason": "",
+                    "speech_or_audio_evidence": ["speech changes"],
+                },
+                {"raw": "refine"},
+            )
+            client.refine_b_line_speech_content.return_value = (
+                {
+                    "reference_speech_content": "not clear enough",
+                    "target_speech_content": "not clear enough",
+                    "speech_transcription_confidence": 0.3,
+                    "speech_language": "",
+                    "refined_edit_text": "",
+                    "reject_if_still_unclear": True,
+                    "speech_rewrite_reject_reason": "speech is not clear enough",
+                },
+                {"raw": "rewrite"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    acceptance_profile="b_audio_review",
+                    audio_dataset_line="speech_audio_content",
+                )
+
+            ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(0, summary["accepted_count"])
+            self.assertIn("speech_rewrite_reject", ranked[0]["judge"]["reject_reason"])
 
     def test_b_audio_review_still_rejects_low_quality_visual_or_hollow_audio(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

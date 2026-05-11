@@ -242,6 +242,86 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("target audio", system_prompt)
         self.assertEqual(44.0, request_holder["timeout"])
 
+    def test_refine_b_line_speech_content_listens_for_specific_topics(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "reference_speech_content": "budget planning",
+                                "target_speech_content": "health services",
+                                "speech_transcription_confidence": 0.92,
+                                "speech_language": "English",
+                                "refined_edit_text": "change the speech from discussing budget planning to discussing health services",
+                                "reject_if_still_unclear": False,
+                                "speech_rewrite_reject_reason": "",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            request_holder["timeout"] = timeout
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-composed-omni-speech-rewrite-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            ref_path = tmp_dir / "ref.mp4"
+            tgt_path = tmp_dir / "tgt.mp4"
+            ref_path.write_bytes(b"fake-ref")
+            tgt_path.write_bytes(b"fake-tgt")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8092/v1",
+                api_key="EMPTY",
+                model="instruct-model",
+                timeout_seconds=55.0,
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.refine_b_line_speech_content(
+                    reference_clip_path=str(ref_path),
+                    target_clip_path=str(tgt_path),
+                    model_fields={
+                        "edit_text": "change the speech from discussing A to discussing B",
+                        "difference": {"type": "speech"},
+                    },
+                    final_verification={"audio_primary": True, "visual_locked": True},
+                    edit_text_refinement={
+                        "refined_edit_text": "change the speech from discussing A to discussing B",
+                        "edit_text_specificity_score": 0.95,
+                    },
+                    reference_annotation={"speech": ["budget planning"], "summary": "same speaker"},
+                    target_annotation={"speech": ["health services"], "summary": "same speaker"},
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual("budget planning", normalized["reference_speech_content"])
+        self.assertEqual("health services", normalized["target_speech_content"])
+        self.assertEqual(
+            "change the speech from discussing budget planning to discussing health services",
+            normalized["refined_edit_text"],
+        )
+        self.assertFalse(normalized["reject_if_still_unclear"])
+        request = request_holder["request"]
+        request_body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual({"type": "json_object"}, request_body["response_format"])
+        system_prompt = request_body["messages"][0]["content"]
+        user_content = request_body["messages"][1]["content"]
+        user_text = "\n".join(item.get("text", "") for item in user_content if item.get("type") == "text")
+        self.assertIn("listen to the reference and target clips", system_prompt)
+        self.assertIn("Paraphrase is allowed", system_prompt)
+        self.assertIn("Do not output placeholders", system_prompt)
+        self.assertIn("listening to the audio only", user_text)
+        self.assertEqual(55.0, request_holder["timeout"])
+
     def test_request_json_repairs_malformed_json_response(self) -> None:
         requests: list[object] = []
         repaired_payload = {
