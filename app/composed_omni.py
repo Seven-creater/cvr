@@ -547,15 +547,10 @@ def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> 
             '"reference_state": object, "target_state": object, "delta_temporal_extent": object, "subject_roles": object, '
             '"is_segment_wide_delta": boolean, "discarded_deltas": [string], "evidence": [string], '
             '"confidence": number, "accept": boolean, "reject_reason": string}. '
-            "Visual context should stay practically locked: same person/speaker, same scene, same program, same match, or same broadcast/view context is enough. "
-            "Minor framing, pose, camera, gesture, or action changes are allowed when listening is still needed. "
-            "The edit must be audio-only: use difference.type=speech for spoken content/topic/transcript changes, or audio_event only for concrete non-speech sounds such as cheering, applause, music, machinery, ambience, rain, or crowd noise. "
-            "Do not label narration/topic changes as audio_event. edit_text must not describe people, objects, scene, color, subtitles, camera, shot distance, or visual action. "
-            "Only accept speech if you can name a concrete topic, keyword, phrase, lyric, or spoken semantic content. If speech is unintelligible, not transcribed, unspecified, or merely present, set accept=false. "
-            "Never write generic edit_text such as 'speech content changed', 'target audio', 'unintelligible speech', or 'speaking but not transcribed'. "
-            "For speech, write exactly like: 'change the speech from discussing {specific topic A} to discussing {specific topic B}' or 'change the voice from saying \"{phrase A}\" to saying \"{phrase B}\"'. "
-            "For audio events, write exactly like: 'replace {specific sound A} with {specific sound B}', 'add {specific sound/event} to the audio', or 'remove {specific sound/event} from the audio'. "
-            "Reject only when visuals dominate, audio evidence is vague, or the target can be found without listening."
+            "Keep visual context practically locked: same speaker/scene/program/match/context is enough; minor framing/pose/action changes are okay. "
+            "Use type=speech for concrete spoken topic/phrase/lyric changes, or audio_event for concrete non-speech sounds. "
+            "edit_text must be audio-only, e.g. 'change the speech from discussing A to discussing B' or 'add crowd cheering to the audio'. "
+            "Reject unintelligible/not-transcribed/unspecified/generic target-audio text, visual edit_text, or visually dominated pairs."
         )
     base_prompt = (
         "You compare two short clips cut from the same original video for composed video retrieval. "
@@ -610,21 +605,9 @@ def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> 
     if line == "speech_audio_content":
         return (
             base_prompt
-            + " This pass is the speech_audio_content B line. Visual variables are locked in a practical dataset sense: the clips should keep the same scene, "
-            "same person/speaker, same program, or same kind of broadcast/view context. They do not need to be pixel-identical. Moderate framing, pose, "
-            "gesture, camera, or minor action changes are acceptable when the same scene/person/context is still obvious and audio is the primary retrieval cue. "
-            "The primary retrieval edit must be speech content "
-            "or a concrete non-speech audio event. Use difference.type=speech for transcript-backed spoken-language content, narration topic, or commentary content; "
-            "do not label narration/topic changes as audio_event. Use difference.type=audio_event only for non-language sounds such as music, applause, machinery, "
-            "wind, animal sounds, ambience, or crowd cheering. The edit_text must describe only the audible change and must not describe people, objects, scene, "
-            "color, camera, subtitles, or shot distance. Good B-line style: two visually similar sports broadcast clips where the target clearly adds crowd cheering "
-            "or the spoken content changes. Reject with reason visual_too_different_for_B only if the person/scene/program/domain clearly changes, or if the visual "
-            "change is so dominant that listening is unnecessary. Reject vague hum/click/electronic tone guesses unless the evidence is explicit and human-audible. "
-            "Reject speech pairs when you cannot name the concrete spoken topic, keyword, phrase, or lyric. Do not output 'unintelligible speech', 'not transcribed', "
-            "'target audio', 'reference audio', or generic 'audio content differs' edit_text. "
-            "Speech edit_text must use a concrete form such as 'change the speech from discussing the bakery opening to discussing the mayor remarks'. "
-            "Audio-event edit_text must use concrete sound names such as 'replace a continuous electronic hum with classical music' or 'add crowd cheering to the audio'. "
-            "Reject if the main change is visual, if transcript/audio evidence is vague, or if edit_text is not audio-only."
+            + " B line: audio-sensitive retrieval. Keep same speaker/scene/program/match/context; minor framing/pose/action differences are okay. "
+            "Use speech for concrete spoken topic/phrase changes; audio_event only for clear non-speech sounds. "
+            "edit_text must be audio-only and specific. Reject vague/untranscribed/target-audio wording, visual edit_text, or visually dominated pairs."
         )
     return base_prompt
 
@@ -655,11 +638,9 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
             '"edit_text_accurate": boolean, "main_reject_reason": string, "evidence": [string], '
             '"recommended_edit_text": string, "audio_primary": boolean, "visual_locked": boolean, '
             '"visual_too_different_for_B": boolean, "edit_text_audio_only": boolean}. '
-            "Accept if the audible speech/audio change is primary, edit_text is audio-only, reference does not satisfy it, target satisfies it, "
-            "and visuals stay practically locked: same person/speaker, same scene, same program, same match, or same broadcast/view context. "
-            "Do not reject only because the speech/audio change covers part of the 6s target clip; segment_wide=false is acceptable when the target clearly contains the requested audio evidence. "
-            "Minor framing, pose, camera, gesture, or action changes are okay. Set visual_too_different_for_B=true only when visuals dominate enough that listening is unnecessary. "
-            "Reject vague audio guesses, visual edit_text, or cases where target can be found without audio. "
+            "Accept when audio is primary, edit_text is audio-only, reference lacks it, target has it, and same speaker/scene/program/match/context remains clear. "
+            "segment_wide=false is allowed if target audio evidence is clear. Minor framing/pose/action changes are okay. "
+            "Reject vague audio, visual edit_text, or visually dominated pairs. "
             "If accept=false, set quality_score below 0.7 and explain main_reject_reason."
         )
     base_prompt = (
@@ -702,18 +683,14 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
     if line == "speech_audio_content":
         return (
             base_prompt
-            + " For this speech_audio_content B line, observable_delta may be an audible speech or non-speech audio delta. "
+            + " For speech_audio_content B, observable_delta may be speech or non-speech audio. "
             'Also include "audio_primary": boolean, "visual_locked": boolean, "visual_too_different_for_B": boolean, '
             'and "edit_text_audio_only": boolean in the JSON object. '
-            "Accept speech only when both sides have concrete transcript-backed evidence and the edit_text names the content change. "
-            "Accept audio_event only for non-speech sound/music/environment changes, not narration topic changes. "
-            "Set visual_locked=true when the clips share the same person/speaker, same scene, same program, or same broadcast/view context, even if framing, pose, "
-            "gesture, camera, or minor action changes. Set visual_too_different_for_B=true only when the person/scene/program/domain changes enough that visuals alone "
-            "would identify the target. "
-            "For B-line review, do not reject only because the audible delta is not present for the full 6 seconds; segment_wide=false should be reported but can still be acceptable. "
+            "Accept speech only with concrete spoken evidence; audio_event only for concrete non-speech sound/music/environment changes. "
+            "visual_locked=true if same speaker/scene/program/context is clear despite minor framing/pose/action changes. "
+            "Do not reject only because audio is not present for the full 6 seconds; report segment_wide=false but it can pass. "
             "Set accept=true only if audio_primary=true, visual_locked=true, visual_too_different_for_B=false, and edit_text_audio_only=true. "
-            "Reject if a stronger visual difference is doing the retrieval work, if the audio evidence is generic, if the edit_text describes visuals, "
-            "or if the edit could be judged without listening."
+            "Reject generic audio, visual edit_text, or cases where visuals alone identify the target."
         )
     return base_prompt
 
@@ -1011,12 +988,13 @@ def _build_single_source_pair_user_content(
     candidate: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     line = _normalize_audio_dataset_line(candidate.get("audio_dataset_line") if isinstance(candidate, dict) else None)
-    ann_char_limit = 650 if line == "speech_audio_content" else 520 if line == "visual_audio_anchor" else 4200
-    candidate_char_limit = 650 if line in {"visual_audio_anchor", "speech_audio_content"} else 3000
+    ann_char_limit = 360 if line == "speech_audio_content" else 520 if line == "visual_audio_anchor" else 4200
+    candidate_char_limit = 260 if line == "speech_audio_content" else 650 if line == "visual_audio_anchor" else 3000
     context_text = ""
     if whole_annotation:
-        whole_limit = 140 if line in {"visual_audio_anchor", "speech_audio_content"} else 2200
-        context_text = f"Whole source video context JSON:\n{_prompt_json(whole_annotation, max_chars=whole_limit)}\n"
+        whole_limit = 0 if line == "speech_audio_content" else 140 if line == "visual_audio_anchor" else 2200
+        if whole_limit:
+            context_text = f"Whole source video context JSON:\n{_prompt_json(whole_annotation, max_chars=whole_limit)}\n"
     candidate_text = ""
     if candidate:
         candidate_text = f"Chronological pair candidate JSON:\n{_prompt_json(candidate, max_chars=candidate_char_limit)}\n"
@@ -1028,21 +1006,16 @@ def _build_single_source_pair_user_content(
         )
     elif line == "speech_audio_content":
         line_text = (
-            "B-line rule: keep visuals locked in a practical sense and make audio primary. Same person, same scene, same program, or same broadcast/view context is enough; "
-            "minor framing, pose, camera, or action differences are okay. The primary edit must be speech content or a concrete non-speech audio event. "
-            "Do not choose scene/action/object/attribute as the final difference; if the person/scene/program clearly changes or audio evidence is not strong, reject.\n"
+            "B-line: audio primary; visuals same context. Use speech/audio_event only; reject vague audio or visual edits.\n"
         )
     prompt = (
-        "Task: compare two clips from the same original 30-second video and write one evidence-backed edit.\n"
-        "Use the actual videos as primary evidence. Use annotations only as supporting context.\n"
+        "Compare two same-source 6s clips and write one evidence-backed edit. Videos are primary evidence; annotations are hints.\n"
         f"{line_text}"
         f"{context_text}"
-        f"Reference segment annotation JSON:\n{_prompt_json(reference_annotation, max_chars=ann_char_limit)}\n"
-        f"Target segment annotation JSON:\n{_prompt_json(target_annotation, max_chars=ann_char_limit)}\n"
+        f"Ref annotation:\n{_prompt_json(reference_annotation, max_chars=ann_char_limit)}\n"
+        f"Tgt annotation:\n{_prompt_json(target_annotation, max_chars=ann_char_limit)}\n"
         f"{candidate_text}"
-        "Choose the dominant visible/audio difference that a human reviewer can verify by opening the two clips. "
-        "Prefer product/overlay/object/action/composition differences over tiny clothing or hair wording changes. "
-        "Return JSON only."
+        "Return JSON only. The edit must be concrete and human-verifiable."
     )
     return [
         {"type": "text", "text": "Reference clip:"},
