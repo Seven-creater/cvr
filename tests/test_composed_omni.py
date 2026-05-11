@@ -173,6 +173,59 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("include both from/to text", system_prompt)
         self.assertEqual(22.0, request_holder["timeout"])
 
+    def test_request_json_repairs_malformed_json_response(self) -> None:
+        requests: list[object] = []
+        repaired_payload = {
+            "edit_text": "change one cat into two cats",
+            "modalities": ["visual"],
+            "reference_caption": "one cat on a sofa",
+            "target_caption": "two cats on a sofa",
+            "difference": {
+                "type": "object_count",
+                "from": "one cat",
+                "to": "two cats",
+                "description": "the cat count increases",
+            },
+            "proposal_reason": "same room and same subject with one clear change",
+        }
+        responses = [
+            _FakeHTTPResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"edit_text": "change one cat into two cats" "modalities": ["visual"]}'
+                            }
+                        }
+                    ]
+                }
+            ),
+            _FakeHTTPResponse({"choices": [{"message": {"content": json.dumps(repaired_payload)}}]}),
+        ]
+
+        def fake_urlopen(request, timeout):
+            requests.append(request)
+            return responses.pop(0)
+
+        client = OpenAIComposedDataClient(
+            base_url="http://127.0.0.1:8092/v1",
+            api_key="EMPTY",
+            model="instruct-model",
+            timeout_seconds=22.0,
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            normalized, _raw_payload = client.propose_pair(
+                reference_annotation={"clip_id": "ref", "summary": "one cat"},
+                target_annotation={"clip_id": "target", "summary": "two cats"},
+                hard_negative_candidates=[],
+            )
+
+        self.assertEqual("change one cat into two cats", normalized["edit_text"])
+        self.assertEqual(2, len(requests))
+        repair_request_body = json.loads(requests[1].data.decode("utf-8"))
+        self.assertIn("Repair the malformed JSON-like", repair_request_body["messages"][0]["content"])
+        self.assertNotIn("video_url", json.dumps(repair_request_body))
+
     def test_propose_single_source_pair_materializes_both_videos_and_requires_evidence(self) -> None:
         request_holder: dict[str, object] = {}
         response_payload = {

@@ -75,11 +75,78 @@ def _extract_json(text: str) -> dict:
     if text.startswith("```"):
         lines = [line for line in text.splitlines() if not line.startswith("```")]
         text = "\n".join(lines).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end < start:
+    candidate = _first_balanced_json_object(text)
+    if candidate is None:
         raise ValueError("response did not contain a JSON object")
-    return json.loads(text[start : end + 1])
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        repaired = _strip_trailing_json_commas(candidate)
+        if repaired != candidate:
+            return json.loads(repaired)
+        raise
+
+
+def _first_balanced_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _strip_trailing_json_commas(text: str) -> str:
+    output: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            index += 1
+            continue
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < len(text) and text[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(text) and text[lookahead] in "]}":
+                index += 1
+                continue
+        output.append(char)
+        index += 1
+    return "".join(output)
 
 
 def _missing_fields(payload: dict, required_fields: tuple[str, ...]) -> list[str]:

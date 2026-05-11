@@ -1657,10 +1657,73 @@ class OpenAIComposedDataClient:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"composed data request failed: HTTP {exc.code}: {detail}") from exc
         content = raw_response["choices"][0]["message"]["content"]
-        payload = _extract_json(content)
+        try:
+            payload = _extract_json(content)
+        except Exception as parse_exc:
+            payload = self._repair_malformed_json_response(
+                malformed_content=str(content),
+                parse_error=parse_exc,
+                max_tokens=max_tokens,
+            )
         if not isinstance(payload, dict):
             raise ValueError("model response must decode to a JSON object")
         return payload
+
+    def _repair_malformed_json_response(
+        self,
+        *,
+        malformed_content: str,
+        parse_error: BaseException,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        repair_prompt = (
+            "Repair the malformed JSON-like model response into exactly one valid JSON object. "
+            "Preserve the original keys and meanings as much as possible. Do not add markdown or commentary. "
+            "If a value is unclear, use an empty string, empty list, false, 0, or null rather than inventing evidence."
+        )
+        repair_user_text = (
+            f"Parse error: {type(parse_error).__name__}: {parse_error}\n"
+            "Malformed response:\n"
+            f"{malformed_content[:8000]}"
+        )
+        repair_payload = {
+            "model": self.model,
+            "modalities": ["text"],
+            "max_tokens": min(max(700, int(max_tokens or 900)), 1400),
+            "response_format": {"type": "json_object"},
+            "temperature": 0.0,
+            "messages": [
+                {"role": "system", "content": repair_prompt},
+                {"role": "user", "content": [{"type": "text", "text": repair_user_text}]},
+            ],
+        }
+        repair_request = urllib.request.Request(
+            url=f"{self.base_url}/chat/completions",
+            data=json.dumps(repair_payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(repair_request, timeout=self.timeout_seconds) as response:
+                raw_response = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"composed data JSON repair failed: HTTP {exc.code}: {detail}") from parse_error
+        repair_content = raw_response["choices"][0]["message"]["content"]
+        try:
+            repaired = _extract_json(str(repair_content))
+        except Exception as repair_exc:
+            raise ValueError(
+                "model response JSON repair failed after original parse error "
+                f"{type(parse_error).__name__}: {parse_error}; repair error "
+                f"{type(repair_exc).__name__}: {repair_exc}"
+            ) from parse_error
+        if not isinstance(repaired, dict):
+            raise ValueError("model JSON repair did not return a JSON object")
+        return repaired
 
 
 def _normalize_clip_annotation_payload(payload: dict[str, Any]) -> dict[str, Any]:

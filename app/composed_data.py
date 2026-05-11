@@ -2428,6 +2428,12 @@ def _is_transient_omni_exception(exc: BaseException) -> bool:
         "http error 504",
         "max retries exceeded",
         "no route to host",
+        "jsondecodeerror",
+        "response did not contain a json object",
+        "model response must decode to a json object",
+        "expecting ',' delimiter",
+        "expecting property name enclosed in double quotes",
+        "unterminated string",
     )
     return any(marker in text for marker in transient_markers)
 

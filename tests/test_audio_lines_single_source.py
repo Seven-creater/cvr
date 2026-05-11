@@ -11,7 +11,7 @@ from app.audio_lines_single_source import (
     prepare_existing_single_source_clips,
     split_audio_line_candidates,
 )
-from app.composed_data import ensure_layout, propose_single_source_pairs
+from app.composed_data import ensure_layout, propose_single_source_pairs, _is_transient_omni_exception
 
 
 class AudioLinesSingleSourceTests(unittest.TestCase):
@@ -20,6 +20,9 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
         with path.open("w", encoding="utf-8") as handle:
             for record in records:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def test_json_decode_errors_are_retried_as_transient_omni_failures(self) -> None:
+        self.assertTrue(_is_transient_omni_exception(ValueError("JSONDecodeError: Expecting ',' delimiter")))
 
     def test_prepare_existing_single_source_reconstructs_groups_and_reuses_annotations(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

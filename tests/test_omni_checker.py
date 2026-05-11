@@ -9,6 +9,7 @@ from app.omni_checker import (
     RetrievalHints,
     T2VQueryUnderstanding,
     VideoDescription,
+    _extract_json,
     _materialize_video_url,
     build_t2v_query_understanding_user_content,
     build_t2v_rerank_user_content,
@@ -99,6 +100,14 @@ class OmniCheckerTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         self.assertTrue(encoded.startswith("data:video/mp4;base64,"))
+
+    def test_extract_json_uses_first_balanced_object(self) -> None:
+        payload = _extract_json('{"ok": true} trailing note {"bad":')
+        self.assertEqual({"ok": True}, payload)
+
+    def test_extract_json_repairs_trailing_commas(self) -> None:
+        payload = _extract_json('```json\n{"items": ["a",], "nested": {"b": 1,},}\n```')
+        self.assertEqual({"items": ["a"], "nested": {"b": 1}}, payload)
 
 
 if __name__ == "__main__":
