@@ -2091,6 +2091,12 @@ def propose_single_source_pairs(
                 raw_model_output = {"error": f"{type(exc).__name__}: {exc}"}
                 fallback_used = True
 
+            model_fields = _repair_single_source_audio_line_model_fields(
+                model_fields=model_fields,
+                audio_dataset_line=audio_dataset_line,
+                reference_annotation=reference_annotation,
+                target_annotation=target_annotation,
+            )
             difference = dict(model_fields.get("difference") or {})
             difference_type = str(difference.get("type", "")).strip()
             confidence = _score_float(model_fields.get("confidence"))
@@ -2278,6 +2284,8 @@ def propose_single_source_pairs(
                 "final_omni_verification": final_omni_verification,
                 "single_source_delta_family": _single_source_delta_family_from_fields(model_fields),
                 "single_source_pair_acceptance_issues": blocking_issues,
+                "b_line_edit_text_repaired": bool(model_fields.get("b_line_edit_text_repaired")),
+                "b_line_original_edit_text": str(model_fields.get("b_line_original_edit_text", "")).strip(),
                 "recommended_edit_text": str(final_omni_verification.get("recommended_edit_text", "")).strip()
                 or _single_source_recommended_edit_text(model_fields),
                 "hard_negatives": hard_negative_paths,
@@ -8539,6 +8547,118 @@ def _single_source_recommended_edit_text(model_fields: dict[str, Any]) -> str:
     if from_value and to_value and not edit_text:
         return f"change {from_value} to {to_value}"
     return edit_text
+
+
+def _repair_single_source_audio_line_model_fields(
+    *,
+    model_fields: dict[str, Any],
+    audio_dataset_line: str,
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> dict[str, Any]:
+    if _normalize_audio_dataset_line(audio_dataset_line) != SPEECH_AUDIO_CONTENT_LINE:
+        return model_fields
+    difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
+    if difference_type not in {"speech", "audio_event"}:
+        return model_fields
+
+    repaired = dict(model_fields)
+    repaired["modalities"] = _ensure_audio_modality(repaired.get("modalities"))
+    candidate_edit = _b_line_audio_only_edit_text_from_difference(
+        difference=difference,
+        reference_annotation=reference_annotation,
+        target_annotation=target_annotation,
+    )
+    if not candidate_edit:
+        return repaired
+    current_issues = _b_line_edit_text_audio_only_issues(str(repaired.get("edit_text", "")), difference_type)
+    candidate_issues = _b_line_edit_text_audio_only_issues(candidate_edit, difference_type)
+    current_quality = _edit_text_quality_payload(
+        edit_text=str(repaired.get("edit_text", "")),
+        difference=difference,
+        modalities=repaired.get("modalities", []),
+        reference_caption=str(repaired.get("reference_caption", "")),
+        target_caption=str(repaired.get("target_caption", "")),
+    )
+    candidate_quality = _edit_text_quality_payload(
+        edit_text=candidate_edit,
+        difference=difference,
+        modalities=repaired.get("modalities", []),
+        reference_caption=str(reference_annotation.get("summary", "")),
+        target_caption=str(target_annotation.get("summary", "")),
+    )
+    should_replace = bool(current_issues and not candidate_issues) or (
+        _score_float(candidate_quality.get("score")) > _score_float(current_quality.get("score"))
+        and not candidate_issues
+    )
+    if should_replace:
+        repaired["edit_text"] = candidate_edit
+        repaired["b_line_edit_text_repaired"] = True
+        repaired["b_line_original_edit_text"] = str(model_fields.get("edit_text", "")).strip()
+    return repaired
+
+
+def _ensure_audio_modality(value: Any) -> list[str]:
+    modalities = [str(item).strip() for item in _normalize_list(value) if str(item).strip()]
+    if "audio" not in {item.lower() for item in modalities}:
+        modalities.append("audio")
+    return modalities
+
+
+def _b_line_audio_only_edit_text_from_difference(
+    *,
+    difference: dict[str, Any],
+    reference_annotation: dict[str, Any],
+    target_annotation: dict[str, Any],
+) -> str:
+    difference_type = str(difference.get("type", "")).strip()
+    from_value = _clean_b_line_audio_phrase(str(difference.get("from", "")).strip(), difference_type=difference_type)
+    to_value = _clean_b_line_audio_phrase(str(difference.get("to", "")).strip(), difference_type=difference_type)
+    if difference_type == "speech":
+        if not from_value:
+            from_value = _clean_b_line_audio_phrase(_first_speech_phrase(reference_annotation), difference_type=difference_type)
+        if not to_value:
+            to_value = _clean_b_line_audio_phrase(_first_speech_phrase(target_annotation), difference_type=difference_type)
+        if from_value and to_value:
+            return f"change the speech from {from_value} to {to_value}"
+        if to_value:
+            return f"change the speech to {to_value}"
+    if difference_type == "audio_event":
+        if from_value and to_value:
+            return f"replace {from_value} in the audio with {to_value}"
+        if to_value:
+            return f"add {to_value} to the audio"
+        if from_value:
+            return f"remove {from_value} from the audio"
+    return ""
+
+
+def _clean_b_line_audio_phrase(value: str, *, difference_type: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\b(?:a|an|the)\s+(?:man|woman|person|speaker|presenter|commentator|narrator)\s+(?:is\s+)?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:man|woman|person|speaker|presenter|commentator|narrator)\s+(?:is\s+)?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:talking|speaking)\s+about\b", "discussing", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:talks|speaks)\s+about\b", "discussing", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:saying|says|said)\b", "saying", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:in|on)\s+(?:the\s+)?(?:shot|scene|camera|view|frame|background|foreground)\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:shot|scene|camera|view|frame|background|foreground|visual|subtitle|logo|text)\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" .,:;-")
+    if difference_type == "speech" and text and not any(term in _normalized_phrase(text) for term in ("discuss", "discussing", "say", "saying", "speech", "spoken", "commentary", "narration", "voice")):
+        text = f"discussing {text}"
+    return text
+
+
+def _first_speech_phrase(annotation: dict[str, Any]) -> str:
+    for key in ("speakers_and_transcript", "speech"):
+        values = _normalize_list(annotation.get(key, []))
+        for value in values:
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
 
 
 def _single_source_text_driven_product_change_issue(

@@ -645,6 +645,135 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual("speech_audio_content", accepted[0]["audio_dataset_line"])
             self.assertEqual("speech", accepted[0]["difference"]["type"])
 
+    def test_speech_audio_content_line_rewrites_visual_leaky_speech_edit_before_final_omni(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"video")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "seg_1",
+                        "output_path": "clips/seg_1.mp4",
+                        "summary": "same man at a desk discusses budgets",
+                        "speech": ["budget planning"],
+                        "speakers_and_transcript": ["speaker: budget planning"],
+                        "audio_events": [],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "seg_2",
+                        "output_path": "clips/seg_2.mp4",
+                        "summary": "same man at a desk discusses health",
+                        "speech": ["health policy"],
+                        "speakers_and_transcript": ["speaker: health policy"],
+                        "audio_events": [],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "proposal_id": "p1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "man talking about budgets", "to": "man talking about health"},
+                        "quality": {
+                            "speech_transcript_backed": 1.0,
+                            "speech_evidence_score": 0.9,
+                            "speech_specificity_score": 0.9,
+                            "has_audio_modality": 1.0,
+                        },
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_single_source_pair.return_value = (
+                {
+                    "edit_text": "change the man talking about budgets to the man talking about health",
+                    "modalities": ["audio"],
+                    "reference_caption": "same man at a desk discusses budgets",
+                    "target_caption": "same man at a desk discusses health",
+                    "difference": {
+                        "type": "speech",
+                        "from": "man talking about budgets",
+                        "to": "man talking about health",
+                        "description": "spoken topic changes",
+                    },
+                    "dominant_delta": {"type": "speech", "from": "budgets", "to": "health", "reason": "speech topic differs"},
+                    "reference_state": {"main_speaker": "man", "inset_subjects": [], "product_overlay": "", "composition": "desk shot", "internal_transitions": []},
+                    "target_state": {"main_speaker": "man", "inset_subjects": [], "product_overlay": "", "composition": "desk shot", "internal_transitions": []},
+                    "delta_temporal_extent": {"reference": "budget is spoken", "target": "health is spoken", "target_coverage": 0.9, "evidence": "target speech says health"},
+                    "subject_roles": {"main_speaker": "man", "inset_subjects": [], "product_overlay": ""},
+                    "is_segment_wide_delta": True,
+                    "discarded_deltas": ["minor pose change"],
+                    "evidence": ["speech content changes"],
+                    "confidence": 0.9,
+                    "accept": True,
+                    "reject_reason": "",
+                },
+                {"raw": "ok"},
+            )
+            client.verify_single_source_pair_final.return_value = (
+                {
+                    "accept": True,
+                    "confidence": 0.9,
+                    "quality_score": 0.9,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "observable_delta": True,
+                    "single_primary_delta": True,
+                    "text_or_ocr_driven": False,
+                    "segment_wide": True,
+                    "edit_text_accurate": True,
+                    "main_reject_reason": "",
+                    "evidence": ["final verifier confirms the audible speech topic changes"],
+                    "recommended_edit_text": "",
+                    "audio_primary": True,
+                    "visual_locked": True,
+                    "visual_too_different_for_B": False,
+                    "edit_text_audio_only": True,
+                },
+                {"raw": "final"},
+            )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    acceptance_profile="exploration",
+                    audio_dataset_line="speech_audio_content",
+                )
+
+            ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            final_call = client.verify_single_source_pair_final.call_args.kwargs
+            self.assertEqual(1, summary["accepted_count"])
+            self.assertEqual("change the speech from discussing budgets to discussing health", ranked[0]["edit_text"])
+            self.assertEqual("change the speech from discussing budgets to discussing health", final_call["model_fields"]["edit_text"])
+            self.assertTrue(ranked[0]["raw_model_output"])
+            self.assertEqual(
+                "change the man talking about budgets to the man talking about health",
+                ranked[0]["b_line_original_edit_text"],
+            )
+
     def test_visual_audio_anchor_line_final_omni_can_rescue_visual_strength_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
