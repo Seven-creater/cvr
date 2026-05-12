@@ -190,6 +190,33 @@ class E5CVREvalTests(unittest.TestCase):
         result = model.module.processor(videos_kwargs={"load_audio_from_video": True, "max_pixels": 123})
         self.assertEqual({"max_pixels": 123}, result["videos_kwargs"])
 
+    def test_configure_video_processing_disables_audio_without_invalid_video_kwarg(self) -> None:
+        class FakeModule:
+            def __init__(self) -> None:
+                self.processing_kwargs = {"video": {"fps": 99, "load_audio_from_video": True}}
+
+        class FakeModel:
+            def __init__(self) -> None:
+                self.module = FakeModule()
+
+            def __getitem__(self, index: int) -> FakeModule:
+                if index != 0:
+                    raise IndexError(index)
+                return self.module
+
+        model = FakeModel()
+        patched = _configure_video_processing(model, max_pixels=321, fps=3, load_audio_from_video=False)
+
+        self.assertEqual(
+            {
+                "max_pixels": 321,
+                "do_sample_frames": True,
+                "fps": 3,
+            },
+            model.module.processing_kwargs["video"],
+        )
+        self.assertFalse(patched)
+
     def test_query_subset_uses_full_gallery_and_calculates_recall(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

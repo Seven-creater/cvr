@@ -762,13 +762,15 @@ def _encode_with_sentence_transformers(model: Any, inputs: list[Any], *, batch_s
 
 
 def _configure_video_processing(model: Any, *, max_pixels: int, fps: int, load_audio_from_video: bool) -> bool:
+    video_processing: dict[str, Any] = {
+        "max_pixels": max_pixels,
+        "do_sample_frames": True,
+        "fps": fps,
+    }
+    if load_audio_from_video:
+        video_processing["load_audio_from_video"] = True
     processing = {
-        "video": {
-            "max_pixels": max_pixels,
-            "do_sample_frames": True,
-            "fps": fps,
-            "load_audio_from_video": load_audio_from_video,
-        }
+        "video": video_processing
     }
     try:
         target = model[0]
@@ -781,6 +783,8 @@ def _configure_video_processing(model: Any, *, max_pixels: int, fps: int, load_a
                 existing[key].update(value)
             else:
                 existing[key] = value
+        if not load_audio_from_video and isinstance(existing.get("video"), dict):
+            existing["video"].pop("load_audio_from_video", None)
     else:
         try:
             setattr(target, "processing_kwargs", processing)
