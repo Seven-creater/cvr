@@ -31,8 +31,11 @@ SHARD_TIMEOUT_SECONDS=${SHARD_TIMEOUT_SECONDS:-3600}
 ANNOTATION_TIMEOUT_SECONDS=${ANNOTATION_TIMEOUT_SECONDS:-900}
 MIN_AUDIO_ANCHOR_SCORE=${MIN_AUDIO_ANCHOR_SCORE:-0.86}
 AUDIO_LINE_QUALITY_PROFILE=${AUDIO_LINE_QUALITY_PROFILE:-default}
+B_ACCEPTANCE_PROFILE=${B_ACCEPTANCE_PROFILE:-exploration}
 FORCE_AUDIO_FOCUSED_REFRESH=${FORCE_AUDIO_FOCUSED_REFRESH:-0}
 FRESH_ANNOTATIONS=${FRESH_ANNOTATIONS:-1}
+REUSE_RUN_ROOT=${REUSE_RUN_ROOT:-}
+SKIP_ANNOTATION_REFRESH=${SKIP_ANNOTATION_REFRESH:-0}
 ANNOTATION_SEARCH_ROOTS=${ANNOTATION_SEARCH_ROOTS:-}
 A_CANDIDATE_MODE=${A_CANDIDATE_MODE:-hybrid}
 B_CANDIDATE_MODE=${B_CANDIDATE_MODE:-hybrid}
@@ -58,9 +61,13 @@ Options:
   --propose-parallel-jobs N
   --request-timeout-seconds N
   --shard-timeout-seconds N
-  --audio-line-quality-profile default|v4_strict|v5_audio_primary
+  --audio-line-quality-profile default|v4_strict|v5_audio_primary|b_audio_context_cvr
+  --acceptance-profile exploration|b_audio_review|b_audio_context_cvr
   --a-candidate-mode hybrid|omni_first
   --b-candidate-mode hybrid|audio_first
+  --reuse-run-root PATH
+  --skip-annotation-refresh
+  --run-b-only
   --fresh-annotations
   --force-audio-focused-refresh
   --annotation-search-root PATH
@@ -88,8 +95,12 @@ while [[ $# -gt 0 ]]; do
     --request-timeout-seconds) REQUEST_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --shard-timeout-seconds) SHARD_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --audio-line-quality-profile) AUDIO_LINE_QUALITY_PROFILE="$2"; shift 2 ;;
+    --acceptance-profile) B_ACCEPTANCE_PROFILE="$2"; shift 2 ;;
     --a-candidate-mode) A_CANDIDATE_MODE="$2"; shift 2 ;;
     --b-candidate-mode) B_CANDIDATE_MODE="$2"; shift 2 ;;
+    --reuse-run-root) REUSE_RUN_ROOT="$2"; RUN_ROOT="$2"; FRESH_ANNOTATIONS=0; shift 2 ;;
+    --skip-annotation-refresh) SKIP_ANNOTATION_REFRESH=1; shift ;;
+    --run-b-only) AUDIO_DATASET_LINE=speech_audio_content; shift ;;
     --fresh-annotations) FRESH_ANNOTATIONS=1; shift ;;
     --force-audio-focused-refresh) FORCE_AUDIO_FOCUSED_REFRESH=1; shift ;;
     --annotation-search-root)
@@ -232,7 +243,7 @@ run_line_shards() {
 mkdir -p "$RUN_ROOT" "$REPO_ROOT/logs"
 echo "[audio-lines] start $(date)"
 echo "[audio-lines] run_root=$RUN_ROOT root=$ROOT single_source_root=$SINGLE_SOURCE_ROOT line=$AUDIO_DATASET_LINE"
-echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS max_clips=$MAX_CLIPS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS shard_timeout_seconds=$SHARD_TIMEOUT_SECONDS annotation_search_roots=$ANNOTATION_SEARCH_ROOTS audio_line_quality_profile=$AUDIO_LINE_QUALITY_PROFILE a_candidate_mode=$A_CANDIDATE_MODE b_candidate_mode=$B_CANDIDATE_MODE fresh_annotations=$FRESH_ANNOTATIONS force_audio_focused_refresh=$FORCE_AUDIO_FOCUSED_REFRESH omni_transient_retries=$OMNI_TRANSIENT_RETRIES fail_on_transient_omni_errors=$FAIL_ON_TRANSIENT_OMNI_ERRORS"
+echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS max_clips=$MAX_CLIPS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS shard_timeout_seconds=$SHARD_TIMEOUT_SECONDS annotation_search_roots=$ANNOTATION_SEARCH_ROOTS audio_line_quality_profile=$AUDIO_LINE_QUALITY_PROFILE b_acceptance_profile=$B_ACCEPTANCE_PROFILE a_candidate_mode=$A_CANDIDATE_MODE b_candidate_mode=$B_CANDIDATE_MODE fresh_annotations=$FRESH_ANNOTATIONS force_audio_focused_refresh=$FORCE_AUDIO_FOCUSED_REFRESH reuse_run_root=$REUSE_RUN_ROOT skip_annotation_refresh=$SKIP_ANNOTATION_REFRESH omni_transient_retries=$OMNI_TRANSIENT_RETRIES fail_on_transient_omni_errors=$FAIL_ON_TRANSIENT_OMNI_ERRORS"
 resolve_omni_model
 
 SEGMENTS_MANIFEST="$RUN_ROOT/extracted_single_source_clips.jsonl"
@@ -261,44 +272,50 @@ if [ "$FRESH_ANNOTATIONS" != "1" ] && [ "${#annotation_search_args[@]}" -eq 0 ];
   annotation_search_args+=(--annotation-search-root "$REPO_ROOT/runs" --annotation-search-root "$ROOT")
 fi
 
-prepare_existing_args=(
-  python3
-  -m
-  app.audio_lines_single_source
-  prepare-existing
-  --root "$ROOT"
-  --single-source-root "$SINGLE_SOURCE_ROOT"
-  --run-root "$RUN_ROOT"
-  --max-source-folders "$MAX_SOURCE_FOLDERS"
-)
-if [ "$MAX_CLIPS" != "0" ]; then
-  prepare_existing_args+=(--max-clips "$MAX_CLIPS")
-fi
-if [ "${#annotation_search_args[@]}" -gt 0 ]; then
-  prepare_existing_args+=("${annotation_search_args[@]}")
-elif [ "$FRESH_ANNOTATIONS" != "1" ]; then
-  prepare_existing_args+=(--annotation-search-root "$REPO_ROOT/runs" --annotation-search-root "$ROOT")
-elif [ "$FRESH_ANNOTATIONS" = "1" ]; then
-  prepare_existing_args+=(--no-annotation-reuse)
-fi
-if [ "$FORCE_AUDIO_FOCUSED_REFRESH" = "1" ]; then
-  prepare_existing_args+=(--force-audio-focused-refresh)
-fi
-"${prepare_existing_args[@]}"
+if [ "$SKIP_ANNOTATION_REFRESH" = "1" ]; then
+  echo "[audio-lines] skip annotation refresh; reusing existing manifests from $RUN_ROOT"
+  require_file "$SEGMENT_ANNOTATIONS" "segment annotations"
+  require_file "$CLIP_GROUPS" "clip groups"
+else
+  prepare_existing_args=(
+    python3
+    -m
+    app.audio_lines_single_source
+    prepare-existing
+    --root "$ROOT"
+    --single-source-root "$SINGLE_SOURCE_ROOT"
+    --run-root "$RUN_ROOT"
+    --max-source-folders "$MAX_SOURCE_FOLDERS"
+  )
+  if [ "$MAX_CLIPS" != "0" ]; then
+    prepare_existing_args+=(--max-clips "$MAX_CLIPS")
+  fi
+  if [ "${#annotation_search_args[@]}" -gt 0 ]; then
+    prepare_existing_args+=("${annotation_search_args[@]}")
+  elif [ "$FRESH_ANNOTATIONS" != "1" ]; then
+    prepare_existing_args+=(--annotation-search-root "$REPO_ROOT/runs" --annotation-search-root "$ROOT")
+  elif [ "$FRESH_ANNOTATIONS" = "1" ]; then
+    prepare_existing_args+=(--no-annotation-reuse)
+  fi
+  if [ "$FORCE_AUDIO_FOCUSED_REFRESH" = "1" ]; then
+    prepare_existing_args+=(--force-audio-focused-refresh)
+  fi
+  "${prepare_existing_args[@]}"
 
-require_file "$CLIPS_TO_ANNOTATE" "clips manifest"
-python3 -m app.composed_data detective-annotate-clips \
-  --root "$ROOT" \
-  --clips-manifest-path "$CLIPS_TO_ANNOTATE" \
-  --output-path "$SEGMENT_ANNOTATIONS" \
-  --base-url "$BASE_URL" \
-  --api-key EMPTY \
-  --model "$MODEL" \
-  --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS" \
-  --concurrency "$CONCURRENCY" \
-  $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "v5_audio_primary" ]; then printf '%s' '--audio-focused'; fi)
+  require_file "$CLIPS_TO_ANNOTATE" "clips manifest"
+  python3 -m app.composed_data detective-annotate-clips \
+    --root "$ROOT" \
+    --clips-manifest-path "$CLIPS_TO_ANNOTATE" \
+    --output-path "$SEGMENT_ANNOTATIONS" \
+    --base-url "$BASE_URL" \
+    --api-key EMPTY \
+    --model "$MODEL" \
+    --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS" \
+    --concurrency "$CONCURRENCY" \
+    $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "v5_audio_primary" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_context_cvr" ]; then printf '%s' '--audio-focused'; fi)
+fi
 
-if [ "$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")" -gt 0 ]; then
+if [ "$SKIP_ANNOTATION_REFRESH" != "1" ] && [ "$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")" -gt 0 ]; then
   echo "[audio-lines] audio refresh annotation start rows=$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")"
   python3 -m app.composed_data detective-annotate-clips \
     --root "$ROOT" \
@@ -309,7 +326,7 @@ if [ "$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")" -gt 0 ]; then
     --model "$MODEL" \
     --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS" \
     --concurrency "$CONCURRENCY" \
-    $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "v5_audio_primary" ]; then printf '%s' '--audio-focused'; fi)
+    $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "v5_audio_primary" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_context_cvr" ]; then printf '%s' '--audio-focused'; fi)
   python3 -m app.audio_lines_single_source merge-annotations \
     --base-annotations-path "$SEGMENT_ANNOTATIONS" \
     --refresh-annotations-path "$AUDIO_REFRESH_ANNOTATIONS" \
@@ -343,6 +360,7 @@ python3 -m app.audio_lines_single_source split-candidates \
   --b-candidate-mode "$B_CANDIDATE_MODE"
 
 if [ "$AUDIO_DATASET_LINE" = "both" ] || [ "$AUDIO_DATASET_LINE" = "visual_audio_anchor" ]; then
+  test -d "$RUN_ROOT/a_shards" && mv "$RUN_ROOT/a_shards" "$RUN_ROOT/a_shards_before_$(date +%Y%m%d_%H%M%S)"
   python3 -m app.audio_lines_single_source shard-jsonl \
     --input-path "$A_CANDIDATES" \
     --output-dir "$RUN_ROOT/a_shards" \
@@ -352,12 +370,13 @@ if [ "$AUDIO_DATASET_LINE" = "both" ] || [ "$AUDIO_DATASET_LINE" = "visual_audio
 fi
 
 if [ "$AUDIO_DATASET_LINE" = "both" ] || [ "$AUDIO_DATASET_LINE" = "speech_audio_content" ]; then
+  test -d "$RUN_ROOT/b_shards" && mv "$RUN_ROOT/b_shards" "$RUN_ROOT/b_shards_before_$(date +%Y%m%d_%H%M%S)"
   python3 -m app.audio_lines_single_source shard-jsonl \
     --input-path "$B_CANDIDATES" \
     --output-dir "$RUN_ROOT/b_shards" \
     --shards "$PROPOSE_SHARDS" \
     --prefix b
-  run_line_shards "b_speech_audio_content" "$RUN_ROOT/b_shards" "b" "b" "exploration" "speech_audio_content" "$TARGET_B_COUNT"
+  run_line_shards "b_speech_audio_content" "$RUN_ROOT/b_shards" "b" "b" "$B_ACCEPTANCE_PROFILE" "speech_audio_content" "$TARGET_B_COUNT"
 fi
 
 python3 -m app.audio_lines_single_source merge-line-results \

@@ -16,6 +16,7 @@ from app.composed_data import (
     propose_single_source_pairs,
     _b_line_edit_text_audio_only_issues,
     _is_transient_omni_exception,
+    _single_source_pair_acceptance_issues,
     _single_source_final_verification_issues,
 )
 
@@ -81,6 +82,64 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
         )
         self.assertIn("final_omni_visual_too_different_for_B", issues)
         self.assertIn("final_omni_audio_not_primary", issues)
+
+    def test_b_context_cvr_final_issues_reject_asr_degeneracy(self) -> None:
+        base = {
+            "accept": True,
+            "confidence": 0.9,
+            "quality_score": 0.72,
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "observable_delta": True,
+            "single_primary_delta": True,
+            "text_or_ocr_driven": False,
+            "segment_wide": False,
+            "edit_text_accurate": True,
+            "main_reject_reason": "",
+            "evidence": ["speech topic changes in the same clip context"],
+            "recommended_edit_text": "",
+            "audio_primary": True,
+            "visual_locked": True,
+            "visual_too_different_for_B": False,
+            "edit_text_audio_only": True,
+            "visual_context_preserved": True,
+            "video_context_strength": 0.30,
+            "asr_degeneracy_risk": 0.80,
+            "not_asr_only": False,
+        }
+        issues = _single_source_final_verification_issues(
+            base,
+            acceptance_profile="b_audio_context_cvr",
+            audio_dataset_line="speech_audio_content",
+            model_fields={"difference": {"type": "speech"}},
+        )
+        self.assertIn("final_omni_video_context_too_weak: 0.30 < 0.45", issues)
+        self.assertIn("final_omni_asr_degeneracy_risk_too_high: 0.80 > 0.55", issues)
+        self.assertIn("final_omni_asr_only", issues)
+
+    def test_b_context_cvr_local_gate_rejects_ami_auxiliary_source(self) -> None:
+        issues = _single_source_pair_acceptance_issues(
+            model_fields={
+                "edit_text": "change the speech from discussing budget to discussing health",
+                "modalities": ["audio"],
+                "difference": {"type": "speech", "from": "budget", "to": "health"},
+                "confidence": 0.9,
+                "delta_temporal_extent": {"target_coverage": 0.8},
+                "is_segment_wide_delta": True,
+            },
+            edit_text_quality={"score": 0.9},
+            acceptance_profile="b_audio_context_cvr",
+            audio_dataset_line="speech_audio_content",
+            candidate_quality={
+                "acceptance_profile": "b_audio_context_cvr",
+                "video_context_strength": 0.7,
+                "asr_degeneracy_risk": 0.2,
+                "video_context_type": "meeting",
+            },
+            reference_annotation={"dataset": "ami_av", "speech": ["budget"]},
+            target_annotation={"dataset": "ami_av", "speech": ["health"]},
+        )
+        self.assertIn("diagnostic_asr_auxiliary_source: AMI-AV is not accepted into main B-line", issues)
 
     def test_b_line_rejects_hollow_or_visual_leaky_audio_edit_text(self) -> None:
         bad_cases = [
@@ -549,6 +608,161 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual(1, summary["b_candidate_count"])
             self.assertEqual("speech", b_records[0]["difference"]["type"])
             self.assertGreaterEqual(b_records[0]["quality"]["speech_evidence_score"], 0.45)
+
+    def test_b_context_cvr_rejects_asr_only_talking_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "ann.jsonl"
+            candidates_path = root / "cand.jsonl"
+            a_path = root / "a.jsonl"
+            b_path = root / "b.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "meeting__single_001",
+                        "output_path": "clips/meeting/meeting__single_001.mp4",
+                        "start_seconds": 0.0,
+                        "summary": "static talking head in a zoom meeting",
+                        "subjects": ["speaker"],
+                        "actions": ["speaking to camera"],
+                        "scene": "webinar meeting",
+                        "speech": ["the speaker says the meeting starts at nine"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "meeting__single_002",
+                        "output_path": "clips/meeting/meeting__single_002.mp4",
+                        "start_seconds": 6.0,
+                        "summary": "static talking head in a zoom meeting",
+                        "subjects": ["speaker"],
+                        "actions": ["speaking to camera"],
+                        "scene": "webinar meeting",
+                        "speech": ["the speaker says the budget review starts tomorrow"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(candidates_path, [])
+
+            summary = split_audio_line_candidates(
+                root=root,
+                clip_annotations_path=annotations_path,
+                pair_candidates_path=candidates_path,
+                a_output_path=a_path,
+                b_output_path=b_path,
+                summary_path=root / "summary.json",
+                audio_line_quality_profile="b_audio_context_cvr",
+                b_candidate_mode="audio_first",
+            )
+
+            self.assertEqual(0, summary["b_candidate_count"])
+            self.assertGreaterEqual(summary["reject_counts"].get("b_audio_first_speech_visual_gate_failed", 0), 1)
+
+    def test_b_context_cvr_accepts_tutorial_speech_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            annotations_path = root / "ann.jsonl"
+            candidates_path = root / "cand.jsonl"
+            a_path = root / "a.jsonl"
+            b_path = root / "b.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "cook__single_001",
+                        "output_path": "clips/cook/cook__single_001.mp4",
+                        "start_seconds": 0.0,
+                        "summary": "cooking tutorial host at a kitchen counter",
+                        "subjects": ["host", "kitchen counter", "ingredients"],
+                        "actions": ["explaining ingredients"],
+                        "scene": "kitchen tutorial",
+                        "speech": ["the host explains flour sugar and eggs for the cake batter"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "cook__single_002",
+                        "output_path": "clips/cook/cook__single_002.mp4",
+                        "start_seconds": 6.0,
+                        "summary": "cooking tutorial host at a kitchen counter",
+                        "subjects": ["host", "kitchen counter", "mixing bowl"],
+                        "actions": ["explaining mixing steps"],
+                        "scene": "kitchen tutorial",
+                        "speech": ["the host explains how to whisk the batter until smooth"],
+                        "audio_events": ["speech"],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(candidates_path, [])
+
+            summary = split_audio_line_candidates(
+                root=root,
+                clip_annotations_path=annotations_path,
+                pair_candidates_path=candidates_path,
+                a_output_path=a_path,
+                b_output_path=b_path,
+                summary_path=root / "summary.json",
+                audio_line_quality_profile="b_audio_context_cvr",
+                b_candidate_mode="audio_first",
+            )
+
+            b_records = [json.loads(line) for line in b_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, summary["b_candidate_count"])
+            self.assertEqual("speech_topic_in_video_context", b_records[0]["quality"]["b_subtype"])
+            self.assertEqual("tutorial_instruction", b_records[0]["quality"]["video_context_type"])
+            self.assertLessEqual(b_records[0]["quality"]["asr_degeneracy_risk"], 0.55)
+
+    def test_merge_b_line_outputs_context_buckets_and_caps_speech(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_root = root / "run"
+            b_shards = run_root / "b_shards"
+            b_shards.mkdir(parents=True)
+            accepted = []
+            for index in range(1, 7):
+                subtype = "speech_topic_in_video_context" if index <= 4 else "music"
+                accepted.append(
+                    {
+                        "proposal_id": f"p{index}",
+                        "reference_video": f"ref{index}.mp4",
+                        "target_video": f"tgt{index}.mp4",
+                        "edit_text": "change the tutorial narration" if subtype.startswith("speech") else "change the background music",
+                        "difference": {"type": "speech" if subtype.startswith("speech") else "audio_event"},
+                        "accepted": True,
+                        "b_subtype": subtype,
+                        "quality": {"b_subtype": subtype},
+                    }
+                )
+            self._write_jsonl(b_shards / "accepted_progress_01.jsonl", accepted)
+            self._write_jsonl(b_shards / "ranked_01.jsonl", accepted)
+
+            summary = merge_line_results(run_root=run_root, target_a_count=0, target_b_count=5)
+
+            selected = [
+                json.loads(line)
+                for line in (run_root / "b_speech_audio_content_triplets.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            speech = [
+                json.loads(line)
+                for line in (run_root / "b_speech_context_triplets.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            music = [
+                json.loads(line)
+                for line in (run_root / "b_music_triplets.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(4, len(selected))
+            self.assertLessEqual(len(speech), 2)
+            self.assertEqual(2, len(music))
+            self.assertIn("b_context_cvr_summary_path", summary)
 
     def test_a_omni_first_keeps_audio_anchor_pairs_for_omni_visual_judging(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

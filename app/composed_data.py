@@ -869,6 +869,7 @@ DEFAULT_ACCEPTANCE_PROFILE = "final"
 EXPLORATION_ACCEPTANCE_PROFILE = "exploration"
 AUDIO_MATTERS_ACCEPTANCE_PROFILE = "audio_matters"
 B_AUDIO_REVIEW_ACCEPTANCE_PROFILE = "b_audio_review"
+B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE = "b_audio_context_cvr"
 STANDARD_AUDIO_DATASET_LINE = "standard"
 VISUAL_AUDIO_ANCHOR_LINE = "visual_audio_anchor"
 SPEECH_AUDIO_CONTENT_LINE = "speech_audio_content"
@@ -975,6 +976,8 @@ B_LINE_FINAL_RESCUABLE_LOCAL_ISSUE_PREFIXES = (
     "visual_too_different_for_B:",
     "audio_not_primary:",
     "vague_audio_event:",
+    "video_context_too_weak_for_B:",
+    "asr_degeneracy_risk_too_high:",
 )
 AUDIO_DATASET_LINE_NAMES = {
     STANDARD_AUDIO_DATASET_LINE,
@@ -986,6 +989,7 @@ ACCEPTANCE_PROFILE_NAMES = {
     EXPLORATION_ACCEPTANCE_PROFILE,
     AUDIO_MATTERS_ACCEPTANCE_PROFILE,
     B_AUDIO_REVIEW_ACCEPTANCE_PROFILE,
+    B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
 }
 ACCEPTANCE_PROFILE_CONFIGS = {
     DEFAULT_ACCEPTANCE_PROFILE: {
@@ -1059,6 +1063,25 @@ ACCEPTANCE_PROFILE_CONFIGS = {
         "non_speech_audio_event_score": 0.40,
         "edit_text_quality_score": 0.50,
     },
+    B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE: {
+        "template_semantic_context_score": 0.25,
+        "template_compatibility_score": 0.55,
+        "template_clean_stability_score": 0.55,
+        "template_single_delta_bundle_score": 0.50,
+        "template_target_uniqueness_score": 0.40,
+        "template_difference_strength_score": 0.45,
+        "same_context_score": 0.40,
+        "edit_match_score": 0.45,
+        "target_uniqueness_score": 0.40,
+        "difference_strength_score": 0.45,
+        "edit_necessity_score": 0.50,
+        "edit_target_alignment_score": 0.50,
+        "action_evidence_score": 0.40,
+        "non_speech_audio_event_score": 0.40,
+        "edit_text_quality_score": 0.50,
+        "video_context_strength": 0.45,
+        "asr_degeneracy_risk": 0.55,
+    },
 }
 SAME_TEMPLATE_CLUSTER_RELATION = "same_template_cluster"
 DEFAULT_DIAGNOSTIC_BUNDLE_NAME = "diagnostic_bundle"
@@ -1085,7 +1108,9 @@ GENERIC_HUMAN_OBJECT_LABELS = {
 
 
 def _normalize_acceptance_profile(value: str | None) -> str:
-    profile = str(value or DEFAULT_ACCEPTANCE_PROFILE).strip().lower()
+    profile = str(value or DEFAULT_ACCEPTANCE_PROFILE).strip().lower().replace("-", "_")
+    if profile == "b_context_cvr":
+        profile = B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE
     if profile not in ACCEPTANCE_PROFILE_NAMES:
         allowed = ", ".join(sorted(ACCEPTANCE_PROFILE_NAMES))
         raise ValueError(f"unsupported acceptance_profile={value!r}; expected one of: {allowed}")
@@ -1119,12 +1144,24 @@ def _is_audio_matters_profile(acceptance_profile: str | None) -> bool:
 
 
 def _is_b_audio_review_profile(acceptance_profile: str | None) -> bool:
-    return _normalize_acceptance_profile(acceptance_profile) == B_AUDIO_REVIEW_ACCEPTANCE_PROFILE
+    return _normalize_acceptance_profile(acceptance_profile) in {
+        B_AUDIO_REVIEW_ACCEPTANCE_PROFILE,
+        B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
+    }
+
+
+def _is_b_audio_context_cvr_profile(acceptance_profile: str | None) -> bool:
+    return _normalize_acceptance_profile(acceptance_profile) == B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE
 
 
 def _uses_soft_local_gate_profile(acceptance_profile: str | None) -> bool:
     profile = _normalize_acceptance_profile(acceptance_profile)
-    return profile in {EXPLORATION_ACCEPTANCE_PROFILE, AUDIO_MATTERS_ACCEPTANCE_PROFILE, B_AUDIO_REVIEW_ACCEPTANCE_PROFILE}
+    return profile in {
+        EXPLORATION_ACCEPTANCE_PROFILE,
+        AUDIO_MATTERS_ACCEPTANCE_PROFILE,
+        B_AUDIO_REVIEW_ACCEPTANCE_PROFILE,
+        B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
+    }
 SUBJECT_SIGNATURE_MARKER_TOKENS = {
     "bald",
     "beard",
@@ -2143,6 +2180,18 @@ def propose_single_source_pairs(
                 model_fields=model_fields,
                 acceptance_profile=acceptance_profile,
             )
+            if audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE and _is_b_audio_context_cvr_profile(acceptance_profile):
+                context_type = _b_line_video_context_type(reference_annotation, target_annotation)
+                video_context_strength = _b_line_video_context_strength(reference_annotation, target_annotation, quality)
+                asr_degeneracy_risk = _b_line_asr_degeneracy_risk(reference_annotation, target_annotation, quality)
+                quality.update(
+                    {
+                        "b_context_cvr": True,
+                        "video_context_type": context_type,
+                        "video_context_strength": video_context_strength,
+                        "asr_degeneracy_risk": asr_degeneracy_risk,
+                    }
+                )
             edit_text_quality = _edit_text_quality_payload(
                 edit_text=str(model_fields.get("edit_text", "")),
                 difference=difference,
@@ -2387,6 +2436,21 @@ def propose_single_source_pairs(
                 "template_route": "single_source_pair_video_comparison",
                 "score": quality["same_context_score"],
             }
+            b_subtype = ""
+            video_context_type = str(quality.get("video_context_type", "")).strip()
+            video_context_strength = _score_float(quality.get("video_context_strength"))
+            asr_degeneracy_risk = _score_float(quality.get("asr_degeneracy_risk"))
+            if audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE:
+                b_subtype = _b_line_subtype_from_evidence(
+                    difference_type=difference_type,
+                    edit_text=str(model_fields.get("edit_text", "")).strip(),
+                    reference_annotation=reference_annotation,
+                    target_annotation=target_annotation,
+                )
+                if "video_context_strength" in final_omni_verification:
+                    video_context_strength = _score_float(final_omni_verification.get("video_context_strength"))
+                if "asr_degeneracy_risk" in final_omni_verification:
+                    asr_degeneracy_risk = _score_float(final_omni_verification.get("asr_degeneracy_risk"))
             record = {
                 "proposal_id": proposal_id,
                 "candidate_id": str(candidate.get("candidate_id", "")),
@@ -2440,6 +2504,26 @@ def propose_single_source_pairs(
                 "speech_rewrite_confidence": _score_float(speech_rewrite.get("speech_transcription_confidence")),
                 "speech_rewrite_reject_reason": str(speech_rewrite.get("speech_rewrite_reject_reason", "")).strip(),
                 "speech_rewrite_used": bool(speech_rewrite_used),
+                "b_subtype": b_subtype,
+                "video_context_type": video_context_type,
+                "video_context_strength": video_context_strength,
+                "asr_degeneracy_risk": asr_degeneracy_risk,
+                "speech_role": str(reference_annotation.get("speech_role") or target_annotation.get("speech_role") or "").strip(),
+                "audio_evidence": _dedupe_strings(
+                    _normalize_list(reference_annotation.get("audio_events", []))
+                    + _normalize_list(target_annotation.get("audio_events", []))
+                    + _normalize_list(edit_text_refinement.get("speech_or_audio_evidence", []))
+                    + _normalize_list(speech_rewrite.get("reference_speech_content", []))
+                    + _normalize_list(speech_rewrite.get("target_speech_content", []))
+                ),
+                "visual_context_evidence": _dedupe_strings(
+                    [
+                        str(reference_annotation.get("scene", "")).strip(),
+                        str(target_annotation.get("scene", "")).strip(),
+                        str(reference_annotation.get("summary", "")).strip(),
+                        str(target_annotation.get("summary", "")).strip(),
+                    ]
+                ),
                 "recommended_edit_text": str(final_omni_verification.get("recommended_edit_text", "")).strip()
                 or _single_source_recommended_edit_text(model_fields),
                 "hard_negatives": hard_negative_paths,
@@ -8175,6 +8259,10 @@ def _single_source_pair_quality(
         "visual_delta_strength",
         "visual_context_similarity",
         "audio_content_delta_strength",
+        "b_subtype",
+        "video_context_type",
+        "video_context_strength",
+        "asr_degeneracy_risk",
     ):
         if key in heuristic_quality:
             quality[key] = heuristic_quality[key]
@@ -8372,6 +8460,10 @@ def _single_source_skipped_final_verification(reason: str) -> dict[str, Any]:
         "visual_locked": False,
         "visual_too_different_for_B": False,
         "edit_text_audio_only": False,
+        "visual_context_preserved": False,
+        "video_context_strength": 0.0,
+        "asr_degeneracy_risk": 1.0,
+        "not_asr_only": False,
         "large_visual_delta": False,
         "audio_context_preserved": False,
         "skipped": True,
@@ -8476,6 +8568,7 @@ def _single_source_final_verification_issues(
         return ["final_omni_verification_missing"]
     audio_dataset_line = _normalize_audio_dataset_line(audio_dataset_line)
     b_audio_review = audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE and _is_b_audio_review_profile(acceptance_profile)
+    b_audio_context_cvr = audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE and _is_b_audio_context_cvr_profile(acceptance_profile)
     difference = model_fields.get("difference") if isinstance(model_fields, dict) and isinstance(model_fields.get("difference"), dict) else {}
     difference_type = str(difference.get("type", "")).strip()
     threshold = _profile_threshold(acceptance_profile, "edit_match_score")
@@ -8525,6 +8618,24 @@ def _single_source_final_verification_issues(
             issues.append("final_omni_visual_too_different_for_B")
         if not _boolish(final_verification.get("edit_text_audio_only")):
             issues.append("final_omni_edit_text_not_audio_only")
+        if b_audio_context_cvr:
+            video_context_strength = _score_float(final_verification.get("video_context_strength"))
+            asr_degeneracy_risk = _score_float(final_verification.get("asr_degeneracy_risk"))
+            not_asr_only = True if "not_asr_only" not in final_verification else _boolish(final_verification.get("not_asr_only"))
+            if "visual_context_preserved" in final_verification and not _boolish(final_verification.get("visual_context_preserved")):
+                issues.append("final_omni_visual_context_not_preserved")
+            if video_context_strength < _profile_threshold(B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE, "video_context_strength"):
+                issues.append(
+                    "final_omni_video_context_too_weak: "
+                    f"{video_context_strength:.2f} < 0.45"
+                )
+            if asr_degeneracy_risk > _profile_threshold(B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE, "asr_degeneracy_risk"):
+                issues.append(
+                    "final_omni_asr_degeneracy_risk_too_high: "
+                    f"{asr_degeneracy_risk:.2f} > 0.55"
+                )
+            if not not_asr_only:
+                issues.append("final_omni_asr_only")
     elif audio_dataset_line == VISUAL_AUDIO_ANCHOR_LINE:
         if "large_visual_delta" in final_verification and not _boolish(final_verification.get("large_visual_delta")):
             issues.append("final_omni_visual_delta_too_small_for_A")
@@ -8563,6 +8674,11 @@ def _single_source_final_verification_review_required(
         review.append("final_omni_audio_not_primary")
     if not _boolish(final_verification.get("visual_locked")):
         review.append("final_omni_visual_not_locked")
+    if _is_b_audio_context_cvr_profile(acceptance_profile):
+        if "asr_degeneracy_risk" in final_verification and _score_float(final_verification.get("asr_degeneracy_risk")) > 0.40:
+            review.append("asr_degeneracy_risk_review")
+        if "video_context_strength" in final_verification and _score_float(final_verification.get("video_context_strength")) < 0.65:
+            review.append("video_context_strength_review")
     return _dedupe_strings(review)
 
 
@@ -8621,6 +8737,129 @@ def _b_line_speech_rewrite_issues(rewrite: dict[str, Any]) -> list[str]:
     if reference_content and target_content and _normalized_phrase(reference_content) == _normalized_phrase(target_content):
         issues.append("speech_rewrite_identical_content")
     return _dedupe_strings(issues)
+
+
+def _b_line_video_context_text(annotation: dict[str, Any] | None) -> str:
+    if not isinstance(annotation, dict):
+        return ""
+    return _normalized_phrase(
+        " ".join(
+            [
+                str(annotation.get("summary", "")),
+                str(annotation.get("scene", "")),
+                " ".join(_normalize_list(annotation.get("subjects", []))),
+                " ".join(_normalize_list(annotation.get("actions", []))),
+                " ".join(_normalize_list(annotation.get("events", []))),
+                " ".join(_normalize_list(annotation.get("storyline", []))),
+                " ".join(_normalize_list(annotation.get("detective_notes", []))),
+                str(annotation.get("video_context_type", "")),
+                str(annotation.get("speech_role", "")),
+            ]
+        )
+    )
+
+
+def _b_line_video_context_type(reference_annotation: dict[str, Any] | None, target_annotation: dict[str, Any] | None) -> str:
+    text = _b_line_video_context_text(reference_annotation) + " " + _b_line_video_context_text(target_annotation)
+    if any(term in text for term in ("news", "report", "anchor", "broadcast", "journalist")):
+        return "news/reporting"
+    if any(term in text for term in ("sport", "match", "game", "cricket", "football", "basketball", "player", "commentary")):
+        return "sports_commentary"
+    if any(term in text for term in ("tutorial", "instruction", "cook", "recipe", "repair", "demo", "demonstration", "how to")):
+        return "tutorial_instruction"
+    if any(term in text for term in ("interview", "podium", "press", "stage", "panel")):
+        return "interview_context"
+    if any(term in text for term in ("livestream", "live stream", "streamer", "vlog", "studio", "desk")):
+        return "livestream_context"
+    if any(term in text for term in ("singing", "song", "music", "guitar", "piano", "performance", "concert")):
+        return "performance_or_singing"
+    if any(term in text for term in ("meeting", "conference call", "webinar", "zoom", "slide deck")):
+        return "asr_only"
+    if any(term in text for term in ("talking head", "speaking to camera", "speaker")):
+        return "generic_talking_head"
+    return "unknown"
+
+
+def _b_line_video_context_strength(
+    reference_annotation: dict[str, Any] | None,
+    target_annotation: dict[str, Any] | None,
+    candidate_quality: dict[str, Any] | None = None,
+) -> float:
+    candidate_quality = candidate_quality if isinstance(candidate_quality, dict) else {}
+    provided = max(
+        _score_float(candidate_quality.get("video_context_strength")),
+        _score_float((reference_annotation or {}).get("video_context_strength") if isinstance(reference_annotation, dict) else 0.0),
+        _score_float((target_annotation or {}).get("video_context_strength") if isinstance(target_annotation, dict) else 0.0),
+    )
+    context_type = _b_line_video_context_type(reference_annotation, target_annotation)
+    visual_similarity = _score_float(candidate_quality.get("visual_context_similarity"))
+    text = _b_line_video_context_text(reference_annotation) + " " + _b_line_video_context_text(target_annotation)
+    evidence_bonus = 0.0
+    if context_type in {
+        "news/reporting",
+        "sports_commentary",
+        "tutorial_instruction",
+        "interview_context",
+        "livestream_context",
+        "performance_or_singing",
+    }:
+        evidence_bonus += 0.35
+    if len(_tokenize_text(text)) >= 8:
+        evidence_bonus += 0.20
+    if any(term in text for term in ("field", "kitchen", "stadium", "podium", "studio", "stage", "outdoor", "classroom")):
+        evidence_bonus += 0.15
+    if visual_similarity > 0:
+        evidence_bonus += min(0.25, visual_similarity * 0.25)
+    return round(min(1.0, max(provided, evidence_bonus)), 3)
+
+
+def _b_line_asr_degeneracy_risk(
+    reference_annotation: dict[str, Any] | None,
+    target_annotation: dict[str, Any] | None,
+    candidate_quality: dict[str, Any] | None = None,
+) -> float:
+    candidate_quality = candidate_quality if isinstance(candidate_quality, dict) else {}
+    provided = max(
+        _score_float(candidate_quality.get("asr_degeneracy_risk")),
+        _score_float((reference_annotation or {}).get("asr_degeneracy_risk") if isinstance(reference_annotation, dict) else 0.0),
+        _score_float((target_annotation or {}).get("asr_degeneracy_risk") if isinstance(target_annotation, dict) else 0.0),
+    )
+    context_type = _b_line_video_context_type(reference_annotation, target_annotation)
+    text = _b_line_video_context_text(reference_annotation) + " " + _b_line_video_context_text(target_annotation)
+    risk = provided
+    if context_type in {"asr_only", "generic_talking_head", "unknown"}:
+        risk = max(risk, 0.62 if context_type != "unknown" else 0.56)
+    if any(term in text for term in ("black screen", "static image", "podcast", "audio only", "meeting", "webinar", "zoom")):
+        risk = max(risk, 0.78)
+    if any(term in text for term in ("news", "sport", "match", "tutorial", "cook", "repair", "interview", "performance", "livestream")):
+        risk = min(risk or 0.45, 0.45)
+    return round(min(1.0, max(0.0, risk)), 3)
+
+
+def _b_line_subtype_from_evidence(
+    *,
+    difference_type: str,
+    edit_text: str,
+    reference_annotation: dict[str, Any] | None,
+    target_annotation: dict[str, Any] | None,
+) -> str:
+    text = _normalized_phrase(
+        " ".join(
+            [
+                difference_type,
+                edit_text,
+                " ".join(_normalize_list((reference_annotation or {}).get("audio_events", [])) if isinstance(reference_annotation, dict) else []),
+                " ".join(_normalize_list((target_annotation or {}).get("audio_events", [])) if isinstance(target_annotation, dict) else []),
+                " ".join(_normalize_list((reference_annotation or {}).get("speech", [])) if isinstance(reference_annotation, dict) else []),
+                " ".join(_normalize_list((target_annotation or {}).get("speech", [])) if isinstance(target_annotation, dict) else []),
+            ]
+        )
+    )
+    if any(term in text for term in ("music", "song", "singing", "guitar", "piano", "lyric", "melody")):
+        return "music"
+    if difference_type == "speech":
+        return "speech_topic_in_video_context"
+    return "sound_event"
 
 
 def _single_source_model_reject_issues(
@@ -8853,6 +9092,28 @@ def _single_source_audio_line_acceptance_issues(
                     issues.append("audio_not_primary: missing concrete audio event evidence")
                 if has_vague_audio and not has_concrete_audio:
                     issues.append("vague_audio_event: vague hum/click/tone without explicit evidence")
+        if _is_b_audio_context_cvr_profile(str(candidate_quality.get("acceptance_profile", ""))):
+            video_context_strength = _score_float(candidate_quality.get("video_context_strength"))
+            asr_degeneracy_risk = _score_float(candidate_quality.get("asr_degeneracy_risk"))
+            context_type = str(candidate_quality.get("video_context_type", "")).strip()
+            if video_context_strength < _profile_threshold(B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE, "video_context_strength"):
+                issues.append(
+                    "video_context_too_weak_for_B: "
+                    f"video_context_strength {video_context_strength:.2f} < 0.45"
+                )
+            if asr_degeneracy_risk > _profile_threshold(B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE, "asr_degeneracy_risk"):
+                issues.append(
+                    "asr_degeneracy_risk_too_high: "
+                    f"asr_degeneracy_risk {asr_degeneracy_risk:.2f} > 0.55"
+                )
+            if context_type in {"asr_only", "generic_talking_head"}:
+                issues.append(f"asr_degeneracy_risk_too_high: context_type={context_type}")
+            datasets = {
+                str((reference_annotation or {}).get("dataset", "")).strip().lower() if isinstance(reference_annotation, dict) else "",
+                str((target_annotation or {}).get("dataset", "")).strip().lower() if isinstance(target_annotation, dict) else "",
+            }
+            if any("ami" in dataset for dataset in datasets if dataset):
+                issues.append("diagnostic_asr_auxiliary_source: AMI-AV is not accepted into main B-line")
     return _dedupe_strings(issues)
 
 
@@ -12733,6 +12994,12 @@ def _single_source_line_annotation_prompt_view(annotation: dict[str, Any], audio
                 ),
                 "audio_events": _prompt_list(annotation.get("audio_events", []), limit=4, text_limit=55),
                 "audio_refresh_annotation": bool(annotation.get("audio_refresh_annotation")),
+                "video_context_type": _truncate_text(annotation.get("video_context_type", ""), 55),
+                "video_context_strength": _score_float(annotation.get("video_context_strength")),
+                "speech_role": _truncate_text(annotation.get("speech_role", ""), 55),
+                "speech_topic_or_step": _truncate_text(annotation.get("speech_topic_or_step", ""), 90),
+                "music_description": _truncate_text(annotation.get("music_description", ""), 70),
+                "asr_degeneracy_risk": _score_float(annotation.get("asr_degeneracy_risk")),
             }
         )
         return base

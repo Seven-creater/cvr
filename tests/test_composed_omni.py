@@ -716,6 +716,10 @@ class ComposedOmniClientTests(unittest.TestCase):
                                 "visual_locked": True,
                                 "visual_too_different_for_B": False,
                                 "edit_text_audio_only": True,
+                                "visual_context_preserved": True,
+                                "video_context_strength": 0.82,
+                                "asr_degeneracy_risk": 0.12,
+                                "not_asr_only": True,
                             }
                         )
                     }
@@ -756,10 +760,15 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertTrue(normalized["visual_locked"])
         self.assertFalse(normalized["visual_too_different_for_B"])
         self.assertTrue(normalized["edit_text_audio_only"])
+        self.assertTrue(normalized["visual_context_preserved"])
+        self.assertEqual(0.82, normalized["video_context_strength"])
+        self.assertEqual(0.12, normalized["asr_degeneracy_risk"])
+        self.assertTrue(normalized["not_asr_only"])
         request_body = json.loads(request_holder["request"].data.decode("utf-8"))
         system_prompt = request_body["messages"][0]["content"]
         user_text = request_body["messages"][1]["content"][-1]["text"]
         self.assertIn("audio_primary", system_prompt)
+        self.assertIn("not_asr_only", system_prompt)
         self.assertIn("visual_locked", system_prompt)
         self.assertIn("edit_text_audio_only", user_text)
 

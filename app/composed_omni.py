@@ -459,7 +459,9 @@ def _detective_final_system_prompt(*, audio_focused: bool = False) -> str:
         '"storyline": [string], "events": [{"start": number, "end": number, "visual": string, '
         '"audio": string, "objects": [string], "actions": [string]}], '
         '"visible_text": [string], "speakers_and_transcript": [string], '
-        '"detective_notes": [string]}. '
+        '"detective_notes": [string], "video_context_type": string, "video_context_strength": number, '
+        '"speech_role": string, "speech_topic_or_step": string, "non_speech_audio_events": [string], '
+        '"music_description": string, "asr_degeneracy_risk": number}. '
         "Keep the summary concise, but preserve discriminative subject, action, audio, OCR, and timeline details. "
         "Use speech only for spoken-language content. Use audio_events only for non-speech sounds such as music, applause, environmental ambience, hums, machinery, footsteps, animal sounds, water, or wind. "
         "If non-speech audio exists, name it explicitly in audio_events and also mention it in events[].audio or detective_notes. "
@@ -471,6 +473,7 @@ def _detective_final_system_prompt(*, audio_focused: bool = False) -> str:
             " This is an audio-focused refresh for an audio retrieval dataset. "
             "Be conservative: include speech/transcript only when you can hear language content, and include audio_events only for clear sounds such as crowd cheering, applause, music, rain, wind, machinery, or other verifiable events. "
             "For speech, write a short transcript/paraphrase or topic-specific summary in speech and speakers_and_transcript, so adjacent clips from the same speaker can be paired by changed spoken content. "
+            "Also rate whether this is useful video-context speech rather than ASR-only: video_context_strength should be high for news, sports, tutorials, interviews, livestreams, performances, or visible activities; asr_degeneracy_risk should be high for pure meetings, podcasts, black/static video, or generic talking-head clips with no useful visual context. "
             "Do not use vague hum/click/tone guesses as distinguishing evidence unless they are unmistakable."
         )
     return prompt
@@ -557,10 +560,14 @@ def _single_source_pair_system_prompt(audio_dataset_line: str | None = None) -> 
             '"reference_state": object, "target_state": object, "delta_temporal_extent": object, "subject_roles": object, '
             '"is_segment_wide_delta": boolean, "discarded_deltas": [string], "evidence": [string], '
             '"confidence": number, "accept": boolean, "reject_reason": string}. '
+            "Keep this a CVR sample, not ASR retrieval: the audio change must be embedded in a recognizable video context such as news, sports, tutorial, livestream, interview, performance, or visible activity. "
             "Keep visual context practically locked: same speaker/scene/program/match/context is enough; minor framing/pose/action changes are okay. "
-            "Use type=speech for concrete spoken topic/phrase/lyric changes, or audio_event for concrete non-speech sounds. "
-            "edit_text must be audio-only, e.g. 'change the speech from discussing A to discussing B' or 'add crowd cheering to the audio'. "
-            "Reject unintelligible/not-transcribed/unspecified/generic target-audio text, visual edit_text, or visually dominated pairs."
+            "Use type=speech for contextual spoken topic/step/commentary/lyric changes, or audio_event for concrete non-speech sounds and music. "
+            "Good speech: change the commentary from introducing the players to describing the goal. "
+            "Good speech: change the tutorial narration from explaining ingredients to explaining the next cooking step. "
+            "Bad speech: change the voice from saying one sentence to another sentence, when the video is only a static talking head or meeting. "
+            "Good audio_event: add crowd cheering to the match audio. Good audio_event: replace quiet room ambience with machine noise. Good music: change the background music from soft piano to upbeat pop music. "
+            "Reject unintelligible/not-transcribed/unspecified/generic target-audio text, visual edit_text, visually dominated pairs, and pairs that are only ASR/transcript retrieval."
         )
     base_prompt = (
         "You compare two short clips cut from the same original video for composed video retrieval. "
@@ -647,8 +654,12 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
             '"single_primary_delta": boolean, "text_or_ocr_driven": boolean, "segment_wide": boolean, '
             '"edit_text_accurate": boolean, "main_reject_reason": string, "evidence": [string], '
             '"recommended_edit_text": string, "audio_primary": boolean, "visual_locked": boolean, '
-            '"visual_too_different_for_B": boolean, "edit_text_audio_only": boolean}. '
+            '"visual_too_different_for_B": boolean, "edit_text_audio_only": boolean, '
+            '"visual_context_preserved": boolean, "video_context_strength": number, '
+            '"asr_degeneracy_risk": number, "not_asr_only": boolean}. '
             "Accept when audio is primary, edit_text is audio-only, reference lacks it, target has it, and same speaker/scene/program/match/context remains clear. "
+            "For B-context CVR, require useful video context: news/reporting, sports commentary, tutorial instruction, livestream, interview, performance, visible activity, or a similar scene. "
+            "Reject pure ASR/transcript retrieval: black/static video, pure meetings, podcasts, or generic talking-head clips with no meaningful visual context. "
             "segment_wide=false is allowed if target audio evidence is clear. Minor framing/pose/action changes are okay. "
             "Reject vague audio, visual edit_text, or visually dominated pairs. "
             "If accept=false, set quality_score below 0.7 and explain main_reject_reason."
@@ -695,10 +706,12 @@ def _single_source_final_verification_system_prompt(audio_dataset_line: str | No
             base_prompt
             + " For speech_audio_content B, observable_delta may be speech or non-speech audio. "
             'Also include "audio_primary": boolean, "visual_locked": boolean, "visual_too_different_for_B": boolean, '
-            'and "edit_text_audio_only": boolean in the JSON object. '
+            '"edit_text_audio_only": boolean, "visual_context_preserved": boolean, "video_context_strength": number, '
+            '"asr_degeneracy_risk": number, and "not_asr_only": boolean in the JSON object. '
             "Accept speech only with concrete spoken evidence; audio_event only for concrete non-speech sound/music/environment changes. "
             "visual_locked=true if same speaker/scene/program/context is clear despite minor framing/pose/action changes. "
             "Do not reject only because audio is not present for the full 6 seconds; report segment_wide=false but it can pass. "
+            "Reject pure ASR/transcript matching: static talking-head, meetings, podcasts, black/static video, or pairs that can be solved only by matching transcript text without video context. "
             "Set accept=true only if audio_primary=true, visual_locked=true, visual_too_different_for_B=false, and edit_text_audio_only=true. "
             "Reject generic audio, visual edit_text, or cases where visuals alone identify the target."
         )
@@ -1081,7 +1094,8 @@ def _build_single_source_final_verification_user_content(
             "B-line final rule: accept if the audible speech/audio change is primary and visuals share the same person, same scene, same program, "
             "or same broadcast/view context. Minor framing, pose, camera, or action changes are acceptable. "
             "Do not reject only because the audio evidence covers part of the 6s clip; report segment_wide=false but accept when target clearly contains the requested audio. "
-            "Reject only when visual changes are dominant enough that listening is unnecessary. Return audio_primary, visual_locked, visual_too_different_for_B, and edit_text_audio_only.\n"
+            "Reject only when visual changes are dominant enough that listening is unnecessary. Also reject pure ASR/transcript retrieval when the video context is black/static, a meeting/podcast, or a generic talking-head clip with no useful scene/activity. "
+            "Return audio_primary, visual_locked, visual_too_different_for_B, edit_text_audio_only, visual_context_preserved, video_context_strength, asr_degeneracy_risk, and not_asr_only.\n"
         )
     prompt = (
         "Task: final-check whether this single-source pair should be accepted.\n"
@@ -1934,6 +1948,13 @@ def _normalize_detective_clip_annotation_payload(payload: dict[str, Any]) -> dic
             "speakers_and_transcript": transcript,
             "detective_notes": _detail_list(payload.get("detective_notes")),
             "uncertainties": _detail_list(payload.get("uncertainties")),
+            "video_context_type": str(payload.get("video_context_type", "")).strip(),
+            "video_context_strength": _score_value(payload.get("video_context_strength")),
+            "speech_role": str(payload.get("speech_role", "")).strip(),
+            "speech_topic_or_step": str(payload.get("speech_topic_or_step", "")).strip(),
+            "non_speech_audio_events": _detail_list(payload.get("non_speech_audio_events")),
+            "music_description": str(payload.get("music_description", "")).strip(),
+            "asr_degeneracy_risk": _score_value(payload.get("asr_degeneracy_risk")),
         }
     )
     normalized["audio_events"] = _merge_audio_events(normalized["audio_events"], _collect_non_speech_audio_terms(normalized))
@@ -2347,12 +2368,17 @@ def _normalize_single_source_final_verification_payload(payload: dict[str, Any])
         "visual_locked",
         "visual_too_different_for_B",
         "edit_text_audio_only",
+        "visual_context_preserved",
+        "not_asr_only",
         "large_visual_delta",
         "audio_context_preserved",
     )
     for field_name in optional_bool_fields:
         if field_name in payload:
             normalized[field_name] = _bool_value(payload.get(field_name))
+    for field_name in ("video_context_strength", "asr_degeneracy_risk"):
+        if field_name in payload:
+            normalized[field_name] = _score_value(payload.get(field_name))
     if "visual_locked" not in normalized and "visual_context_sufficient" in payload:
         normalized["visual_locked"] = _bool_value(payload.get("visual_context_sufficient"))
     if normalized["accept"] and not normalized["evidence"]:
@@ -2409,6 +2435,59 @@ def _normalize_b_line_speech_rewrite_payload(payload: dict[str, Any]) -> dict[st
         "reject_if_still_unclear": reject,
         "speech_rewrite_reject_reason": reason,
     }
+
+
+def _annotation_context_text(*annotations: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for annotation in annotations:
+        if not isinstance(annotation, dict):
+            continue
+        for key in (
+            "summary",
+            "scene",
+            "video_context_type",
+            "speech_role",
+            "speech_topic_or_step",
+            "music_description",
+        ):
+            value = str(annotation.get(key, "")).strip()
+            if value:
+                parts.append(value)
+        for key in ("subjects", "actions", "storyline", "events", "detective_notes", "audio_events"):
+            parts.extend(_detail_list(annotation.get(key)))
+    return " ".join(parts).lower()
+
+
+def _context_strength_from_annotations(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> float:
+    provided = max(
+        _score_value(reference_annotation.get("video_context_strength") if isinstance(reference_annotation, dict) else 0.0),
+        _score_value(target_annotation.get("video_context_strength") if isinstance(target_annotation, dict) else 0.0),
+    )
+    text = _annotation_context_text(reference_annotation, target_annotation)
+    score = provided
+    if any(term in text for term in ("news", "broadcast", "match", "sport", "tutorial", "interview", "livestream", "performance")):
+        score = max(score, 0.65)
+    elif any(term in text for term in ("studio", "podium", "stage", "kitchen", "field", "stadium", "classroom")):
+        score = max(score, 0.52)
+    elif len(TOKEN_PATTERN.findall(text)) >= 10:
+        score = max(score, 0.45)
+    return round(min(1.0, max(0.0, score)), 3)
+
+
+def _asr_degeneracy_risk_from_annotations(reference_annotation: dict[str, Any], target_annotation: dict[str, Any]) -> float:
+    provided = max(
+        _score_value(reference_annotation.get("asr_degeneracy_risk") if isinstance(reference_annotation, dict) else 0.0),
+        _score_value(target_annotation.get("asr_degeneracy_risk") if isinstance(target_annotation, dict) else 0.0),
+    )
+    text = _annotation_context_text(reference_annotation, target_annotation)
+    risk = provided
+    if any(term in text for term in ("asr only", "audio only", "black screen", "static image", "podcast", "meeting", "webinar", "zoom")):
+        risk = max(risk, 0.78)
+    elif any(term in text for term in ("generic talking head", "speaking to camera")):
+        risk = max(risk, 0.62)
+    if any(term in text for term in ("news", "broadcast", "match", "sport", "tutorial", "interview", "performance", "livestream")):
+        risk = min(risk or 0.45, 0.45)
+    return round(min(1.0, max(0.0, risk)), 3)
 
 
 def _repair_audio_line_single_source_final_verification_payload(
@@ -2497,13 +2576,25 @@ def _repair_audio_line_single_source_final_verification_payload(
         repaired_fields.append("main_reject_reason")
 
     if line == "speech_audio_content":
+        video_context_strength = _context_strength_from_annotations(reference_annotation, target_annotation)
+        asr_degeneracy_risk = _asr_degeneracy_risk_from_annotations(reference_annotation, target_annotation)
         optional_defaults = {
             "audio_primary": accept and difference_type in {"speech", "audio_event"},
             "visual_locked": accept and not _local_gate_mentions_visual_too_different(local_gate_report),
             "visual_too_different_for_B": False if accept else _local_gate_mentions_visual_too_different(local_gate_report),
             "edit_text_audio_only": accept and difference_type in {"speech", "audio_event"},
+            "visual_context_preserved": accept and not _local_gate_mentions_visual_too_different(local_gate_report),
+            "not_asr_only": asr_degeneracy_risk <= 0.55,
         }
         for field_name, default_value in optional_defaults.items():
+            if field_name not in repaired:
+                repaired[field_name] = default_value
+                repaired_fields.append(field_name)
+        numeric_defaults = {
+            "video_context_strength": video_context_strength,
+            "asr_degeneracy_risk": asr_degeneracy_risk,
+        }
+        for field_name, default_value in numeric_defaults.items():
             if field_name not in repaired:
                 repaired[field_name] = default_value
                 repaired_fields.append(field_name)

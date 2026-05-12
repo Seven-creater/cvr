@@ -36,7 +36,14 @@ VISUAL_LINE_TYPES = {"attribute", "object_presence", "object_count", "action", "
 AUDIO_LINE_PROFILE_DEFAULT = "default"
 AUDIO_LINE_PROFILE_V4_STRICT = "v4_strict"
 AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY = "v5_audio_primary"
-AUDIO_LINE_PROFILES = {AUDIO_LINE_PROFILE_DEFAULT, AUDIO_LINE_PROFILE_V4_STRICT, AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY}
+AUDIO_LINE_PROFILE_B_CONTEXT_CVR = "b_audio_context_cvr"
+AUDIO_LINE_PROFILE_ALIASES = {"b_context_cvr": AUDIO_LINE_PROFILE_B_CONTEXT_CVR}
+AUDIO_LINE_PROFILES = {
+    AUDIO_LINE_PROFILE_DEFAULT,
+    AUDIO_LINE_PROFILE_V4_STRICT,
+    AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY,
+    AUDIO_LINE_PROFILE_B_CONTEXT_CVR,
+}
 B_CANDIDATE_MODE_HYBRID = "hybrid"
 B_CANDIDATE_MODE_AUDIO_FIRST = "audio_first"
 B_CANDIDATE_MODES = {B_CANDIDATE_MODE_HYBRID, B_CANDIDATE_MODE_AUDIO_FIRST}
@@ -317,6 +324,9 @@ def split_audio_line_candidates(
         difference_type = str(difference.get("type", "")).strip()
         visual_delta_strength = _visual_delta_strength(candidate, reference, target)
         visual_context_similarity = _visual_context_similarity(reference, target)
+        video_context_type = _b_context_type(reference, target)
+        video_context_strength = _b_context_strength(reference, target, visual_context_similarity)
+        asr_degeneracy_risk = _b_asr_degeneracy_risk(reference, target)
         should_score_a = difference_type in VISUAL_LINE_TYPES or a_candidate_mode == A_CANDIDATE_MODE_OMNI_FIRST
         if should_score_a:
             score, min_rms = _pair_audio_anchor_score(root_path, reference, target, audio_features)
@@ -349,7 +359,20 @@ def split_audio_line_candidates(
                     reject_counts["a_v4_visual_delta_too_weak"] += 1
         if b_candidate_mode == B_CANDIDATE_MODE_HYBRID:
             speech_score = _speech_evidence_score(reference, target)
-            if _speech_is_transcript_backed(reference, target) and speech_score >= 0.70 and _v4_b_candidate_allowed(
+            if _uses_audio_primary_mining_profile(audio_line_quality_profile):
+                speech_score = max(speech_score, _speech_content_delta_score(reference, target))
+                speech_threshold = 0.45
+            else:
+                speech_threshold = 0.70
+            b_context_ok = (
+                audio_line_quality_profile != AUDIO_LINE_PROFILE_B_CONTEXT_CVR
+                or _b_context_candidate_allowed(
+                    difference_type="speech",
+                    video_context_strength=video_context_strength,
+                    asr_degeneracy_risk=asr_degeneracy_risk,
+                )
+            )
+            if _speech_is_transcript_backed(reference, target) and speech_score >= speech_threshold and b_context_ok and _v4_b_candidate_allowed(
                 audio_line_quality_profile=audio_line_quality_profile,
                 visual_delta_strength=visual_delta_strength,
                 visual_context_similarity=visual_context_similarity,
@@ -364,12 +387,24 @@ def split_audio_line_candidates(
                         visual_delta_strength=visual_delta_strength,
                         visual_context_similarity=visual_context_similarity,
                         audio_line_quality_profile=audio_line_quality_profile,
+                        video_context_type=video_context_type,
+                        video_context_strength=video_context_strength,
+                        asr_degeneracy_risk=asr_degeneracy_risk,
                     )
                 )
             else:
                 non_speech_score = _non_speech_audio_event_score(reference, target)
+                non_speech_threshold = 0.55 if _uses_audio_primary_mining_profile(audio_line_quality_profile) else 0.70
                 audio_text = " ".join(_normalize_list(reference.get("audio_events", [])) + _normalize_list(target.get("audio_events", [])))
-                if non_speech_score >= 0.45 and _v4_b_candidate_allowed(
+                event_context_ok = (
+                    audio_line_quality_profile != AUDIO_LINE_PROFILE_B_CONTEXT_CVR
+                    or _b_context_candidate_allowed(
+                        difference_type="audio_event",
+                        video_context_strength=video_context_strength,
+                        asr_degeneracy_risk=asr_degeneracy_risk,
+                    )
+                )
+                if non_speech_score >= non_speech_threshold and event_context_ok and _v4_b_candidate_allowed(
                     audio_line_quality_profile=audio_line_quality_profile,
                     visual_delta_strength=visual_delta_strength,
                     visual_context_similarity=visual_context_similarity,
@@ -385,11 +420,16 @@ def split_audio_line_candidates(
                             visual_delta_strength=visual_delta_strength,
                             visual_context_similarity=visual_context_similarity,
                             audio_line_quality_profile=audio_line_quality_profile,
+                            video_context_type=video_context_type,
+                            video_context_strength=video_context_strength,
+                            asr_degeneracy_risk=asr_degeneracy_risk,
                         )
                     )
                 else:
-                    if non_speech_score < 0.45:
+                    if non_speech_score < non_speech_threshold:
                         reject_counts["b_missing_audio_evidence"] += 1
+                    elif audio_line_quality_profile == AUDIO_LINE_PROFILE_B_CONTEXT_CVR and not event_context_ok:
+                        reject_counts["b_context_cvr_gate_failed"] += 1
                     else:
                         reject_counts["b_v4_visual_or_audio_gate_failed"] += 1
         if index % 50 == 0:
@@ -467,11 +507,17 @@ def merge_line_results(
     a_accepted_all = [record for record in a_ranked if bool(record.get("accepted"))]
     b_accepted_all = [record for record in b_ranked if bool(record.get("accepted"))]
     a_selected = a_accepted_all[: max(0, target_a_count)]
-    b_selected = b_accepted_all[: max(0, target_b_count)]
+    b_selected = _select_b_line_records(b_accepted_all, target_b_count=target_b_count)
+    b_speech = [record for record in b_selected if _b_line_record_subtype(record) == "speech_topic_in_video_context"]
+    b_music = [record for record in b_selected if _b_line_record_subtype(record) == "music"]
+    b_sound = [record for record in b_selected if _b_line_record_subtype(record) == "sound_event"]
     _write_jsonl(root / "a_ranked_single_source_pairs.jsonl", a_ranked)
     _write_jsonl(root / "b_ranked_single_source_pairs.jsonl", b_ranked)
     _write_jsonl(root / "a_visual_audio_anchor_triplets.jsonl", a_selected)
     _write_jsonl(root / "b_speech_audio_content_triplets.jsonl", b_selected)
+    _write_jsonl(root / "b_speech_context_triplets.jsonl", b_speech)
+    _write_jsonl(root / "b_music_triplets.jsonl", b_music)
+    _write_jsonl(root / "b_sound_event_triplets.jsonl", b_sound)
     _write_jsonl(root / "a_accepted.progress.jsonl", a_accepted_progress)
     _write_jsonl(root / "a_rejected.progress.jsonl", a_rejected_progress)
     _write_jsonl(root / "b_accepted.progress.jsonl", b_accepted_progress)
@@ -484,13 +530,79 @@ def merge_line_results(
         "b_accepted_count": len(b_accepted_all),
         "a_exported_count": len(a_selected),
         "b_exported_count": len(b_selected),
+        "b_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_accepted_all)),
+        "b_exported_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_selected)),
+        "b_context_cvr_summary_path": str(root / "b_context_cvr_summary.json"),
         "target_a_count": target_a_count,
         "target_b_count": target_b_count,
         "a_reject_reason_counts": _reject_reason_counts(a_ranked),
         "b_reject_reason_counts": _reject_reason_counts(b_ranked),
     }
     (root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (root / "b_context_cvr_summary.json").write_text(
+        json.dumps(_b_context_cvr_summary(root=root, b_ranked=b_ranked, b_selected=b_selected), ensure_ascii=False, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
     return summary
+
+
+def _select_b_line_records(records: list[dict[str, Any]], *, target_b_count: int) -> list[dict[str, Any]]:
+    target = max(0, int(target_b_count or 0))
+    if target <= 0:
+        return []
+    speech_cap = max(1, int(target * 0.40)) if target else 0
+    non_speech = [record for record in records if _b_line_record_subtype(record) in {"music", "sound_event"}]
+    speech = [record for record in records if _b_line_record_subtype(record) == "speech_topic_in_video_context"]
+    other = [record for record in records if _b_line_record_subtype(record) not in {"music", "sound_event", "speech_topic_in_video_context"}]
+    selected = non_speech[:target]
+    remaining = target - len(selected)
+    if remaining > 0:
+        selected.extend(speech[: min(remaining, speech_cap)])
+    remaining = target - len(selected)
+    if remaining > 0:
+        selected.extend(other[:remaining])
+    return selected[:target]
+
+
+def _b_line_record_subtype(record: dict[str, Any]) -> str:
+    subtype = str(record.get("b_subtype") or "").strip()
+    if subtype in {"speech_topic_in_video_context", "music", "sound_event"}:
+        return subtype
+    quality = record.get("quality") if isinstance(record.get("quality"), dict) else {}
+    subtype = str(quality.get("b_subtype") or "").strip()
+    if subtype in {"speech_topic_in_video_context", "music", "sound_event"}:
+        return subtype
+    difference = record.get("difference") if isinstance(record.get("difference"), dict) else {}
+    difference_type = str(difference.get("type", "")).strip()
+    text = _annotation_text(record, ("edit_text", "audio_evidence"))
+    if any(term in text.lower() for term in ("music", "song", "sing", "guitar", "piano", "melody")):
+        return "music"
+    if difference_type == "speech":
+        return "speech_topic_in_video_context"
+    return "sound_event" if difference_type == "audio_event" else "unknown"
+
+
+def _b_context_cvr_summary(*, root: Path, b_ranked: list[dict[str, Any]], b_selected: list[dict[str, Any]]) -> dict[str, Any]:
+    risk_bins: Counter[str] = Counter()
+    for record in b_ranked:
+        risk = _score_float(record.get("asr_degeneracy_risk", (record.get("quality") or {}).get("asr_degeneracy_risk") if isinstance(record.get("quality"), dict) else 0.0))
+        if risk > 0.55:
+            risk_bins[">0.55"] += 1
+        elif risk > 0.40:
+            risk_bins["0.40-0.55"] += 1
+        else:
+            risk_bins["<=0.40"] += 1
+    return {
+        "run_root": str(root),
+        "b_ranked_count": len(b_ranked),
+        "b_accepted_count": sum(1 for record in b_ranked if bool(record.get("accepted"))),
+        "b_exported_count": len(b_selected),
+        "accepted_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_ranked if bool(record.get("accepted")))),
+        "exported_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_selected)),
+        "asr_degeneracy_risk_bins": dict(risk_bins),
+        "reject_reason_counts": _reject_reason_counts(b_ranked),
+    }
 
 
 def _dedupe_line_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -611,6 +723,7 @@ def _pair_audio_anchor_score(root: Path, reference: dict[str, Any], target: dict
 
 def _normalize_audio_line_quality_profile(value: str | None) -> str:
     profile = str(value or AUDIO_LINE_PROFILE_DEFAULT).strip().lower().replace("-", "_")
+    profile = AUDIO_LINE_PROFILE_ALIASES.get(profile, profile)
     if profile in {"", "none"}:
         return AUDIO_LINE_PROFILE_DEFAULT
     if profile not in AUDIO_LINE_PROFILES:
@@ -636,10 +749,17 @@ def _normalize_b_candidate_mode(value: str | None) -> str:
     return mode
 
 
+def _metadata_value(annotation: dict[str, Any], key: str) -> Any:
+    if key in annotation:
+        return annotation.get(key)
+    metadata = annotation.get("metadata") if isinstance(annotation.get("metadata"), dict) else {}
+    return metadata.get(key)
+
+
 def _annotation_text(annotation: dict[str, Any], fields: tuple[str, ...]) -> str:
     parts: list[str] = []
     for field in fields:
-        value = annotation.get(field)
+        value = _metadata_value(annotation, field)
         if isinstance(value, dict):
             parts.extend(str(key) for key in value.keys())
             parts.extend(str(item) for item in value.values())
@@ -697,6 +817,13 @@ def _v4_a_candidate_allowed(*, audio_line_quality_profile: str, difference_type:
     return (difference_type in V4_A_STRONG_VISUAL_TYPES and visual_delta_strength >= 0.45) or visual_delta_strength >= 0.72
 
 
+def _uses_audio_primary_mining_profile(audio_line_quality_profile: str) -> bool:
+    return _normalize_audio_line_quality_profile(audio_line_quality_profile) in {
+        AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY,
+        AUDIO_LINE_PROFILE_B_CONTEXT_CVR,
+    }
+
+
 def _v4_b_candidate_allowed(
     *,
     audio_line_quality_profile: str,
@@ -705,7 +832,7 @@ def _v4_b_candidate_allowed(
     audio_text: str,
     difference_type: str,
 ) -> bool:
-    if audio_line_quality_profile == AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY:
+    if _uses_audio_primary_mining_profile(audio_line_quality_profile):
         normalized_audio = audio_text.lower()
         if difference_type == "audio_event":
             return any(term in normalized_audio for term in V4_CONCRETE_AUDIO_TERMS)
@@ -721,6 +848,90 @@ def _v4_b_candidate_allowed(
         if any(term in normalized_audio for term in V4_VAGUE_AUDIO_TERMS) and not any(term in normalized_audio for term in V4_CONCRETE_AUDIO_TERMS):
             return False
     return True
+
+
+def _b_context_type(reference: dict[str, Any], target: dict[str, Any]) -> str:
+    text = _annotation_text(
+        reference,
+        ("summary", "subjects", "actions", "scene", "storyline", "events", "video_context_type", "speech_role"),
+    ).lower()
+    text += " " + _annotation_text(
+        target,
+        ("summary", "subjects", "actions", "scene", "storyline", "events", "video_context_type", "speech_role"),
+    ).lower()
+    if any(term in text for term in ("news", "report", "anchor", "broadcast")):
+        return "news/reporting"
+    if any(term in text for term in ("sport", "match", "game", "cricket", "football", "player", "commentary")):
+        return "sports_commentary"
+    if any(term in text for term in ("tutorial", "instruction", "cook", "recipe", "repair", "demo", "how to")):
+        return "tutorial_instruction"
+    if any(term in text for term in ("interview", "podium", "press", "stage", "panel")):
+        return "interview_context"
+    if any(term in text for term in ("livestream", "live stream", "streamer", "vlog", "studio", "desk")):
+        return "livestream_context"
+    if any(term in text for term in ("singing", "song", "music", "guitar", "piano", "performance", "concert")):
+        return "performance_or_singing"
+    if any(term in text for term in ("meeting", "conference call", "webinar", "zoom", "podcast", "black screen", "static image")):
+        return "asr_only"
+    if any(term in text for term in ("talking head", "speaking to camera", "speaker")):
+        return "generic_talking_head"
+    return "unknown"
+
+
+def _b_context_strength(reference: dict[str, Any], target: dict[str, Any], visual_context_similarity: float) -> float:
+    provided = max(_score_float(_metadata_value(reference, "video_context_strength")), _score_float(_metadata_value(target, "video_context_strength")))
+    context_type = _b_context_type(reference, target)
+    score = provided
+    if context_type in {
+        "news/reporting",
+        "sports_commentary",
+        "tutorial_instruction",
+        "interview_context",
+        "livestream_context",
+        "performance_or_singing",
+    }:
+        score = max(score, 0.65)
+    elif context_type == "generic_talking_head":
+        score = max(score, 0.35)
+    text_tokens = _token_set(_annotation_text(reference, ("summary", "subjects", "actions", "scene")) + " " + _annotation_text(target, ("summary", "subjects", "actions", "scene")))
+    if len(text_tokens) >= 8:
+        score = max(score, 0.45)
+    if visual_context_similarity > 0:
+        score = max(score, min(0.75, 0.25 + visual_context_similarity * 0.5))
+    return round(min(1.0, max(0.0, score)), 3)
+
+
+def _b_asr_degeneracy_risk(reference: dict[str, Any], target: dict[str, Any]) -> float:
+    provided = max(_score_float(_metadata_value(reference, "asr_degeneracy_risk")), _score_float(_metadata_value(target, "asr_degeneracy_risk")))
+    context_type = _b_context_type(reference, target)
+    text = (
+        _annotation_text(reference, ("summary", "scene", "subjects", "actions", "video_context_type", "speech_role"))
+        + " "
+        + _annotation_text(target, ("summary", "scene", "subjects", "actions", "video_context_type", "speech_role"))
+    ).lower()
+    risk = provided
+    if context_type == "asr_only":
+        risk = max(risk, 0.80)
+    elif context_type == "generic_talking_head":
+        risk = max(risk, 0.62)
+    elif context_type == "unknown":
+        risk = max(risk, 0.56)
+    if any(term in text for term in ("black screen", "static image", "podcast", "meeting", "webinar", "zoom")):
+        risk = max(risk, 0.80)
+    if context_type in {"news/reporting", "sports_commentary", "tutorial_instruction", "interview_context", "livestream_context", "performance_or_singing"}:
+        risk = min(risk or 0.45, 0.45)
+    return round(min(1.0, max(0.0, risk)), 3)
+
+
+def _b_context_candidate_allowed(
+    *,
+    difference_type: str,
+    video_context_strength: float,
+    asr_degeneracy_risk: float,
+) -> bool:
+    if difference_type == "speech":
+        return video_context_strength >= 0.45 and asr_degeneracy_risk <= 0.55
+    return video_context_strength >= 0.35 and asr_degeneracy_risk <= 0.70
 
 
 def _speech_content_delta_score(reference: dict[str, Any], target: dict[str, Any]) -> float:
@@ -762,8 +973,11 @@ def _mine_audio_first_b_candidates(
         for left_index, reference in enumerate(ordered):
             for target in ordered[left_index + 1 :]:
                 visual_context_similarity = _visual_context_similarity(reference, target)
+                video_context_type = _b_context_type(reference, target)
+                video_context_strength = _b_context_strength(reference, target, visual_context_similarity)
+                asr_degeneracy_risk = _b_asr_degeneracy_risk(reference, target)
                 speech_score = _speech_evidence_score(reference, target)
-                if audio_line_quality_profile == AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY:
+                if _uses_audio_primary_mining_profile(audio_line_quality_profile):
                     speech_score = max(speech_score, _speech_content_delta_score(reference, target))
                     speech_threshold = 0.45
                 else:
@@ -772,7 +986,15 @@ def _mine_audio_first_b_candidates(
                     candidate = _audio_first_base_candidate(reference, target, difference_type="speech", group_key=group_key)
                     visual_delta_strength = _visual_delta_strength(candidate, reference, target)
                     audio_text = " ".join(_speech_texts_from_annotation(reference)[:2] + _speech_texts_from_annotation(target)[:2])
-                    if _v4_b_candidate_allowed(
+                    context_ok = (
+                        audio_line_quality_profile != AUDIO_LINE_PROFILE_B_CONTEXT_CVR
+                        or _b_context_candidate_allowed(
+                            difference_type="speech",
+                            video_context_strength=video_context_strength,
+                            asr_degeneracy_risk=asr_degeneracy_risk,
+                        )
+                    )
+                    if context_ok and _v4_b_candidate_allowed(
                         audio_line_quality_profile=audio_line_quality_profile,
                         visual_delta_strength=visual_delta_strength,
                         visual_context_similarity=visual_context_similarity,
@@ -789,18 +1011,29 @@ def _mine_audio_first_b_candidates(
                                     visual_delta_strength=visual_delta_strength,
                                     visual_context_similarity=visual_context_similarity,
                                     audio_line_quality_profile=audio_line_quality_profile,
+                                    video_context_type=video_context_type,
+                                    video_context_strength=video_context_strength,
+                                    asr_degeneracy_risk=asr_degeneracy_risk,
                                 )
                             )
                             existing_keys.add(key)
                     else:
                         reject_counts["b_audio_first_speech_visual_gate_failed"] += 1
                 non_speech_score = _non_speech_audio_event_score(reference, target)
-                non_speech_threshold = 0.55 if audio_line_quality_profile == AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY else 0.70
+                non_speech_threshold = 0.55 if _uses_audio_primary_mining_profile(audio_line_quality_profile) else 0.70
                 if non_speech_score >= non_speech_threshold:
                     candidate = _audio_first_base_candidate(reference, target, difference_type="audio_event", group_key=group_key)
                     visual_delta_strength = _visual_delta_strength(candidate, reference, target)
                     audio_text = " ".join(_normalize_list(reference.get("audio_events", [])) + _normalize_list(target.get("audio_events", [])))
-                    if _v4_b_candidate_allowed(
+                    context_ok = (
+                        audio_line_quality_profile != AUDIO_LINE_PROFILE_B_CONTEXT_CVR
+                        or _b_context_candidate_allowed(
+                            difference_type="audio_event",
+                            video_context_strength=video_context_strength,
+                            asr_degeneracy_risk=asr_degeneracy_risk,
+                        )
+                    )
+                    if context_ok and _v4_b_candidate_allowed(
                         audio_line_quality_profile=audio_line_quality_profile,
                         visual_delta_strength=visual_delta_strength,
                         visual_context_similarity=visual_context_similarity,
@@ -818,6 +1051,9 @@ def _mine_audio_first_b_candidates(
                                     visual_delta_strength=visual_delta_strength,
                                     visual_context_similarity=visual_context_similarity,
                                     audio_line_quality_profile=audio_line_quality_profile,
+                                    video_context_type=video_context_type,
+                                    video_context_strength=video_context_strength,
+                                    asr_degeneracy_risk=asr_degeneracy_risk,
                                 )
                             )
                             existing_keys.add(key)
@@ -918,6 +1154,9 @@ def _speech_line_candidate(
     visual_delta_strength: float = 0.0,
     visual_context_similarity: float = 0.0,
     audio_line_quality_profile: str = AUDIO_LINE_PROFILE_DEFAULT,
+    video_context_type: str = "",
+    video_context_strength: float = 0.0,
+    asr_degeneracy_risk: float = 0.0,
 ) -> dict[str, Any]:
     record = _line_candidate(
         candidate,
@@ -944,6 +1183,10 @@ def _speech_line_candidate(
             "speech_specificity_score": _speech_specificity_score(reference, target),
             "speech_transcript_backed": 1.0 if _speech_is_transcript_backed(reference, target) else 0.0,
             "audio_content_delta_strength": max(speech_score, _speech_specificity_score(reference, target)),
+            "b_subtype": "speech_topic_in_video_context",
+            "video_context_type": video_context_type or _b_context_type(reference, target),
+            "video_context_strength": video_context_strength or _b_context_strength(reference, target, visual_context_similarity),
+            "asr_degeneracy_risk": asr_degeneracy_risk or _b_asr_degeneracy_risk(reference, target),
         }
     )
     record["quality"] = quality
@@ -959,6 +1202,9 @@ def _audio_event_line_candidate(
     visual_delta_strength: float = 0.0,
     visual_context_similarity: float = 0.0,
     audio_line_quality_profile: str = AUDIO_LINE_PROFILE_DEFAULT,
+    video_context_type: str = "",
+    video_context_strength: float = 0.0,
+    asr_degeneracy_risk: float = 0.0,
 ) -> dict[str, Any]:
     record = _line_candidate(
         candidate,
@@ -974,7 +1220,20 @@ def _audio_event_line_candidate(
         "description": "the non-speech audio event differs between the reference and target clips",
     }
     quality = dict(record.get("quality", {}))
-    quality.update({"difference_type": "audio_event", "has_audio_modality": 1.0, "non_speech_audio_event_score": round(score, 3), "audio_content_delta_strength": round(score, 3)})
+    audio_text = _annotation_text(reference, ("audio_events", "music_description")) + " " + _annotation_text(target, ("audio_events", "music_description"))
+    subtype = "music" if any(term in audio_text.lower() for term in ("music", "song", "sing", "guitar", "piano", "melody")) else "sound_event"
+    quality.update(
+        {
+            "difference_type": "audio_event",
+            "has_audio_modality": 1.0,
+            "non_speech_audio_event_score": round(score, 3),
+            "audio_content_delta_strength": round(score, 3),
+            "b_subtype": subtype,
+            "video_context_type": video_context_type or _b_context_type(reference, target),
+            "video_context_strength": video_context_strength or _b_context_strength(reference, target, visual_context_similarity),
+            "asr_degeneracy_risk": asr_degeneracy_risk or _b_asr_degeneracy_risk(reference, target),
+        }
+    )
     record["quality"] = quality
     return record
 
@@ -982,7 +1241,7 @@ def _audio_event_line_candidate(
 def _line_candidate_sort_key(record: dict[str, Any]) -> tuple[Any, ...]:
     quality = record.get("quality", {}) if isinstance(record.get("quality"), dict) else {}
     profile = str(quality.get("audio_line_quality_profile", ""))
-    if profile in {AUDIO_LINE_PROFILE_V4_STRICT, AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY}:
+    if profile in {AUDIO_LINE_PROFILE_V4_STRICT, AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY, AUDIO_LINE_PROFILE_B_CONTEXT_CVR}:
         if str(record.get("audio_dataset_line", "")) == VISUAL_AUDIO_ANCHOR_LINE:
             return (
                 _score_float(quality.get("visual_delta_strength")),
@@ -992,6 +1251,8 @@ def _line_candidate_sort_key(record: dict[str, Any]) -> tuple[Any, ...]:
             )
         if str(record.get("audio_dataset_line", "")) == SPEECH_AUDIO_CONTENT_LINE:
             return (
+                -_score_float(quality.get("asr_degeneracy_risk")),
+                _score_float(quality.get("video_context_strength")),
                 _score_float(quality.get("visual_context_similarity")),
                 _score_float(quality.get("audio_content_delta_strength")),
                 _score_float(record.get("composite_score")),
