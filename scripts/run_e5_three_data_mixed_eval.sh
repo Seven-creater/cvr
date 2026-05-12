@@ -16,6 +16,8 @@ RUN_ROOT=${RUN_ROOT:-}
 TRIPLETS_JSONL=${TRIPLETS_JSONL:-/data02/usr/wangqihao/Demo/test/three_data/merged_all/triplets.jsonl}
 E5_MODEL=${E5_MODEL:-/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/e5-omni-7B}
 GPU_ID=${GPU_ID:-4}
+GPU_IDS=${GPU_IDS:-}
+PARALLEL_MODES=${PARALLEL_MODES:-0}
 EXPECTED_COUNT=${EXPECTED_COUNT:-1697}
 SMOKE_SIZE=${SMOKE_SIZE:-20}
 TOPK=${TOPK:-1,5,10}
@@ -41,6 +43,8 @@ Options:
   --runs-root PATH
   --e5-model PATH
   --gpu-id ID
+  --gpu-ids ID1,ID2,ID3
+  --parallel-modes
   --expected-count N
   --smoke-size N
   --topk 1,5,10
@@ -62,6 +66,8 @@ while [[ $# -gt 0 ]]; do
     --runs-root) RUNS_ROOT="$2"; shift 2 ;;
     --e5-model) E5_MODEL="$2"; shift 2 ;;
     --gpu-id) GPU_ID="$2"; shift 2 ;;
+    --gpu-ids) GPU_IDS="$2"; shift 2 ;;
+    --parallel-modes) PARALLEL_MODES=1; shift ;;
     --expected-count) EXPECTED_COUNT="$2"; shift 2 ;;
     --smoke-size) SMOKE_SIZE="$2"; shift 2 ;;
     --topk) TOPK="$2"; shift 2 ;;
@@ -106,7 +112,6 @@ common_args=(
   --triplets-jsonl "$TRIPLETS_JSONL"
   --runs-root "$RUNS_ROOT"
   --e5-model "$E5_MODEL"
-  --gpu-id "$GPU_ID"
   --expected-count "$EXPECTED_COUNT"
   --smoke-size "$SMOKE_SIZE"
   --topk "$TOPK"
@@ -129,32 +134,95 @@ echo "[e5-three-data] run_root=$RUN_ROOT"
 echo "[e5-three-data] triplets_jsonl=$TRIPLETS_JSONL"
 echo "[e5-three-data] e5_model=$E5_MODEL"
 echo "[e5-three-data] gpu_id=$GPU_ID"
+echo "[e5-three-data] gpu_ids=${GPU_IDS:-}"
+echo "[e5-three-data] parallel_modes=$PARALLEL_MODES"
 echo "[e5-three-data] expected_count=$EXPECTED_COUNT"
 echo "[e5-three-data] topk=$TOPK"
-echo "[e5-three-data] mode 1/3 V+T+A audio-on start $(date)"
 
-bash scripts/run_e5_cvr_eval.sh \
-  "${common_args[@]}" \
-  --run-root "$RUN_ROOT/vta_audio_on" \
-  --query-mode composed \
-  --video-audio-mode on \
-  "${force_args[@]}"
+run_mode() {
+  local label="$1"
+  local mode_root="$2"
+  local gpu_id="$3"
+  local query_mode="$4"
+  local video_audio_mode="$5"
+  shift 5
 
-echo "[e5-three-data] mode 2/3 V+T audio-off start $(date)"
-bash scripts/run_e5_cvr_eval.sh \
-  "${common_args[@]}" \
-  --run-root "$RUN_ROOT/vt_audio_off" \
-  --query-mode composed \
-  --video-audio-mode off \
-  "${force_args[@]}"
+  echo "[e5-three-data] $label start $(date) gpu=$gpu_id run_root=$mode_root"
+  bash scripts/run_e5_cvr_eval.sh \
+    "${common_args[@]}" \
+    --gpu-id "$gpu_id" \
+    --run-root "$mode_root" \
+    --query-mode "$query_mode" \
+    --video-audio-mode "$video_audio_mode" \
+    "$@" \
+    "${force_args[@]}"
+  echo "[e5-three-data] $label done $(date)"
+}
 
-echo "[e5-three-data] mode 3/3 V+A video-only audio-on start $(date)"
-bash scripts/run_e5_cvr_eval.sh \
-  "${common_args[@]}" \
-  --run-root "$RUN_ROOT/va_video_only_audio_on" \
-  --query-mode video-only \
-  --video-audio-mode on \
-  --target-index-dir "$RUN_ROOT/vta_audio_on/target_index"
+if [ "$PARALLEL_MODES" = "1" ]; then
+  if [ -z "$GPU_IDS" ]; then
+    echo "[e5-three-data] --parallel-modes requires --gpu-ids ID1,ID2,ID3" >&2
+    exit 2
+  fi
+  IFS=',' read -r -a MODE_GPUS <<< "$GPU_IDS"
+  if [ "${#MODE_GPUS[@]}" -lt 3 ]; then
+    echo "[e5-three-data] --parallel-modes requires at least 3 GPU ids, got: $GPU_IDS" >&2
+    exit 2
+  fi
+
+  mkdir -p "$RUN_ROOT/mode_logs"
+  pids=()
+  labels=()
+
+  (
+    run_mode "mode 1/3 V+T+A audio-on" "$RUN_ROOT/vta_audio_on" "${MODE_GPUS[0]}" composed on
+  ) > "$RUN_ROOT/mode_logs/vta_audio_on.log" 2>&1 &
+  pids+=($!)
+  labels+=("V+T+A")
+
+  (
+    run_mode "mode 2/3 V+T audio-off" "$RUN_ROOT/vt_audio_off" "${MODE_GPUS[1]}" composed off
+  ) > "$RUN_ROOT/mode_logs/vt_audio_off.log" 2>&1 &
+  pids+=($!)
+  labels+=("V+T")
+
+  # In parallel mode this builds its own audio-on target index instead of waiting
+  # for V+T+A, trading some duplicate work for lower wall-clock time.
+  (
+    run_mode "mode 3/3 V+A video-only audio-on" "$RUN_ROOT/va_video_only_audio_on" "${MODE_GPUS[2]}" video-only on
+  ) > "$RUN_ROOT/mode_logs/va_video_only_audio_on.log" 2>&1 &
+  pids+=($!)
+  labels+=("V+A")
+
+  failed=0
+  for i in "${!pids[@]}"; do
+    if wait "${pids[$i]}"; then
+      echo "[e5-three-data] parallel mode done label=${labels[$i]} log=$RUN_ROOT/mode_logs"
+    else
+      echo "[e5-three-data] parallel mode FAILED label=${labels[$i]} log=$RUN_ROOT/mode_logs" >&2
+      failed=1
+    fi
+  done
+  if [ "$failed" -ne 0 ]; then
+    echo "[e5-three-data] one or more parallel modes failed; skip grouped summary" >&2
+    exit 1
+  fi
+else
+  echo "[e5-three-data] serial mode 1/3 V+T+A audio-on start $(date)"
+  run_mode "mode 1/3 V+T+A audio-on" "$RUN_ROOT/vta_audio_on" "$GPU_ID" composed on
+
+  echo "[e5-three-data] serial mode 2/3 V+T audio-off start $(date)"
+  run_mode "mode 2/3 V+T audio-off" "$RUN_ROOT/vt_audio_off" "$GPU_ID" composed off
+
+  echo "[e5-three-data] serial mode 3/3 V+A video-only audio-on start $(date)"
+  run_mode \
+    "mode 3/3 V+A video-only audio-on" \
+    "$RUN_ROOT/va_video_only_audio_on" \
+    "$GPU_ID" \
+    video-only \
+    on \
+    --target-index-dir "$RUN_ROOT/vta_audio_on/target_index"
+fi
 
 echo "[e5-three-data] grouped summary start $(date)"
 python3 -m app.e5_three_data_eval \
