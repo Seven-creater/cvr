@@ -42,6 +42,9 @@ class E5CVRTriplet:
     reference_caption: str = ""
     source: str = ""
     difference_type: str = ""
+    dataset: str = ""
+    modality: str = ""
+    original_sample_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -383,6 +386,9 @@ def run_eval_slice(
                         "reference_video": triplet.reference_video,
                         "target_video": triplet.target_video,
                         "edit_text": triplet.edit_text,
+                        "dataset": triplet.dataset,
+                        "modality": triplet.modality,
+                        "original_sample_id": triplet.original_sample_id,
                         "target_rank": target_rank,
                         "target_score": round(float(scores[target_index_value]), 6),
                         "query_index": query_index,
@@ -595,6 +601,9 @@ def _triplet_from_payload(payload: dict[str, Any], *, line_number: int) -> E5CVR
         reference_caption=str(payload.get("reference_caption", "")).strip(),
         source=str(payload.get("source", "")).strip(),
         difference_type=str(payload.get("difference_type", "")).strip(),
+        dataset=str(payload.get("dataset", "")).strip(),
+        modality=str(payload.get("modality", "")).strip(),
+        original_sample_id=str(payload.get("original_sample_id", "")).strip(),
     )
 
 

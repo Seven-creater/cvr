@@ -15,6 +15,7 @@ from app.e5_cvr_eval import (
     prepare_reference_audio_triplets,
     run_eval_slice,
 )
+from app.e5_three_data_eval import build_three_data_comparison, summarize_traces_by_dataset, write_three_data_comparison
 
 
 class FakeE5Encoder:
@@ -63,6 +64,31 @@ class E5CVREvalTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "missing target_video"):
                 load_triplets_jsonl(path)
+
+    def test_load_triplets_preserves_three_data_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "triplets.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "sample_id": "00001_cvr_943_x",
+                        "reference_video": "ref.mp4",
+                        "target_video": "target.mp4",
+                        "edit_text": "change the shot",
+                        "dataset": "cvr_943",
+                        "modality": "visual",
+                        "original_sample_id": "x",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            triplets = load_triplets_jsonl(path)
+
+            self.assertEqual("cvr_943", triplets[0].dataset)
+            self.assertEqual("visual", triplets[0].modality)
+            self.assertEqual("x", triplets[0].original_sample_id)
 
     def test_target_index_keeps_manifest_order_and_embedding_count(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -197,9 +223,110 @@ class E5CVREvalTests(unittest.TestCase):
             self.assertEqual({"R@1": 1.0, "R@2": 1.0, "R@3": 1.0}, summary["recall"])
             self.assertEqual(2, len(traces))
             self.assertEqual(1, traces[1]["target_rank"])
+            self.assertEqual("", traces[0]["dataset"])
             self.assertNotIn("target_caption", traces[0])
             self.assertTrue(any("query 1/2 start" in message for message in progress))
             self.assertTrue(any("query 2/2 done rank=1" in message for message in progress))
+
+    def test_three_data_grouped_summary_uses_dataset_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            triplets_path = root / "triplets.jsonl"
+            records = [
+                ("cvr1", "cvr_943"),
+                ("a1", "a_line"),
+                ("b1", "b_line"),
+                ("b2", "b_line"),
+            ]
+            triplets_path.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "sample_id": sample_id,
+                            "reference_video": f"{sample_id}_ref.mp4",
+                            "target_video": f"{sample_id}_target.mp4",
+                            "edit_text": "edit",
+                            "dataset": dataset,
+                            "modality": "audio" if dataset == "b_line" else "visual",
+                            "original_sample_id": sample_id,
+                        }
+                    )
+                    + "\n"
+                    for sample_id, dataset in records
+                ),
+                encoding="utf-8",
+            )
+            traces_path = root / "traces.jsonl"
+            traces_path.write_text(
+                "".join(
+                    json.dumps({"sample_id": sample_id, "target_rank": rank}) + "\n"
+                    for sample_id, rank in [
+                        ("cvr1", 1),
+                        ("a1", 2),
+                        ("b1", 5),
+                        ("b2", 20),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            summary = summarize_traces_by_dataset(triplets_jsonl=triplets_path, traces_jsonl=traces_path, recall_ks=(1, 5, 10))
+
+            self.assertEqual(4, summary["total_query_count"])
+            self.assertEqual({"R@1": 1.0, "R@5": 1.0, "R@10": 1.0}, summary["groups"]["cvr_943"]["recall"])
+            self.assertEqual({"R@1": 0.0, "R@5": 1.0, "R@10": 1.0}, summary["groups"]["a_line"]["recall"])
+            self.assertEqual({"R@1": 0.0, "R@5": 0.5, "R@10": 0.5}, summary["groups"]["b_line"]["recall"])
+            self.assertEqual({"R@1": 0.25, "R@5": 0.75, "R@10": 0.75}, summary["groups"]["overall"]["recall"])
+
+    def test_three_data_comparison_writes_aaa_style_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            triplets_path = root / "triplets.jsonl"
+            triplets_path.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "sample_id": sample_id,
+                            "reference_video": f"{sample_id}_ref.mp4",
+                            "target_video": f"{sample_id}_target.mp4",
+                            "edit_text": "edit",
+                            "dataset": dataset,
+                        }
+                    )
+                    + "\n"
+                    for sample_id, dataset in [
+                        ("cvr1", "cvr_943"),
+                        ("a1", "a_line"),
+                        ("b1", "b_line"),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            run_root = root / "run"
+            for mode_name in ("vta_audio_on", "vt_audio_off", "va_video_only_audio_on"):
+                full = run_root / mode_name / "full3"
+                full.mkdir(parents=True)
+                full.joinpath("traces.jsonl").write_text(
+                    "".join(
+                        json.dumps({"sample_id": sample_id, "target_rank": rank}) + "\n"
+                        for sample_id, rank in [
+                            ("cvr1", 1),
+                            ("a1", 5),
+                            ("b1", 10),
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+
+            comparison = write_three_data_comparison(triplets_jsonl=triplets_path, run_root=run_root)
+            markdown = (run_root / "comparison_by_dataset.md").read_text(encoding="utf-8")
+
+            self.assertEqual(3, comparison["total_triplets"])
+            self.assertTrue((run_root / "comparison_by_dataset.json").exists())
+            self.assertTrue((run_root / "per_mode_grouped_summary.json").exists())
+            self.assertIn("| 输入模式 | 测 原CVR 943 | 测 Line-A | 测 Line-B |", markdown)
+            self.assertIn("| V + T + A | 1.0000 | 0.0000 | 0.0000 |", markdown)
+            self.assertIn("| V + A | 1.0000 | 0.0000 | 0.0000 |", markdown)
 
     def test_query_mode_composed_passes_video_and_text_to_encoder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

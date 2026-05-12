@@ -337,6 +337,26 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("vllm.entrypoints.openai.api_server", script)
         self.assertNotIn("8092", script)
 
+    def test_e5_three_data_mixed_script_runs_three_modes_and_groups_results(self) -> None:
+        script = Path("scripts/run_e5_three_data_mixed_eval.sh").read_text(encoding="utf-8")
+
+        self.assertIn("merged_all/triplets.jsonl", script)
+        self.assertIn("EXPECTED_COUNT=${EXPECTED_COUNT:-1697}", script)
+        self.assertIn("vta_audio_on", script)
+        self.assertIn("--query-mode composed", script)
+        self.assertIn("--video-audio-mode on", script)
+        self.assertIn("vt_audio_off", script)
+        self.assertIn("--video-audio-mode off", script)
+        self.assertIn("va_video_only_audio_on", script)
+        self.assertIn("--query-mode video-only", script)
+        self.assertIn('--target-index-dir "$RUN_ROOT/vta_audio_on/target_index"', script)
+        self.assertIn("app.e5_three_data_eval", script)
+        self.assertIn("comparison_by_dataset.md", script)
+        self.assertNotIn("modelscope download", script)
+        self.assertNotIn("vllm.entrypoints.openai.api_server", script)
+        self.assertNotIn("8092", script)
+        self.assertNotIn("8093", script)
+
     def test_vace_visual_synthetic_smoke_uses_plan_and_remuxes_audio(self) -> None:
         script = Path("scripts/run_vace_visual_synthetic_smoke.sh").read_text(encoding="utf-8")
 
