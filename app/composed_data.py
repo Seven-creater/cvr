@@ -9936,6 +9936,10 @@ def _b_line_edit_text_specificity_issues(edit_text: str, difference_type: str) -
         issues.append("edit_text_not_audio_only: placeholder audio wording")
     if any(marker in normalized for marker in hollow_markers):
         issues.append("edit_text_not_audio_only: hollow audio wording")
+    if difference_type == "audio_event":
+        audio_event_endpoint_issue = _b_line_audio_event_edit_text_endpoint_issue(edit_text)
+        if audio_event_endpoint_issue:
+            issues.append(audio_event_endpoint_issue)
     clauses = [clause.strip() for clause in re.split(r"[;\n]+", edit_text) if clause.strip()]
     for clause in clauses[1:]:
         clause_norm = _normalized_phrase(clause)
@@ -9947,6 +9951,76 @@ def _b_line_edit_text_specificity_issues(edit_text: str, difference_type: str) -
     if difference_type == "speech" and normalized in {"speech", "speaking", "audio", "sound", "voice"}:
         issues.append("edit_text_not_audio_only: hollow speech edit")
     return _dedupe_strings(issues)
+
+
+def _b_line_audio_event_edit_text_endpoint_issue(edit_text: str) -> str:
+    normalized = _normalized_phrase(edit_text)
+    if not normalized:
+        return ""
+    weak_markers = (
+        "similar to reference",
+        "similar to the reference",
+        "same as reference",
+        "same as the reference",
+        "almost the same",
+        "nearly the same",
+        "slightly different",
+        "subtle difference",
+        "minor difference",
+        "minimal difference",
+    )
+    if any(marker in normalized for marker in weak_markers):
+        return "edit_text_not_audio_only: weak audio_event delta"
+    patterns = (
+        r"\breplace\s+(.+?)(?:\s+in the audio)?\s+with\s+(.+)$",
+        r"\bchange\s+(.+?)\s+to\s+(.+)$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if not match:
+            continue
+        return _b_line_audio_event_endpoint_issue(match.group(1), match.group(2), edit_text=edit_text)
+    return ""
+
+
+def _b_line_audio_event_endpoint_issue(from_value: str, to_value: str, *, edit_text: str = "") -> str:
+    from_norm = _normalized_audio_event_endpoint_for_similarity(from_value)
+    to_norm = _normalized_audio_event_endpoint_for_similarity(to_value)
+    combined = _normalized_phrase(" ".join([str(from_value or ""), str(to_value or ""), str(edit_text or "")]))
+    weak_markers = (
+        "similar to reference",
+        "similar to the reference",
+        "same as reference",
+        "same as the reference",
+        "almost the same",
+        "nearly the same",
+        "slightly different",
+        "subtle difference",
+        "minor difference",
+        "minimal difference",
+    )
+    if any(marker in combined for marker in weak_markers):
+        return "edit_text_not_audio_only: weak audio_event delta"
+    if not from_norm or not to_norm:
+        return ""
+    if from_norm == to_norm or _difference_values_are_too_similar(from_norm, to_norm, threshold=0.78):
+        return "edit_text_not_audio_only: audio_event endpoints too similar"
+    from_tokens = _tokenize_text(from_norm)
+    to_tokens = _tokenize_text(to_norm)
+    if from_tokens and to_tokens and _jaccard(from_tokens, to_tokens) >= 0.72:
+        return "edit_text_not_audio_only: audio_event endpoints too similar"
+    return ""
+
+
+def _normalized_audio_event_endpoint_for_similarity(value: str) -> str:
+    normalized = _normalized_phrase(_clean_b_line_audio_phrase(str(value or ""), difference_type="audio_event"))
+    if not normalized:
+        return ""
+    normalized = re.sub(r"\b(?:similar|same|close)\s+(?:to|as)\s+(?:the\s+)?reference\b", " ", normalized)
+    normalized = re.sub(r"\b(?:almost|nearly)\s+(?:the\s+)?same\b", " ", normalized)
+    normalized = re.sub(r"\b(?:slightly|subtly|minimally)\s+(?:different|changed|varied|altered)\b", " ", normalized)
+    normalized = re.sub(r"\b(?:subtle|minor|minimal)\s+difference\b", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def _single_source_audio_line_acceptance_issues(
@@ -10063,6 +10137,10 @@ def _b_line_difference_endpoint_issue(difference: dict[str, Any], difference_typ
         return ""
     from_value = _clean_b_line_audio_phrase(str(difference.get("from", "")).strip(), difference_type=difference_type)
     to_value = _clean_b_line_audio_phrase(str(difference.get("to", "")).strip(), difference_type=difference_type)
+    if difference_type == "audio_event":
+        endpoint_issue = _b_line_audio_event_endpoint_issue(from_value, to_value)
+        if endpoint_issue:
+            return endpoint_issue
     if from_value and to_value and _normalized_phrase(from_value) == _normalized_phrase(to_value):
         return "edit_text_not_audio_only: identical audio endpoints"
     hollow_markers = (

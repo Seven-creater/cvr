@@ -152,6 +152,16 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             ("change the speech from discussing wide smile to discussing neutral smile", "speech", "visual wording smile"),
             ("change the speech from discussing hand gestures to discussing walking off-screen", "speech", "visual wording gesture"),
             ("add a SUBSCRIBE button and bell icon animation with a mouse click sound to the audio", "audio_event", "visual wording subscribe"),
+            (
+                "replace acoustic guitar music, fingerstyle, gentle melody with acoustic guitar music, fingerstyle, gentle melody, similar to reference",
+                "audio_event",
+                "weak audio_event delta",
+            ),
+            (
+                "replace low electronic hum with low-frequency electronic hum",
+                "audio_event",
+                "audio_event endpoints too similar",
+            ),
         ]
         for edit_text, difference_type, expected in bad_cases:
             with self.subTest(edit_text=edit_text):
@@ -168,6 +178,10 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
         self.assertEqual(
             [],
             _b_line_edit_text_audio_only_issues("replace a continuous electronic hum with classical music", "audio_event"),
+        )
+        self.assertEqual(
+            [],
+            _b_line_edit_text_audio_only_issues("replace soft piano music with upbeat pop music", "audio_event"),
         )
         self.assertEqual([], _b_line_edit_text_audio_only_issues("add crowd cheering to the audio", "audio_event"))
 
