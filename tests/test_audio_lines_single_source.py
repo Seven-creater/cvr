@@ -162,6 +162,11 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 "audio_event",
                 "audio_event endpoints too similar",
             ),
+            (
+                "change the speech from discussing imaging session and image processing workflows to discussing interesting as well and plan is to",
+                "speech",
+                "fragmentary speech wording",
+            ),
         ]
         for edit_text, difference_type, expected in bad_cases:
             with self.subTest(edit_text=edit_text):
@@ -172,6 +177,13 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             [],
             _b_line_edit_text_audio_only_issues(
                 "change the speech from discussing the bakery opening to discussing the mayor's remarks",
+                "speech",
+            ),
+        )
+        self.assertEqual(
+            [],
+            _b_line_edit_text_audio_only_issues(
+                "change the speech from discussing imaging session and image processing workflows to discussing famous nebulas on the internet",
                 "speech",
             ),
         )

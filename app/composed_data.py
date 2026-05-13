@@ -9940,6 +9940,10 @@ def _b_line_edit_text_specificity_issues(edit_text: str, difference_type: str) -
         audio_event_endpoint_issue = _b_line_audio_event_edit_text_endpoint_issue(edit_text)
         if audio_event_endpoint_issue:
             issues.append(audio_event_endpoint_issue)
+    if difference_type == "speech":
+        speech_endpoint_issue = _b_line_speech_edit_text_endpoint_issue(edit_text)
+        if speech_endpoint_issue:
+            issues.append(speech_endpoint_issue)
     clauses = [clause.strip() for clause in re.split(r"[;\n]+", edit_text) if clause.strip()]
     for clause in clauses[1:]:
         clause_norm = _normalized_phrase(clause)
@@ -10021,6 +10025,85 @@ def _normalized_audio_event_endpoint_for_similarity(value: str) -> str:
     normalized = re.sub(r"\b(?:slightly|subtly|minimally)\s+(?:different|changed|varied|altered)\b", " ", normalized)
     normalized = re.sub(r"\b(?:subtle|minor|minimal)\s+difference\b", " ", normalized)
     return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _b_line_speech_edit_text_endpoint_issue(edit_text: str) -> str:
+    normalized = _normalized_phrase(edit_text)
+    if not normalized:
+        return ""
+    match = re.search(r"\bfrom\s+(.+?)\s+to\s+(.+)$", normalized)
+    if not match:
+        return ""
+    return _b_line_speech_endpoint_issue(match.group(1), match.group(2))
+
+
+def _b_line_speech_endpoint_issue(from_value: str, to_value: str) -> str:
+    from_norm = _normalized_speech_endpoint_for_quality(from_value)
+    to_norm = _normalized_speech_endpoint_for_quality(to_value)
+    if not from_norm or not to_norm:
+        return ""
+    placeholder_endpoints = {"a", "b", "topic a", "topic b", "content a", "content b", "phrase a", "phrase b"}
+    if from_norm in placeholder_endpoints or to_norm in placeholder_endpoints:
+        return ""
+    if _b_line_audio_phrase_is_hollow(from_norm) or _b_line_audio_phrase_is_hollow(to_norm):
+        return "edit_text_not_audio_only: hollow speech target"
+    if _speech_endpoint_is_fragmentary(from_norm) or _speech_endpoint_is_fragmentary(to_norm):
+        return "edit_text_not_audio_only: fragmentary speech wording"
+    if _difference_values_are_too_similar(from_norm, to_norm, threshold=0.88):
+        return "edit_text_not_audio_only: identical audio endpoints"
+    return ""
+
+
+def _normalized_speech_endpoint_for_quality(value: str) -> str:
+    normalized = _normalized_phrase(_clean_b_line_audio_phrase(str(value or ""), difference_type="speech"))
+    normalized = re.sub(r"\b(?:change|speech|spoken|voice|commentary|narration|discuss|discussing|say|saying|talk|talking)\b", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _speech_endpoint_is_fragmentary(value: str) -> bool:
+    normalized = _normalized_phrase(value)
+    if not normalized:
+        return False
+    fragment_markers = (
+        "interesting as well",
+        "plan is to",
+        "the plan is to",
+        "going to",
+        "about to",
+        "kind of",
+        "sort of",
+        "you know",
+        "i think",
+        "as well",
+    )
+    if any(marker in normalized for marker in fragment_markers):
+        tokens = _speech_endpoint_substantive_tokens(normalized)
+        if len(tokens) < 3:
+            return True
+    return False
+
+
+def _speech_endpoint_substantive_tokens(value: str) -> set[str]:
+    filler_tokens = {
+        "actually",
+        "also",
+        "basically",
+        "bit",
+        "going",
+        "interesting",
+        "just",
+        "kind",
+        "maybe",
+        "plan",
+        "probably",
+        "really",
+        "sort",
+        "thing",
+        "things",
+        "well",
+    }
+    tokens = _tokenize_text(value)
+    return {token for token in tokens if token not in GENERIC_SPEECH_TOKENS and token not in filler_tokens}
 
 
 def _single_source_audio_line_acceptance_issues(
@@ -10139,6 +10222,10 @@ def _b_line_difference_endpoint_issue(difference: dict[str, Any], difference_typ
     to_value = _clean_b_line_audio_phrase(str(difference.get("to", "")).strip(), difference_type=difference_type)
     if difference_type == "audio_event":
         endpoint_issue = _b_line_audio_event_endpoint_issue(from_value, to_value)
+        if endpoint_issue:
+            return endpoint_issue
+    if difference_type == "speech":
+        endpoint_issue = _b_line_speech_endpoint_issue(from_value, to_value)
         if endpoint_issue:
             return endpoint_issue
     if from_value and to_value and _normalized_phrase(from_value) == _normalized_phrase(to_value):
