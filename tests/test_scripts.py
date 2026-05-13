@@ -249,6 +249,24 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("modelscope download", run_script)
         self.assertNotIn("vllm.entrypoints.openai.api_server", run_script)
 
+    def test_audio_cvr_v1_b_first_4gpu_fast_starts_omni_and_uses_b_first_pipeline(self) -> None:
+        script = Path("scripts/run_audio_cvr_v1_b_first_4gpu_fast.sh").read_text(encoding="utf-8")
+
+        self.assertIn("GPU_IDS=${GPU_IDS:-0,1,2,3}", script)
+        self.assertIn("TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-4}", script)
+        self.assertIn("MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}", script)
+        self.assertIn("MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}", script)
+        self.assertIn("PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-8}", script)
+        self.assertIn("CONCURRENCY=${CONCURRENCY:-4}", script)
+        self.assertIn("python -m vllm.entrypoints.openai.api_server", script)
+        self.assertIn("--tensor-parallel-size \"$TENSOR_PARALLEL_SIZE\"", script)
+        self.assertIn("--max-model-len \"$MAX_MODEL_LEN\"", script)
+        self.assertIn("--max-num-seqs \"$MAX_NUM_SEQS\"", script)
+        self.assertIn("scripts/build_audio_cvr_8_12s_clips.sh", script)
+        self.assertIn("scripts/run_audio_cvr_v1_b_first.sh", script)
+        self.assertIn("--propose-parallel-jobs \"$PROPOSE_PARALLEL_JOBS\"", script)
+        self.assertNotIn("modelscope download", script)
+
     def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
         script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")
 
