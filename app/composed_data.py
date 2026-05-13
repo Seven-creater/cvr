@@ -871,6 +871,7 @@ AUDIO_MATTERS_ACCEPTANCE_PROFILE = "audio_matters"
 B_AUDIO_REVIEW_ACCEPTANCE_PROFILE = "b_audio_review"
 B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE = "b_audio_context_cvr"
 B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE = "b_audio_blind_review"
+B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE = "b_audio_blind_review_v2"
 STANDARD_AUDIO_DATASET_LINE = "standard"
 VISUAL_AUDIO_ANCHOR_LINE = "visual_audio_anchor"
 SPEECH_AUDIO_CONTENT_LINE = "speech_audio_content"
@@ -958,8 +959,16 @@ B_LINE_VISUAL_EDIT_TERMS = (
     "fishing",
     "podium",
     "microphone",
+    "card",
+    "hair",
     "color",
     "colour",
+    "front",
+    "back",
+    "pipette",
+    "shown",
+    "showing",
+    "orchestra",
     "close up",
     "close-up",
     "gesture",
@@ -970,6 +979,7 @@ B_LINE_VISUAL_EDIT_TERMS = (
     "walk off",
     "off screen",
     "off-screen",
+    "screen",
     "subscribe",
     "button",
     "bell icon",
@@ -1007,6 +1017,7 @@ ACCEPTANCE_PROFILE_NAMES = {
     B_AUDIO_REVIEW_ACCEPTANCE_PROFILE,
     B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
     B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE,
+    B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE,
 }
 ACCEPTANCE_PROFILE_CONFIGS = {
     DEFAULT_ACCEPTANCE_PROFILE: {
@@ -1119,6 +1130,27 @@ ACCEPTANCE_PROFILE_CONFIGS = {
         "asr_degeneracy_risk": 0.55,
         "visual_delta_strength": 0.55,
     },
+    B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE: {
+        "template_semantic_context_score": 0.25,
+        "template_compatibility_score": 0.55,
+        "template_clean_stability_score": 0.55,
+        "template_single_delta_bundle_score": 0.50,
+        "template_target_uniqueness_score": 0.40,
+        "template_difference_strength_score": 0.45,
+        "same_context_score": 0.40,
+        "edit_match_score": 0.45,
+        "target_uniqueness_score": 0.40,
+        "difference_strength_score": 0.45,
+        "edit_necessity_score": 0.50,
+        "edit_target_alignment_score": 0.50,
+        "action_evidence_score": 0.40,
+        "non_speech_audio_event_score": 0.40,
+        "edit_text_quality_score": 0.50,
+        "video_context_strength": 0.45,
+        "asr_degeneracy_risk": 0.55,
+        "visual_delta_strength": 0.55,
+        "audio_delta_strength": 0.60,
+    },
 }
 SAME_TEMPLATE_CLUSTER_RELATION = "same_template_cluster"
 DEFAULT_DIAGNOSTIC_BUNDLE_NAME = "diagnostic_bundle"
@@ -1150,6 +1182,8 @@ def _normalize_acceptance_profile(value: str | None) -> str:
         profile = B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE
     if profile in {"b_audio_blind", "b_blind_review", "blind_audio_review"}:
         profile = B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE
+    if profile in {"b_audio_blind_v2", "b_blind_review_v2", "blind_audio_review_v2"}:
+        profile = B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE
     if profile not in ACCEPTANCE_PROFILE_NAMES:
         allowed = ", ".join(sorted(ACCEPTANCE_PROFILE_NAMES))
         raise ValueError(f"unsupported acceptance_profile={value!r}; expected one of: {allowed}")
@@ -1187,6 +1221,7 @@ def _is_b_audio_review_profile(acceptance_profile: str | None) -> bool:
         B_AUDIO_REVIEW_ACCEPTANCE_PROFILE,
         B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
         B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE,
+        B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE,
     }
 
 
@@ -1198,6 +1233,17 @@ def _is_b_audio_blind_review_profile(acceptance_profile: str | None) -> bool:
     return _normalize_acceptance_profile(acceptance_profile) == B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE
 
 
+def _is_b_audio_blind_review_v2_profile(acceptance_profile: str | None) -> bool:
+    return _normalize_acceptance_profile(acceptance_profile) == B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE
+
+
+def _is_b_audio_blind_review_family_profile(acceptance_profile: str | None) -> bool:
+    return _normalize_acceptance_profile(acceptance_profile) in {
+        B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE,
+        B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE,
+    }
+
+
 def _uses_soft_local_gate_profile(acceptance_profile: str | None) -> bool:
     profile = _normalize_acceptance_profile(acceptance_profile)
     return profile in {
@@ -1206,6 +1252,7 @@ def _uses_soft_local_gate_profile(acceptance_profile: str | None) -> bool:
         B_AUDIO_REVIEW_ACCEPTANCE_PROFILE,
         B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
         B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE,
+        B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE,
     }
 SUBJECT_SIGNATURE_MARKER_TOKENS = {
     "bald",
@@ -2167,20 +2214,28 @@ def propose_single_source_pairs(
             target_path = _resolve_under_root(layout["root"], target_video)
             if (
                 audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE
-                and _is_b_audio_blind_review_profile(acceptance_profile)
+                and _is_b_audio_blind_review_family_profile(acceptance_profile)
                 and proposal_id not in existing_records
             ):
+                blind_v2 = _is_b_audio_blind_review_v2_profile(acceptance_profile)
                 fallback_used = False
                 raw_model_output: dict[str, Any] = {}
                 raw_final_omni_output: dict[str, Any] = {}
+                audio_delta_analysis: dict[str, Any] = {}
+                raw_audio_delta_analysis: dict[str, Any] = {}
+                audio_edit_generation: dict[str, Any] = {}
+                raw_audio_edit_generation: dict[str, Any] = {}
                 audio_only_proposal: dict[str, Any] = {}
                 raw_audio_only_proposal: dict[str, Any] = {}
                 audio_only_verification: dict[str, Any] = {}
                 raw_audio_only_verification: dict[str, Any] = {}
+                video_only_shortcut: dict[str, Any] = {}
+                raw_video_only_shortcut: dict[str, Any] = {}
                 full_av_consistency: dict[str, Any] = {}
                 raw_full_av_consistency: dict[str, Any] = {}
                 extraction_error = ""
                 reference_audio_path = target_audio_path = Path()
+                reference_video_only_path = target_video_only_path = Path()
                 try:
                     cache_dir = output.parent / "audio_only_cache"
                     reference_audio_path = _extract_audio_only_cache(
@@ -2193,6 +2248,18 @@ def propose_single_source_pairs(
                         cache_dir=cache_dir,
                         clip_id=target_clip_id,
                     )
+                    if blind_v2:
+                        video_only_cache_dir = output.parent / "video_only_cache"
+                        reference_video_only_path = _extract_video_only_cache(
+                            video_path=reference_path,
+                            cache_dir=video_only_cache_dir,
+                            clip_id=reference_clip_id,
+                        )
+                        target_video_only_path = _extract_video_only_cache(
+                            video_path=target_path,
+                            cache_dir=video_only_cache_dir,
+                            clip_id=target_clip_id,
+                        )
                 except Exception as exc:
                     extraction_error = f"missing_audio_track: {type(exc).__name__}: {exc}"
 
@@ -2222,9 +2289,9 @@ def propose_single_source_pairs(
                 blind_local_issues: list[str] = []
                 if extraction_error:
                     blind_local_issues.append(extraction_error)
-                if video_context_strength < _profile_threshold(B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE, "video_context_strength"):
+                if video_context_strength < _profile_threshold(acceptance_profile, "video_context_strength"):
                     blind_local_issues.append("blind_review_video_context_too_weak")
-                if asr_degeneracy_risk > _profile_threshold(B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE, "asr_degeneracy_risk"):
+                if asr_degeneracy_risk > _profile_threshold(acceptance_profile, "asr_degeneracy_risk"):
                     blind_local_issues.append("blind_review_asr_degeneracy_risk_too_high")
                 if context_type in {"asr_only", "generic_talking_head"}:
                     blind_local_issues.append(f"blind_review_asr_degeneracy_risk_too_high: context_type={context_type}")
@@ -2246,20 +2313,52 @@ def propose_single_source_pairs(
                 model_fields = _b_audio_blind_review_model_fields({})
                 if not blind_local_issues:
                     try:
-                        audio_only_proposal, raw_audio_only_proposal = _call_omni_with_retries(
-                            label=f"audio_only_proposal:{proposal_id}",
-                            retries=omni_retries,
-                            fail_on_transient=fail_on_transient_omni_errors,
-                            func=lambda: client.propose_b_line_audio_only_pair(
-                                reference_audio_path=str(reference_audio_path),
-                                target_audio_path=str(target_audio_path),
-                                metadata={
-                                    "proposal_id": proposal_id,
-                                    "reference_clip_id": reference_clip_id,
-                                    "target_clip_id": target_clip_id,
-                                },
-                            ),
-                        )
+                        if blind_v2:
+                            audio_delta_analysis, raw_audio_delta_analysis = _call_omni_with_retries(
+                                label=f"audio_delta:{proposal_id}",
+                                retries=omni_retries,
+                                fail_on_transient=fail_on_transient_omni_errors,
+                                func=lambda: client.analyze_b_line_audio_delta(
+                                    reference_audio_path=str(reference_audio_path),
+                                    target_audio_path=str(target_audio_path),
+                                    metadata={
+                                        "proposal_id": proposal_id,
+                                        "reference_clip_id": reference_clip_id,
+                                        "target_clip_id": target_clip_id,
+                                    },
+                                ),
+                            )
+                            audio_edit_generation, raw_audio_edit_generation = _call_omni_with_retries(
+                                label=f"audio_edit:{proposal_id}",
+                                retries=omni_retries,
+                                fail_on_transient=fail_on_transient_omni_errors,
+                                func=lambda: client.generate_b_line_audio_edit_text(
+                                    audio_delta=audio_delta_analysis,
+                                ),
+                            )
+                            audio_only_proposal = _b_audio_blind_review_v2_proposal_from_stages(
+                                audio_delta_analysis=audio_delta_analysis,
+                                audio_edit_generation=audio_edit_generation,
+                            )
+                            raw_audio_only_proposal = {
+                                "audio_delta_analysis": raw_audio_delta_analysis,
+                                "audio_edit_generation": raw_audio_edit_generation,
+                            }
+                        else:
+                            audio_only_proposal, raw_audio_only_proposal = _call_omni_with_retries(
+                                label=f"audio_only_proposal:{proposal_id}",
+                                retries=omni_retries,
+                                fail_on_transient=fail_on_transient_omni_errors,
+                                func=lambda: client.propose_b_line_audio_only_pair(
+                                    reference_audio_path=str(reference_audio_path),
+                                    target_audio_path=str(target_audio_path),
+                                    metadata={
+                                        "proposal_id": proposal_id,
+                                        "reference_clip_id": reference_clip_id,
+                                        "target_clip_id": target_clip_id,
+                                    },
+                                ),
+                            )
                         model_fields = _b_audio_blind_review_model_fields(audio_only_proposal)
                         audio_only_verification, raw_audio_only_verification = _call_omni_with_retries(
                             label=f"audio_only_verify:{proposal_id}",
@@ -2272,6 +2371,23 @@ def propose_single_source_pairs(
                                 audio_only_proposal=audio_only_proposal,
                             ),
                         )
+                        if blind_v2:
+                            video_only_shortcut, raw_video_only_shortcut = _call_omni_with_retries(
+                                label=f"video_only_shortcut:{proposal_id}",
+                                retries=omni_retries,
+                                fail_on_transient=fail_on_transient_omni_errors,
+                                func=lambda: client.verify_b_line_video_only_shortcut(
+                                    reference_clip_path=str(reference_video_only_path),
+                                    target_clip_path=str(target_video_only_path),
+                                    edit_text=str(model_fields.get("edit_text", "")).strip(),
+                                    audio_only_evidence={
+                                        "audio_delta_analysis": audio_delta_analysis,
+                                        "audio_edit_generation": audio_edit_generation,
+                                        "audio_only_verification": audio_only_verification,
+                                    },
+                                    local_gate_report=local_gate_report,
+                                ),
+                            )
                         full_av_consistency, raw_full_av_consistency = _call_omni_with_retries(
                             label=f"full_av_consistency:{proposal_id}",
                             retries=omni_retries,
@@ -2319,15 +2435,24 @@ def propose_single_source_pairs(
                         "asr_degeneracy_risk": asr_degeneracy_risk,
                     }
                 )
-                blocking_issues = _dedupe_strings(
-                    blind_local_issues
-                    + _b_audio_blind_review_issues(
+                if blind_v2:
+                    blind_review_issues = _b_audio_blind_review_v2_issues(
+                        audio_delta_analysis=audio_delta_analysis,
+                        audio_edit_generation=audio_edit_generation,
+                        audio_only_proposal=audio_only_proposal,
+                        audio_only_verification=audio_only_verification,
+                        video_only_shortcut=video_only_shortcut,
+                        full_av_consistency=full_av_consistency,
+                        quality=quality,
+                    )
+                else:
+                    blind_review_issues = _b_audio_blind_review_issues(
                         audio_only_proposal=audio_only_proposal,
                         audio_only_verification=audio_only_verification,
                         full_av_consistency=full_av_consistency,
                         quality=quality,
                     )
-                )
+                blocking_issues = _dedupe_strings(blind_local_issues + blind_review_issues)
                 accepted = not blocking_issues
                 final_omni_accept = accepted
                 reject_reason = "" if accepted else "; ".join(blocking_issues)
@@ -2358,6 +2483,7 @@ def propose_single_source_pairs(
                     "evidence": _dedupe_strings(
                         _normalize_list(audio_only_proposal.get("evidence", []))
                         + _normalize_list(audio_only_verification.get("evidence", []))
+                        + _normalize_list(video_only_shortcut.get("evidence", []))
                         + _normalize_list(full_av_consistency.get("evidence", []))
                     ),
                     "recommended_edit_text": "",
@@ -2368,7 +2494,9 @@ def propose_single_source_pairs(
                     "visual_context_preserved": _boolish(full_av_consistency.get("visual_context_preserved")),
                     "video_context_strength": video_context_strength,
                     "asr_degeneracy_risk": asr_degeneracy_risk,
-                    "not_asr_only": asr_degeneracy_risk <= _profile_threshold(B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE, "asr_degeneracy_risk"),
+                    "not_asr_only": asr_degeneracy_risk <= _profile_threshold(acceptance_profile, "asr_degeneracy_risk"),
+                    "video_only_shortcut_risk": _boolish(video_only_shortcut.get("visual_shortcut_risk")),
+                    "can_identify_target_without_audio": _boolish(video_only_shortcut.get("can_identify_target_without_audio")),
                 }
                 hard_negative_paths = _single_source_hard_negative_paths(
                     root=layout["root"],
@@ -2422,6 +2550,12 @@ def propose_single_source_pairs(
                     "difference": difference,
                     "audio_dataset_line": audio_dataset_line,
                     "audio_line_quality_profile": str(quality.get("audio_line_quality_profile", "")).strip(),
+                    "audio_delta_strength": _score_float(audio_delta_analysis.get("audio_delta_strength")),
+                    "audio_delta_type": str(audio_delta_analysis.get("audio_delta_type", "")).strip(),
+                    "audio_delta_analysis": audio_delta_analysis,
+                    "raw_audio_delta_analysis": raw_audio_delta_analysis,
+                    "audio_edit_generation": audio_edit_generation,
+                    "raw_audio_edit_generation": raw_audio_edit_generation,
                     "audio_only_reference_content": str(audio_only_proposal.get("reference_audio_content", "")).strip(),
                     "audio_only_target_content": str(audio_only_proposal.get("target_audio_content", "")).strip(),
                     "audio_only_edit_text": str(audio_only_proposal.get("edit_text", "")).strip(),
@@ -2430,6 +2564,9 @@ def propose_single_source_pairs(
                     "audio_only_verification": audio_only_verification,
                     "raw_audio_only_proposal": raw_audio_only_proposal,
                     "raw_audio_only_verification": raw_audio_only_verification,
+                    "video_only_shortcut": video_only_shortcut,
+                    "raw_video_only_shortcut": raw_video_only_shortcut,
+                    "video_only_shortcut_risk": _boolish(video_only_shortcut.get("visual_shortcut_risk")),
                     "full_av_consistency": full_av_consistency,
                     "raw_full_av_consistency": raw_full_av_consistency,
                     "visual_shortcut_risk": _boolish(full_av_consistency.get("visual_shortcut_risk")),
@@ -2504,6 +2641,7 @@ def propose_single_source_pairs(
                         **_evidence_from_annotations(reference_annotation, target_annotation),
                         "audio_only_proposal": _normalize_list(audio_only_proposal.get("evidence", [])),
                         "audio_only_verification": _normalize_list(audio_only_verification.get("evidence", [])),
+                        "video_only_shortcut": _normalize_list(video_only_shortcut.get("evidence", [])),
                         "full_av_consistency": _normalize_list(full_av_consistency.get("evidence", [])),
                     },
                     "judge": judge,
@@ -9003,6 +9141,49 @@ def _extract_audio_only_cache(*, video_path: Path, cache_dir: Path, clip_id: str
     return output_path
 
 
+def _extract_video_only_cache(*, video_path: Path, cache_dir: Path, clip_id: str) -> Path:
+    if not video_path.exists():
+        raise FileNotFoundError(f"video file not found for video-only extraction: {video_path}")
+    stat = video_path.stat()
+    cache_key = json.dumps(
+        {
+            "path": str(video_path.resolve()),
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+            "mode": "video_only_no_audio",
+        },
+        sort_keys=True,
+    )
+    safe_clip_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", clip_id).strip("_") or "clip"
+    output_path = cache_dir / f"{safe_clip_id}_{_stable_hash(cache_key)}.mp4"
+    if output_path.exists() and output_path.stat().st_size > 0:
+        return output_path
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_suffix(".tmp.mp4")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-an",
+        "-c:v",
+        "copy",
+        str(tmp_path),
+    ]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+            raise RuntimeError("ffmpeg produced an empty video-only mp4")
+        tmp_path.replace(output_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+    return output_path
+
+
 def _b_audio_blind_review_model_fields(audio_only_proposal: dict[str, Any]) -> dict[str, Any]:
     difference_type = str(audio_only_proposal.get("difference_type", "")).strip()
     if difference_type == "speech_topic":
@@ -9044,6 +9225,51 @@ def _b_audio_blind_review_model_fields(audio_only_proposal: dict[str, Any]) -> d
         "confidence": _score_float(audio_only_proposal.get("confidence")),
         "accept": _boolish(audio_only_proposal.get("accept")),
         "reject_reason": str(audio_only_proposal.get("reject_reason", "")).strip(),
+    }
+
+
+def _b_audio_blind_review_v2_proposal_from_stages(
+    *,
+    audio_delta_analysis: dict[str, Any],
+    audio_edit_generation: dict[str, Any],
+) -> dict[str, Any]:
+    difference_type = str(audio_delta_analysis.get("audio_delta_type", audio_delta_analysis.get("difference_type", ""))).strip()
+    if difference_type == "speech_topic":
+        difference_type = "speech"
+    if difference_type in {"music", "sound_event", "sound", "audio"}:
+        difference_type = "audio_event"
+    if difference_type not in {"speech", "audio_event"}:
+        difference_type = "audio_event" if str(audio_delta_analysis.get("b_subtype", "")).strip() in {"music", "sound_event"} else "speech"
+    edit_text = str(audio_edit_generation.get("edit_text", "")).strip()
+    delta_confidence = _score_float(audio_delta_analysis.get("confidence"))
+    edit_confidence = _score_float(audio_edit_generation.get("confidence"))
+    accept = (
+        _boolish(audio_delta_analysis.get("accept"))
+        and _boolish(audio_edit_generation.get("accept"))
+        and _boolish(audio_delta_analysis.get("audio_difference_specific"))
+        and _boolish(audio_edit_generation.get("edit_text_audio_only"))
+    )
+    reasons = [
+        str(audio_delta_analysis.get("reject_reason", "")).strip(),
+        str(audio_edit_generation.get("reject_reason", "")).strip(),
+    ]
+    return {
+        "accept": accept,
+        "reject_reason": "; ".join(reason for reason in reasons if reason),
+        "difference_type": difference_type,
+        "b_subtype": str(audio_delta_analysis.get("b_subtype", "")).strip(),
+        "reference_audio_content": str(audio_delta_analysis.get("reference_audio_content", "")).strip(),
+        "target_audio_content": str(audio_delta_analysis.get("target_audio_content", "")).strip(),
+        "edit_text": edit_text,
+        "audio_difference_specific": _boolish(audio_delta_analysis.get("audio_difference_specific")),
+        "edit_text_audio_only": _boolish(audio_edit_generation.get("edit_text_audio_only")),
+        "confidence": min(delta_confidence, edit_confidence) if delta_confidence and edit_confidence else max(delta_confidence, edit_confidence),
+        "evidence": _dedupe_strings(
+            _normalize_list(audio_delta_analysis.get("evidence", []))
+            + _normalize_list(audio_edit_generation.get("evidence", []))
+        ),
+        "audio_delta_strength": _score_float(audio_delta_analysis.get("audio_delta_strength")),
+        "edit_text_specificity_score": _score_float(audio_edit_generation.get("edit_text_specificity_score")),
     }
 
 
@@ -9107,6 +9333,106 @@ def _b_audio_blind_review_issues(
     if _score_float(quality.get("asr_degeneracy_risk")) > _profile_threshold(B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE, "asr_degeneracy_risk"):
         issues.append("blind_review_asr_degeneracy_risk_too_high")
     if _score_float(quality.get("visual_delta_strength")) > _profile_threshold(B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE, "visual_delta_strength"):
+        issues.append("visual_shortcut_risk: local visual_delta_strength too high")
+    return _dedupe_strings(issues)
+
+
+def _b_audio_blind_review_v2_issues(
+    *,
+    audio_delta_analysis: dict[str, Any],
+    audio_edit_generation: dict[str, Any],
+    audio_only_proposal: dict[str, Any],
+    audio_only_verification: dict[str, Any],
+    video_only_shortcut: dict[str, Any],
+    full_av_consistency: dict[str, Any],
+    quality: dict[str, Any],
+) -> list[str]:
+    issues: list[str] = []
+    difference_type = str(audio_delta_analysis.get("audio_delta_type", audio_only_proposal.get("difference_type", ""))).strip()
+    if difference_type == "speech_topic":
+        difference_type = "speech"
+    if difference_type in {"music", "sound_event", "sound", "audio"}:
+        difference_type = "audio_event"
+    if difference_type not in {"speech", "audio_event"}:
+        issues.append(f"audio_delta_invalid_type: {difference_type or 'missing'}")
+
+    edit_text = str(audio_edit_generation.get("edit_text", audio_only_proposal.get("edit_text", ""))).strip()
+    issues.extend(_b_line_edit_text_audio_only_issues(edit_text, difference_type))
+
+    if not _boolish(audio_delta_analysis.get("accept")):
+        reason = str(audio_delta_analysis.get("reject_reason", "")).strip()
+        issues.append("audio_delta_reject" + (f": {reason}" if reason else ""))
+    if _score_float(audio_delta_analysis.get("audio_delta_strength")) < _profile_threshold(
+        B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE, "audio_delta_strength"
+    ):
+        issues.append(
+            "audio_delta_strength_below_threshold: "
+            f"{_score_float(audio_delta_analysis.get('audio_delta_strength')):.2f} < "
+            f"{_profile_threshold(B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE, 'audio_delta_strength'):.2f}"
+        )
+    if not _boolish(audio_delta_analysis.get("audio_difference_specific")):
+        issues.append("audio_delta_not_specific")
+    if _b_line_audio_phrase_is_hollow(str(audio_delta_analysis.get("reference_audio_content", ""))) or _b_line_audio_phrase_is_hollow(
+        str(audio_delta_analysis.get("target_audio_content", ""))
+    ):
+        issues.append("audio_delta_hollow_content")
+
+    if not _boolish(audio_edit_generation.get("accept")):
+        reason = str(audio_edit_generation.get("reject_reason", "")).strip()
+        issues.append("audio_edit_generation_reject" + (f": {reason}" if reason else ""))
+    if not _boolish(audio_edit_generation.get("edit_text_audio_only")):
+        issues.append("audio_edit_generation_not_audio_only")
+    if _score_float(audio_edit_generation.get("edit_text_specificity_score")) < 0.70:
+        issues.append(
+            "audio_edit_specificity_below_threshold: "
+            f"{_score_float(audio_edit_generation.get('edit_text_specificity_score')):.2f} < 0.70"
+        )
+    if _score_float(audio_edit_generation.get("confidence")) < 0.70:
+        issues.append(f"audio_edit_generation_confidence_below_threshold: {_score_float(audio_edit_generation.get('confidence')):.2f} < 0.70")
+
+    if not _boolish(audio_only_verification.get("accept")):
+        reason = str(audio_only_verification.get("reject_reason", "")).strip()
+        issues.append("audio_only_verification_reject" + (f": {reason}" if reason else ""))
+    if _boolish(audio_only_verification.get("reference_satisfies_edit")):
+        issues.append("audio_only_reference_satisfies_edit")
+    if not _boolish(audio_only_verification.get("target_satisfies_edit")):
+        issues.append("audio_only_target_missing_edit")
+    if not _boolish(audio_only_verification.get("audio_difference_specific")):
+        issues.append("audio_only_verification_not_specific")
+    if not _boolish(audio_only_verification.get("edit_text_audio_only")):
+        issues.append("audio_only_verification_edit_text_not_audio_only")
+    if _score_float(audio_only_verification.get("confidence")) < 0.70:
+        issues.append(f"audio_only_verification_confidence_below_threshold: {_score_float(audio_only_verification.get('confidence')):.2f} < 0.70")
+
+    if not _boolish(video_only_shortcut.get("accept")):
+        reason = str(video_only_shortcut.get("reject_reason", "")).strip()
+        issues.append("video_only_shortcut_reject" + (f": {reason}" if reason else ""))
+    if _boolish(video_only_shortcut.get("visual_shortcut_risk")):
+        issues.append("video_only_shortcut_risk")
+    if _boolish(video_only_shortcut.get("can_identify_target_without_audio")):
+        issues.append("video_only_can_identify_target_without_audio")
+    if not _boolish(video_only_shortcut.get("visual_context_preserved")):
+        issues.append("video_only_visual_context_not_preserved")
+    if _score_float(video_only_shortcut.get("confidence")) < 0.60:
+        issues.append(f"video_only_shortcut_confidence_below_threshold: {_score_float(video_only_shortcut.get('confidence')):.2f} < 0.60")
+
+    if not _boolish(full_av_consistency.get("accept")):
+        reason = str(full_av_consistency.get("reject_reason", "")).strip()
+        issues.append("full_av_consistency_reject" + (f": {reason}" if reason else ""))
+    if not _boolish(full_av_consistency.get("visual_context_preserved")):
+        issues.append("full_av_visual_context_not_preserved")
+    if _boolish(full_av_consistency.get("visual_shortcut_risk")):
+        issues.append("visual_shortcut_risk")
+    if not _boolish(full_av_consistency.get("audio_edit_still_valid")):
+        issues.append("full_av_audio_edit_not_valid")
+    if _score_float(full_av_consistency.get("confidence")) < 0.60:
+        issues.append(f"full_av_consistency_confidence_below_threshold: {_score_float(full_av_consistency.get('confidence')):.2f} < 0.60")
+
+    if _score_float(quality.get("video_context_strength")) < _profile_threshold(B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE, "video_context_strength"):
+        issues.append("blind_review_video_context_too_weak")
+    if _score_float(quality.get("asr_degeneracy_risk")) > _profile_threshold(B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE, "asr_degeneracy_risk"):
+        issues.append("blind_review_asr_degeneracy_risk_too_high")
+    if _score_float(quality.get("visual_delta_strength")) > _profile_threshold(B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE, "visual_delta_strength"):
         issues.append("visual_shortcut_risk: local visual_delta_strength too high")
     return _dedupe_strings(issues)
 
@@ -9566,6 +9892,14 @@ def _b_line_edit_text_specificity_issues(edit_text: str, difference_type: str) -
         "reference audio",
         "add target audio to the audio",
         "replace reference audio",
+        "different sentence",
+        "saying one sentence",
+        "speech changed",
+        "neutral tone",
+        "emphatic tone",
+        "questioning tone",
+        "tone to discussing",
+        "emotional almost singing tone",
     )
     placeholder_patterns = (
         r"\bfrom discussing a to discussing b\b",
@@ -9573,6 +9907,7 @@ def _b_line_edit_text_specificity_issues(edit_text: str, difference_type: str) -
         r"\bfrom content a to content b\b",
         r"\bfrom phrase a to phrase b\b",
         r"\bfrom saying a to saying b\b",
+        r"\bone sentence to saying a different sentence\b",
         r"\bspecific topic a\b",
         r"\bspecific topic b\b",
         r"\bspecific sound a\b",
@@ -9593,6 +9928,7 @@ def _b_line_edit_text_specificity_issues(edit_text: str, difference_type: str) -
         "speech is present but",
         "unknown",
         "unspecified",
+        "garbled",
     )
     if any(phrase in normalized for phrase in generic_phrases):
         issues.append("edit_text_not_audio_only: generic audio placeholder")

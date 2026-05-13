@@ -387,6 +387,155 @@ class ComposedOmniClientTests(unittest.TestCase):
         for forbidden in ("video", "frame", "visual", "scene", "caption", "gesture", "smile", "button"):
             self.assertNotIn(forbidden, prompt_text)
 
+    def test_b_line_audio_delta_and_edit_generation_are_separate(self) -> None:
+        requests: list[object] = []
+        responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "accept": True,
+                                    "reject_reason": "",
+                                    "audio_delta_type": "speech",
+                                    "b_subtype": "speech_topic",
+                                    "audio_delta_strength": 0.86,
+                                    "reference_audio_content": "commentary introduces the players",
+                                    "target_audio_content": "commentary describes a goal",
+                                    "audio_difference_specific": True,
+                                    "confidence": 0.9,
+                                    "evidence": ["reference introduces players", "target describes a goal"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "accept": True,
+                                    "reject_reason": "",
+                                    "edit_text": "change the commentary from introducing the players to describing the goal",
+                                    "edit_text_audio_only": True,
+                                    "edit_text_specificity_score": 0.92,
+                                    "confidence": 0.9,
+                                    "evidence": ["specific speech-topic delta"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        ]
+
+        def fake_urlopen(request, timeout):
+            requests.append(request)
+            return _FakeHTTPResponse(responses[len(requests) - 1])
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-audio-delta-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            ref_audio = tmp_dir / "ref.wav"
+            tgt_audio = tmp_dir / "tgt.wav"
+            ref_audio.write_bytes(b"fake-ref-wav")
+            tgt_audio.write_bytes(b"fake-tgt-wav")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+                timeout_seconds=30.0,
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                delta, _raw_delta = client.analyze_b_line_audio_delta(
+                    reference_audio_path=str(ref_audio),
+                    target_audio_path=str(tgt_audio),
+                    metadata={"proposal_id": "p1"},
+                )
+                edit, _raw_edit = client.generate_b_line_audio_edit_text(audio_delta=delta)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual("speech", delta["audio_delta_type"])
+        self.assertEqual(0.86, delta["audio_delta_strength"])
+        self.assertEqual("change the commentary from introducing the players to describing the goal", edit["edit_text"])
+        delta_body = json.loads(requests[0].data.decode("utf-8"))
+        delta_text = " ".join(item.get("text", "") for item in delta_body["messages"][1]["content"] if item.get("type") == "text").lower()
+        self.assertIn("do not write edit_text", delta_text)
+        for forbidden in ("visual", "scene", "caption", "gesture", "smile", "button"):
+            self.assertNotIn(forbidden, delta_text)
+        edit_body = json.loads(requests[1].data.decode("utf-8"))
+        edit_user_text = " ".join(item.get("text", "") for item in edit_body["messages"][1]["content"] if item.get("type") == "text")
+        self.assertIn("Audio delta JSON", edit_user_text)
+        self.assertNotIn("video_url", json.dumps(edit_body))
+
+    def test_b_line_video_only_shortcut_uses_silent_video_inputs(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "accept": False,
+                                "reject_reason": "card side reveals the target",
+                                "visual_context_preserved": True,
+                                "visual_shortcut_risk": True,
+                                "can_identify_target_without_audio": True,
+                                "confidence": 0.9,
+                                "evidence": ["target shows the card back"],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-video-only-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            ref_video = tmp_dir / "ref_silent.mp4"
+            tgt_video = tmp_dir / "tgt_silent.mp4"
+            ref_video.write_bytes(b"fake-ref-video")
+            tgt_video.write_bytes(b"fake-tgt-video")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+                timeout_seconds=30.0,
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.verify_b_line_video_only_shortcut(
+                    reference_clip_path=str(ref_video),
+                    target_clip_path=str(tgt_video),
+                    edit_text="change the speech from discussing budget to discussing health",
+                    audio_only_evidence={"audio_delta_strength": 0.8},
+                    local_gate_report={"passed": True},
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertFalse(normalized["accept"])
+        self.assertTrue(normalized["visual_shortcut_risk"])
+        request = request_holder["request"]
+        request_body = json.loads(request.data.decode("utf-8"))
+        user_content = request_body["messages"][1]["content"]
+        self.assertEqual(2, len([item for item in user_content if item.get("type") == "video_url"]))
+        user_text = " ".join(item.get("text", "") for item in user_content if item.get("type") == "text")
+        self.assertIn("Ignore sound completely", user_text)
+
     def test_request_json_repairs_malformed_json_response(self) -> None:
         requests: list[object] = []
         repaired_payload = {

@@ -1173,6 +1173,280 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual(0, summary["accepted_count"])
             self.assertIn("visual_shortcut_risk", ranked[0]["judge"]["reject_reason"])
 
+    def test_b_audio_blind_review_v2_accepts_delta_then_video_only_checked_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4", "ref.wav", "tgt.wav", "ref_silent.mp4", "tgt_silent.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"media")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "seg_1",
+                        "output_path": "clips/seg_1.mp4",
+                        "summary": "same sports broadcast field view",
+                        "scene": "stadium broadcast",
+                        "speech": ["commentary introduces the players"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "seg_2",
+                        "output_path": "clips/seg_2.mp4",
+                        "summary": "same sports broadcast field view",
+                        "scene": "stadium broadcast",
+                        "speech": ["commentary describes a goal"],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "proposal_id": "p1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "players", "to": "goal"},
+                        "quality": {"visual_delta_strength": 0.1, "visual_context_similarity": 0.9},
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.analyze_b_line_audio_delta.return_value = (
+                {
+                    "accept": True,
+                    "reject_reason": "",
+                    "audio_delta_type": "speech",
+                    "b_subtype": "speech_topic",
+                    "audio_delta_strength": 0.86,
+                    "reference_audio_content": "commentary introducing the players",
+                    "target_audio_content": "commentary describing a goal",
+                    "audio_difference_specific": True,
+                    "confidence": 0.91,
+                    "evidence": ["reference introduces players", "target describes a goal"],
+                },
+                {"raw": "delta"},
+            )
+            client.generate_b_line_audio_edit_text.return_value = (
+                {
+                    "accept": True,
+                    "reject_reason": "",
+                    "edit_text": "change the commentary from introducing the players to describing the goal",
+                    "edit_text_audio_only": True,
+                    "edit_text_specificity_score": 0.92,
+                    "confidence": 0.9,
+                    "evidence": ["specific speech-topic delta"],
+                },
+                {"raw": "edit"},
+            )
+            client.verify_b_line_audio_only_edit.return_value = (
+                {
+                    "accept": True,
+                    "reject_reason": "",
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "audio_difference_specific": True,
+                    "edit_text_audio_only": True,
+                    "confidence": 0.92,
+                    "evidence": ["target audio describes a goal"],
+                },
+                {"raw": "audio_verify"},
+            )
+            client.verify_b_line_video_only_shortcut.return_value = (
+                {
+                    "accept": True,
+                    "reject_reason": "",
+                    "visual_context_preserved": True,
+                    "visual_shortcut_risk": False,
+                    "can_identify_target_without_audio": False,
+                    "confidence": 0.86,
+                    "evidence": ["silent videos preserve the same broadcast view"],
+                },
+                {"raw": "video_only"},
+            )
+            client.verify_b_line_full_av_consistency.return_value = (
+                {
+                    "accept": True,
+                    "reject_reason": "",
+                    "visual_context_preserved": True,
+                    "visual_shortcut_risk": False,
+                    "audio_edit_still_valid": True,
+                    "confidence": 0.85,
+                    "evidence": ["full videos keep the same broadcast context"],
+                },
+                {"raw": "full_av"},
+            )
+            with (
+                mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client),
+                mock.patch(
+                    "app.composed_data._extract_audio_only_cache",
+                    side_effect=[root / "clips" / "ref.wav", root / "clips" / "tgt.wav"],
+                ),
+                mock.patch(
+                    "app.composed_data._extract_video_only_cache",
+                    side_effect=[root / "clips" / "ref_silent.mp4", root / "clips" / "tgt_silent.mp4"],
+                ),
+            ):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    acceptance_profile="b_audio_blind_review_v2",
+                    audio_dataset_line="speech_audio_content",
+                )
+
+            ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, summary["accepted_count"])
+            self.assertEqual("change the commentary from introducing the players to describing the goal", ranked[0]["edit_text"])
+            self.assertEqual(0.86, ranked[0]["audio_delta_strength"])
+            self.assertFalse(ranked[0]["video_only_shortcut_risk"])
+            self.assertEqual("speech", ranked[0]["difference"]["type"])
+            client.propose_b_line_audio_only_pair.assert_not_called()
+            client.propose_single_source_pair.assert_not_called()
+
+    def test_b_audio_blind_review_v2_rejects_weak_audio_delta_and_video_shortcut(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4", "ref.wav", "tgt.wav", "ref_silent.mp4", "tgt_silent.mp4"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"media")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {"clip_id": "seg_1", "output_path": "clips/seg_1.mp4", "summary": "same host holding a card", "scene": "desk demo", "speech": ["same talk"], "modalities": ["audio", "visual"]},
+                    {"clip_id": "seg_2", "output_path": "clips/seg_2.mp4", "summary": "same host flips the card back", "scene": "desk demo", "speech": ["same talk"], "modalities": ["audio", "visual"]},
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "proposal_id": "p1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "same talk", "to": "same talk"},
+                        "quality": {"visual_delta_strength": 0.1, "visual_context_similarity": 0.9},
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.analyze_b_line_audio_delta.return_value = (
+                {
+                    "accept": False,
+                    "reject_reason": "audio difference is weak",
+                    "audio_delta_type": "speech",
+                    "b_subtype": "speech_topic",
+                    "audio_delta_strength": 0.2,
+                    "reference_audio_content": "same talk",
+                    "target_audio_content": "same talk",
+                    "audio_difference_specific": False,
+                    "confidence": 0.4,
+                    "evidence": ["both clips contain similar speech"],
+                },
+                {"raw": "delta"},
+            )
+            client.generate_b_line_audio_edit_text.return_value = (
+                {
+                    "accept": False,
+                    "reject_reason": "no specific audio edit",
+                    "edit_text": "change the speech from discussing the card front to discussing the card back",
+                    "edit_text_audio_only": False,
+                    "edit_text_specificity_score": 0.2,
+                    "confidence": 0.3,
+                    "evidence": [],
+                },
+                {"raw": "edit"},
+            )
+            client.verify_b_line_audio_only_edit.return_value = (
+                {
+                    "accept": False,
+                    "reject_reason": "reference also satisfies edit",
+                    "reference_satisfies_edit": True,
+                    "target_satisfies_edit": False,
+                    "audio_difference_specific": False,
+                    "edit_text_audio_only": False,
+                    "confidence": 0.3,
+                    "evidence": [],
+                },
+                {},
+            )
+            client.verify_b_line_video_only_shortcut.return_value = (
+                {
+                    "accept": False,
+                    "reject_reason": "card side reveals the target",
+                    "visual_context_preserved": True,
+                    "visual_shortcut_risk": True,
+                    "can_identify_target_without_audio": True,
+                    "confidence": 0.9,
+                    "evidence": ["silent target shows the card back"],
+                },
+                {},
+            )
+            client.verify_b_line_full_av_consistency.return_value = (
+                {
+                    "accept": False,
+                    "reject_reason": "visual shortcut",
+                    "visual_context_preserved": True,
+                    "visual_shortcut_risk": True,
+                    "audio_edit_still_valid": False,
+                    "confidence": 0.8,
+                    "evidence": ["visual change is enough"],
+                },
+                {},
+            )
+            with (
+                mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client),
+                mock.patch(
+                    "app.composed_data._extract_audio_only_cache",
+                    side_effect=[root / "clips" / "ref.wav", root / "clips" / "tgt.wav"],
+                ),
+                mock.patch(
+                    "app.composed_data._extract_video_only_cache",
+                    side_effect=[root / "clips" / "ref_silent.mp4", root / "clips" / "tgt_silent.mp4"],
+                ),
+            ):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    acceptance_profile="b_audio_blind_review_v2",
+                    audio_dataset_line="speech_audio_content",
+                )
+
+            ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(0, summary["accepted_count"])
+            reject_reason = ranked[0]["judge"]["reject_reason"]
+            self.assertIn("audio_delta_strength_below_threshold", reject_reason)
+            self.assertIn("video_only_shortcut_risk", reject_reason)
+            self.assertIn("visual wording card", reject_reason)
+
     def test_speech_audio_content_line_rewrites_visual_leaky_speech_edit_before_final_omni(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

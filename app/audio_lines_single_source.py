@@ -38,10 +38,13 @@ AUDIO_LINE_PROFILE_V4_STRICT = "v4_strict"
 AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY = "v5_audio_primary"
 AUDIO_LINE_PROFILE_B_CONTEXT_CVR = "b_audio_context_cvr"
 AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW = "b_audio_blind_review"
+AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW_V2 = "b_audio_blind_review_v2"
 AUDIO_LINE_PROFILE_ALIASES = {
     "b_context_cvr": AUDIO_LINE_PROFILE_B_CONTEXT_CVR,
     "b_audio_blind": AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW,
     "b_blind_review": AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW,
+    "b_audio_blind_v2": AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW_V2,
+    "b_blind_review_v2": AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW_V2,
 }
 AUDIO_LINE_PROFILES = {
     AUDIO_LINE_PROFILE_DEFAULT,
@@ -49,6 +52,7 @@ AUDIO_LINE_PROFILES = {
     AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY,
     AUDIO_LINE_PROFILE_B_CONTEXT_CVR,
     AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW,
+    AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW_V2,
 }
 B_CANDIDATE_MODE_HYBRID = "hybrid"
 B_CANDIDATE_MODE_AUDIO_FIRST = "audio_first"
@@ -371,7 +375,8 @@ def split_audio_line_candidates(
             else:
                 speech_threshold = 0.70
             b_context_ok = (
-                audio_line_quality_profile not in {AUDIO_LINE_PROFILE_B_CONTEXT_CVR, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW}
+                audio_line_quality_profile
+                not in {AUDIO_LINE_PROFILE_B_CONTEXT_CVR, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW_V2}
                 or _b_context_candidate_allowed(
                     difference_type="speech",
                     video_context_strength=video_context_strength,
@@ -403,7 +408,8 @@ def split_audio_line_candidates(
                 non_speech_threshold = 0.55 if _uses_audio_primary_mining_profile(audio_line_quality_profile) else 0.70
                 audio_text = " ".join(_normalize_list(reference.get("audio_events", [])) + _normalize_list(target.get("audio_events", [])))
                 event_context_ok = (
-                    audio_line_quality_profile not in {AUDIO_LINE_PROFILE_B_CONTEXT_CVR, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW}
+                    audio_line_quality_profile
+                    not in {AUDIO_LINE_PROFILE_B_CONTEXT_CVR, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW_V2}
                     or _b_context_candidate_allowed(
                         difference_type="audio_event",
                         video_context_strength=video_context_strength,
@@ -434,7 +440,11 @@ def split_audio_line_candidates(
                 else:
                     if non_speech_score < non_speech_threshold:
                         reject_counts["b_missing_audio_evidence"] += 1
-                    elif audio_line_quality_profile in {AUDIO_LINE_PROFILE_B_CONTEXT_CVR, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW} and not event_context_ok:
+                    elif (
+                        audio_line_quality_profile
+                        in {AUDIO_LINE_PROFILE_B_CONTEXT_CVR, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW_V2}
+                        and not event_context_ok
+                    ):
                         reject_counts["b_context_cvr_gate_failed"] += 1
                     else:
                         reject_counts["b_v4_visual_or_audio_gate_failed"] += 1
@@ -828,6 +838,7 @@ def _uses_audio_primary_mining_profile(audio_line_quality_profile: str) -> bool:
         AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY,
         AUDIO_LINE_PROFILE_B_CONTEXT_CVR,
         AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW,
+        AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW_V2,
     }
 
 
@@ -994,7 +1005,8 @@ def _mine_audio_first_b_candidates(
                     visual_delta_strength = _visual_delta_strength(candidate, reference, target)
                     audio_text = " ".join(_speech_texts_from_annotation(reference)[:2] + _speech_texts_from_annotation(target)[:2])
                     context_ok = (
-                        audio_line_quality_profile not in {AUDIO_LINE_PROFILE_B_CONTEXT_CVR, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW}
+                        audio_line_quality_profile
+                        not in {AUDIO_LINE_PROFILE_B_CONTEXT_CVR, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW_V2}
                         or _b_context_candidate_allowed(
                             difference_type="speech",
                             video_context_strength=video_context_strength,
@@ -1033,7 +1045,8 @@ def _mine_audio_first_b_candidates(
                     visual_delta_strength = _visual_delta_strength(candidate, reference, target)
                     audio_text = " ".join(_normalize_list(reference.get("audio_events", [])) + _normalize_list(target.get("audio_events", [])))
                     context_ok = (
-                        audio_line_quality_profile not in {AUDIO_LINE_PROFILE_B_CONTEXT_CVR, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW}
+                        audio_line_quality_profile
+                        not in {AUDIO_LINE_PROFILE_B_CONTEXT_CVR, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW, AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW_V2}
                         or _b_context_candidate_allowed(
                             difference_type="audio_event",
                             video_context_strength=video_context_strength,
@@ -1253,6 +1266,7 @@ def _line_candidate_sort_key(record: dict[str, Any]) -> tuple[Any, ...]:
         AUDIO_LINE_PROFILE_V5_AUDIO_PRIMARY,
         AUDIO_LINE_PROFILE_B_CONTEXT_CVR,
         AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW,
+        AUDIO_LINE_PROFILE_B_AUDIO_BLIND_REVIEW_V2,
     }:
         if str(record.get("audio_dataset_line", "")) == VISUAL_AUDIO_ANCHOR_LINE:
             return (

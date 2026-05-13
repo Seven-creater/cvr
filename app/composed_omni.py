@@ -181,6 +181,39 @@ REQUIRED_B_LINE_AUDIO_ONLY_VERIFICATION_FIELDS = (
     "evidence",
 )
 
+REQUIRED_B_LINE_AUDIO_DELTA_FIELDS = (
+    "accept",
+    "reject_reason",
+    "audio_delta_type",
+    "b_subtype",
+    "audio_delta_strength",
+    "reference_audio_content",
+    "target_audio_content",
+    "audio_difference_specific",
+    "confidence",
+    "evidence",
+)
+
+REQUIRED_B_LINE_AUDIO_EDIT_GENERATION_FIELDS = (
+    "accept",
+    "reject_reason",
+    "edit_text",
+    "edit_text_audio_only",
+    "edit_text_specificity_score",
+    "confidence",
+    "evidence",
+)
+
+REQUIRED_B_LINE_VIDEO_ONLY_SHORTCUT_FIELDS = (
+    "accept",
+    "reject_reason",
+    "visual_context_preserved",
+    "visual_shortcut_risk",
+    "can_identify_target_without_audio",
+    "confidence",
+    "evidence",
+)
+
 REQUIRED_B_LINE_FULL_AV_CONSISTENCY_FIELDS = (
     "accept",
     "reject_reason",
@@ -831,6 +864,50 @@ def _b_line_audio_only_verification_system_prompt() -> str:
     )
 
 
+def _b_line_audio_delta_system_prompt() -> str:
+    return (
+        "You are the first blind audio-only gate for B-line audio-primary CVR data. "
+        "You receive reference and target audio only. Do not create an edit_text yet. "
+        "Return exactly one JSON object with schema: "
+        '{"accept": boolean, "reject_reason": string, "audio_delta_type": "speech"|"audio_event", '
+        '"b_subtype": "speech_topic"|"music"|"sound_event", "audio_delta_strength": number, '
+        '"reference_audio_content": string, "target_audio_content": string, '
+        '"audio_difference_specific": boolean, "confidence": number, "evidence": [string]}. '
+        "Accept only if the audible difference is concrete and strong enough for retrieval. "
+        "Reject generic cases such as both clips only containing unclear speech, similar music, similar ambience, different tone, or unknown sound."
+    )
+
+
+def _b_line_audio_edit_generation_system_prompt() -> str:
+    return (
+        "You generate the final B-line audio edit_text only from an audio delta JSON. "
+        "Do not use visual, scene, frame, object, person, action, camera, subtitle, button, screen, front, or back wording. "
+        "Return exactly one JSON object with schema: "
+        '{"accept": boolean, "reject_reason": string, "edit_text": string, '
+        '"edit_text_audio_only": boolean, "edit_text_specificity_score": number, '
+        '"confidence": number, "evidence": [string]}. '
+        "For speech, use 'change the speech from discussing {specific ref topic} to discussing {specific target topic}' "
+        "or 'change the voice from saying \"{specific ref phrase}\" to saying \"{specific target phrase}\"'. "
+        "For music or sound events, use 'replace {specific ref sound} with {specific target sound}', "
+        "'add {specific target sound} to the audio', or 'remove {specific ref sound} from the audio'. "
+        "Reject A/B placeholders, unintelligible/not transcribed content, generic tone changes, and any visual edit."
+    )
+
+
+def _b_line_video_only_shortcut_system_prompt() -> str:
+    return (
+        "You are the video-only shortcut judge for B-line audio-primary CVR data. "
+        "You receive reference and target videos that should be judged without using sound. "
+        "Do not rewrite the edit_text. Return exactly one JSON object with schema: "
+        '{"accept": boolean, "reject_reason": string, "visual_context_preserved": boolean, '
+        '"visual_shortcut_risk": boolean, "can_identify_target_without_audio": boolean, '
+        '"confidence": number, "evidence": [string]}. '
+        "Set visual_shortcut_risk=true if a viewer can identify the target from visual changes alone, "
+        "including gesture, expression, action, camera distance, card side/front/back, button/text overlays, people, objects, or scene changes. "
+        "Accept only when visual context is preserved and the target cannot be identified without audio."
+    )
+
+
 def _b_line_full_av_consistency_system_prompt() -> str:
     return (
         "You are the final consistency auditor for B-line audio-primary CVR data. "
@@ -1307,6 +1384,64 @@ def _build_b_line_audio_only_verification_user_content(
         {"type": "audio_url", "audio_url": {"url": reference_audio_path}},
         {"type": "text", "text": "Target audio only:"},
         {"type": "audio_url", "audio_url": {"url": target_audio_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
+def _build_b_line_audio_delta_user_content(
+    *,
+    reference_audio_path: str,
+    target_audio_path: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: listen to the two audio clips and decide whether there is a concrete B-line audio delta.\n"
+        f"Pair metadata JSON:\n{_prompt_json(metadata, max_chars=500)}\n"
+        "Use audio only. Do not write edit_text. Reject if the difference is weak, generic, unclear, or only a vague tone change."
+    )
+    return [
+        {"type": "text", "text": "Reference audio only:"},
+        {"type": "audio_url", "audio_url": {"url": reference_audio_path}},
+        {"type": "text", "text": "Target audio only:"},
+        {"type": "audio_url", "audio_url": {"url": target_audio_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
+def _build_b_line_audio_edit_generation_user_content(
+    *,
+    audio_delta: dict[str, Any],
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: generate one final audio-only edit_text from this audio delta JSON.\n"
+        f"Audio delta JSON:\n{_prompt_json(audio_delta, max_chars=950)}\n"
+        "Use only the reference_audio_content, target_audio_content, audio_delta_type, and evidence above. "
+        "Reject instead of inventing content if either side is generic or unclear."
+    )
+    return [{"type": "text", "text": prompt}]
+
+
+def _build_b_line_video_only_shortcut_user_content(
+    *,
+    reference_clip_path: str,
+    target_clip_path: str,
+    edit_text: str,
+    audio_only_evidence: dict[str, Any],
+    local_gate_report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: judge visual shortcut risk without using audio.\n"
+        f"Audio-only edit_text: {edit_text}\n"
+        f"Audio-only evidence JSON:\n{_prompt_json(audio_only_evidence, max_chars=800)}\n"
+        f"Local visual/context gate JSON:\n{_prompt_json(local_gate_report, max_chars=500)}\n"
+        "Ignore sound completely. Do not rewrite the edit_text. "
+        "Reject if visual differences alone reveal the target."
+    )
+    return [
+        {"type": "text", "text": "Reference silent video:"},
+        {"type": "video_url", "video_url": {"url": reference_clip_path}},
+        {"type": "text", "text": "Target silent video:"},
+        {"type": "video_url", "video_url": {"url": target_clip_path}},
         {"type": "text", "text": prompt},
     ]
 
@@ -1845,6 +1980,58 @@ class OpenAIComposedDataClient:
             max_tokens=600,
         )
         return _normalize_b_line_audio_only_verification_payload(raw_payload), raw_payload
+
+    def analyze_b_line_audio_delta(
+        self,
+        *,
+        reference_audio_path: str,
+        target_audio_path: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_b_line_audio_delta_user_content(
+                reference_audio_path=reference_audio_path,
+                target_audio_path=target_audio_path,
+                metadata=metadata or {},
+            ),
+            system_prompt=_b_line_audio_delta_system_prompt(),
+            max_tokens=650,
+        )
+        return _normalize_b_line_audio_delta_payload(raw_payload), raw_payload
+
+    def generate_b_line_audio_edit_text(
+        self,
+        *,
+        audio_delta: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_b_line_audio_edit_generation_user_content(audio_delta=audio_delta),
+            system_prompt=_b_line_audio_edit_generation_system_prompt(),
+            max_tokens=450,
+        )
+        return _normalize_b_line_audio_edit_generation_payload(raw_payload), raw_payload
+
+    def verify_b_line_video_only_shortcut(
+        self,
+        *,
+        reference_clip_path: str,
+        target_clip_path: str,
+        edit_text: str,
+        audio_only_evidence: dict[str, Any],
+        local_gate_report: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_b_line_video_only_shortcut_user_content(
+                reference_clip_path=reference_clip_path,
+                target_clip_path=target_clip_path,
+                edit_text=edit_text,
+                audio_only_evidence=audio_only_evidence,
+                local_gate_report=local_gate_report,
+            ),
+            system_prompt=_b_line_video_only_shortcut_system_prompt(),
+            max_tokens=500,
+        )
+        return _normalize_b_line_video_only_shortcut_payload(raw_payload), raw_payload
 
     def verify_b_line_full_av_consistency(
         self,
@@ -2701,6 +2888,71 @@ def _normalize_b_line_audio_only_verification_payload(payload: dict[str, Any]) -
         "target_satisfies_edit": _bool_value(payload.get("target_satisfies_edit")),
         "audio_difference_specific": _bool_value(payload.get("audio_difference_specific")),
         "edit_text_audio_only": _bool_value(payload.get("edit_text_audio_only")),
+        "confidence": _score_value(payload.get("confidence")),
+        "evidence": _detail_list(payload.get("evidence")),
+    }
+
+
+def _normalize_b_line_audio_delta_type(value: Any, subtype: Any = "") -> str:
+    delta_type = str(value or "").strip()
+    if delta_type == "speech_topic":
+        delta_type = "speech"
+    if delta_type in {"music", "sound_event", "sound", "audio"}:
+        delta_type = "audio_event"
+    if delta_type not in {"speech", "audio_event"}:
+        delta_type = "audio_event" if str(subtype or "").strip() in {"music", "sound_event"} else "speech"
+    return delta_type
+
+
+def _normalize_b_line_audio_delta_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_B_LINE_AUDIO_DELTA_FIELDS)
+    if missing_fields:
+        raise ValueError(f"B-line audio delta missing fields: {missing_fields}")
+    delta_type = _normalize_b_line_audio_delta_type(payload.get("audio_delta_type"), payload.get("b_subtype"))
+    subtype = str(payload.get("b_subtype", "")).strip()
+    if subtype not in {"speech_topic", "music", "sound_event"}:
+        subtype = "speech_topic" if delta_type == "speech" else "sound_event"
+    return {
+        "accept": _bool_value(payload.get("accept")),
+        "reject_reason": str(payload.get("reject_reason", "")).strip(),
+        "audio_delta_type": delta_type,
+        "difference_type": delta_type,
+        "b_subtype": subtype,
+        "audio_delta_strength": _score_value(payload.get("audio_delta_strength")),
+        "reference_audio_content": str(payload.get("reference_audio_content", "")).strip(),
+        "target_audio_content": str(payload.get("target_audio_content", "")).strip(),
+        "audio_difference_specific": _bool_value(payload.get("audio_difference_specific")),
+        "confidence": _score_value(payload.get("confidence")),
+        "evidence": _detail_list(payload.get("evidence")),
+    }
+
+
+def _normalize_b_line_audio_edit_generation_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_B_LINE_AUDIO_EDIT_GENERATION_FIELDS)
+    if missing_fields:
+        raise ValueError(f"B-line audio edit generation missing fields: {missing_fields}")
+    return {
+        "accept": _bool_value(payload.get("accept")),
+        "reject_reason": str(payload.get("reject_reason", "")).strip(),
+        "edit_text": str(payload.get("edit_text", "")).strip(),
+        "edit_text_audio_only": _bool_value(payload.get("edit_text_audio_only")),
+        "edit_text_specificity_score": _score_value(payload.get("edit_text_specificity_score")),
+        "confidence": _score_value(payload.get("confidence")),
+        "evidence": _detail_list(payload.get("evidence")),
+    }
+
+
+def _normalize_b_line_video_only_shortcut_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_B_LINE_VIDEO_ONLY_SHORTCUT_FIELDS)
+    if missing_fields:
+        raise ValueError(f"B-line video-only shortcut missing fields: {missing_fields}")
+    shortcut = _bool_value(payload.get("visual_shortcut_risk")) or _bool_value(payload.get("can_identify_target_without_audio"))
+    return {
+        "accept": _bool_value(payload.get("accept")) and not shortcut,
+        "reject_reason": str(payload.get("reject_reason", "")).strip(),
+        "visual_context_preserved": _bool_value(payload.get("visual_context_preserved")),
+        "visual_shortcut_risk": shortcut,
+        "can_identify_target_without_audio": _bool_value(payload.get("can_identify_target_without_audio")),
         "confidence": _score_value(payload.get("confidence")),
         "evidence": _detail_list(payload.get("evidence")),
     }
