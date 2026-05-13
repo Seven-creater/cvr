@@ -33,6 +33,7 @@ CONCURRENCY=${CONCURRENCY:-4}
 REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-240}
 SHARD_TIMEOUT_SECONDS=${SHARD_TIMEOUT_SECONDS:-10800}
 TARGET_B_COUNT=${TARGET_B_COUNT:-1000000}
+MAX_SOURCE_VIDEOS=${MAX_SOURCE_VIDEOS:-0}
 MAX_SOURCE_FOLDERS=${MAX_SOURCE_FOLDERS:-0}
 MAX_CLIPS=${MAX_CLIPS:-0}
 MAX_B_CANDIDATES=${MAX_B_CANDIDATES:-0}
@@ -56,6 +57,10 @@ Options:
   --max-num-seqs N             default: 8
   --start-omni auto|always|never
   --skip-clip-build
+  --max-source-videos N        cap source videos during clip build
+  --max-source-folders N       cap source folders during B-line run
+  --max-clips N
+  --max-b-candidates N
   --propose-shards N
   --propose-parallel-jobs N
   --concurrency N
@@ -80,6 +85,10 @@ while [[ $# -gt 0 ]]; do
     --max-num-seqs) MAX_NUM_SEQS="$2"; shift 2 ;;
     --start-omni) START_OMNI="$2"; shift 2 ;;
     --skip-clip-build) BUILD_CLIPS=0; shift ;;
+    --max-source-videos) MAX_SOURCE_VIDEOS="$2"; shift 2 ;;
+    --max-source-folders) MAX_SOURCE_FOLDERS="$2"; shift 2 ;;
+    --max-clips) MAX_CLIPS="$2"; shift 2 ;;
+    --max-b-candidates) MAX_B_CANDIDATES="$2"; shift 2 ;;
     --propose-shards) PROPOSE_SHARDS="$2"; shift 2 ;;
     --propose-parallel-jobs) PROPOSE_PARALLEL_JOBS="$2"; shift 2 ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
@@ -196,7 +205,8 @@ if [ "$BUILD_CLIPS" = "1" ]; then
     --clip-seconds 10 \
     --min-clip-seconds 8 \
     --max-clip-seconds 12 \
-    --min-clips-per-source 2
+    --min-clips-per-source 2 \
+    --max-source-videos "$MAX_SOURCE_VIDEOS"
 fi
 
 ANNOTATION_TIMEOUT_SECONDS="$ANNOTATION_TIMEOUT_SECONDS" \
