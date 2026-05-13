@@ -143,6 +143,43 @@ class AudioCvrClipsTests(unittest.TestCase):
             self.assertEqual(0, summary["source_video_count"])
             self.assertEqual({"too_few_segments:1": 3}, summary["skipped_counts_by_dataset"]["avatar"])
 
+    def test_clip_extraction_writes_temp_file_then_final_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            raw = root / "raw" / "daily_omni" / "video"
+            raw.mkdir(parents=True)
+            source = raw / "daily.mp4"
+            source.write_bytes(b"video")
+
+            def fake_probe(path: Path) -> dict:
+                return {"has_video": True, "has_audio": True, "duration_seconds": 20.0}
+
+            def fake_run(command: list[str], check: bool) -> None:
+                self.assertTrue(check)
+                Path(command[-1]).write_bytes(b"complete clip")
+
+            with mock.patch("app.audio_cvr_clips.probe_media", side_effect=fake_probe), mock.patch(
+                "app.audio_cvr_clips.subprocess.run", side_effect=fake_run
+            ):
+                summary = build_audio_cvr_clips(
+                    root=root,
+                    datasets=["daily_omni"],
+                    clip_seconds=10,
+                    min_clip_seconds=8,
+                    max_clip_seconds=12,
+                )
+
+            records = [
+                json.loads(line)
+                for line in Path(summary["manifest_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            output_paths = [root / record["output_path"] for record in records]
+            self.assertEqual(2, len(output_paths))
+            self.assertTrue(all(path.read_bytes() == b"complete clip" for path in output_paths))
+            self.assertFalse(list(output_paths[0].parent.glob("*.tmp.*.mp4")))
+
 
 if __name__ == "__main__":
     unittest.main()

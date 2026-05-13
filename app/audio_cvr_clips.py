@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from collections import Counter
@@ -168,14 +169,13 @@ def build_audio_cvr_clips(
                 segments.append(record)
                 candidate_clip_ids.append(clip_id)
                 if not dry_run and (overwrite or not output_path.exists()):
-                    command = build_ffmpeg_extract_command(
+                    _extract_clip_atomic(
                         source_path=source_path,
                         output_path=output_path,
                         start_seconds=start_seconds,
                         end_seconds=end_seconds,
                         overwrite=overwrite,
                     )
-                    subprocess.run(command, check=True)
                     extracted_count += 1
 
             groups.append(
@@ -301,6 +301,36 @@ def _source_id(dataset: str, source_path: Path, raw_root: Path) -> str:
     except ValueError:
         relative = source_path.as_posix()
     return _safe_id(f"{dataset}_{source_path.stem}_{_stable_hash(relative)[:8]}")
+
+
+def _extract_clip_atomic(
+    *,
+    source_path: Path,
+    output_path: Path,
+    start_seconds: float,
+    end_seconds: float,
+    overwrite: bool,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f".{output_path.stem}.tmp.{os.getpid()}{output_path.suffix}")
+    if temp_path.exists():
+        temp_path.unlink()
+    command = build_ffmpeg_extract_command(
+        source_path=source_path,
+        output_path=temp_path,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        overwrite=True,
+    )
+    try:
+        subprocess.run(command, check=True)
+        if overwrite or not output_path.exists():
+            temp_path.replace(output_path)
+        else:
+            temp_path.unlink(missing_ok=True)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def build_parser() -> argparse.ArgumentParser:
