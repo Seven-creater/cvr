@@ -234,6 +234,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("CLIP_SECONDS=${CLIP_SECONDS:-10}", clip_script)
         self.assertIn("MIN_CLIP_SECONDS=${MIN_CLIP_SECONDS:-8}", clip_script)
         self.assertIn("MAX_CLIP_SECONDS=${MAX_CLIP_SECONDS:-12}", clip_script)
+        self.assertIn("EXCLUDE_DATASETS=${EXCLUDE_DATASETS:-VoxCeleb,voxceleb,voxceleb_seed}", clip_script)
+        self.assertIn("--exclude-dataset \"$dataset\"", clip_script)
         self.assertIn("python3 -m app.audio_cvr_clips", clip_script)
         self.assertNotIn("modelscope download", clip_script)
         self.assertNotIn("vllm.entrypoints.openai.api_server", clip_script)

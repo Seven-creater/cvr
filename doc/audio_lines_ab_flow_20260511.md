@@ -29,6 +29,18 @@ raw datasets 目录：
 /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/raw
 ```
 
+服务器当前需要纳入 Audio-CVR v1 的 raw 数据集布局必须按下表理解，不能只扫 `video/` 子目录：
+
+| 数据集 | 必扫视频目录 | 当前用途 | 备注 |
+|---|---|---|---|
+| `daily_omni` | `raw/daily_omni/video/` | 通用音视频样本 | `audio/` 是独立 wav，不作为视频源 |
+| `hdtf` | `raw/hdtf/videos/`, `raw/hdtf/clips/` | B 线 speech_content | 既有原视频也有切片，低于 8s 的会被跳过 |
+| `avatar` | `raw/avatar/`, `raw/avatar/video/` | 音频/说话/事件补充 | 目录结构可能有根目录 mp4，也可能有 `video/` |
+| `vggsound` | `raw/vggsound/scratch/` | music / sound_event | 不在 `video/` 下，必须递归扫 `scratch/` |
+| `vgg_monoaudio` | `raw/vgg_monoaudio/inter_class/mixed/` | sound/music 补充 | `target_audio/` 是 wav，不作为视频源 |
+| `worldsense` | `raw/worldsense/videos/` | 通用音视频样本 | 只扫视频目录，不扫 `audios/` 和 `subtitles/` |
+| `VoxCeleb` | `/data02/pretrained_model/cvr_learn/cvr_data/audio_datasets/VoxCeleb/` | 后续 B 线 speech pair | 仍在下载中，本轮默认排除 |
+
 正式 Audio-CVR v1 切片输出：
 
 ```text

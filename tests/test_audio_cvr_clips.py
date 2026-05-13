@@ -59,6 +59,62 @@ class AudioCvrClipsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build_audio_cvr_clips(root=root, clip_seconds=6, min_clip_seconds=8, max_clip_seconds=12, dry_run=True)
 
+    def test_scans_known_server_dataset_layouts_instead_of_only_video_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            raw = root / "raw"
+            video_paths = [
+                raw / "daily_omni" / "video" / "daily.mp4",
+                raw / "hdtf" / "videos" / "hdtf_video.mp4",
+                raw / "hdtf" / "clips" / "hdtf_clip.mp4",
+                raw / "avatar" / "avatar_root.mp4",
+                raw / "avatar" / "video" / "avatar_video.mp4",
+                raw / "vggsound" / "scratch" / "class_a" / "vgg.mp4",
+                raw / "vgg_monoaudio" / "inter_class" / "mixed" / "mono.mp4",
+                raw / "worldsense" / "videos" / "world.mp4",
+                raw / "VoxCeleb" / "vox.mp4",
+            ]
+            ignored_paths = [
+                raw / "daily_omni" / "other" / "ignored.mp4",
+                raw / "vgg_monoaudio" / "intra_class" / "ignored.mp4",
+            ]
+            for path in video_paths + ignored_paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"video")
+
+            def fake_probe(path: Path) -> dict:
+                return {"has_video": True, "has_audio": True, "duration_seconds": 20.0}
+
+            datasets = ["daily_omni", "hdtf", "avatar", "vggsound", "vgg_monoaudio", "worldsense", "VoxCeleb"]
+            with mock.patch("app.audio_cvr_clips.probe_media", side_effect=fake_probe):
+                summary = build_audio_cvr_clips(
+                    root=root,
+                    datasets=datasets,
+                    exclude_datasets=["VoxCeleb"],
+                    clip_seconds=10,
+                    min_clip_seconds=8,
+                    max_clip_seconds=12,
+                    dry_run=True,
+                )
+
+            self.assertEqual(
+                {
+                    "daily_omni": 1,
+                    "hdtf": 2,
+                    "avatar": 2,
+                    "vggsound": 1,
+                    "vgg_monoaudio": 1,
+                    "worldsense": 1,
+                },
+                summary["discovered_video_counts"],
+            )
+            self.assertNotIn("VoxCeleb", summary["dataset_names"])
+            self.assertEqual(8, summary["source_video_count"])
+            self.assertEqual(16, summary["segment_count"])
+            self.assertTrue(any(path.endswith("raw/vggsound/scratch") for path in summary["dataset_scan_roots"]["vggsound"]))
+            self.assertTrue(any(path.endswith("raw/vgg_monoaudio/inter_class/mixed") for path in summary["dataset_scan_roots"]["vgg_monoaudio"]))
+
 
 if __name__ == "__main__":
     unittest.main()

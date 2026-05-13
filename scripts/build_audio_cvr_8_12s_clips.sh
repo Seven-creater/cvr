@@ -22,6 +22,7 @@ MAX_CLIPS_PER_SOURCE=${MAX_CLIPS_PER_SOURCE:-0}
 MAX_SOURCE_VIDEOS=${MAX_SOURCE_VIDEOS:-0}
 MAX_SOURCE_VIDEOS_PER_DATASET=${MAX_SOURCE_VIDEOS_PER_DATASET:-0}
 DATASETS=${DATASETS:-}
+EXCLUDE_DATASETS=${EXCLUDE_DATASETS:-VoxCeleb,voxceleb,voxceleb_seed}
 DRY_RUN=${DRY_RUN:-0}
 OVERWRITE=${OVERWRITE:-0}
 
@@ -33,6 +34,7 @@ Options:
   --root PATH
   --output-root PATH
   --dataset NAME[,NAME]
+  --exclude-dataset NAME[,NAME] default: VoxCeleb,voxceleb,voxceleb_seed
   --clip-seconds N          default: 10
   --min-clip-seconds N      default: 8
   --max-clip-seconds N      default: 12
@@ -51,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     --root) ROOT="$2"; shift 2 ;;
     --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
     --dataset) DATASETS="${DATASETS:+$DATASETS,}$2"; shift 2 ;;
+    --exclude-dataset) EXCLUDE_DATASETS="${EXCLUDE_DATASETS:+$EXCLUDE_DATASETS,}$2"; shift 2 ;;
     --clip-seconds) CLIP_SECONDS="$2"; shift 2 ;;
     --min-clip-seconds) MIN_CLIP_SECONDS="$2"; shift 2 ;;
     --max-clip-seconds) MAX_CLIP_SECONDS="$2"; shift 2 ;;
@@ -90,6 +93,14 @@ if [ -n "$DATASETS" ]; then
     test -n "$dataset" && args+=(--dataset "$dataset")
   done
 fi
+if [ -n "$EXCLUDE_DATASETS" ]; then
+  IFS=',' read -r -a excluded_dataset_items <<< "$EXCLUDE_DATASETS"
+  for dataset in "${excluded_dataset_items[@]}"; do
+    dataset="${dataset#"${dataset%%[![:space:]]*}"}"
+    dataset="${dataset%"${dataset##*[![:space:]]}"}"
+    test -n "$dataset" && args+=(--exclude-dataset "$dataset")
+  done
+fi
 if [ "$DRY_RUN" = "1" ]; then
   args+=(--dry-run)
 fi
@@ -97,5 +108,5 @@ if [ "$OVERWRITE" = "1" ]; then
   args+=(--overwrite)
 fi
 
-echo "[audio-cvr-clips] root=$ROOT output_root=$OUTPUT_ROOT clip_seconds=$CLIP_SECONDS min=$MIN_CLIP_SECONDS max=$MAX_CLIP_SECONDS datasets=${DATASETS:-all}"
+echo "[audio-cvr-clips] root=$ROOT output_root=$OUTPUT_ROOT clip_seconds=$CLIP_SECONDS min=$MIN_CLIP_SECONDS max=$MAX_CLIP_SECONDS datasets=${DATASETS:-all} exclude_datasets=${EXCLUDE_DATASETS:-none}"
 "${args[@]}"
