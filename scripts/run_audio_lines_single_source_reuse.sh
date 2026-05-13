@@ -39,6 +39,9 @@ SKIP_ANNOTATION_REFRESH=${SKIP_ANNOTATION_REFRESH:-0}
 ANNOTATION_SEARCH_ROOTS=${ANNOTATION_SEARCH_ROOTS:-}
 A_CANDIDATE_MODE=${A_CANDIDATE_MODE:-hybrid}
 B_CANDIDATE_MODE=${B_CANDIDATE_MODE:-hybrid}
+MIN_CLIPS_PER_FOLDER=${MIN_CLIPS_PER_FOLDER:-4}
+MIN_GROUP_CLIPS=${MIN_GROUP_CLIPS:-4}
+KEEP_ALL_B=${KEEP_ALL_B:-0}
 OMNI_TRANSIENT_RETRIES=${OMNI_TRANSIENT_RETRIES:-2}
 FAIL_ON_TRANSIENT_OMNI_ERRORS=${FAIL_ON_TRANSIENT_OMNI_ERRORS:-1}
 
@@ -65,6 +68,9 @@ Options:
   --acceptance-profile exploration|b_audio_review|b_audio_context_cvr|b_audio_blind_review|b_audio_blind_review_v2
   --a-candidate-mode hybrid|omni_first
   --b-candidate-mode hybrid|audio_first
+  --min-clips-per-folder N
+  --min-group-clips N
+  --keep-all-b
   --reuse-run-root PATH
   --skip-annotation-refresh
   --run-b-only
@@ -98,6 +104,9 @@ while [[ $# -gt 0 ]]; do
     --acceptance-profile) B_ACCEPTANCE_PROFILE="$2"; shift 2 ;;
     --a-candidate-mode) A_CANDIDATE_MODE="$2"; shift 2 ;;
     --b-candidate-mode) B_CANDIDATE_MODE="$2"; shift 2 ;;
+    --min-clips-per-folder) MIN_CLIPS_PER_FOLDER="$2"; shift 2 ;;
+    --min-group-clips) MIN_GROUP_CLIPS="$2"; shift 2 ;;
+    --keep-all-b) KEEP_ALL_B=1; shift ;;
     --reuse-run-root) REUSE_RUN_ROOT="$2"; RUN_ROOT="$2"; FRESH_ANNOTATIONS=0; shift 2 ;;
     --skip-annotation-refresh) SKIP_ANNOTATION_REFRESH=1; shift ;;
     --run-b-only) AUDIO_DATASET_LINE=speech_audio_content; shift ;;
@@ -243,7 +252,7 @@ run_line_shards() {
 mkdir -p "$RUN_ROOT" "$REPO_ROOT/logs"
 echo "[audio-lines] start $(date)"
 echo "[audio-lines] run_root=$RUN_ROOT root=$ROOT single_source_root=$SINGLE_SOURCE_ROOT line=$AUDIO_DATASET_LINE"
-echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS max_clips=$MAX_CLIPS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS shard_timeout_seconds=$SHARD_TIMEOUT_SECONDS annotation_search_roots=$ANNOTATION_SEARCH_ROOTS audio_line_quality_profile=$AUDIO_LINE_QUALITY_PROFILE b_acceptance_profile=$B_ACCEPTANCE_PROFILE a_candidate_mode=$A_CANDIDATE_MODE b_candidate_mode=$B_CANDIDATE_MODE fresh_annotations=$FRESH_ANNOTATIONS force_audio_focused_refresh=$FORCE_AUDIO_FOCUSED_REFRESH reuse_run_root=$REUSE_RUN_ROOT skip_annotation_refresh=$SKIP_ANNOTATION_REFRESH omni_transient_retries=$OMNI_TRANSIENT_RETRIES fail_on_transient_omni_errors=$FAIL_ON_TRANSIENT_OMNI_ERRORS"
+echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS max_clips=$MAX_CLIPS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS shard_timeout_seconds=$SHARD_TIMEOUT_SECONDS annotation_search_roots=$ANNOTATION_SEARCH_ROOTS audio_line_quality_profile=$AUDIO_LINE_QUALITY_PROFILE b_acceptance_profile=$B_ACCEPTANCE_PROFILE a_candidate_mode=$A_CANDIDATE_MODE b_candidate_mode=$B_CANDIDATE_MODE min_clips_per_folder=$MIN_CLIPS_PER_FOLDER min_group_clips=$MIN_GROUP_CLIPS keep_all_b=$KEEP_ALL_B fresh_annotations=$FRESH_ANNOTATIONS force_audio_focused_refresh=$FORCE_AUDIO_FOCUSED_REFRESH reuse_run_root=$REUSE_RUN_ROOT skip_annotation_refresh=$SKIP_ANNOTATION_REFRESH omni_transient_retries=$OMNI_TRANSIENT_RETRIES fail_on_transient_omni_errors=$FAIL_ON_TRANSIENT_OMNI_ERRORS"
 resolve_omni_model
 
 SEGMENTS_MANIFEST="$RUN_ROOT/extracted_single_source_clips.jsonl"
@@ -286,6 +295,7 @@ else
     --single-source-root "$SINGLE_SOURCE_ROOT"
     --run-root "$RUN_ROOT"
     --max-source-folders "$MAX_SOURCE_FOLDERS"
+    --min-clips-per-folder "$MIN_CLIPS_PER_FOLDER"
   )
   if [ "$MAX_CLIPS" != "0" ]; then
     prepare_existing_args+=(--max-clips "$MAX_CLIPS")
@@ -343,7 +353,8 @@ python3 -m app.composed_data mine-single-source-pairs \
   --clip-groups-path "$CLIP_GROUPS" \
   --output-path "$PAIR_CANDIDATES" \
   --report-path "$RUN_ROOT/single_source_pair_report.md" \
-  --acceptance-profile exploration
+  --acceptance-profile exploration \
+  --min-group-clips "$MIN_GROUP_CLIPS"
 
 python3 -m app.audio_lines_single_source split-candidates \
   --root "$ROOT" \
@@ -382,7 +393,8 @@ fi
 python3 -m app.audio_lines_single_source merge-line-results \
   --run-root "$RUN_ROOT" \
   --target-a-count "$TARGET_A_COUNT" \
-  --target-b-count "$TARGET_B_COUNT"
+  --target-b-count "$TARGET_B_COUNT" \
+  $(if [ "$KEEP_ALL_B" = "1" ]; then printf '%s' '--keep-all-b'; fi)
 
 mkdir -p "$RUN_ROOT/manual_review"
 python3 -m app.composed_data build-review-bundle \

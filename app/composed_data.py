@@ -2016,8 +2016,10 @@ def mine_single_source_pairs(
     output_path: str | Path | None = None,
     report_path: str | Path | None = None,
     acceptance_profile: str = DEFAULT_ACCEPTANCE_PROFILE,
+    min_group_clips: int = 4,
 ) -> dict[str, Any]:
     acceptance_profile = _normalize_acceptance_profile(acceptance_profile)
+    min_group_clips = max(2, int(min_group_clips or 2))
     layout = ensure_layout(root)
     annotations_path = Path(clip_annotations_path)
     groups_path = Path(clip_groups_path)
@@ -2046,7 +2048,7 @@ def mine_single_source_pairs(
             if clip_id in annotations_by_id and not bool(annotations_by_id[clip_id].get("fallback_used"))
         ]
         ordered_annotations.sort(key=lambda item: (_clip_start_seconds(item), str(item.get("clip_id", ""))))
-        if len(ordered_annotations) < 4:
+        if len(ordered_annotations) < min_group_clips:
             skipped_group_count += 1
             continue
         usable_group_count += 1
@@ -2081,7 +2083,7 @@ def mine_single_source_pairs(
                     record["risk_flags"] = _dedupe_strings(list(record.get("risk_flags", [])) + ["diagnostic_only_final_disabled_type"])
                 mined_records.append(record)
     if usable_group_count <= 0:
-        raise ValueError("single-source pair mining needs at least one group with 4 usable annotations")
+        raise ValueError(f"single-source pair mining needs at least one group with {min_group_clips} usable annotations")
 
     _write_jsonl(output, mined_records)
     report.write_text(
@@ -2107,6 +2109,7 @@ def mine_single_source_pairs(
         "group_count": len(groups),
         "usable_group_count": usable_group_count,
         "skipped_group_count": skipped_group_count,
+        "min_group_clips": min_group_clips,
         "difference_type_counts": dict(Counter(str(item.get("difference", {}).get("type", "")) for item in mined_records)),
         "acceptance_profile": acceptance_profile,
     }
@@ -10552,6 +10555,18 @@ def _apply_single_source_delta_uniqueness(
     acceptance_profile: str,
 ) -> None:
     if not records or not any(bool(record.get("single_source_pair")) for record in records):
+        return
+    if _is_b_audio_blind_review_v2_profile(acceptance_profile):
+        for record in records:
+            if not bool(record.get("single_source_pair")):
+                continue
+            issues = [
+                str(issue).strip()
+                for issue in record.get("single_source_pair_acceptance_issues", [])
+                if str(issue).strip()
+            ]
+            base_accepted = bool(record.get("model_accepted", record.get("accepted")))
+            _set_single_source_record_acceptance(record, accepted=base_accepted and not issues, extra_issues=issues)
         return
     # `max_accepted_pairs` is kept for API compatibility, but single-source
     # production now treats all final-Omni-passed pairs as dataset candidates.
@@ -19637,6 +19652,7 @@ def build_parser() -> argparse.ArgumentParser:
     mine_single_source_parser.add_argument("--output-path")
     mine_single_source_parser.add_argument("--report-path")
     mine_single_source_parser.add_argument("--acceptance-profile", choices=sorted(ACCEPTANCE_PROFILE_NAMES), default=DEFAULT_ACCEPTANCE_PROFILE)
+    mine_single_source_parser.add_argument("--min-group-clips", type=int, default=4)
 
     propose_single_source_parser = subparsers.add_parser("propose-single-source-pairs")
     propose_single_source_parser.add_argument("--root", default=DEFAULT_DATA_ROOT)
@@ -19939,6 +19955,7 @@ def main() -> None:
             output_path=args.output_path,
             report_path=args.report_path,
             acceptance_profile=args.acceptance_profile,
+            min_group_clips=args.min_group_clips,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

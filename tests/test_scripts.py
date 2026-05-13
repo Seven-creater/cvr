@@ -204,6 +204,12 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--a-candidate-mode \"$A_CANDIDATE_MODE\"", script)
         self.assertIn("B_CANDIDATE_MODE=${B_CANDIDATE_MODE:-hybrid}", script)
         self.assertIn("--b-candidate-mode \"$B_CANDIDATE_MODE\"", script)
+        self.assertIn("MIN_CLIPS_PER_FOLDER=${MIN_CLIPS_PER_FOLDER:-4}", script)
+        self.assertIn("--min-clips-per-folder \"$MIN_CLIPS_PER_FOLDER\"", script)
+        self.assertIn("MIN_GROUP_CLIPS=${MIN_GROUP_CLIPS:-4}", script)
+        self.assertIn("--min-group-clips \"$MIN_GROUP_CLIPS\"", script)
+        self.assertIn("KEEP_ALL_B=${KEEP_ALL_B:-0}", script)
+        self.assertIn("--keep-all-b", script)
         self.assertIn("v5_audio_primary", script)
         self.assertIn("--audio-focused", script)
         self.assertIn("OMNI_TRANSIENT_RETRIES=${OMNI_TRANSIENT_RETRIES:-2}", script)
@@ -220,6 +226,28 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("modelscope download", script)
         self.assertNotIn("vllm", script)
         self.assertNotIn("8092", script)
+
+    def test_audio_cvr_v1_b_first_scripts_use_10s_clips_and_keep_all_b(self) -> None:
+        clip_script = Path("scripts/build_audio_cvr_8_12s_clips.sh").read_text(encoding="utf-8")
+        run_script = Path("scripts/run_audio_cvr_v1_b_first.sh").read_text(encoding="utf-8")
+
+        self.assertIn("CLIP_SECONDS=${CLIP_SECONDS:-10}", clip_script)
+        self.assertIn("MIN_CLIP_SECONDS=${MIN_CLIP_SECONDS:-8}", clip_script)
+        self.assertIn("MAX_CLIP_SECONDS=${MAX_CLIP_SECONDS:-12}", clip_script)
+        self.assertIn("python3 -m app.audio_cvr_clips", clip_script)
+        self.assertNotIn("modelscope download", clip_script)
+        self.assertNotIn("vllm.entrypoints.openai.api_server", clip_script)
+
+        self.assertIn("AUDIO_DATASET_LINE=speech_audio_content", run_script)
+        self.assertIn("AUDIO_LINE_QUALITY_PROFILE=b_audio_blind_review_v2", run_script)
+        self.assertIn("B_ACCEPTANCE_PROFILE=b_audio_blind_review_v2", run_script)
+        self.assertIn("B_CANDIDATE_MODE=audio_first", run_script)
+        self.assertIn("MIN_CLIPS_PER_FOLDER=2", run_script)
+        self.assertIn("MIN_GROUP_CLIPS=2", run_script)
+        self.assertIn("KEEP_ALL_B=1", run_script)
+        self.assertIn("--keep-all-b", run_script)
+        self.assertNotIn("modelscope download", run_script)
+        self.assertNotIn("vllm.entrypoints.openai.api_server", run_script)
 
     def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
         script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")

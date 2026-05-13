@@ -107,6 +107,7 @@ def prepare_existing_single_source_clips(
     annotation_search_roots: list[str | Path] | None = None,
     force_audio_focused_refresh: bool = False,
     reuse_annotations: bool = True,
+    min_clips_per_folder: int = 4,
 ) -> dict[str, Any]:
     root_path = Path(root)
     source_root = Path(single_source_root)
@@ -114,6 +115,7 @@ def prepare_existing_single_source_clips(
     output_root.mkdir(parents=True, exist_ok=True)
     if not source_root.exists():
         raise FileNotFoundError(f"single_source_root does not exist: {source_root}")
+    min_clips_per_folder = max(1, int(min_clips_per_folder or 1))
 
     folders = [path for path in sorted(source_root.iterdir(), key=lambda item: item.name) if path.is_dir()]
     if max_source_folders and max_source_folders > 0:
@@ -142,12 +144,12 @@ def prepare_existing_single_source_clips(
         single_files = [path for path in media_files if path != whole and "single" in path.stem.lower()]
         if not single_files:
             single_files = [path for path in media_files if path != whole]
-        if len(single_files) < 4:
+        if len(single_files) < min_clips_per_folder:
             skipped_folders.append({"folder": str(folder), "reason": f"too_few_segments:{len(single_files)}"})
             continue
         if max_clips and max_clips > 0:
             remaining = max_clips - len(segments)
-            if remaining < 4:
+            if remaining < min_clips_per_folder:
                 break
             single_files = single_files[:remaining]
 
@@ -263,6 +265,7 @@ def prepare_existing_single_source_clips(
         "audio_refresh_needed_count": len(audio_refresh_manifest),
         "force_audio_focused_refresh": bool(force_audio_focused_refresh),
         "reuse_annotations": bool(reuse_annotations),
+        "min_clips_per_folder": min_clips_per_folder,
         "max_clips": int(max_clips or 0),
         "annotation_sources": annotation_sources,
         "outputs": {key: str(value) for key, value in paths.items()},
@@ -512,6 +515,7 @@ def merge_line_results(
     run_root: str | Path,
     target_a_count: int = 8,
     target_b_count: int = 8,
+    keep_all_b: bool = False,
 ) -> dict[str, Any]:
     root = Path(run_root)
     a_accepted_progress = _load_many_jsonl(root / "a_shards", "accepted_progress_*.jsonl")
@@ -523,7 +527,7 @@ def merge_line_results(
     a_accepted_all = [record for record in a_ranked if bool(record.get("accepted"))]
     b_accepted_all = [record for record in b_ranked if bool(record.get("accepted"))]
     a_selected = a_accepted_all[: max(0, target_a_count)]
-    b_selected = _select_b_line_records(b_accepted_all, target_b_count=target_b_count)
+    b_selected = b_accepted_all if keep_all_b else _select_b_line_records(b_accepted_all, target_b_count=target_b_count)
     b_speech = [record for record in b_selected if _b_line_record_subtype(record) == "speech_topic_in_video_context"]
     b_music = [record for record in b_selected if _b_line_record_subtype(record) == "music"]
     b_sound = [record for record in b_selected if _b_line_record_subtype(record) == "sound_event"]
@@ -551,6 +555,7 @@ def merge_line_results(
         "b_context_cvr_summary_path": str(root / "b_context_cvr_summary.json"),
         "target_a_count": target_a_count,
         "target_b_count": target_b_count,
+        "keep_all_b": bool(keep_all_b),
         "a_reject_reason_counts": _reject_reason_counts(a_ranked),
         "b_reject_reason_counts": _reject_reason_counts(b_ranked),
     }
@@ -1324,6 +1329,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--annotation-search-root", action="append", default=[])
     prepare.add_argument("--force-audio-focused-refresh", action="store_true")
     prepare.add_argument("--no-annotation-reuse", action="store_true")
+    prepare.add_argument("--min-clips-per-folder", type=int, default=4)
 
     merge_ann = subparsers.add_parser("merge-annotations")
     merge_ann.add_argument("--base-annotations-path", required=True)
@@ -1354,6 +1360,7 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--run-root", required=True)
     merge.add_argument("--target-a-count", type=int, default=8)
     merge.add_argument("--target-b-count", type=int, default=8)
+    merge.add_argument("--keep-all-b", action="store_true")
     return parser
 
 
@@ -1369,6 +1376,7 @@ def main() -> None:
             annotation_search_roots=args.annotation_search_root,
             force_audio_focused_refresh=args.force_audio_focused_refresh,
             reuse_annotations=not args.no_annotation_reuse,
+            min_clips_per_folder=args.min_clips_per_folder,
         )
     elif args.command == "merge-annotations":
         result = merge_annotations(
@@ -1394,7 +1402,12 @@ def main() -> None:
     elif args.command == "shard-jsonl":
         result = shard_jsonl(input_path=args.input_path, output_dir=args.output_dir, shards=args.shards, prefix=args.prefix)
     elif args.command == "merge-line-results":
-        result = merge_line_results(run_root=args.run_root, target_a_count=args.target_a_count, target_b_count=args.target_b_count)
+        result = merge_line_results(
+            run_root=args.run_root,
+            target_a_count=args.target_a_count,
+            target_b_count=args.target_b_count,
+            keep_all_b=args.keep_all_b,
+        )
     else:
         raise ValueError(f"unsupported command: {args.command}")
     print(json.dumps(result, ensure_ascii=False, indent=2))

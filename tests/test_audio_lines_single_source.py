@@ -283,6 +283,33 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertFalse(summary["reuse_annotations"])
             self.assertEqual(9, summary["segment_count"])
 
+    def test_prepare_existing_can_accept_two_clip_audio_cvr_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            folder = root / "clips" / "audio_cvr_8_12s" / "daily_source_001"
+            folder.mkdir(parents=True)
+            for index in range(1, 3):
+                (folder / f"daily_source_001__single_{index:03d}.mp4").write_bytes(b"video")
+
+            summary = prepare_existing_single_source_clips(
+                root=root,
+                single_source_root=root / "clips" / "audio_cvr_8_12s",
+                run_root=root / "runs" / "audio_cvr",
+                min_clips_per_folder=2,
+                reuse_annotations=False,
+            )
+
+            groups = [
+                json.loads(line)
+                for line in (root / "runs" / "audio_cvr" / "single_source_clip_groups.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, summary["usable_group_count"])
+            self.assertEqual(2, summary["segment_count"])
+            self.assertEqual(2, summary["min_clips_per_folder"])
+            self.assertEqual(["daily_source_001__single_001", "daily_source_001__single_002"], groups[0]["candidate_clip_ids"])
+
     def test_split_candidates_builds_a_and_b_lines_without_caption_answers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -792,6 +819,39 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertLessEqual(len(speech), 2)
             self.assertEqual(2, len(music))
             self.assertIn("b_context_cvr_summary_path", summary)
+
+    def test_merge_b_line_can_keep_all_accepted_records_for_large_b_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_root = root / "run"
+            b_shards = run_root / "b_shards"
+            b_shards.mkdir(parents=True)
+            accepted = []
+            for index in range(1, 7):
+                accepted.append(
+                    {
+                        "proposal_id": f"b{index}",
+                        "reference_video": f"ref{index}.mp4",
+                        "target_video": f"tgt{index}.mp4",
+                        "edit_text": f"change the speech from discussing topic {index} to discussing topic {index + 1}",
+                        "difference": {"type": "speech"},
+                        "accepted": True,
+                        "b_subtype": "speech_topic_in_video_context",
+                        "quality": {"b_subtype": "speech_topic_in_video_context"},
+                    }
+                )
+            self._write_jsonl(b_shards / "ranked_01.jsonl", accepted)
+
+            summary = merge_line_results(run_root=run_root, target_a_count=0, target_b_count=2, keep_all_b=True)
+
+            selected = [
+                json.loads(line)
+                for line in (run_root / "b_speech_audio_content_triplets.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(6, len(selected))
+            self.assertEqual(6, summary["b_exported_count"])
+            self.assertTrue(summary["keep_all_b"])
 
     def test_a_omni_first_keeps_audio_anchor_pairs_for_omni_visual_judging(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
