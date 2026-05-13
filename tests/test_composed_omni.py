@@ -322,6 +322,71 @@ class ComposedOmniClientTests(unittest.TestCase):
         self.assertIn("listening to the audio only", user_text)
         self.assertEqual(55.0, request_holder["timeout"])
 
+    def test_b_line_audio_only_proposal_uses_audio_urls_without_visual_prompting(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "accept": True,
+                                "reject_reason": "",
+                                "difference_type": "speech",
+                                "b_subtype": "speech_topic",
+                                "reference_audio_content": "commentary introduces the players",
+                                "target_audio_content": "commentary describes a goal",
+                                "edit_text": "change the commentary from introducing the players to describing the goal",
+                                "audio_difference_specific": True,
+                                "edit_text_audio_only": True,
+                                "confidence": 0.91,
+                                "evidence": ["reference introduces players", "target describes a goal"],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-audio-only-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            ref_audio = tmp_dir / "ref.wav"
+            tgt_audio = tmp_dir / "tgt.wav"
+            ref_audio.write_bytes(b"fake-ref-wav")
+            tgt_audio.write_bytes(b"fake-tgt-wav")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8093/v1",
+                api_key="EMPTY",
+                model="qwen3-omni",
+                timeout_seconds=30.0,
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _raw_payload = client.propose_b_line_audio_only_pair(
+                    reference_audio_path=str(ref_audio),
+                    target_audio_path=str(tgt_audio),
+                    metadata={"proposal_id": "p1"},
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertTrue(normalized["accept"])
+        request = request_holder["request"]
+        request_body = json.loads(request.data.decode("utf-8"))
+        user_content = request_body["messages"][1]["content"]
+        audio_items = [item for item in user_content if item.get("type") == "audio_url"]
+        self.assertEqual(2, len(audio_items))
+        self.assertTrue(audio_items[0]["audio_url"]["url"].startswith("data:audio/"))
+        prompt_text = " ".join(item.get("text", "") for item in user_content if item.get("type") == "text").lower()
+        for forbidden in ("video", "frame", "visual", "scene", "caption", "gesture", "smile", "button"):
+            self.assertNotIn(forbidden, prompt_text)
+
     def test_request_json_repairs_malformed_json_response(self) -> None:
         requests: list[object] = []
         repaired_payload = {

@@ -149,6 +149,9 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             ("change the voice from saying \"A\" to saying \"B\"", "speech", "placeholder audio wording"),
             ("add target audio to the audio", "audio_event", "generic audio placeholder"),
             ("replace fishing reel sound; Two men are fishing near the river.", "audio_event", "visual clause in audio edit"),
+            ("change the speech from discussing wide smile to discussing neutral smile", "speech", "visual wording smile"),
+            ("change the speech from discussing hand gestures to discussing walking off-screen", "speech", "visual wording gesture"),
+            ("add a SUBSCRIBE button and bell icon animation with a mouse click sound to the audio", "audio_event", "visual wording subscribe"),
         ]
         for edit_text, difference_type, expected in bad_cases:
             with self.subTest(edit_text=edit_text):
@@ -953,6 +956,222 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual(1, summary["accepted_count"])
             self.assertEqual("speech_audio_content", accepted[0]["audio_dataset_line"])
             self.assertEqual("speech", accepted[0]["difference"]["type"])
+
+    def test_b_audio_blind_review_accepts_audio_only_verified_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4", "ref.wav", "tgt.wav"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"media")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {
+                        "clip_id": "seg_1",
+                        "output_path": "clips/seg_1.mp4",
+                        "summary": "sports broadcast with the same field view",
+                        "scene": "stadium broadcast",
+                        "speech": ["commentary introduces the players"],
+                        "modalities": ["audio", "visual"],
+                    },
+                    {
+                        "clip_id": "seg_2",
+                        "output_path": "clips/seg_2.mp4",
+                        "summary": "sports broadcast with the same field view",
+                        "scene": "stadium broadcast",
+                        "speech": ["commentary describes a goal"],
+                        "modalities": ["audio", "visual"],
+                    },
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "proposal_id": "p1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "players", "to": "goal"},
+                        "quality": {"visual_delta_strength": 0.1, "visual_context_similarity": 0.9},
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_b_line_audio_only_pair.return_value = (
+                {
+                    "accept": True,
+                    "reject_reason": "",
+                    "difference_type": "speech",
+                    "b_subtype": "speech_topic",
+                    "reference_audio_content": "commentary introduces the players",
+                    "target_audio_content": "commentary describes a goal",
+                    "edit_text": "change the commentary from introducing the players to describing the goal",
+                    "audio_difference_specific": True,
+                    "edit_text_audio_only": True,
+                    "confidence": 0.91,
+                    "evidence": ["reference introduces players", "target describes a goal"],
+                },
+                {"raw": "proposal"},
+            )
+            client.verify_b_line_audio_only_edit.return_value = (
+                {
+                    "accept": True,
+                    "reject_reason": "",
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "audio_difference_specific": True,
+                    "edit_text_audio_only": True,
+                    "confidence": 0.92,
+                    "evidence": ["target audio describes a goal"],
+                },
+                {"raw": "audio_verify"},
+            )
+            client.verify_b_line_full_av_consistency.return_value = (
+                {
+                    "accept": True,
+                    "reject_reason": "",
+                    "visual_context_preserved": True,
+                    "visual_shortcut_risk": False,
+                    "audio_edit_still_valid": True,
+                    "confidence": 0.85,
+                    "evidence": ["full videos keep the same broadcast context"],
+                },
+                {"raw": "full_av"},
+            )
+            with (
+                mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client),
+                mock.patch(
+                    "app.composed_data._extract_audio_only_cache",
+                    side_effect=[root / "clips" / "ref.wav", root / "clips" / "tgt.wav"],
+                ),
+            ):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    acceptance_profile="b_audio_blind_review",
+                    audio_dataset_line="speech_audio_content",
+                )
+
+            ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, summary["accepted_count"])
+            self.assertEqual("audio_only_blind_review", ranked[0]["candidate_stage"])
+            self.assertEqual("change the commentary from introducing the players to describing the goal", ranked[0]["edit_text"])
+            self.assertTrue(ranked[0]["audio_only_accept"])
+            self.assertTrue(ranked[0]["full_av_consistency_accept"])
+            client.propose_single_source_pair.assert_not_called()
+
+    def test_b_audio_blind_review_rejects_full_av_visual_shortcut(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            for name in ("seg_1.mp4", "seg_2.mp4", "ref.wav", "tgt.wav"):
+                path = root / "clips" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"media")
+            annotations_path = root / "captions" / "single_source_annotations.jsonl"
+            candidates_path = root / "pairs" / "single_source_pair_candidates.jsonl"
+            self._write_jsonl(
+                annotations_path,
+                [
+                    {"clip_id": "seg_1", "output_path": "clips/seg_1.mp4", "summary": "same host in a tutorial", "scene": "kitchen tutorial", "speech": ["ingredients"], "modalities": ["audio", "visual"]},
+                    {"clip_id": "seg_2", "output_path": "clips/seg_2.mp4", "summary": "same host in a tutorial", "scene": "kitchen tutorial", "speech": ["mixing"], "modalities": ["audio", "visual"]},
+                ],
+            )
+            self._write_jsonl(
+                candidates_path,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "proposal_id": "p1",
+                        "reference_clip_id": "seg_1",
+                        "target_clip_id": "seg_2",
+                        "reference_video": "clips/seg_1.mp4",
+                        "target_video": "clips/seg_2.mp4",
+                        "difference": {"type": "speech", "from": "ingredients", "to": "mixing"},
+                        "quality": {"visual_delta_strength": 0.1, "visual_context_similarity": 0.9},
+                        "audio_dataset_line": "speech_audio_content",
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.propose_b_line_audio_only_pair.return_value = (
+                {
+                    "accept": True,
+                    "reject_reason": "",
+                    "difference_type": "speech",
+                    "b_subtype": "speech_topic",
+                    "reference_audio_content": "ingredients",
+                    "target_audio_content": "mixing",
+                    "edit_text": "change the speech from discussing ingredients to discussing mixing",
+                    "audio_difference_specific": True,
+                    "edit_text_audio_only": True,
+                    "confidence": 0.9,
+                    "evidence": ["speech differs"],
+                },
+                {},
+            )
+            client.verify_b_line_audio_only_edit.return_value = (
+                {
+                    "accept": True,
+                    "reject_reason": "",
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "audio_difference_specific": True,
+                    "edit_text_audio_only": True,
+                    "confidence": 0.9,
+                    "evidence": ["target discusses mixing"],
+                },
+                {},
+            )
+            client.verify_b_line_full_av_consistency.return_value = (
+                {
+                    "accept": False,
+                    "reject_reason": "target is identifiable from visible step change",
+                    "visual_context_preserved": True,
+                    "visual_shortcut_risk": True,
+                    "audio_edit_still_valid": True,
+                    "confidence": 0.8,
+                    "evidence": ["visual cooking step reveals target"],
+                },
+                {},
+            )
+            with (
+                mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client),
+                mock.patch(
+                    "app.composed_data._extract_audio_only_cache",
+                    side_effect=[root / "clips" / "ref.wav", root / "clips" / "tgt.wav"],
+                ),
+            ):
+                summary = propose_single_source_pairs(
+                    root=root,
+                    clip_annotations_path=annotations_path,
+                    pair_candidates_path=candidates_path,
+                    output_path=root / "pairs" / "ranked.jsonl",
+                    accepted_output_path=root / "pairs" / "accepted.jsonl",
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    acceptance_profile="b_audio_blind_review",
+                    audio_dataset_line="speech_audio_content",
+                )
+
+            ranked = [json.loads(line) for line in (root / "pairs" / "ranked.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(0, summary["accepted_count"])
+            self.assertIn("visual_shortcut_risk", ranked[0]["judge"]["reject_reason"])
 
     def test_speech_audio_content_line_rewrites_visual_leaky_speech_edit_before_final_omni(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -156,6 +156,41 @@ REQUIRED_B_LINE_SPEECH_REWRITE_FIELDS = (
     "speech_rewrite_reject_reason",
 )
 
+REQUIRED_B_LINE_AUDIO_ONLY_PROPOSAL_FIELDS = (
+    "accept",
+    "reject_reason",
+    "difference_type",
+    "b_subtype",
+    "reference_audio_content",
+    "target_audio_content",
+    "edit_text",
+    "audio_difference_specific",
+    "edit_text_audio_only",
+    "confidence",
+    "evidence",
+)
+
+REQUIRED_B_LINE_AUDIO_ONLY_VERIFICATION_FIELDS = (
+    "accept",
+    "reject_reason",
+    "reference_satisfies_edit",
+    "target_satisfies_edit",
+    "audio_difference_specific",
+    "edit_text_audio_only",
+    "confidence",
+    "evidence",
+)
+
+REQUIRED_B_LINE_FULL_AV_CONSISTENCY_FIELDS = (
+    "accept",
+    "reject_reason",
+    "visual_context_preserved",
+    "visual_shortcut_risk",
+    "audio_edit_still_valid",
+    "confidence",
+    "evidence",
+)
+
 REQUIRED_VIDEO_EDIT_PLAN_FIELDS = (
     "should_generate",
     "source_prompt",
@@ -307,6 +342,20 @@ def _materialize_image_url(raw_url: str) -> str:
     mime_type, _ = mimetypes.guess_type(str(image_path))
     mime_type = mime_type or "image/png"
     content = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+    return f"data:{mime_type};base64,{content}"
+
+
+def _materialize_audio_url(raw_url: str) -> str:
+    if raw_url.startswith(("http://", "https://", "data:")):
+        return raw_url
+    audio_path = Path(raw_url)
+    if raw_url.startswith("file://"):
+        audio_path = Path(urllib.request.url2pathname(raw_url.removeprefix("file://")))
+    if not audio_path.exists():
+        raise FileNotFoundError(f"audio file not found: {audio_path}")
+    mime_type, _ = mimetypes.guess_type(str(audio_path))
+    mime_type = mime_type or "audio/wav"
+    content = base64.b64encode(audio_path.read_bytes()).decode("utf-8")
     return f"data:{mime_type};base64,{content}"
 
 
@@ -753,6 +802,48 @@ def _b_line_speech_rewrite_system_prompt() -> str:
     )
 
 
+def _b_line_audio_only_proposal_system_prompt() -> str:
+    return (
+        "You are the blind audio-only proposal stage for B-line audio-primary CVR data. "
+        "You receive reference and target audio only. Do not infer from any non-audio cue. "
+        "Return exactly one JSON object with schema: "
+        '{"accept": boolean, "reject_reason": string, "difference_type": "speech"|"audio_event", '
+        '"b_subtype": "speech_topic"|"music"|"sound_event", "reference_audio_content": string, '
+        '"target_audio_content": string, "edit_text": string, "audio_difference_specific": boolean, '
+        '"edit_text_audio_only": boolean, "confidence": number, "evidence": [string]}. '
+        "Accept only if the audible difference is specific and can produce a retrieval edit_text without visual wording. "
+        "Reject placeholders such as A/B, speech changed, different tone, unintelligible, not transcribed, target audio, or reference audio. "
+        "For speech, name a concrete topic, phrase, narration/commentary content, or sung lyric/theme. "
+        "For audio_event, name a concrete non-speech sound or music change."
+    )
+
+
+def _b_line_audio_only_verification_system_prompt() -> str:
+    return (
+        "You are the blind audio-only verifier for B-line audio-primary CVR data. "
+        "You receive reference and target audio only plus a proposed edit_text. Ignore all non-audio concepts. "
+        "Return exactly one JSON object with schema: "
+        '{"accept": boolean, "reject_reason": string, "reference_satisfies_edit": boolean, '
+        '"target_satisfies_edit": boolean, "audio_difference_specific": boolean, '
+        '"edit_text_audio_only": boolean, "confidence": number, "evidence": [string]}. '
+        "Accept only if the reference audio does not satisfy the edit, the target audio does satisfy it, and the edit is specific enough for retrieval. "
+        "Reject if the edit_text mentions visual content or if the audio evidence is generic/unclear."
+    )
+
+
+def _b_line_full_av_consistency_system_prompt() -> str:
+    return (
+        "You are the final consistency auditor for B-line audio-primary CVR data. "
+        "You receive full reference and target videos plus an edit_text that was created by an audio-only stage. "
+        "Do not rewrite the edit_text. Return exactly one JSON object with schema: "
+        '{"accept": boolean, "reject_reason": string, "visual_context_preserved": boolean, '
+        '"visual_shortcut_risk": boolean, "audio_edit_still_valid": boolean, '
+        '"confidence": number, "evidence": [string]}. '
+        "Accept only if the videos preserve enough context and the target still satisfies the audio edit. "
+        "Reject if a viewer could identify the target from visual changes alone, including changes in action, expression, button/text overlays, camera distance, people, objects, or scene."
+    )
+
+
 def _pair_judge_system_prompt() -> str:
     return (
         "You are a strict judge for composed video retrieval dataset construction. "
@@ -1170,6 +1261,76 @@ def _build_b_line_speech_rewrite_user_content(
         {"type": "text", "text": "Reference clip for speech rewrite:"},
         {"type": "video_url", "video_url": {"url": reference_clip_path}},
         {"type": "text", "text": "Target clip for speech rewrite:"},
+        {"type": "video_url", "video_url": {"url": target_clip_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
+def _build_b_line_audio_only_proposal_user_content(
+    *,
+    reference_audio_path: str,
+    target_audio_path: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: listen to the two audio clips and propose one B-line audio edit only if the audible difference is concrete.\n"
+        f"Pair metadata JSON:\n{_prompt_json(metadata, max_chars=700)}\n"
+        "Use audio only. Do not use or mention non-audio content. "
+        "The edit_text must describe speech/topic/commentary/music/sound only. "
+        "If both sides are unclear speech, or if you cannot name the audible difference, reject."
+    )
+    return [
+        {"type": "text", "text": "Reference audio only:"},
+        {"type": "audio_url", "audio_url": {"url": reference_audio_path}},
+        {"type": "text", "text": "Target audio only:"},
+        {"type": "audio_url", "audio_url": {"url": target_audio_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
+def _build_b_line_audio_only_verification_user_content(
+    *,
+    reference_audio_path: str,
+    target_audio_path: str,
+    edit_text: str,
+    audio_only_proposal: dict[str, Any],
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: verify the proposed B-line edit using only audio.\n"
+        f"Proposed edit_text: {edit_text}\n"
+        f"Audio-only proposal JSON:\n{_prompt_json(audio_only_proposal, max_chars=800)}\n"
+        "Use audio only. Accept only if reference audio does not satisfy the edit and target audio does. "
+        "Reject if the edit is generic, visual, or not supported by clearly audible evidence."
+    )
+    return [
+        {"type": "text", "text": "Reference audio only:"},
+        {"type": "audio_url", "audio_url": {"url": reference_audio_path}},
+        {"type": "text", "text": "Target audio only:"},
+        {"type": "audio_url", "audio_url": {"url": target_audio_path}},
+        {"type": "text", "text": prompt},
+    ]
+
+
+def _build_b_line_full_av_consistency_user_content(
+    *,
+    reference_clip_path: str,
+    target_clip_path: str,
+    edit_text: str,
+    audio_only_evidence: dict[str, Any],
+    local_gate_report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    prompt = (
+        "Task: check whether this audio-only B-line edit remains a valid CVR pair when seeing the full videos.\n"
+        f"Audio-only edit_text: {edit_text}\n"
+        f"Audio-only evidence JSON:\n{_prompt_json(audio_only_evidence, max_chars=900)}\n"
+        f"Local visual/context gate JSON:\n{_prompt_json(local_gate_report, max_chars=600)}\n"
+        "Do not rewrite the edit_text. Reject if visual changes alone reveal the target, or if the audio-only edit is no longer supported. "
+        "Accept only when visual context is preserved enough that audio is needed."
+    )
+    return [
+        {"type": "text", "text": "Reference full video:"},
+        {"type": "video_url", "video_url": {"url": reference_clip_path}},
+        {"type": "text", "text": "Target full video:"},
         {"type": "video_url", "video_url": {"url": target_clip_path}},
         {"type": "text", "text": prompt},
     ]
@@ -1647,6 +1808,66 @@ class OpenAIComposedDataClient:
         )
         return _normalize_b_line_speech_rewrite_payload(raw_payload), raw_payload
 
+    def propose_b_line_audio_only_pair(
+        self,
+        *,
+        reference_audio_path: str,
+        target_audio_path: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_b_line_audio_only_proposal_user_content(
+                reference_audio_path=reference_audio_path,
+                target_audio_path=target_audio_path,
+                metadata=metadata or {},
+            ),
+            system_prompt=_b_line_audio_only_proposal_system_prompt(),
+            max_tokens=700,
+        )
+        return _normalize_b_line_audio_only_proposal_payload(raw_payload), raw_payload
+
+    def verify_b_line_audio_only_edit(
+        self,
+        *,
+        reference_audio_path: str,
+        target_audio_path: str,
+        edit_text: str,
+        audio_only_proposal: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_b_line_audio_only_verification_user_content(
+                reference_audio_path=reference_audio_path,
+                target_audio_path=target_audio_path,
+                edit_text=edit_text,
+                audio_only_proposal=audio_only_proposal,
+            ),
+            system_prompt=_b_line_audio_only_verification_system_prompt(),
+            max_tokens=600,
+        )
+        return _normalize_b_line_audio_only_verification_payload(raw_payload), raw_payload
+
+    def verify_b_line_full_av_consistency(
+        self,
+        *,
+        reference_clip_path: str,
+        target_clip_path: str,
+        edit_text: str,
+        audio_only_evidence: dict[str, Any],
+        local_gate_report: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_b_line_full_av_consistency_user_content(
+                reference_clip_path=reference_clip_path,
+                target_clip_path=target_clip_path,
+                edit_text=edit_text,
+                audio_only_evidence=audio_only_evidence,
+                local_gate_report=local_gate_report,
+            ),
+            system_prompt=_b_line_full_av_consistency_system_prompt(),
+            max_tokens=600,
+        )
+        return _normalize_b_line_full_av_consistency_payload(raw_payload), raw_payload
+
     def judge_pair(
         self,
         *,
@@ -1802,6 +2023,11 @@ class OpenAIComposedDataClient:
                 image_url = dict(item["image_url"])
                 image_url["url"] = _materialize_image_url(str(image_url["url"]))
                 request_content.append({"type": "image_url", "image_url": image_url})
+                continue
+            if item.get("type") == "audio_url":
+                audio_url = dict(item["audio_url"])
+                audio_url["url"] = _materialize_audio_url(str(audio_url["url"]))
+                request_content.append({"type": "audio_url", "audio_url": audio_url})
                 continue
             request_content.append(item)
 
@@ -2434,6 +2660,64 @@ def _normalize_b_line_speech_rewrite_payload(payload: dict[str, Any]) -> dict[st
         "refined_edit_text": refined,
         "reject_if_still_unclear": reject,
         "speech_rewrite_reject_reason": reason,
+    }
+
+
+def _normalize_b_line_audio_only_proposal_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_B_LINE_AUDIO_ONLY_PROPOSAL_FIELDS)
+    if missing_fields:
+        raise ValueError(f"B-line audio-only proposal missing fields: {missing_fields}")
+    difference_type = str(payload.get("difference_type", "")).strip()
+    if difference_type == "speech_topic":
+        difference_type = "speech"
+    if difference_type not in {"speech", "audio_event"}:
+        difference_type = "audio_event" if str(payload.get("b_subtype", "")).strip() in {"music", "sound_event"} else "speech"
+    b_subtype = str(payload.get("b_subtype", "")).strip()
+    if b_subtype not in {"speech_topic", "music", "sound_event"}:
+        b_subtype = "speech_topic" if difference_type == "speech" else "sound_event"
+    return {
+        "accept": _bool_value(payload.get("accept")),
+        "reject_reason": str(payload.get("reject_reason", "")).strip(),
+        "difference_type": difference_type,
+        "b_subtype": b_subtype,
+        "reference_audio_content": str(payload.get("reference_audio_content", "")).strip(),
+        "target_audio_content": str(payload.get("target_audio_content", "")).strip(),
+        "edit_text": str(payload.get("edit_text", "")).strip(),
+        "audio_difference_specific": _bool_value(payload.get("audio_difference_specific")),
+        "edit_text_audio_only": _bool_value(payload.get("edit_text_audio_only")),
+        "confidence": _score_value(payload.get("confidence")),
+        "evidence": _detail_list(payload.get("evidence")),
+    }
+
+
+def _normalize_b_line_audio_only_verification_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_B_LINE_AUDIO_ONLY_VERIFICATION_FIELDS)
+    if missing_fields:
+        raise ValueError(f"B-line audio-only verification missing fields: {missing_fields}")
+    return {
+        "accept": _bool_value(payload.get("accept")),
+        "reject_reason": str(payload.get("reject_reason", "")).strip(),
+        "reference_satisfies_edit": _bool_value(payload.get("reference_satisfies_edit")),
+        "target_satisfies_edit": _bool_value(payload.get("target_satisfies_edit")),
+        "audio_difference_specific": _bool_value(payload.get("audio_difference_specific")),
+        "edit_text_audio_only": _bool_value(payload.get("edit_text_audio_only")),
+        "confidence": _score_value(payload.get("confidence")),
+        "evidence": _detail_list(payload.get("evidence")),
+    }
+
+
+def _normalize_b_line_full_av_consistency_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_B_LINE_FULL_AV_CONSISTENCY_FIELDS)
+    if missing_fields:
+        raise ValueError(f"B-line full AV consistency missing fields: {missing_fields}")
+    return {
+        "accept": _bool_value(payload.get("accept")),
+        "reject_reason": str(payload.get("reject_reason", "")).strip(),
+        "visual_context_preserved": _bool_value(payload.get("visual_context_preserved")),
+        "visual_shortcut_risk": _bool_value(payload.get("visual_shortcut_risk")),
+        "audio_edit_still_valid": _bool_value(payload.get("audio_edit_still_valid")),
+        "confidence": _score_value(payload.get("confidence")),
+        "evidence": _detail_list(payload.get("evidence")),
     }
 
 

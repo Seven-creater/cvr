@@ -870,6 +870,7 @@ EXPLORATION_ACCEPTANCE_PROFILE = "exploration"
 AUDIO_MATTERS_ACCEPTANCE_PROFILE = "audio_matters"
 B_AUDIO_REVIEW_ACCEPTANCE_PROFILE = "b_audio_review"
 B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE = "b_audio_context_cvr"
+B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE = "b_audio_blind_review"
 STANDARD_AUDIO_DATASET_LINE = "standard"
 VISUAL_AUDIO_ANCHOR_LINE = "visual_audio_anchor"
 SPEECH_AUDIO_CONTENT_LINE = "speech_audio_content"
@@ -959,6 +960,21 @@ B_LINE_VISUAL_EDIT_TERMS = (
     "microphone",
     "color",
     "colour",
+    "close up",
+    "close-up",
+    "gesture",
+    "gestures",
+    "smile",
+    "walking",
+    "walks",
+    "walk off",
+    "off screen",
+    "off-screen",
+    "subscribe",
+    "button",
+    "bell icon",
+    "wide shot",
+    "full orchestra",
     "text",
     "subtitle",
     "logo",
@@ -990,6 +1006,7 @@ ACCEPTANCE_PROFILE_NAMES = {
     AUDIO_MATTERS_ACCEPTANCE_PROFILE,
     B_AUDIO_REVIEW_ACCEPTANCE_PROFILE,
     B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
+    B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE,
 }
 ACCEPTANCE_PROFILE_CONFIGS = {
     DEFAULT_ACCEPTANCE_PROFILE: {
@@ -1082,6 +1099,26 @@ ACCEPTANCE_PROFILE_CONFIGS = {
         "video_context_strength": 0.45,
         "asr_degeneracy_risk": 0.55,
     },
+    B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE: {
+        "template_semantic_context_score": 0.25,
+        "template_compatibility_score": 0.55,
+        "template_clean_stability_score": 0.55,
+        "template_single_delta_bundle_score": 0.50,
+        "template_target_uniqueness_score": 0.40,
+        "template_difference_strength_score": 0.45,
+        "same_context_score": 0.40,
+        "edit_match_score": 0.45,
+        "target_uniqueness_score": 0.40,
+        "difference_strength_score": 0.45,
+        "edit_necessity_score": 0.50,
+        "edit_target_alignment_score": 0.50,
+        "action_evidence_score": 0.40,
+        "non_speech_audio_event_score": 0.40,
+        "edit_text_quality_score": 0.50,
+        "video_context_strength": 0.45,
+        "asr_degeneracy_risk": 0.55,
+        "visual_delta_strength": 0.55,
+    },
 }
 SAME_TEMPLATE_CLUSTER_RELATION = "same_template_cluster"
 DEFAULT_DIAGNOSTIC_BUNDLE_NAME = "diagnostic_bundle"
@@ -1111,6 +1148,8 @@ def _normalize_acceptance_profile(value: str | None) -> str:
     profile = str(value or DEFAULT_ACCEPTANCE_PROFILE).strip().lower().replace("-", "_")
     if profile == "b_context_cvr":
         profile = B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE
+    if profile in {"b_audio_blind", "b_blind_review", "blind_audio_review"}:
+        profile = B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE
     if profile not in ACCEPTANCE_PROFILE_NAMES:
         allowed = ", ".join(sorted(ACCEPTANCE_PROFILE_NAMES))
         raise ValueError(f"unsupported acceptance_profile={value!r}; expected one of: {allowed}")
@@ -1147,11 +1186,16 @@ def _is_b_audio_review_profile(acceptance_profile: str | None) -> bool:
     return _normalize_acceptance_profile(acceptance_profile) in {
         B_AUDIO_REVIEW_ACCEPTANCE_PROFILE,
         B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
+        B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE,
     }
 
 
 def _is_b_audio_context_cvr_profile(acceptance_profile: str | None) -> bool:
     return _normalize_acceptance_profile(acceptance_profile) == B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE
+
+
+def _is_b_audio_blind_review_profile(acceptance_profile: str | None) -> bool:
+    return _normalize_acceptance_profile(acceptance_profile) == B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE
 
 
 def _uses_soft_local_gate_profile(acceptance_profile: str | None) -> bool:
@@ -1161,6 +1205,7 @@ def _uses_soft_local_gate_profile(acceptance_profile: str | None) -> bool:
         AUDIO_MATTERS_ACCEPTANCE_PROFILE,
         B_AUDIO_REVIEW_ACCEPTANCE_PROFILE,
         B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
+        B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE,
     }
 SUBJECT_SIGNATURE_MARKER_TOKENS = {
     "bald",
@@ -2120,6 +2165,414 @@ def propose_single_source_pairs(
         else:
             reference_path = _resolve_under_root(layout["root"], reference_video)
             target_path = _resolve_under_root(layout["root"], target_video)
+            if (
+                audio_dataset_line == SPEECH_AUDIO_CONTENT_LINE
+                and _is_b_audio_blind_review_profile(acceptance_profile)
+                and proposal_id not in existing_records
+            ):
+                fallback_used = False
+                raw_model_output: dict[str, Any] = {}
+                raw_final_omni_output: dict[str, Any] = {}
+                audio_only_proposal: dict[str, Any] = {}
+                raw_audio_only_proposal: dict[str, Any] = {}
+                audio_only_verification: dict[str, Any] = {}
+                raw_audio_only_verification: dict[str, Any] = {}
+                full_av_consistency: dict[str, Any] = {}
+                raw_full_av_consistency: dict[str, Any] = {}
+                extraction_error = ""
+                reference_audio_path = target_audio_path = Path()
+                try:
+                    cache_dir = output.parent / "audio_only_cache"
+                    reference_audio_path = _extract_audio_only_cache(
+                        video_path=reference_path,
+                        cache_dir=cache_dir,
+                        clip_id=reference_clip_id,
+                    )
+                    target_audio_path = _extract_audio_only_cache(
+                        video_path=target_path,
+                        cache_dir=cache_dir,
+                        clip_id=target_clip_id,
+                    )
+                except Exception as exc:
+                    extraction_error = f"missing_audio_track: {type(exc).__name__}: {exc}"
+
+                quality_seed = {
+                    "difference": {"type": "speech"},
+                    "edit_text": "",
+                    "modalities": ["audio"],
+                    "confidence": 0.0,
+                    "accept": False,
+                }
+                quality = _single_source_pair_quality(
+                    candidate=candidate,
+                    model_fields=quality_seed,
+                    acceptance_profile=acceptance_profile,
+                )
+                context_type = _b_line_video_context_type(reference_annotation, target_annotation)
+                video_context_strength = _b_line_video_context_strength(reference_annotation, target_annotation, quality)
+                asr_degeneracy_risk = _b_line_asr_degeneracy_risk(reference_annotation, target_annotation, quality)
+                quality.update(
+                    {
+                        "b_audio_blind_review": True,
+                        "video_context_type": context_type,
+                        "video_context_strength": video_context_strength,
+                        "asr_degeneracy_risk": asr_degeneracy_risk,
+                    }
+                )
+                blind_local_issues: list[str] = []
+                if extraction_error:
+                    blind_local_issues.append(extraction_error)
+                if video_context_strength < _profile_threshold(B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE, "video_context_strength"):
+                    blind_local_issues.append("blind_review_video_context_too_weak")
+                if asr_degeneracy_risk > _profile_threshold(B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE, "asr_degeneracy_risk"):
+                    blind_local_issues.append("blind_review_asr_degeneracy_risk_too_high")
+                if context_type in {"asr_only", "generic_talking_head"}:
+                    blind_local_issues.append(f"blind_review_asr_degeneracy_risk_too_high: context_type={context_type}")
+                local_gate_report = {
+                    "passed": not blind_local_issues,
+                    "hard_reject": blind_local_issues,
+                    "review_required": [],
+                    "difference_type": "audio_only_pending",
+                    "confidence": 0.0,
+                    "acceptance_profile": acceptance_profile,
+                    "audio_dataset_line": audio_dataset_line,
+                    "reference_video_exists": reference_path.exists(),
+                    "target_video_exists": target_path.exists(),
+                    "visual_context_type": context_type,
+                    "video_context_strength": video_context_strength,
+                    "asr_degeneracy_risk": asr_degeneracy_risk,
+                }
+
+                model_fields = _b_audio_blind_review_model_fields({})
+                if not blind_local_issues:
+                    try:
+                        audio_only_proposal, raw_audio_only_proposal = _call_omni_with_retries(
+                            label=f"audio_only_proposal:{proposal_id}",
+                            retries=omni_retries,
+                            fail_on_transient=fail_on_transient_omni_errors,
+                            func=lambda: client.propose_b_line_audio_only_pair(
+                                reference_audio_path=str(reference_audio_path),
+                                target_audio_path=str(target_audio_path),
+                                metadata={
+                                    "proposal_id": proposal_id,
+                                    "reference_clip_id": reference_clip_id,
+                                    "target_clip_id": target_clip_id,
+                                },
+                            ),
+                        )
+                        model_fields = _b_audio_blind_review_model_fields(audio_only_proposal)
+                        audio_only_verification, raw_audio_only_verification = _call_omni_with_retries(
+                            label=f"audio_only_verify:{proposal_id}",
+                            retries=omni_retries,
+                            fail_on_transient=fail_on_transient_omni_errors,
+                            func=lambda: client.verify_b_line_audio_only_edit(
+                                reference_audio_path=str(reference_audio_path),
+                                target_audio_path=str(target_audio_path),
+                                edit_text=str(model_fields.get("edit_text", "")).strip(),
+                                audio_only_proposal=audio_only_proposal,
+                            ),
+                        )
+                        full_av_consistency, raw_full_av_consistency = _call_omni_with_retries(
+                            label=f"full_av_consistency:{proposal_id}",
+                            retries=omni_retries,
+                            fail_on_transient=fail_on_transient_omni_errors,
+                            func=lambda: client.verify_b_line_full_av_consistency(
+                                reference_clip_path=str(reference_path),
+                                target_clip_path=str(target_path),
+                                edit_text=str(model_fields.get("edit_text", "")).strip(),
+                                audio_only_evidence={
+                                    "proposal": audio_only_proposal,
+                                    "verification": audio_only_verification,
+                                },
+                                local_gate_report=local_gate_report,
+                            ),
+                        )
+                    except Exception as exc:
+                        if fail_on_transient_omni_errors and _is_transient_omni_exception(exc):
+                            print(
+                                "[propose-single-source-pairs] transient blind review error; shard will fail for retry "
+                                f"proposal_id={proposal_id} error={type(exc).__name__}: {exc}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            raise
+                        blind_local_issues.append(f"blind_review_error: {type(exc).__name__}: {exc}")
+                        local_gate_report["passed"] = False
+                        local_gate_report["hard_reject"] = blind_local_issues
+                        raw_audio_only_proposal = raw_audio_only_proposal or {"error": f"{type(exc).__name__}: {exc}"}
+
+                difference = dict(model_fields.get("difference") or {})
+                difference_type = str(difference.get("type", "")).strip()
+                confidence = _score_float(model_fields.get("confidence"))
+                quality.update(
+                    _single_source_pair_quality(
+                        candidate=candidate,
+                        model_fields=model_fields,
+                        acceptance_profile=acceptance_profile,
+                    )
+                )
+                quality.update(
+                    {
+                        "b_audio_blind_review": True,
+                        "video_context_type": context_type,
+                        "video_context_strength": video_context_strength,
+                        "asr_degeneracy_risk": asr_degeneracy_risk,
+                    }
+                )
+                blocking_issues = _dedupe_strings(
+                    blind_local_issues
+                    + _b_audio_blind_review_issues(
+                        audio_only_proposal=audio_only_proposal,
+                        audio_only_verification=audio_only_verification,
+                        full_av_consistency=full_av_consistency,
+                        quality=quality,
+                    )
+                )
+                accepted = not blocking_issues
+                final_omni_accept = accepted
+                reject_reason = "" if accepted else "; ".join(blocking_issues)
+                final_omni_verification = {
+                    "accept": accepted,
+                    "confidence": min(
+                        _score_float(audio_only_proposal.get("confidence")),
+                        _score_float(audio_only_verification.get("confidence")),
+                        _score_float(full_av_consistency.get("confidence")),
+                    )
+                    if accepted
+                    else 0.0,
+                    "quality_score": min(
+                        _score_float(audio_only_proposal.get("confidence")),
+                        _score_float(audio_only_verification.get("confidence")),
+                        _score_float(full_av_consistency.get("confidence")),
+                    )
+                    if accepted
+                    else 0.0,
+                    "reference_satisfies_edit": _boolish(audio_only_verification.get("reference_satisfies_edit")),
+                    "target_satisfies_edit": _boolish(audio_only_verification.get("target_satisfies_edit")),
+                    "observable_delta": _boolish(audio_only_verification.get("audio_difference_specific")),
+                    "single_primary_delta": True,
+                    "text_or_ocr_driven": False,
+                    "segment_wide": True,
+                    "edit_text_accurate": _boolish(audio_only_verification.get("accept")),
+                    "main_reject_reason": reject_reason,
+                    "evidence": _dedupe_strings(
+                        _normalize_list(audio_only_proposal.get("evidence", []))
+                        + _normalize_list(audio_only_verification.get("evidence", []))
+                        + _normalize_list(full_av_consistency.get("evidence", []))
+                    ),
+                    "recommended_edit_text": "",
+                    "audio_primary": True,
+                    "visual_locked": _boolish(full_av_consistency.get("visual_context_preserved")),
+                    "visual_too_different_for_B": _boolish(full_av_consistency.get("visual_shortcut_risk")),
+                    "edit_text_audio_only": _boolish(audio_only_verification.get("edit_text_audio_only")),
+                    "visual_context_preserved": _boolish(full_av_consistency.get("visual_context_preserved")),
+                    "video_context_strength": video_context_strength,
+                    "asr_degeneracy_risk": asr_degeneracy_risk,
+                    "not_asr_only": asr_degeneracy_risk <= _profile_threshold(B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE, "asr_degeneracy_risk"),
+                }
+                hard_negative_paths = _single_source_hard_negative_paths(
+                    root=layout["root"],
+                    candidate=candidate,
+                    annotations=annotations,
+                    reference_clip_id=reference_clip_id,
+                    target_clip_id=target_clip_id,
+                )
+                judge = {
+                    "reference_satisfies_edit": _boolish(audio_only_verification.get("reference_satisfies_edit")),
+                    "target_satisfies_edit": accepted,
+                    "single_main_difference": accepted,
+                    "same_context_score": quality["same_context_score"],
+                    "edit_match_score": quality["edit_match_score"],
+                    "target_uniqueness_score": quality["target_uniqueness_score"],
+                    "audio_required": True,
+                    "hard_negative_quality": "weak",
+                    "accept": accepted,
+                    "reject_reason": reject_reason,
+                }
+                verification = _single_source_pair_verification(model_fields, accepted=accepted, reject_reason=reject_reason)
+                source = {
+                    "platform": str(target_annotation.get("dataset") or reference_annotation.get("dataset") or "daily_omni"),
+                    "url": target_path.resolve().as_uri(),
+                    "license_note": DEFAULT_LICENSE_NOTE,
+                }
+                b_subtype = str(audio_only_proposal.get("b_subtype", "")).strip()
+                if b_subtype == "speech_topic":
+                    b_subtype = "speech_topic_in_video_context"
+                elif b_subtype not in {"music", "sound_event"}:
+                    b_subtype = _b_line_subtype_from_evidence(
+                        difference_type=difference_type,
+                        edit_text=str(model_fields.get("edit_text", "")).strip(),
+                        reference_annotation=reference_annotation,
+                        target_annotation=target_annotation,
+                    )
+                record = {
+                    "proposal_id": proposal_id,
+                    "candidate_id": str(candidate.get("candidate_id", "")),
+                    "candidate_stage": "audio_only_blind_review",
+                    "group_id": str(candidate.get("group_id", "")),
+                    "group_reason": str(candidate.get("group_reason", "single_source_video")),
+                    "reference_clip_id": reference_clip_id,
+                    "target_clip_id": target_clip_id,
+                    "reference_video": reference_video,
+                    "target_video": target_video,
+                    "edit_text": str(model_fields.get("edit_text", "")).strip(),
+                    "modalities": ["audio"],
+                    "reference_caption": str(audio_only_proposal.get("reference_audio_content", "")).strip(),
+                    "target_caption": str(audio_only_proposal.get("target_audio_content", "")).strip(),
+                    "difference": difference,
+                    "audio_dataset_line": audio_dataset_line,
+                    "audio_line_quality_profile": str(quality.get("audio_line_quality_profile", "")).strip(),
+                    "audio_only_reference_content": str(audio_only_proposal.get("reference_audio_content", "")).strip(),
+                    "audio_only_target_content": str(audio_only_proposal.get("target_audio_content", "")).strip(),
+                    "audio_only_edit_text": str(audio_only_proposal.get("edit_text", "")).strip(),
+                    "audio_only_accept": _boolish(audio_only_verification.get("accept")),
+                    "audio_only_proposal": audio_only_proposal,
+                    "audio_only_verification": audio_only_verification,
+                    "raw_audio_only_proposal": raw_audio_only_proposal,
+                    "raw_audio_only_verification": raw_audio_only_verification,
+                    "full_av_consistency": full_av_consistency,
+                    "raw_full_av_consistency": raw_full_av_consistency,
+                    "visual_shortcut_risk": _boolish(full_av_consistency.get("visual_shortcut_risk")),
+                    "full_av_consistency_accept": _boolish(full_av_consistency.get("accept")),
+                    "dominant_delta": dict(model_fields.get("dominant_delta", {})),
+                    "reference_state": dict(model_fields.get("reference_state", {})) if isinstance(model_fields.get("reference_state"), dict) else {},
+                    "target_state": dict(model_fields.get("target_state", {})) if isinstance(model_fields.get("target_state"), dict) else {},
+                    "delta_temporal_extent": dict(model_fields.get("delta_temporal_extent", {})) if isinstance(model_fields.get("delta_temporal_extent"), dict) else {},
+                    "subject_roles": dict(model_fields.get("subject_roles", {})) if isinstance(model_fields.get("subject_roles"), dict) else {},
+                    "is_segment_wide_delta": bool(model_fields.get("is_segment_wide_delta")),
+                    "discarded_deltas": list(model_fields.get("discarded_deltas", [])),
+                    "pair_video_evidence": list(model_fields.get("evidence", [])),
+                    "confidence": confidence,
+                    "model_accepted": _boolish(audio_only_proposal.get("accept")),
+                    "local_gate_passed": not blind_local_issues,
+                    "final_omni_accept": final_omni_accept,
+                    "final_accept_source": "audio_only_blind_review",
+                    "local_gate_report": local_gate_report,
+                    "final_omni_verification": final_omni_verification,
+                    "single_source_delta_family": _single_source_delta_family_from_fields(model_fields),
+                    "single_source_pair_acceptance_issues": blocking_issues,
+                    "single_source_pair_review_required": [],
+                    "b_line_edit_text_repaired": False,
+                    "b_line_original_edit_text": "",
+                    "raw_proposed_edit_text": str(audio_only_proposal.get("edit_text", "")).strip(),
+                    "edit_text_refinement": {},
+                    "raw_edit_text_refinement": {},
+                    "refined_edit_text": "",
+                    "edit_text_specificity_score": 0.0,
+                    "edit_text_reject_reason": "",
+                    "speech_or_audio_evidence": _normalize_list(audio_only_proposal.get("evidence", [])),
+                    "speech_rewrite": {},
+                    "raw_speech_rewrite": {},
+                    "speech_rewrite_refined_edit_text": "",
+                    "speech_rewrite_confidence": 0.0,
+                    "speech_rewrite_reject_reason": "",
+                    "speech_rewrite_used": False,
+                    "b_subtype": b_subtype,
+                    "video_context_type": context_type,
+                    "video_context_strength": video_context_strength,
+                    "asr_degeneracy_risk": asr_degeneracy_risk,
+                    "speech_role": str(reference_annotation.get("speech_role") or target_annotation.get("speech_role") or "").strip(),
+                    "audio_evidence": _dedupe_strings(
+                        [
+                            str(audio_only_proposal.get("reference_audio_content", "")).strip(),
+                            str(audio_only_proposal.get("target_audio_content", "")).strip(),
+                            *_normalize_list(audio_only_proposal.get("evidence", [])),
+                            *_normalize_list(audio_only_verification.get("evidence", [])),
+                        ]
+                    ),
+                    "visual_context_evidence": _dedupe_strings(
+                        [
+                            str(reference_annotation.get("scene", "")).strip(),
+                            str(target_annotation.get("scene", "")).strip(),
+                            str(reference_annotation.get("summary", "")).strip(),
+                            str(target_annotation.get("summary", "")).strip(),
+                        ]
+                    ),
+                    "recommended_edit_text": "",
+                    "hard_negatives": hard_negative_paths,
+                    "quality": quality,
+                    "heuristic_quality": dict(candidate.get("quality", {})) if isinstance(candidate.get("quality"), dict) else {},
+                    "source_context": {
+                        "relation": "same_source_video",
+                        "single_source_pair": True,
+                        "template_route": "audio_only_blind_review",
+                        "score": quality["same_context_score"],
+                    },
+                    "source": source,
+                    "proposal_reason": "audio-only blind review",
+                    "evidence": {
+                        **_evidence_from_annotations(reference_annotation, target_annotation),
+                        "audio_only_proposal": _normalize_list(audio_only_proposal.get("evidence", [])),
+                        "audio_only_verification": _normalize_list(audio_only_verification.get("evidence", [])),
+                        "full_av_consistency": _normalize_list(full_av_consistency.get("evidence", [])),
+                    },
+                    "judge": judge,
+                    "verification": verification,
+                    "edit_text_quality": _edit_text_quality_payload(
+                        edit_text=str(model_fields.get("edit_text", "")),
+                        difference=difference,
+                        modalities=["audio"],
+                        reference_caption=str(audio_only_proposal.get("reference_audio_content", "")),
+                        target_caption=str(audio_only_proposal.get("target_audio_content", "")),
+                    ),
+                    "observable_difference": {
+                        "passed": accepted,
+                        "frame_backed": False,
+                        "failure_reason": "" if accepted else reject_reason,
+                        "reference_evidence": _normalize_list(audio_only_proposal.get("evidence", [])),
+                        "target_evidence": _normalize_list(audio_only_verification.get("evidence", [])),
+                        "supporting_fields": ["audio_only_blind_review"],
+                    },
+                    "dominant_delta_decision": dict(model_fields.get("dominant_delta", {})),
+                    "accepted": accepted,
+                    "fallback_used": fallback_used,
+                    "raw_model_output": raw_audio_only_proposal,
+                    "raw_final_omni_output": raw_full_av_consistency,
+                    "single_source_pair": True,
+                }
+                if bool(record.get("accepted")):
+                    accepted_total_count += 1
+                else:
+                    rejected_count += 1
+                output_records.append(record)
+                _apply_single_source_delta_uniqueness(
+                    output_records,
+                    max_accepted_pairs=max_accepted_pairs,
+                    acceptance_profile=acceptance_profile,
+                )
+                if bool(record.get("accepted")) and accepted_progress_output is not None:
+                    _append_jsonl_record(accepted_progress_output, record)
+                if not bool(record.get("accepted")) and rejected_progress_output is not None:
+                    _append_jsonl_record(rejected_progress_output, record)
+                persist_progress()
+                current_accepted = _select_single_source_quality_passed_records(output_records)
+                print(
+                    "[propose-single-source-pairs] wrote "
+                    f"proposal_count={len(output_records)} accepted_current={len(current_accepted)} "
+                    f"proposal_id={record.get('proposal_id', '')} "
+                    f"accepted={bool(record.get('accepted'))} "
+                    f"final_omni_accept={bool(record.get('final_omni_accept'))} "
+                    f"final_omni_quality_score={_score_float((record.get('final_omni_verification') or {}).get('quality_score')) if isinstance(record.get('final_omni_verification'), dict) else 0.0:.2f} "
+                    f"difference_type={record.get('difference', {}).get('type', '') if isinstance(record.get('difference'), dict) else ''} "
+                    f"delta_family={record.get('single_source_delta_family', '')} "
+                    f"fallback={bool(record.get('fallback_used'))} "
+                    f"issues={';'.join(str(issue) for issue in record.get('single_source_pair_acceptance_issues', []))} "
+                    f"edit_text={str(record.get('edit_text', '')).replace(chr(10), ' ')[:180]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if (
+                    zero_accepted_stop_after
+                    and zero_accepted_stop_after > 0
+                    and len(output_records) >= zero_accepted_stop_after
+                    and not current_accepted
+                ):
+                    early_stop_reason = (
+                        f"zero accepted after {len(output_records)} single-source pair comparisons; "
+                        "inspect selected source, segment captions, or pair-level Omni output"
+                    )
+                    break
+                continue
             raw_model_output: dict[str, Any]
             fallback_used = False
             try:
@@ -8504,6 +8957,158 @@ def _b_line_can_run_final_rescue(
         return False
     difference = model_fields.get("difference") if isinstance(model_fields.get("difference"), dict) else {}
     return str(difference.get("type", "")).strip() in {"speech", "audio_event"}
+
+
+def _extract_audio_only_cache(*, video_path: Path, cache_dir: Path, clip_id: str) -> Path:
+    if not video_path.exists():
+        raise FileNotFoundError(f"video file not found for audio extraction: {video_path}")
+    stat = video_path.stat()
+    cache_key = json.dumps(
+        {
+            "path": str(video_path.resolve()),
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+        },
+        sort_keys=True,
+    )
+    safe_clip_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", clip_id).strip("_") or "clip"
+    output_path = cache_dir / f"{safe_clip_id}_{_stable_hash(cache_key)}.wav"
+    if output_path.exists() and output_path.stat().st_size > 0:
+        return output_path
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_suffix(".tmp.wav")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(tmp_path),
+    ]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+            raise RuntimeError("ffmpeg produced an empty wav")
+        tmp_path.replace(output_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+    return output_path
+
+
+def _b_audio_blind_review_model_fields(audio_only_proposal: dict[str, Any]) -> dict[str, Any]:
+    difference_type = str(audio_only_proposal.get("difference_type", "")).strip()
+    if difference_type == "speech_topic":
+        difference_type = "speech"
+    if difference_type not in {"speech", "audio_event"}:
+        difference_type = "audio_event" if str(audio_only_proposal.get("b_subtype", "")) in {"music", "sound_event"} else "speech"
+    reference_audio = str(audio_only_proposal.get("reference_audio_content", "")).strip()
+    target_audio = str(audio_only_proposal.get("target_audio_content", "")).strip()
+    edit_text = str(audio_only_proposal.get("edit_text", "")).strip()
+    return {
+        "edit_text": edit_text,
+        "modalities": ["audio"],
+        "reference_caption": reference_audio,
+        "target_caption": target_audio,
+        "difference": {
+            "type": difference_type,
+            "from": reference_audio,
+            "to": target_audio,
+            "description": "; ".join(_normalize_list(audio_only_proposal.get("evidence", []))) or edit_text,
+        },
+        "dominant_delta": {
+            "type": difference_type,
+            "from": reference_audio,
+            "to": target_audio,
+            "reason": "audio-only blind proposal",
+        },
+        "reference_state": {"composition": "", "main_speaker": ""},
+        "target_state": {"composition": "", "main_speaker": ""},
+        "delta_temporal_extent": {
+            "reference": reference_audio,
+            "target": target_audio,
+            "target_coverage": _score_float(audio_only_proposal.get("confidence")),
+            "evidence": "; ".join(_normalize_list(audio_only_proposal.get("evidence", []))),
+        },
+        "subject_roles": {"main_speaker": "", "inset_subjects": [], "product_overlay": ""},
+        "is_segment_wide_delta": True,
+        "discarded_deltas": [],
+        "evidence": _normalize_list(audio_only_proposal.get("evidence", [])),
+        "confidence": _score_float(audio_only_proposal.get("confidence")),
+        "accept": _boolish(audio_only_proposal.get("accept")),
+        "reject_reason": str(audio_only_proposal.get("reject_reason", "")).strip(),
+    }
+
+
+def _b_audio_blind_review_issues(
+    *,
+    audio_only_proposal: dict[str, Any],
+    audio_only_verification: dict[str, Any],
+    full_av_consistency: dict[str, Any],
+    quality: dict[str, Any],
+) -> list[str]:
+    issues: list[str] = []
+    difference_type = str(audio_only_proposal.get("difference_type", "")).strip()
+    if difference_type == "speech_topic":
+        difference_type = "speech"
+    if difference_type not in {"speech", "audio_event"}:
+        issues.append(f"audio_only_invalid_difference_type: {difference_type or 'missing'}")
+    edit_text = str(audio_only_proposal.get("edit_text", "")).strip()
+    issues.extend(_b_line_edit_text_audio_only_issues(edit_text, difference_type))
+    if not _boolish(audio_only_proposal.get("accept")):
+        reason = str(audio_only_proposal.get("reject_reason", "")).strip()
+        issues.append("audio_only_proposal_reject" + (f": {reason}" if reason else ""))
+    if _score_float(audio_only_proposal.get("confidence")) < 0.70:
+        issues.append(f"audio_only_proposal_confidence_below_threshold: {_score_float(audio_only_proposal.get('confidence')):.2f} < 0.70")
+    if not _boolish(audio_only_proposal.get("audio_difference_specific")):
+        issues.append("audio_only_difference_not_specific")
+    if not _boolish(audio_only_proposal.get("edit_text_audio_only")):
+        issues.append("audio_only_edit_text_not_audio_only")
+    if _b_line_audio_phrase_is_hollow(str(audio_only_proposal.get("reference_audio_content", ""))) or _b_line_audio_phrase_is_hollow(
+        str(audio_only_proposal.get("target_audio_content", ""))
+    ):
+        issues.append("audio_only_hollow_content")
+
+    if not _boolish(audio_only_verification.get("accept")):
+        reason = str(audio_only_verification.get("reject_reason", "")).strip()
+        issues.append("audio_only_verification_reject" + (f": {reason}" if reason else ""))
+    if _boolish(audio_only_verification.get("reference_satisfies_edit")):
+        issues.append("audio_only_reference_satisfies_edit")
+    if not _boolish(audio_only_verification.get("target_satisfies_edit")):
+        issues.append("audio_only_target_missing_edit")
+    if not _boolish(audio_only_verification.get("audio_difference_specific")):
+        issues.append("audio_only_verification_not_specific")
+    if not _boolish(audio_only_verification.get("edit_text_audio_only")):
+        issues.append("audio_only_verification_edit_text_not_audio_only")
+    if _score_float(audio_only_verification.get("confidence")) < 0.70:
+        issues.append(f"audio_only_verification_confidence_below_threshold: {_score_float(audio_only_verification.get('confidence')):.2f} < 0.70")
+
+    if not _boolish(full_av_consistency.get("accept")):
+        reason = str(full_av_consistency.get("reject_reason", "")).strip()
+        issues.append("full_av_consistency_reject" + (f": {reason}" if reason else ""))
+    if not _boolish(full_av_consistency.get("visual_context_preserved")):
+        issues.append("full_av_visual_context_not_preserved")
+    if _boolish(full_av_consistency.get("visual_shortcut_risk")):
+        issues.append("visual_shortcut_risk")
+    if not _boolish(full_av_consistency.get("audio_edit_still_valid")):
+        issues.append("full_av_audio_edit_not_valid")
+    if _score_float(full_av_consistency.get("confidence")) < 0.60:
+        issues.append(f"full_av_consistency_confidence_below_threshold: {_score_float(full_av_consistency.get('confidence')):.2f} < 0.60")
+
+    if _score_float(quality.get("video_context_strength")) < _profile_threshold(B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE, "video_context_strength"):
+        issues.append("blind_review_video_context_too_weak")
+    if _score_float(quality.get("asr_degeneracy_risk")) > _profile_threshold(B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE, "asr_degeneracy_risk"):
+        issues.append("blind_review_asr_degeneracy_risk_too_high")
+    if _score_float(quality.get("visual_delta_strength")) > _profile_threshold(B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE, "visual_delta_strength"):
+        issues.append("visual_shortcut_risk: local visual_delta_strength too high")
+    return _dedupe_strings(issues)
 
 
 def _a_line_unrescued_local_hard_rejects(

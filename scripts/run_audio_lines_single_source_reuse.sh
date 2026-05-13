@@ -61,8 +61,8 @@ Options:
   --propose-parallel-jobs N
   --request-timeout-seconds N
   --shard-timeout-seconds N
-  --audio-line-quality-profile default|v4_strict|v5_audio_primary|b_audio_context_cvr
-  --acceptance-profile exploration|b_audio_review|b_audio_context_cvr
+  --audio-line-quality-profile default|v4_strict|v5_audio_primary|b_audio_context_cvr|b_audio_blind_review
+  --acceptance-profile exploration|b_audio_review|b_audio_context_cvr|b_audio_blind_review
   --a-candidate-mode hybrid|omni_first
   --b-candidate-mode hybrid|audio_first
   --reuse-run-root PATH
@@ -312,7 +312,7 @@ else
     --model "$MODEL" \
     --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS" \
     --concurrency "$CONCURRENCY" \
-    $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "v5_audio_primary" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_context_cvr" ]; then printf '%s' '--audio-focused'; fi)
+    $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "v5_audio_primary" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_context_cvr" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_blind_review" ]; then printf '%s' '--audio-focused'; fi)
 fi
 
 if [ "$SKIP_ANNOTATION_REFRESH" != "1" ] && [ "$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")" -gt 0 ]; then
@@ -326,7 +326,7 @@ if [ "$SKIP_ANNOTATION_REFRESH" != "1" ] && [ "$(jsonl_row_count "$AUDIO_REFRESH
     --model "$MODEL" \
     --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS" \
     --concurrency "$CONCURRENCY" \
-    $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "v5_audio_primary" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_context_cvr" ]; then printf '%s' '--audio-focused'; fi)
+    $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "v5_audio_primary" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_context_cvr" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_blind_review" ]; then printf '%s' '--audio-focused'; fi)
   python3 -m app.audio_lines_single_source merge-annotations \
     --base-annotations-path "$SEGMENT_ANNOTATIONS" \
     --refresh-annotations-path "$AUDIO_REFRESH_ANNOTATIONS" \

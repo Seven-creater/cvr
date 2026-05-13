@@ -182,6 +182,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("B_ACCEPTANCE_PROFILE=${B_ACCEPTANCE_PROFILE:-exploration}", script)
         self.assertIn("--acceptance-profile", script)
         self.assertIn("b_audio_context_cvr", script)
+        self.assertIn("b_audio_blind_review", script)
         self.assertIn("--reuse-run-root", script)
         self.assertIn("--skip-annotation-refresh", script)
         self.assertIn("--run-b-only", script)
