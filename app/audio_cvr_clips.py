@@ -85,6 +85,7 @@ def build_audio_cvr_clips(
     segments: list[dict[str, Any]] = []
     groups: list[dict[str, Any]] = []
     skipped: Counter[str] = Counter()
+    skipped_by_dataset: dict[str, Counter[str]] = {}
     source_counts: Counter[str] = Counter()
     discovered_video_counts: Counter[str] = Counter()
     dataset_scan_roots: dict[str, list[str]] = {}
@@ -92,6 +93,7 @@ def build_audio_cvr_clips(
     planned_sources = 0
 
     for dataset in dataset_names:
+        skipped_by_dataset.setdefault(dataset, Counter())
         dataset_root = raw_root / dataset
         dataset_videos, scan_roots = _iter_dataset_videos(dataset_root, dataset_name=dataset)
         discovered_video_counts[dataset] = len(dataset_videos)
@@ -105,12 +107,15 @@ def build_audio_cvr_clips(
             media = probe_media(source_path)
             if "error" in media:
                 skipped["probe_error"] += 1
+                skipped_by_dataset[dataset]["probe_error"] += 1
                 continue
             if not media.get("has_video"):
                 skipped["missing_video_stream"] += 1
+                skipped_by_dataset[dataset]["missing_video_stream"] += 1
                 continue
             if not media.get("has_audio"):
                 skipped["missing_audio_stream"] += 1
+                skipped_by_dataset[dataset]["missing_audio_stream"] += 1
                 continue
             duration = float(media.get("duration_seconds") or 0.0)
             segment_spans = _fixed_segments(
@@ -121,7 +126,9 @@ def build_audio_cvr_clips(
                 max_clips=max_clips_per_source,
             )
             if len(segment_spans) < min_clips_per_source:
-                skipped[f"too_few_segments:{len(segment_spans)}"] += 1
+                reason = f"too_few_segments:{len(segment_spans)}"
+                skipped[reason] += 1
+                skipped_by_dataset[dataset][reason] += 1
                 continue
 
             dataset_seen += 1
@@ -220,6 +227,7 @@ def build_audio_cvr_clips(
         "discovered_video_counts": dict(discovered_video_counts),
         "dataset_scan_roots": dataset_scan_roots,
         "skipped_counts": dict(skipped),
+        "skipped_counts_by_dataset": {dataset: dict(counter) for dataset, counter in skipped_by_dataset.items()},
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return summary

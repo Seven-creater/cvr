@@ -35,7 +35,7 @@ raw datasets 目录：
 |---|---|---|---|
 | `daily_omni` | `raw/daily_omni/video/` | 通用音视频样本 | `audio/` 是独立 wav，不作为视频源 |
 | `hdtf` | `raw/hdtf/videos/`, `raw/hdtf/clips/` | B 线 speech_content | 既有原视频也有切片，低于 8s 的会被跳过 |
-| `avatar` | `raw/avatar/`, `raw/avatar/video/` | 音频/说话/事件补充 | 目录结构可能有根目录 mp4，也可能有 `video/` |
+| `avatar` | `raw/avatar/`, `raw/avatar/video/` | 后续跨视频/同类分组补充 | 多数约 10s，只能切 1 个 clip；当前 single-source B 线会记录为 `too_few_segments:1`，不能直接组成 pair |
 | `vggsound` | `raw/vggsound/scratch/` | music / sound_event | 不在 `video/` 下，必须递归扫 `scratch/` |
 | `vgg_monoaudio` | `raw/vgg_monoaudio/inter_class/mixed/` | sound/music 补充 | `target_audio/` 是 wav，不作为视频源 |
 | `worldsense` | `raw/worldsense/videos/` | 通用音视频样本 | 只扫视频目录，不扫 `audios/` 和 `subtitles/` |
@@ -81,6 +81,7 @@ raw datasets 目录：
 4. 本地规则只做候选排序、日志记录和少量不可救硬边界；不要让本地第二层规则提前杀掉可能正确的样本。
 5. 最终是否接受，必须由 Omni final verifier 再看 ref/tgt 视频、听音频后决定。
 6. B 线 accepted 样本全部保留，后续再通过人工审核、训练/测试划分和评测分桶来筛选。
+7. `avatar` 这类单视频约 10 秒的数据不能在当前 single-source 方案里直接产出 B pair；它需要后续按人物/类别/metadata 做跨视频分组。
 
 ## 5. 总流程
 

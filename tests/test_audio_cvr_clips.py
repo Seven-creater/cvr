@@ -43,6 +43,7 @@ class AudioCvrClipsTests(unittest.TestCase):
             self.assertEqual(3, summary["segment_count"])
             self.assertEqual({"daily_omni": 1}, summary["source_counts"])
             self.assertEqual({"too_few_segments:1": 1}, summary["skipped_counts"])
+            self.assertEqual({"too_few_segments:1": 1}, summary["skipped_counts_by_dataset"]["daily_omni"])
 
             records = [
                 json.loads(line)
@@ -114,6 +115,33 @@ class AudioCvrClipsTests(unittest.TestCase):
             self.assertEqual(16, summary["segment_count"])
             self.assertTrue(any(path.endswith("raw/vggsound/scratch") for path in summary["dataset_scan_roots"]["vggsound"]))
             self.assertTrue(any(path.endswith("raw/vgg_monoaudio/inter_class/mixed") for path in summary["dataset_scan_roots"]["vgg_monoaudio"]))
+
+    def test_reports_avatar_single_clip_sources_as_too_few_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            raw = root / "raw" / "avatar"
+            raw.mkdir(parents=True)
+            for index in range(3):
+                (raw / f"avatar_{index}.mp4").write_bytes(b"video")
+
+            def fake_probe(path: Path) -> dict:
+                return {"has_video": True, "has_audio": True, "duration_seconds": 10.0}
+
+            with mock.patch("app.audio_cvr_clips.probe_media", side_effect=fake_probe):
+                summary = build_audio_cvr_clips(
+                    root=root,
+                    datasets=["avatar"],
+                    clip_seconds=10,
+                    min_clip_seconds=8,
+                    max_clip_seconds=12,
+                    min_clips_per_source=2,
+                    dry_run=True,
+                )
+
+            self.assertEqual({"avatar": 3}, summary["discovered_video_counts"])
+            self.assertEqual(0, summary["source_video_count"])
+            self.assertEqual({"too_few_segments:1": 3}, summary["skipped_counts_by_dataset"]["avatar"])
 
 
 if __name__ == "__main__":
