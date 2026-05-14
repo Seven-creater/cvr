@@ -45,6 +45,7 @@ def build_audio_cvr_clips(
     output_root: str | Path | None = None,
     datasets: list[str] | None = None,
     exclude_datasets: list[str] | None = None,
+    dataset_video_roots: dict[str, tuple[str, ...]] | None = None,
     clip_seconds: float = DEFAULT_CLIP_SECONDS,
     min_clip_seconds: float = DEFAULT_MIN_CLIP_SECONDS,
     max_clip_seconds: float = DEFAULT_MAX_CLIP_SECONDS,
@@ -53,6 +54,7 @@ def build_audio_cvr_clips(
     max_clips_per_source: int = 0,
     max_source_videos: int = 0,
     max_source_videos_per_dataset: int = 0,
+    include_tail_segment: bool = False,
     dry_run: bool = False,
     overwrite: bool = False,
 ) -> dict[str, Any]:
@@ -66,6 +68,7 @@ def build_audio_cvr_clips(
         output_dir = root_path / output_dir
     manifest_dir = output_dir / "_manifests"
     manifest_dir.mkdir(parents=True, exist_ok=True)
+    clip_set_name = _safe_id(output_dir.name or "audio_cvr_clips")
 
     clip_seconds = float(clip_seconds)
     min_clip_seconds = float(min_clip_seconds)
@@ -83,6 +86,7 @@ def build_audio_cvr_clips(
     max_clips_per_source = max(0, int(max_clips_per_source or 0))
 
     dataset_names = _dataset_names(raw_root, datasets, exclude_datasets)
+    scan_root_overrides = {key.lower(): value for key, value in (dataset_video_roots or {}).items()}
     segments: list[dict[str, Any]] = []
     groups: list[dict[str, Any]] = []
     skipped: Counter[str] = Counter()
@@ -96,7 +100,11 @@ def build_audio_cvr_clips(
     for dataset in dataset_names:
         skipped_by_dataset.setdefault(dataset, Counter())
         dataset_root = raw_root / dataset
-        dataset_videos, scan_roots = _iter_dataset_videos(dataset_root, dataset_name=dataset)
+        dataset_videos, scan_roots = _iter_dataset_videos(
+            dataset_root,
+            dataset_name=dataset,
+            configured_roots=scan_root_overrides.get(dataset.lower()),
+        )
         discovered_video_counts[dataset] = len(dataset_videos)
         dataset_scan_roots[dataset] = [_display_path(root_path, path) for path in scan_roots]
         dataset_seen = 0
@@ -125,6 +133,7 @@ def build_audio_cvr_clips(
                 min_clip_seconds=min_clip_seconds,
                 stride_seconds=stride,
                 max_clips=max_clips_per_source,
+                include_tail_segment=include_tail_segment,
             )
             if len(segment_spans) < min_clips_per_source:
                 reason = f"too_few_segments:{len(segment_spans)}"
@@ -149,7 +158,7 @@ def build_audio_cvr_clips(
                     "start_seconds": round(start_seconds, 3),
                     "end_seconds": round(end_seconds, 3),
                     "duration_seconds": round(end_seconds - start_seconds, 3),
-                    "role": "audio_cvr_8_12s_segment",
+                    "role": f"{clip_set_name}_segment",
                     "notes": f"audio-cvr fixed {clip_seconds:g}s segment, min {min_clip_seconds:g}s",
                     "dataset": dataset,
                     "source_clip_id": source_id,
@@ -164,6 +173,7 @@ def build_audio_cvr_clips(
                         "min_clip_seconds": min_clip_seconds,
                         "max_clip_seconds": max_clip_seconds,
                         "stride_seconds": stride,
+                        "include_tail_segment": include_tail_segment,
                     },
                 }
                 segments.append(record)
@@ -182,16 +192,17 @@ def build_audio_cvr_clips(
                 {
                     "group_id": f"single_source_{source_id}",
                     "dataset": dataset,
-                    "group_reason": "audio_cvr_8_12s_source_video",
+                    "group_reason": f"{clip_set_name}_source_video",
                     "source_clip_ids": [source_id],
                     "candidate_clip_ids": candidate_clip_ids,
-                    "group_tags": ["single_source", dataset, "audio_cvr_8_12s", "b_line_first"],
+                    "group_tags": ["single_source", dataset, clip_set_name, "b_line_first"],
                     "source_path": str(source_path),
                     "media_probe": media,
                     "clip_seconds": clip_seconds,
                     "min_clip_seconds": min_clip_seconds,
                     "max_clip_seconds": max_clip_seconds,
                     "stride_seconds": stride,
+                    "include_tail_segment": include_tail_segment,
                 }
             )
             print(
@@ -200,9 +211,9 @@ def build_audio_cvr_clips(
                 flush=True,
             )
 
-    manifest_path = manifest_dir / "audio_cvr_8_12s_clips.jsonl"
-    groups_path = manifest_dir / "audio_cvr_8_12s_groups.jsonl"
-    summary_path = manifest_dir / "audio_cvr_8_12s_summary.json"
+    manifest_path = manifest_dir / f"{clip_set_name}_clips.jsonl"
+    groups_path = manifest_dir / f"{clip_set_name}_groups.jsonl"
+    summary_path = manifest_dir / f"{clip_set_name}_summary.json"
     _write_jsonl(manifest_path, segments)
     _write_jsonl(groups_path, groups)
     summary = {
@@ -221,6 +232,7 @@ def build_audio_cvr_clips(
         "min_clip_seconds": min_clip_seconds,
         "max_clip_seconds": max_clip_seconds,
         "stride_seconds": stride,
+        "include_tail_segment": include_tail_segment,
         "min_clips_per_source": min_clips_per_source,
         "max_clips_per_source": max_clips_per_source,
         "source_counts": dict(source_counts),
@@ -252,10 +264,16 @@ def _dataset_names(raw_root: Path, datasets: list[str] | None, exclude_datasets:
     ]
 
 
-def _iter_dataset_videos(dataset_root: Path, *, dataset_name: str) -> tuple[list[Path], list[Path]]:
+def _iter_dataset_videos(
+    dataset_root: Path,
+    *,
+    dataset_name: str,
+    configured_roots: tuple[str, ...] | None = None,
+) -> tuple[list[Path], list[Path]]:
     if not dataset_root.exists():
         return [], []
-    configured_roots = SERVER_RAW_DATASET_VIDEO_ROOTS.get(dataset_name.lower())
+    if configured_roots is None:
+        configured_roots = SERVER_RAW_DATASET_VIDEO_ROOTS.get(dataset_name.lower())
     scan_roots: list[Path] = []
     if configured_roots:
         for relative_root in configured_roots:
@@ -280,11 +298,27 @@ def _fixed_segments(
     min_clip_seconds: float,
     stride_seconds: float,
     max_clips: int,
+    include_tail_segment: bool = False,
 ) -> list[tuple[float, float]]:
     if duration_seconds <= 0:
         return []
     segments: list[tuple[float, float]] = []
     start = 0.0
+    if include_tail_segment:
+        while start + clip_seconds <= duration_seconds + 1e-6:
+            segments.append((round(start, 3), round(start + clip_seconds, 3)))
+            if max_clips > 0 and len(segments) >= max_clips:
+                return segments
+            start += stride_seconds
+        if duration_seconds >= min_clip_seconds:
+            tail_start = max(0.0, duration_seconds - clip_seconds)
+            tail_end = duration_seconds
+            if tail_end - tail_start >= min_clip_seconds and (
+                not segments or tail_start > segments[-1][0] + 1e-3
+            ):
+                segments.append((round(tail_start, 3), round(tail_end, 3)))
+        return segments
+
     while start < duration_seconds:
         end = min(start + clip_seconds, duration_seconds)
         if end - start >= min_clip_seconds:
@@ -339,6 +373,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root")
     parser.add_argument("--dataset", action="append", default=[])
     parser.add_argument("--exclude-dataset", action="append", default=[])
+    parser.add_argument(
+        "--dataset-video-root",
+        action="append",
+        default=[],
+        help="Override scan roots for one dataset, e.g. hdtf=videos or avatar=.,video.",
+    )
     parser.add_argument("--clip-seconds", type=float, default=DEFAULT_CLIP_SECONDS)
     parser.add_argument("--min-clip-seconds", type=float, default=DEFAULT_MIN_CLIP_SECONDS)
     parser.add_argument("--max-clip-seconds", type=float, default=DEFAULT_MAX_CLIP_SECONDS)
@@ -347,6 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-clips-per-source", type=int, default=0)
     parser.add_argument("--max-source-videos", type=int, default=0)
     parser.add_argument("--max-source-videos-per-dataset", type=int, default=0)
+    parser.add_argument("--include-tail-segment", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser
@@ -359,6 +400,7 @@ def main() -> None:
         output_root=args.output_root,
         datasets=args.dataset,
         exclude_datasets=args.exclude_dataset,
+        dataset_video_roots=_parse_dataset_video_roots(args.dataset_video_root),
         clip_seconds=args.clip_seconds,
         min_clip_seconds=args.min_clip_seconds,
         max_clip_seconds=args.max_clip_seconds,
@@ -367,10 +409,25 @@ def main() -> None:
         max_clips_per_source=args.max_clips_per_source,
         max_source_videos=args.max_source_videos,
         max_source_videos_per_dataset=args.max_source_videos_per_dataset,
+        include_tail_segment=args.include_tail_segment,
         dry_run=args.dry_run,
         overwrite=args.overwrite,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def _parse_dataset_video_roots(items: list[str]) -> dict[str, tuple[str, ...]]:
+    overrides: dict[str, tuple[str, ...]] = {}
+    for raw_item in items or []:
+        if "=" not in raw_item:
+            raise ValueError(f"--dataset-video-root must be DATASET=ROOT[,ROOT...], got: {raw_item}")
+        dataset, raw_roots = raw_item.split("=", 1)
+        dataset = dataset.strip()
+        roots = tuple(root.strip() for root in raw_roots.split(",") if root.strip())
+        if not dataset or not roots:
+            raise ValueError(f"--dataset-video-root must include dataset and at least one root, got: {raw_item}")
+        overrides[dataset] = roots
+    return overrides
 
 
 if __name__ == "__main__":

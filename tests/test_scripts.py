@@ -275,6 +275,35 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--propose-parallel-jobs \"$PROPOSE_PARALLEL_JOBS\"", script)
         self.assertNotIn("modelscope download", script)
 
+    def test_audio_cvr_6_9s_full_scripts_are_bline_handoff_ready(self) -> None:
+        clip_script = Path("scripts/build_audio_cvr_6_9s_clips.sh").read_text(encoding="utf-8")
+        run_script = Path("scripts/run_audio_cvr_bline_6_9s_full_4gpu.sh").read_text(encoding="utf-8")
+
+        self.assertIn("OUTPUT_ROOT=${OUTPUT_ROOT:-$ROOT/clips/audio_cvr_6_9s}", clip_script)
+        self.assertIn("CLIP_SECONDS=${CLIP_SECONDS:-8}", clip_script)
+        self.assertIn("MIN_CLIP_SECONDS=${MIN_CLIP_SECONDS:-6}", clip_script)
+        self.assertIn("MAX_CLIP_SECONDS=${MAX_CLIP_SECONDS:-9}", clip_script)
+        self.assertIn("INCLUDE_TAIL_SEGMENT=${INCLUDE_TAIL_SEGMENT:-1}", clip_script)
+        self.assertIn("--dataset-video-root hdtf=videos", clip_script)
+        self.assertIn("--dataset-video-root voxceleb=.", clip_script)
+        self.assertIn("EXCLUDE_DATASETS=${EXCLUDE_DATASETS:-voxceleb_seed}", clip_script)
+        self.assertNotIn("modelscope download", clip_script)
+        self.assertNotIn("vllm.entrypoints.openai.api_server", clip_script)
+
+        self.assertIn("SINGLE_SOURCE_ROOT=${SINGLE_SOURCE_ROOT:-$ROOT/clips/audio_cvr_6_9s}", run_script)
+        self.assertIn("audio_cvr_bline_6_9s_full_", run_script)
+        self.assertIn("CLIP_SECONDS=${CLIP_SECONDS:-8}", run_script)
+        self.assertIn("MIN_CLIP_SECONDS=${MIN_CLIP_SECONDS:-6}", run_script)
+        self.assertIn("MAX_CLIP_SECONDS=${MAX_CLIP_SECONDS:-9}", run_script)
+        self.assertIn("GPU_IDS=${GPU_IDS:-0,1,2,3}", run_script)
+        self.assertIn("MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}", run_script)
+        self.assertIn("scripts/build_audio_cvr_6_9s_clips.sh", run_script)
+        self.assertIn("scripts/run_audio_cvr_v1_b_first.sh", run_script)
+        self.assertIn("--skip-clip-build", run_script)
+        self.assertIn("--max-source-videos N", run_script)
+        self.assertNotIn("VACE", run_script)
+        self.assertNotIn("modelscope download", run_script)
+
     def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
         script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")
 
