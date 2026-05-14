@@ -24,6 +24,7 @@ MAX_SOURCE_VIDEOS_PER_DATASET=${MAX_SOURCE_VIDEOS_PER_DATASET:-0}
 DATASETS=${DATASETS:-}
 EXCLUDE_DATASETS=${EXCLUDE_DATASETS:-voxceleb_seed}
 INCLUDE_TAIL_SEGMENT=${INCLUDE_TAIL_SEGMENT:-1}
+SHORT_CLIP_GROUP_DATASETS=${SHORT_CLIP_GROUP_DATASETS:-voxceleb}
 DRY_RUN=${DRY_RUN:-0}
 OVERWRITE=${OVERWRITE:-0}
 
@@ -49,6 +50,7 @@ Options:
   --max-source-videos-per-dataset N default: 0 (all)
   --include-tail-segment    default: enabled
   --no-include-tail-segment
+  --short-clip-group-dataset NAME[,NAME] default: voxceleb
   --dry-run
   --overwrite
 EOF
@@ -70,6 +72,7 @@ while [[ $# -gt 0 ]]; do
     --max-source-videos-per-dataset) MAX_SOURCE_VIDEOS_PER_DATASET="$2"; shift 2 ;;
     --include-tail-segment) INCLUDE_TAIL_SEGMENT=1; shift ;;
     --no-include-tail-segment) INCLUDE_TAIL_SEGMENT=0; shift ;;
+    --short-clip-group-dataset) SHORT_CLIP_GROUP_DATASETS="${SHORT_CLIP_GROUP_DATASETS:+$SHORT_CLIP_GROUP_DATASETS,}$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --overwrite) OVERWRITE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -94,7 +97,7 @@ args=(
   --dataset-video-root avatar=.,video
   --dataset-video-root vggsound=scratch
   --dataset-video-root vgg_monoaudio=inter_class/mixed
-  --dataset-video-root voxceleb=.
+  --dataset-video-root voxceleb=vox2_mp4/dev
 )
 
 if [ -n "$STRIDE_SECONDS" ]; then
@@ -122,9 +125,17 @@ fi
 if [ "$INCLUDE_TAIL_SEGMENT" = "1" ]; then
   args+=(--include-tail-segment)
 fi
+if [ -n "$SHORT_CLIP_GROUP_DATASETS" ]; then
+  IFS=',' read -r -a short_group_dataset_items <<< "$SHORT_CLIP_GROUP_DATASETS"
+  for dataset in "${short_group_dataset_items[@]}"; do
+    dataset="${dataset#"${dataset%%[![:space:]]*}"}"
+    dataset="${dataset%"${dataset##*[![:space:]]}"}"
+    test -n "$dataset" && args+=(--short-clip-group-dataset "$dataset")
+  done
+fi
 if [ "$OVERWRITE" = "1" ]; then
   args+=(--overwrite)
 fi
 
-echo "[audio-cvr-6-9s] root=$ROOT output_root=$OUTPUT_ROOT clip_seconds=$CLIP_SECONDS min=$MIN_CLIP_SECONDS max=$MAX_CLIP_SECONDS include_tail_segment=$INCLUDE_TAIL_SEGMENT datasets=${DATASETS:-all} exclude_datasets=${EXCLUDE_DATASETS:-none}"
+echo "[audio-cvr-6-9s] root=$ROOT output_root=$OUTPUT_ROOT clip_seconds=$CLIP_SECONDS min=$MIN_CLIP_SECONDS max=$MAX_CLIP_SECONDS include_tail_segment=$INCLUDE_TAIL_SEGMENT short_clip_group_datasets=${SHORT_CLIP_GROUP_DATASETS:-none} datasets=${DATASETS:-all} exclude_datasets=${EXCLUDE_DATASETS:-none}"
 "${args[@]}"

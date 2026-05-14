@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections import Counter
@@ -36,6 +37,7 @@ SERVER_RAW_DATASET_VIDEO_ROOTS: dict[str, tuple[str, ...]] = {
     "vggsound": ("scratch",),
     "vgg_monoaudio": ("inter_class/mixed",),
     "worldsense": ("videos",),
+    "voxceleb": ("vox2_mp4/dev",),
 }
 
 
@@ -55,6 +57,7 @@ def build_audio_cvr_clips(
     max_source_videos: int = 0,
     max_source_videos_per_dataset: int = 0,
     include_tail_segment: bool = False,
+    short_clip_group_datasets: set[str] | None = None,
     dry_run: bool = False,
     overwrite: bool = False,
 ) -> dict[str, Any]:
@@ -87,8 +90,11 @@ def build_audio_cvr_clips(
 
     dataset_names = _dataset_names(raw_root, datasets, exclude_datasets)
     scan_root_overrides = {key.lower(): value for key, value in (dataset_video_roots or {}).items()}
+    short_clip_group_dataset_names = {name.lower() for name in (short_clip_group_datasets or set())}
     segments: list[dict[str, Any]] = []
     groups: list[dict[str, Any]] = []
+    short_clip_groups: dict[str, dict[str, Any]] = {}
+    short_clip_group_segments: dict[str, list[dict[str, Any]]] = {}
     skipped: Counter[str] = Counter()
     skipped_by_dataset: dict[str, Counter[str]] = {}
     source_counts: Counter[str] = Counter()
@@ -109,10 +115,6 @@ def build_audio_cvr_clips(
         dataset_scan_roots[dataset] = [_display_path(root_path, path) for path in scan_roots]
         dataset_seen = 0
         for source_path in dataset_videos:
-            if max_source_videos > 0 and planned_sources >= max_source_videos:
-                break
-            if max_source_videos_per_dataset > 0 and dataset_seen >= max_source_videos_per_dataset:
-                break
             media = probe_media(source_path)
             if "error" in media:
                 skipped["probe_error"] += 1
@@ -135,21 +137,44 @@ def build_audio_cvr_clips(
                 max_clips=max_clips_per_source,
                 include_tail_segment=include_tail_segment,
             )
-            if len(segment_spans) < min_clips_per_source:
+            use_short_clip_group = (
+                dataset.lower() in short_clip_group_dataset_names
+                and len(segment_spans) == 1
+                and min_clip_seconds <= duration <= max_clip_seconds
+            )
+            if len(segment_spans) < min_clips_per_source and not use_short_clip_group:
                 reason = f"too_few_segments:{len(segment_spans)}"
                 skipped[reason] += 1
                 skipped_by_dataset[dataset][reason] += 1
                 continue
 
-            dataset_seen += 1
-            planned_sources += 1
-            source_counts[dataset] += 1
-            source_id = _source_id(dataset, source_path, raw_root)
+            if use_short_clip_group:
+                source_id = _short_clip_group_source_id(dataset, source_path, raw_root)
+                if source_id not in short_clip_groups:
+                    if max_source_videos > 0 and planned_sources >= max_source_videos:
+                        break
+                    if max_source_videos_per_dataset > 0 and dataset_seen >= max_source_videos_per_dataset:
+                        break
+                    dataset_seen += 1
+                    planned_sources += 1
+                    source_counts[dataset] += 1
+            else:
+                if max_source_videos > 0 and planned_sources >= max_source_videos:
+                    break
+                if max_source_videos_per_dataset > 0 and dataset_seen >= max_source_videos_per_dataset:
+                    break
+                dataset_seen += 1
+                planned_sources += 1
+                source_counts[dataset] += 1
+                source_id = _source_id(dataset, source_path, raw_root)
             source_folder = output_dir / source_id
             source_folder.mkdir(parents=True, exist_ok=True)
-            candidate_clip_ids: list[str] = []
+            candidate_clip_ids: list[str] = [] if not use_short_clip_group else short_clip_groups.get(source_id, {}).get("candidate_clip_ids", [])
             for segment_index, (start_seconds, end_seconds) in enumerate(segment_spans, start=1):
-                clip_id = f"{source_id}__single_{segment_index:03d}"
+                if use_short_clip_group:
+                    clip_id = _short_clip_id(source_id, source_path, raw_root)
+                else:
+                    clip_id = f"{source_id}__single_{segment_index:03d}"
                 output_path = source_folder / f"{clip_id}.mp4"
                 record = {
                     "clip_id": clip_id,
@@ -176,7 +201,10 @@ def build_audio_cvr_clips(
                         "include_tail_segment": include_tail_segment,
                     },
                 }
-                segments.append(record)
+                if use_short_clip_group:
+                    short_clip_group_segments.setdefault(source_id, []).append(record)
+                else:
+                    segments.append(record)
                 candidate_clip_ids.append(clip_id)
                 if not dry_run and (overwrite or not output_path.exists()):
                     _extract_clip_atomic(
@@ -184,32 +212,67 @@ def build_audio_cvr_clips(
                         output_path=output_path,
                         start_seconds=start_seconds,
                         end_seconds=end_seconds,
+                        source_duration_seconds=duration,
                         overwrite=overwrite,
                     )
                     extracted_count += 1
 
-            groups.append(
-                {
-                    "group_id": f"single_source_{source_id}",
-                    "dataset": dataset,
-                    "group_reason": f"{clip_set_name}_source_video",
-                    "source_clip_ids": [source_id],
-                    "candidate_clip_ids": candidate_clip_ids,
-                    "group_tags": ["single_source", dataset, clip_set_name, "b_line_first"],
-                    "source_path": str(source_path),
-                    "media_probe": media,
-                    "clip_seconds": clip_seconds,
-                    "min_clip_seconds": min_clip_seconds,
-                    "max_clip_seconds": max_clip_seconds,
-                    "stride_seconds": stride,
-                    "include_tail_segment": include_tail_segment,
-                }
-            )
+            if use_short_clip_group:
+                group_record = short_clip_groups.setdefault(
+                    source_id,
+                    {
+                        "group_id": f"single_source_{source_id}",
+                        "dataset": dataset,
+                        "group_reason": f"{clip_set_name}_short_clip_parent_group",
+                        "source_clip_ids": [source_id],
+                        "candidate_clip_ids": [],
+                        "group_tags": ["single_source", dataset, clip_set_name, "b_line_first", "short_clip_group"],
+                        "source_paths": [],
+                        "clip_seconds": clip_seconds,
+                        "min_clip_seconds": min_clip_seconds,
+                        "max_clip_seconds": max_clip_seconds,
+                        "stride_seconds": stride,
+                        "include_tail_segment": include_tail_segment,
+                    },
+                )
+                group_record["candidate_clip_ids"].extend([clip_id for clip_id in candidate_clip_ids if clip_id not in group_record["candidate_clip_ids"]])
+                group_record["source_paths"].append(str(source_path))
+            else:
+                groups.append(
+                    {
+                        "group_id": f"single_source_{source_id}",
+                        "dataset": dataset,
+                        "group_reason": f"{clip_set_name}_source_video",
+                        "source_clip_ids": [source_id],
+                        "candidate_clip_ids": candidate_clip_ids,
+                        "group_tags": ["single_source", dataset, clip_set_name, "b_line_first"],
+                        "source_path": str(source_path),
+                        "media_probe": media,
+                        "clip_seconds": clip_seconds,
+                        "min_clip_seconds": min_clip_seconds,
+                        "max_clip_seconds": max_clip_seconds,
+                        "stride_seconds": stride,
+                        "include_tail_segment": include_tail_segment,
+                    }
+                )
             print(
                 f"[audio-cvr-clips] dataset={dataset} source={planned_sources} clips={len(candidate_clip_ids)} path={source_path}",
                 file=sys.stderr,
                 flush=True,
             )
+
+    for group_record in short_clip_groups.values():
+        if len(group_record.get("candidate_clip_ids", [])) >= min_clips_per_source:
+            groups.append(group_record)
+            source_ids = group_record.get("source_clip_ids") or []
+            if source_ids:
+                segments.extend(short_clip_group_segments.get(str(source_ids[0]), []))
+        else:
+            reason = f"too_few_grouped_short_clips:{len(group_record.get('candidate_clip_ids', []))}"
+            skipped[reason] += 1
+            skipped_by_dataset.setdefault(str(group_record.get("dataset") or "unknown"), Counter())[reason] += 1
+
+    final_source_counts = Counter(str(group.get("dataset") or "unknown") for group in groups)
 
     manifest_path = manifest_dir / f"{clip_set_name}_clips.jsonl"
     groups_path = manifest_dir / f"{clip_set_name}_groups.jsonl"
@@ -223,7 +286,7 @@ def build_audio_cvr_clips(
         "manifest_path": str(manifest_path),
         "groups_path": str(groups_path),
         "dataset_names": dataset_names,
-        "source_video_count": planned_sources,
+        "source_video_count": sum(final_source_counts.values()),
         "segment_count": len(segments),
         "extracted_count": extracted_count,
         "dry_run": bool(dry_run),
@@ -233,9 +296,10 @@ def build_audio_cvr_clips(
         "max_clip_seconds": max_clip_seconds,
         "stride_seconds": stride,
         "include_tail_segment": include_tail_segment,
+        "short_clip_group_datasets": sorted(short_clip_group_dataset_names),
         "min_clips_per_source": min_clips_per_source,
         "max_clips_per_source": max_clips_per_source,
-        "source_counts": dict(source_counts),
+        "source_counts": dict(final_source_counts),
         "discovered_video_counts": dict(discovered_video_counts),
         "dataset_scan_roots": dataset_scan_roots,
         "skipped_counts": dict(skipped),
@@ -337,15 +401,35 @@ def _source_id(dataset: str, source_path: Path, raw_root: Path) -> str:
     return _safe_id(f"{dataset}_{source_path.stem}_{_stable_hash(relative)[:8]}")
 
 
+def _short_clip_group_source_id(dataset: str, source_path: Path, raw_root: Path) -> str:
+    try:
+        relative_parent = source_path.parent.relative_to(raw_root).as_posix()
+    except ValueError:
+        relative_parent = source_path.parent.as_posix()
+    return _safe_id(f"{dataset}_{relative_parent}_{_stable_hash(relative_parent)[:8]}")
+
+
+def _short_clip_id(source_id: str, source_path: Path, raw_root: Path) -> str:
+    try:
+        relative = source_path.relative_to(raw_root).as_posix()
+    except ValueError:
+        relative = source_path.as_posix()
+    return _safe_id(f"{source_id}_{source_path.stem}_{_stable_hash(relative)[:8]}")
+
+
 def _extract_clip_atomic(
     *,
     source_path: Path,
     output_path: Path,
     start_seconds: float,
     end_seconds: float,
+    source_duration_seconds: float | None = None,
     overwrite: bool,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if _is_full_mp4_span(source_path, start_seconds, end_seconds, source_duration_seconds):
+        _materialize_full_mp4_atomic(source_path=source_path, output_path=output_path, overwrite=overwrite)
+        return
     temp_path = output_path.with_name(f".{output_path.stem}.tmp.{os.getpid()}{output_path.suffix}")
     if temp_path.exists():
         temp_path.unlink()
@@ -358,6 +442,38 @@ def _extract_clip_atomic(
     )
     try:
         subprocess.run(command, check=True)
+        if overwrite or not output_path.exists():
+            temp_path.replace(output_path)
+        else:
+            temp_path.unlink(missing_ok=True)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _is_full_mp4_span(
+    source_path: Path,
+    start_seconds: float,
+    end_seconds: float,
+    source_duration_seconds: float | None,
+) -> bool:
+    if source_path.suffix.lower() != ".mp4":
+        return False
+    if source_duration_seconds is None or source_duration_seconds <= 0:
+        return False
+    return start_seconds <= 0.001 and abs(float(end_seconds) - float(source_duration_seconds)) <= 0.05
+
+
+def _materialize_full_mp4_atomic(*, source_path: Path, output_path: Path, overwrite: bool) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f".{output_path.stem}.tmp.{os.getpid()}{output_path.suffix}")
+    if temp_path.exists():
+        temp_path.unlink()
+    try:
+        try:
+            os.link(source_path, temp_path)
+        except OSError:
+            shutil.copy2(source_path, temp_path)
         if overwrite or not output_path.exists():
             temp_path.replace(output_path)
         else:
@@ -388,6 +504,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-source-videos", type=int, default=0)
     parser.add_argument("--max-source-videos-per-dataset", type=int, default=0)
     parser.add_argument("--include-tail-segment", action="store_true")
+    parser.add_argument(
+        "--short-clip-group-dataset",
+        action="append",
+        default=[],
+        help="For datasets made of short mp4 clips, group full short clips by their parent folder.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser
@@ -410,6 +532,7 @@ def main() -> None:
         max_source_videos=args.max_source_videos,
         max_source_videos_per_dataset=args.max_source_videos_per_dataset,
         include_tail_segment=args.include_tail_segment,
+        short_clip_group_datasets={item.strip() for raw in args.short_clip_group_dataset for item in raw.split(",") if item.strip()},
         dry_run=args.dry_run,
         overwrite=args.overwrite,
     )

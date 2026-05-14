@@ -212,6 +212,121 @@ class AudioCvrClipsTests(unittest.TestCase):
             self.assertEqual(4, summary["segment_count"])
             self.assertTrue(all(path.endswith("raw/hdtf/videos") for path in summary["dataset_scan_roots"]["hdtf"]))
 
+    def test_voxceleb_short_mp4s_are_grouped_by_parent_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            video_dir = root / "raw" / "voxceleb" / "vox2_mp4" / "dev" / "id00001" / "youtube_a"
+            ignored_dir = root / "raw" / "voxceleb" / "vox2_aac" / "dev" / "id00001" / "youtube_a"
+            video_dir.mkdir(parents=True)
+            ignored_dir.mkdir(parents=True)
+            for name in ("00001.mp4", "00002.mp4"):
+                (video_dir / name).write_bytes(b"video")
+            (ignored_dir / "ignored.mp4").write_bytes(b"video")
+
+            def fake_probe(path: Path) -> dict:
+                return {"has_video": True, "has_audio": True, "duration_seconds": 7.0}
+
+            with mock.patch("app.audio_cvr_clips.probe_media", side_effect=fake_probe):
+                summary = build_audio_cvr_clips(
+                    root=root,
+                    output_root=root / "clips" / "audio_cvr_6_9s",
+                    datasets=["voxceleb"],
+                    clip_seconds=8,
+                    min_clip_seconds=6,
+                    max_clip_seconds=9,
+                    min_clips_per_source=2,
+                    include_tail_segment=True,
+                    short_clip_group_datasets={"voxceleb"},
+                    dry_run=True,
+                )
+
+            records = [
+                json.loads(line)
+                for line in Path(summary["manifest_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            groups = [
+                json.loads(line)
+                for line in Path(summary["groups_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual({"voxceleb": 2}, summary["discovered_video_counts"])
+            self.assertEqual(1, summary["source_video_count"])
+            self.assertEqual(2, summary["segment_count"])
+            self.assertEqual(1, len(groups))
+            self.assertEqual(2, len(groups[0]["candidate_clip_ids"]))
+            self.assertEqual(1, len({record["group_id"] for record in records}))
+            self.assertTrue(summary["dataset_scan_roots"]["voxceleb"][0].endswith("raw/voxceleb/vox2_mp4/dev"))
+            self.assertIn("voxceleb", summary["short_clip_group_datasets"])
+
+    def test_voxceleb_singleton_parent_folder_is_not_manifested(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            video_dir = root / "raw" / "voxceleb" / "vox2_mp4" / "dev" / "id00001" / "youtube_a"
+            video_dir.mkdir(parents=True)
+            (video_dir / "00001.mp4").write_bytes(b"video")
+
+            def fake_probe(path: Path) -> dict:
+                return {"has_video": True, "has_audio": True, "duration_seconds": 7.0}
+
+            with mock.patch("app.audio_cvr_clips.probe_media", side_effect=fake_probe):
+                summary = build_audio_cvr_clips(
+                    root=root,
+                    output_root=root / "clips" / "audio_cvr_6_9s",
+                    datasets=["voxceleb"],
+                    clip_seconds=8,
+                    min_clip_seconds=6,
+                    max_clip_seconds=9,
+                    min_clips_per_source=2,
+                    include_tail_segment=True,
+                    short_clip_group_datasets={"voxceleb"},
+                    dry_run=True,
+                )
+
+            self.assertEqual(0, summary["source_video_count"])
+            self.assertEqual(0, summary["segment_count"])
+            self.assertEqual({"too_few_grouped_short_clips:1": 1}, summary["skipped_counts_by_dataset"]["voxceleb"])
+            self.assertEqual("", Path(summary["manifest_path"]).read_text(encoding="utf-8"))
+            self.assertEqual("", Path(summary["groups_path"]).read_text(encoding="utf-8"))
+
+    def test_full_short_mp4_materialization_avoids_ffmpeg_reencode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            video_dir = root / "raw" / "voxceleb" / "vox2_mp4" / "dev" / "id00001" / "youtube_a"
+            video_dir.mkdir(parents=True)
+            (video_dir / "00001.mp4").write_bytes(b"video one")
+            (video_dir / "00002.mp4").write_bytes(b"video two")
+
+            def fake_probe(path: Path) -> dict:
+                return {"has_video": True, "has_audio": True, "duration_seconds": 7.0}
+
+            with mock.patch("app.audio_cvr_clips.probe_media", side_effect=fake_probe), mock.patch(
+                "app.audio_cvr_clips.subprocess.run", side_effect=AssertionError("ffmpeg should not run")
+            ):
+                summary = build_audio_cvr_clips(
+                    root=root,
+                    output_root=root / "clips" / "audio_cvr_6_9s",
+                    datasets=["voxceleb"],
+                    clip_seconds=8,
+                    min_clip_seconds=6,
+                    max_clip_seconds=9,
+                    min_clips_per_source=2,
+                    include_tail_segment=True,
+                    short_clip_group_datasets={"voxceleb"},
+                )
+
+            records = [
+                json.loads(line)
+                for line in Path(summary["manifest_path"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            output_paths = [root / record["output_path"] for record in records]
+            self.assertEqual([b"video one", b"video two"], [path.read_bytes() for path in output_paths])
+            self.assertFalse(list(output_paths[0].parent.glob("*.tmp.*.mp4")))
+
     def test_clip_extraction_writes_temp_file_then_final_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

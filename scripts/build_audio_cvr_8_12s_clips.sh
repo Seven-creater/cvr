@@ -25,6 +25,7 @@ DATASETS=${DATASETS:-}
 EXCLUDE_DATASETS=${EXCLUDE_DATASETS:-VoxCeleb,voxceleb,voxceleb_seed}
 DATASET_VIDEO_ROOTS=${DATASET_VIDEO_ROOTS:-}
 INCLUDE_TAIL_SEGMENT=${INCLUDE_TAIL_SEGMENT:-0}
+SHORT_CLIP_GROUP_DATASETS=${SHORT_CLIP_GROUP_DATASETS:-}
 DRY_RUN=${DRY_RUN:-0}
 OVERWRITE=${OVERWRITE:-0}
 
@@ -38,6 +39,7 @@ Options:
   --dataset NAME[,NAME]
   --exclude-dataset NAME[,NAME] default: VoxCeleb,voxceleb,voxceleb_seed
   --dataset-video-root DATASET=ROOT[,ROOT] override scan roots for a dataset
+  --short-clip-group-dataset NAME[,NAME] group full short clips by parent folder
   --clip-seconds N          default: 10
   --min-clip-seconds N      default: 8
   --max-clip-seconds N      default: 12
@@ -59,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --dataset) DATASETS="${DATASETS:+$DATASETS,}$2"; shift 2 ;;
     --exclude-dataset) EXCLUDE_DATASETS="${EXCLUDE_DATASETS:+$EXCLUDE_DATASETS,}$2"; shift 2 ;;
     --dataset-video-root) DATASET_VIDEO_ROOTS="${DATASET_VIDEO_ROOTS:+$DATASET_VIDEO_ROOTS;}$2"; shift 2 ;;
+    --short-clip-group-dataset) SHORT_CLIP_GROUP_DATASETS="${SHORT_CLIP_GROUP_DATASETS:+$SHORT_CLIP_GROUP_DATASETS,}$2"; shift 2 ;;
     --clip-seconds) CLIP_SECONDS="$2"; shift 2 ;;
     --min-clip-seconds) MIN_CLIP_SECONDS="$2"; shift 2 ;;
     --max-clip-seconds) MAX_CLIP_SECONDS="$2"; shift 2 ;;
@@ -120,6 +123,14 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 if [ "$INCLUDE_TAIL_SEGMENT" = "1" ]; then
   args+=(--include-tail-segment)
+fi
+if [ -n "$SHORT_CLIP_GROUP_DATASETS" ]; then
+  IFS=',' read -r -a short_group_dataset_items <<< "$SHORT_CLIP_GROUP_DATASETS"
+  for dataset in "${short_group_dataset_items[@]}"; do
+    dataset="${dataset#"${dataset%%[![:space:]]*}"}"
+    dataset="${dataset%"${dataset##*[![:space:]]}"}"
+    test -n "$dataset" && args+=(--short-clip-group-dataset "$dataset")
+  done
 fi
 if [ "$OVERWRITE" = "1" ]; then
   args+=(--overwrite)

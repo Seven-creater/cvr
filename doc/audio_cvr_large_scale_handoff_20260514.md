@@ -38,7 +38,7 @@ MODEL_PATH=/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbon
 | `avatar` | `raw/avatar/` 和 `raw/avatar/video/` | 10,000 mp4，约 10s | 8s + tail clip，保证短视频可成 pair |
 | `vggsound` | `raw/vggsound/scratch/` | 20,000 mp4，约 10-15s | 8s + tail clip |
 | `vgg_monoaudio` | `raw/vgg_monoaudio/inter_class/mixed/` | 1,071 mp4，约 8s | 有视频和音轨才使用 |
-| `voxceleb` | `raw/voxceleb/` | 以服务器实际 inventory 为准 | 递归扫描 mp4，只使用有视频流和音频流的文件 |
+| `voxceleb` | `raw/voxceleb/vox2_mp4/dev/` | 1,092,009 mp4，约 4-9s，224×224 | 同一父目录短 mp4 聚成 single-source group；跳过 `vox1/` 和 `vox2_aac/` |
 
 注意：`raw/hdtf/clips/` 大多约 3.2s，低于本次 6s 下限，不能作为主 B 线切片输入。
 
@@ -87,7 +87,8 @@ test -d raw/hdtf/videos
 test -d raw/avatar
 test -d raw/vggsound/scratch
 test -d raw/vgg_monoaudio/inter_class/mixed
-find raw/voxceleb -name "*.mp4" | head
+test -d raw/voxceleb/vox2_mp4/dev
+find raw/voxceleb/vox2_mp4/dev -name "*.mp4" | head
 ```
 
 如果某一项不存在，停止，把缺失路径回传，不要现场改代码。
@@ -131,11 +132,19 @@ echo "$RUN_ROOT"
 echo "$LOG"
 ```
 
+VoxCeleb 注意事项：
+
+- 脚本只扫描 `raw/voxceleb/vox2_mp4/dev/`。
+- `raw/voxceleb/vox1/` 是 wav/txt，不进入主 B 线。
+- `raw/voxceleb/vox2_aac/` 是纯音频，不进入主 B 线。
+- VoxCeleb mp4 多数只有 4-9s；脚本会把 6-9s 的短 mp4 按父目录聚成 single-source group，并用 hardlink/copy 写入 clip cache，避免对 100 万级短 mp4 重编码。
+
 ## 7. 缓存和断点续跑
 
 不要删除 run 目录，不要删除 clip 目录。
 
 - 切片：每个 mp4 先写临时文件，成功后原子替换成最终文件；重跑会复用已完成 mp4。
+- VoxCeleb 短 mp4：完整 6-9s mp4 使用 hardlink/copy 缓存，不走 ffmpeg 重编码。
 - annotation：每条写入 `single_source_annotations.jsonl`，中断后按 `clip_id` 复用。
 - propose：每条写入 `accepted_progress_*.jsonl` / `rejected_progress_*.jsonl`。
 - merge：可以从 ranked/progress JSONL 重新生成最终 summary 和 review bundle。
