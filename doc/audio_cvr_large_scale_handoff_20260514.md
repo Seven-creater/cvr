@@ -185,6 +185,10 @@ echo "$RUN_ROOT"
 
 cat "$RUN_ROOT/summary.json"
 wc -l "$RUN_ROOT/b_speech_audio_content_triplets.jsonl"
+wc -l "$RUN_ROOT/b_all_audio_cvr_triplets.jsonl" 2>/dev/null || true
+wc -l "$RUN_ROOT/b_main_audio_cvr_triplets.jsonl" 2>/dev/null || true
+wc -l "$RUN_ROOT/b_extended_audio_cvr_triplets.jsonl" 2>/dev/null || true
+wc -l "$RUN_ROOT/b_diagnostic_asr_risk_triplets.jsonl" 2>/dev/null || true
 ls "$RUN_ROOT/manual_review/B" | head
 find "$RUN_ROOT/manual_review/B" -maxdepth 2 -type f | head -30
 
@@ -194,11 +198,23 @@ cat /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/au
 验收重点：
 
 - `b_speech_audio_content_triplets.jsonl` 存在且有样本。
+- `b_all_audio_cvr_triplets.jsonl`、`b_main_audio_cvr_triplets.jsonl`、`b_extended_audio_cvr_triplets.jsonl`、`b_diagnostic_asr_risk_triplets.jsonl` 已按 tier 生成。
+- `summary.json` 中包含 `b_split_tier_counts`、`b_main_count`、`b_extended_count`、`b_diagnostic_count`。
 - `manual_review/B/` 有可审查样本。
 - 日志没有持续大量 `Input length exceeds`、`fallback_pair_proposal`、`timeout`。
 - summary 中 B 线使用的是 `b_audio_blind_review_v2`。
 
-## 10. 禁止事项
+## 10. B 线分层口径
+
+大规模构造时不要因为 ASR-risk 直接停止或删除样本。当前策略是先保留所有 B accepted，再在 merge 阶段分层：
+
+- `B-main`：低 ASR 风险、高视频语境、强 audio delta，用于论文主 benchmark。
+- `B-extended`：中等风险、质量合格，用于训练或预训练。
+- `B-diagnostic`：ASR-risk、generic talking-head、transcript-like edit 等样本，只做附录诊断。
+
+兼容输出 `b_speech_audio_content_triplets.jsonl` 等同所有 B accepted。论文主表优先使用 `b_main_audio_cvr_triplets.jsonl`，训练可使用 `b_extended_audio_cvr_triplets.jsonl` 或 main+extended 的组合。
+
+## 11. 禁止事项
 
 服务器执行人员必须遵守：
 
@@ -209,9 +225,9 @@ cat /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/au
 - 不要跑 A 线。
 - 不要跑 e5、AVIGATE、agent。
 - 不要启动 VACE 或任何视频生成模型。
-- 不要把纯 ASR / 纯音频数据混入主 B 线。
+- 不要把纯 ASR / 纯音频数据混入 `B-main`；如产生 ASR-risk 样本，应保留在 diagnostic tier。
 
-## 11. 失败时回传信息
+## 12. 失败时回传信息
 
 如果失败，回传以下信息，不要现场 patch：
 

@@ -525,16 +525,23 @@ def merge_line_results(
     a_ranked = _dedupe_line_records(_load_many_jsonl(root / "a_shards", "ranked_*.jsonl") + a_accepted_progress + a_rejected_progress)
     b_ranked = _dedupe_line_records(_load_many_jsonl(root / "b_shards", "ranked_*.jsonl") + b_accepted_progress + b_rejected_progress)
     a_accepted_all = [record for record in a_ranked if bool(record.get("accepted"))]
-    b_accepted_all = [record for record in b_ranked if bool(record.get("accepted"))]
+    b_accepted_all = _assign_b_line_tiers([record for record in b_ranked if bool(record.get("accepted"))])
     a_selected = a_accepted_all[: max(0, target_a_count)]
     b_selected = b_accepted_all if keep_all_b else _select_b_line_records(b_accepted_all, target_b_count=target_b_count)
-    b_speech = [record for record in b_selected if _b_line_record_subtype(record) == "speech_topic_in_video_context"]
-    b_music = [record for record in b_selected if _b_line_record_subtype(record) == "music"]
-    b_sound = [record for record in b_selected if _b_line_record_subtype(record) == "sound_event"]
+    b_main = [record for record in b_accepted_all if record.get("split_tier") == "main"]
+    b_extended = [record for record in b_accepted_all if record.get("split_tier") == "extended"]
+    b_diagnostic = [record for record in b_accepted_all if record.get("split_tier") == "diagnostic"]
+    b_speech = [record for record in b_accepted_all if _b_line_record_subtype(record) == "speech_topic_in_video_context"]
+    b_music = [record for record in b_accepted_all if _b_line_record_subtype(record) == "music"]
+    b_sound = [record for record in b_accepted_all if _b_line_record_subtype(record) == "sound_event"]
     _write_jsonl(root / "a_ranked_single_source_pairs.jsonl", a_ranked)
     _write_jsonl(root / "b_ranked_single_source_pairs.jsonl", b_ranked)
     _write_jsonl(root / "a_visual_audio_anchor_triplets.jsonl", a_selected)
-    _write_jsonl(root / "b_speech_audio_content_triplets.jsonl", b_selected)
+    _write_jsonl(root / "b_speech_audio_content_triplets.jsonl", b_accepted_all)
+    _write_jsonl(root / "b_all_audio_cvr_triplets.jsonl", b_accepted_all)
+    _write_jsonl(root / "b_main_audio_cvr_triplets.jsonl", b_main)
+    _write_jsonl(root / "b_extended_audio_cvr_triplets.jsonl", b_extended)
+    _write_jsonl(root / "b_diagnostic_asr_risk_triplets.jsonl", b_diagnostic)
     _write_jsonl(root / "b_speech_context_triplets.jsonl", b_speech)
     _write_jsonl(root / "b_music_triplets.jsonl", b_music)
     _write_jsonl(root / "b_sound_event_triplets.jsonl", b_sound)
@@ -549,9 +556,21 @@ def merge_line_results(
         "a_accepted_count": len(a_accepted_all),
         "b_accepted_count": len(b_accepted_all),
         "a_exported_count": len(a_selected),
-        "b_exported_count": len(b_selected),
+        "b_exported_count": len(b_accepted_all),
+        "b_selected_count": len(b_selected),
+        "b_main_count": len(b_main),
+        "b_extended_count": len(b_extended),
+        "b_diagnostic_count": len(b_diagnostic),
+        "b_split_tier_counts": dict(Counter(str(record.get("split_tier") or "unknown") for record in b_accepted_all)),
         "b_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_accepted_all)),
-        "b_exported_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_selected)),
+        "b_exported_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_accepted_all)),
+        "b_main_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_main)),
+        "b_extended_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_extended)),
+        "b_diagnostic_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_diagnostic)),
+        "b_main_speech_ratio": _ratio(
+            sum(1 for record in b_main if _b_line_record_subtype(record) == "speech_topic_in_video_context"),
+            len(b_main),
+        ),
         "b_context_cvr_summary_path": str(root / "b_context_cvr_summary.json"),
         "target_a_count": target_a_count,
         "target_b_count": target_b_count,
@@ -561,11 +580,126 @@ def merge_line_results(
     }
     (root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (root / "b_context_cvr_summary.json").write_text(
-        json.dumps(_b_context_cvr_summary(root=root, b_ranked=b_ranked, b_selected=b_selected), ensure_ascii=False, indent=2)
+        json.dumps(_b_context_cvr_summary(root=root, b_ranked=b_ranked, b_selected=b_accepted_all), ensure_ascii=False, indent=2)
         + "\n",
         encoding="utf-8",
     )
     return summary
+
+
+def _assign_b_line_tiers(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tiered = [_b_line_record_with_tier(record) for record in records]
+    main_speech = [record for record in tiered if record.get("split_tier") == "main" and _b_line_record_subtype(record) == "speech_topic_in_video_context"]
+    main_non_speech = [record for record in tiered if record.get("split_tier") == "main" and _b_line_record_subtype(record) in {"music", "sound_event"}]
+    speech_cap_35 = int(len(main_non_speech) * 0.35 / 0.65) if main_non_speech else 0
+    speech_cap_40 = int(len(main_non_speech) * 0.40 / 0.60) if main_non_speech else 0
+    speech_cap = speech_cap_35 if len(main_speech) <= speech_cap_35 else speech_cap_40
+    for record in main_speech[speech_cap:]:
+        reasons = _dedupe_strings(_normalize_list(record.get("diagnostic_reason", [])) + ["main_speech_cap_exceeded"])
+        record["split_tier"] = "extended"
+        record["benchmark_eligible"] = False
+        record["training_eligible"] = True
+        record["diagnostic_reason"] = reasons
+    return tiered
+
+
+def _b_line_record_with_tier(record: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(record)
+    tier_metadata = _b_line_record_tier(record)
+    enriched.update(tier_metadata)
+    quality = dict(enriched.get("quality") if isinstance(enriched.get("quality"), dict) else {})
+    for key in (
+        "split_tier",
+        "benchmark_eligible",
+        "training_eligible",
+        "diagnostic_reason",
+        "b_subtype",
+        "video_context_strength",
+        "asr_degeneracy_risk",
+        "audio_delta_strength",
+        "visual_shortcut_risk",
+        "audio_only_solvability",
+        "full_av_required",
+    ):
+        quality[key] = enriched.get(key)
+    enriched["quality"] = quality
+    return enriched
+
+
+def _b_line_record_tier(record: dict[str, Any]) -> dict[str, Any]:
+    subtype = _b_line_record_subtype(record)
+    video_context_strength = _b_line_metric(record, "video_context_strength")
+    asr_degeneracy_risk = _b_line_metric(record, "asr_degeneracy_risk")
+    audio_delta_strength = _b_line_metric(record, "audio_delta_strength")
+    visual_shortcut_risk = _b_line_visual_shortcut_risk(record)
+    audio_only_solvability = _b_line_audio_only_solvability(record, asr_degeneracy_risk=asr_degeneracy_risk, audio_delta_strength=audio_delta_strength)
+    full_av_required = _b_line_full_av_required(record, video_context_strength=video_context_strength, asr_degeneracy_risk=asr_degeneracy_risk, visual_shortcut_risk=visual_shortcut_risk)
+    speech_role = _b_line_text_value(record, "speech_role")
+    reasons: list[str] = []
+    if bool(record.get("fallback")):
+        reasons.append("fallback_pair_proposal")
+    if subtype not in {"speech_topic_in_video_context", "music", "sound_event"}:
+        reasons.append(f"unsupported_b_subtype:{subtype or 'unknown'}")
+    if asr_degeneracy_risk > 0.70:
+        reasons.append("asr_degeneracy_risk_high")
+    if speech_role in {"asr_only", "generic_talking_head"}:
+        reasons.append(f"speech_role_{speech_role}")
+    if audio_only_solvability >= 0.85:
+        reasons.append("audio_only_solvability_high")
+    if _b_line_transcript_like_edit(record):
+        reasons.append("transcript_like_edit_text")
+    if _b_line_hollow_audio_edit(record):
+        reasons.append("hollow_audio_edit_text")
+    if visual_shortcut_risk > 0.35 or _b_line_bool(record, "can_identify_target_without_audio") or _b_line_bool(record, "video_only_can_identify_target_without_audio"):
+        reasons.append("visual_shortcut_risk")
+
+    main_ready = (
+        bool(record.get("accepted"))
+        and not bool(record.get("fallback"))
+        and subtype in {"speech_topic_in_video_context", "music", "sound_event"}
+        and audio_delta_strength >= 0.70
+        and video_context_strength >= 0.60
+        and asr_degeneracy_risk <= 0.35
+        and visual_shortcut_risk <= 0.35
+        and not _b_line_bool(record, "can_identify_target_without_audio")
+        and not _b_line_bool(record, "video_only_can_identify_target_without_audio")
+        and (audio_only_solvability < 0.85 or full_av_required)
+        and not _b_line_transcript_like_edit(record)
+        and not _b_line_hollow_audio_edit(record)
+    )
+    extended_ready = (
+        bool(record.get("accepted"))
+        and not bool(record.get("fallback"))
+        and subtype in {"speech_topic_in_video_context", "music", "sound_event"}
+        and audio_delta_strength >= 0.60
+        and video_context_strength >= 0.35
+        and asr_degeneracy_risk <= 0.70
+        and visual_shortcut_risk <= 0.35
+        and not _b_line_bool(record, "can_identify_target_without_audio")
+        and not _b_line_bool(record, "video_only_can_identify_target_without_audio")
+        and not _b_line_hollow_audio_edit(record)
+    )
+    if main_ready and not reasons:
+        split_tier = "main"
+    elif extended_ready:
+        split_tier = "extended"
+    else:
+        split_tier = "diagnostic"
+        if not reasons:
+            reasons.append("below_extended_threshold")
+    return {
+        "split_tier": split_tier,
+        "benchmark_eligible": split_tier == "main",
+        "training_eligible": split_tier in {"main", "extended"},
+        "diagnostic_reason": _dedupe_strings(reasons),
+        "b_subtype": subtype,
+        "video_context_strength": round(video_context_strength, 3),
+        "asr_degeneracy_risk": round(asr_degeneracy_risk, 3),
+        "audio_delta_strength": round(audio_delta_strength, 3),
+        "visual_shortcut_risk": round(visual_shortcut_risk, 3),
+        "audio_only_solvability": round(audio_only_solvability, 3),
+        "full_av_required": bool(full_av_required),
+    }
 
 
 def _select_b_line_records(records: list[dict[str, Any]], *, target_b_count: int) -> list[dict[str, Any]]:
@@ -604,6 +738,126 @@ def _b_line_record_subtype(record: dict[str, Any]) -> str:
     return "sound_event" if difference_type == "audio_event" else "unknown"
 
 
+def _b_line_metric(record: dict[str, Any], key: str) -> float:
+    if key in record:
+        return _score_float(record.get(key))
+    quality = record.get("quality") if isinstance(record.get("quality"), dict) else {}
+    if key in quality:
+        return _score_float(quality.get(key))
+    final = record.get("final_omni_verification") if isinstance(record.get("final_omni_verification"), dict) else {}
+    if key in final:
+        return _score_float(final.get(key))
+    audio_delta = record.get("audio_delta_analysis") if isinstance(record.get("audio_delta_analysis"), dict) else {}
+    if key in audio_delta:
+        return _score_float(audio_delta.get(key))
+    audio_verify = record.get("audio_only_verification") if isinstance(record.get("audio_only_verification"), dict) else {}
+    if key in audio_verify:
+        return _score_float(audio_verify.get(key))
+    full_av = record.get("full_av_consistency") if isinstance(record.get("full_av_consistency"), dict) else {}
+    if key in full_av:
+        return _score_float(full_av.get(key))
+    video_only = record.get("video_only_shortcut") if isinstance(record.get("video_only_shortcut"), dict) else {}
+    if key in video_only:
+        return _score_float(video_only.get(key))
+    return 0.0
+
+
+def _b_line_text_value(record: dict[str, Any], key: str) -> str:
+    for source in (
+        record,
+        record.get("quality") if isinstance(record.get("quality"), dict) else {},
+        record.get("final_omni_verification") if isinstance(record.get("final_omni_verification"), dict) else {},
+        record.get("audio_delta_analysis") if isinstance(record.get("audio_delta_analysis"), dict) else {},
+        record.get("audio_only_proposal") if isinstance(record.get("audio_only_proposal"), dict) else {},
+    ):
+        value = source.get(key) if isinstance(source, dict) else None
+        if str(value or "").strip():
+            return str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    return ""
+
+
+def _b_line_bool(record: dict[str, Any], key: str) -> bool:
+    for source in (
+        record,
+        record.get("quality") if isinstance(record.get("quality"), dict) else {},
+        record.get("final_omni_verification") if isinstance(record.get("final_omni_verification"), dict) else {},
+        record.get("video_only_shortcut") if isinstance(record.get("video_only_shortcut"), dict) else {},
+        record.get("full_av_consistency") if isinstance(record.get("full_av_consistency"), dict) else {},
+    ):
+        if isinstance(source, dict) and key in source:
+            value = source.get(key)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return float(value) >= 0.5
+            return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _b_line_visual_shortcut_risk(record: dict[str, Any]) -> float:
+    if _b_line_bool(record, "visual_shortcut_risk") or _b_line_bool(record, "video_only_shortcut_risk"):
+        return 1.0
+    return max(
+        _b_line_metric(record, "visual_shortcut_risk"),
+        _b_line_metric(record, "video_only_shortcut_risk"),
+    )
+
+
+def _b_line_audio_only_solvability(record: dict[str, Any], *, asr_degeneracy_risk: float, audio_delta_strength: float) -> float:
+    explicit = _b_line_metric(record, "audio_only_solvability")
+    if explicit > 0:
+        return explicit
+    audio_verify = record.get("audio_only_verification") if isinstance(record.get("audio_only_verification"), dict) else {}
+    verification_confidence = _score_float(audio_verify.get("confidence") or audio_verify.get("quality_score"))
+    if asr_degeneracy_risk > 0.55 or _b_line_text_value(record, "speech_role") in {"asr_only", "generic_talking_head"}:
+        return max(audio_delta_strength, verification_confidence)
+    return min(0.75, max(audio_delta_strength * 0.75, verification_confidence * 0.75))
+
+
+def _b_line_full_av_required(
+    record: dict[str, Any],
+    *,
+    video_context_strength: float,
+    asr_degeneracy_risk: float,
+    visual_shortcut_risk: float,
+) -> bool:
+    if "full_av_required" in record:
+        return _b_line_bool(record, "full_av_required")
+    return video_context_strength >= 0.45 and asr_degeneracy_risk <= 0.55 and visual_shortcut_risk <= 0.35
+
+
+def _b_line_transcript_like_edit(record: dict[str, Any]) -> bool:
+    text = str(record.get("edit_text") or record.get("audio_only_edit_text") or "").strip().lower()
+    if not text:
+        return True
+    if re.search(r'\bfrom saying\s+"[^"]+"\s+to saying\s+"[^"]+"', text):
+        return True
+    transcript_terms = ("sentence", "transcript", "word for word", "verbatim", "saying a different", "says something different")
+    return any(term in text for term in transcript_terms)
+
+
+def _b_line_hollow_audio_edit(record: dict[str, Any]) -> bool:
+    text = str(record.get("edit_text") or record.get("audio_only_edit_text") or "").strip().lower()
+    hollow_terms = (
+        "a to b",
+        "discussing a to discussing b",
+        "speech changed",
+        "speech content changed",
+        "different tone",
+        "different sentence",
+        "unintelligible",
+        "not transcribed",
+        "not discernible",
+        "unknown",
+        "unspecified",
+    )
+    return not text or any(term in text for term in hollow_terms)
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    return round(float(numerator) / float(denominator), 4) if denominator else 0.0
+
+
 def _b_context_cvr_summary(*, root: Path, b_ranked: list[dict[str, Any]], b_selected: list[dict[str, Any]]) -> dict[str, Any]:
     risk_bins: Counter[str] = Counter()
     for record in b_ranked:
@@ -619,8 +873,16 @@ def _b_context_cvr_summary(*, root: Path, b_ranked: list[dict[str, Any]], b_sele
         "b_ranked_count": len(b_ranked),
         "b_accepted_count": sum(1 for record in b_ranked if bool(record.get("accepted"))),
         "b_exported_count": len(b_selected),
+        "split_tier_counts": dict(Counter(str(record.get("split_tier") or "unknown") for record in b_selected)),
+        "main_count": sum(1 for record in b_selected if record.get("split_tier") == "main"),
+        "extended_count": sum(1 for record in b_selected if record.get("split_tier") == "extended"),
+        "diagnostic_count": sum(1 for record in b_selected if record.get("split_tier") == "diagnostic"),
         "accepted_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_ranked if bool(record.get("accepted")))),
         "exported_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_selected)),
+        "main_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_selected if record.get("split_tier") == "main")),
+        "extended_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_selected if record.get("split_tier") == "extended")),
+        "diagnostic_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_selected if record.get("split_tier") == "diagnostic")),
+        "diagnostic_reason_counts": dict(Counter(reason for record in b_selected for reason in _normalize_list(record.get("diagnostic_reason", [])))),
         "asr_degeneracy_risk_bins": dict(risk_bins),
         "reject_reason_counts": _reject_reason_counts(b_ranked),
     }

@@ -1,23 +1,79 @@
 # Audio Dataset A/B Lines 构造流程
 
 日期：2026-05-11
-更新：2026-05-13
+更新：2026-05-15
 
-这份文档说明当前音频敏感 CVR 数据集的 A/B 两条线如何构造、如何运行、以及服务器大规模实验应该怎么调度。它不替换旧的 943 条视觉 CVR 数据集，也不修改原始 raw 视频；它是在旧 CVR 构造方法基础上，针对 audio-sensitive retrieval 做出的安全扩展。
+这份文档说明当前 Audio-CVR 数据集的 A/B 两条线如何构造、为什么这样构造、服务器大规模运行应该如何调度，以及后续 e5/agent 实验应该如何使用这些数据。它不替代旧的 943 条 visual CVR 数据集，不修改任何原始 raw 视频；它是在旧 CVR “同源切片、两两比较、Omni proposal + Omni final verify” 方法基础上，为音频敏感检索新增的安全扩展。
+
+更细的服务器交接命令见：
+
+```text
+doc/audio_cvr_large_scale_handoff_20260514.md
+```
 
 ## 1. 当前结论
 
-本轮正式进入 Audio-CVR v1 大规模构造，执行顺序固定为 **B 线优先**：
+当前正式进入 Audio-CVR 大规模构造阶段，执行顺序固定为 **B 线优先**。
 
-- 旧 B 线数据不再作为主数据保留；正式 B 线只使用最新 `b_audio_blind_review_v2` 方法。
-- 切片长度改为 `8-12s`，默认 `10s`；低于 `8s` 的旧 6s 切片不进入主构造。
-- 所有 raw datasets 都先经过 B 线；只要 B 线 accepted，就全部保留，不再按 `target-b-count` 或 subtype 比例裁剪。
-- A 线暂时不跑大规模；等 B 线数量和质量稳定后，再看 A 线数量并做合理分配。
-- 当前服务器推荐入口是 `scripts/run_audio_cvr_v1_b_first_4gpu_fast.sh`，它负责四卡 Omni 服务、切片、B-first pipeline 三件事。
+- 旧的 B 线数据不再保留为主数据，因为早期方法会接受大量视觉捷径样本。
+- 正式 B 线只使用最新 `b_audio_blind_review_v2` 方法。
+- 切片窗口改为 `6-9s`，默认 `8s`，输出到新目录 `clips/audio_cvr_6_9s/`。
+- 所有 raw datasets 都要先经过 B 线；只要 B 线 accepted，先全部保留，后续再人工审核、训练/验证/测试划分。
+- A 线暂时不大规模跑；等 B 线做好后，再根据 A 线可产出数量和研究叙事做合理分配。
+- 大规模运行入口是 `scripts/run_audio_cvr_bline_6_9s_full_4gpu.sh`。
+- 服务器执行人员只运行命令，不改代码。
 
-## 2. 输入与输出
+## 2. 任务定义
 
-原始数据根目录：
+### A 线：`visual_audio_anchor`
+
+目标：音频上下文相似或连续，视觉发生明显变化。
+
+输入输出：
+
+```text
+reference_video + visual edit_text -> target_video
+```
+
+要求：
+
+- `edit_text` 只描述视觉变化，不能提 audio/speech/music/sound/voice/transcript。
+- ref/target 音频应相似、连续或来自同一节目/新闻/比赛/直播上下文。
+- 视觉差异要明显，不能只是亮度、镜头远近、手势、小物体变化。
+- A 线验证的是“音频作为上下文锚点是否帮助视觉 CVR”，不一定要求 audio-on 明显强于 audio-off。
+
+典型合格样本：
+
+- 同一新闻音频上下文中，画面从主播切到洪水航拍。
+- 同一比赛音频上下文中，画面从解说台切到比赛现场。
+
+### B 线：`speech_audio_content`
+
+目标：视觉上下文尽量锁定，主要差异来自 speech、music 或 sound event。
+
+输入输出：
+
+```text
+reference_video + audio edit_text -> target_video
+```
+
+要求：
+
+- `edit_text` 只能描述声音变化。
+- 允许类型：`speech`、`music`、`sound_event`。
+- 不允许主差异是场景、人物、动作、物体、字幕、按钮、镜头远近。
+- 不允许退化成纯 ASR benchmark；speech 必须嵌在视频场景中，例如新闻、比赛、教程、直播、访谈、表演。
+- B 线是证明 audio 对 CVR 有用的主线，预期 audio-on 在 B 线上应强于 audio-off。
+
+典型合格样本：
+
+- 同一人物/同一访谈场景中，speech 从讨论旅行变成讨论建筑出售。
+- 同一比赛画面中，target 出现明显欢呼或掌声。
+- 同类画面中，背景音乐从安静吉他变成更强的演奏或另一种音乐。
+
+## 3. 数据根目录和数据集清单
+
+固定根目录：
 
 ```text
 /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval
@@ -29,81 +85,65 @@ raw datasets 目录：
 /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/raw
 ```
 
-服务器当前需要纳入 Audio-CVR v1 的 raw 数据集布局必须按下表理解，不能只扫 `video/` 子目录：
-
-| 数据集 | 必扫视频目录 | 当前用途 | 备注 |
-|---|---|---|---|
-| `daily_omni` | `raw/daily_omni/video/` | 通用音视频样本 | `audio/` 是独立 wav，不作为视频源 |
-| `hdtf` | `raw/hdtf/videos/`, `raw/hdtf/clips/` | B 线 speech_content | 既有原视频也有切片，低于 8s 的会被跳过 |
-| `avatar` | `raw/avatar/`, `raw/avatar/video/` | 后续跨视频/同类分组补充 | 多数约 10s，只能切 1 个 clip；当前 single-source B 线会记录为 `too_few_segments:1`，不能直接组成 pair |
-| `vggsound` | `raw/vggsound/scratch/` | music / sound_event | 不在 `video/` 下，必须递归扫 `scratch/` |
-| `vgg_monoaudio` | `raw/vgg_monoaudio/inter_class/mixed/` | sound/music 补充 | `target_audio/` 是 wav，不作为视频源 |
-| `worldsense` | `raw/worldsense/videos/` | 通用音视频样本 | 只扫视频目录，不扫 `audios/` 和 `subtitles/` |
-| `VoxCeleb` | `/data02/pretrained_model/cvr_learn/cvr_data/audio_datasets/VoxCeleb/` | 后续 B 线 speech pair | 仍在下载中，本轮默认排除 |
-
-正式 Audio-CVR v1 切片输出：
+当前大规模 B 线切片输出：
 
 ```text
-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_8_12s
+/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s
 ```
 
-每个子文件夹代表一个原视频，内部是 8-12 秒切片，默认约 10 秒。旧 CVR 方法里最有价值的结构仍然保留：**同一个源视频文件夹内枚举所有时间顺序 pair，让 Omni 直接比较 reference 和 target 两段视频，再由 Omni final verifier 最终审核**。
+运行输出：
 
-主要输出：
+```text
+/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs/audio_cvr_bline_6_9s_full_<timestamp>
+```
 
-- `single_source_annotations.jsonl`：fresh audio-focused clip annotation。
-- `b_candidates.jsonl`：B 线候选 pair。
-- `b_speech_audio_content_triplets.jsonl`：正式 B 线 triplets，保留所有 accepted。
-- `manual_review/B/`：人工审核样本包。
-- `summary.json`：数量、accepted/rejected、`keep_all_b` 等汇总。
+服务器 raw 数据集结构必须按下表理解，不能只扫 `video/` 子目录。
 
-## 3. A/B 两条线目标
+| 数据集 | 必扫视频目录 | 规模和时长 | 本轮处理规则 |
+|---|---|---:|---|
+| `daily_omni` | `raw/daily_omni/video/` | 1,196 mp4，约 30s | 重新切 6-9s，默认 8s |
+| `worldsense` | `raw/worldsense/videos/` | 1,662 mp4，约 30-540s | 重新切 6-9s |
+| `hdtf` | `raw/hdtf/videos/` | 400 长视频，约 30-140s | 只用 `videos/`；不要用低于 6s 的 `clips/` |
+| `avatar` | `raw/avatar/` 和 `raw/avatar/video/` | 10,000 mp4，约 10s | 8s + tail clip，使短视频也能形成 pair |
+| `vggsound` | `raw/vggsound/scratch/` | 20,000 mp4，约 10-15s | 8s + tail clip，主力 sound/music 来源 |
+| `vgg_monoaudio` | `raw/vgg_monoaudio/inter_class/mixed/` | 1,071 mp4，约 8s | 只使用有视频流和音频流的 mp4 |
+| `voxceleb` | `raw/voxceleb/vox2_mp4/dev/` | 1,092,009 mp4，约 4-9s，224x224 | 同一父目录短 mp4 聚成 single-source group；跳过 `vox1/` 和 `vox2_aac/` |
 
-**A 线：`visual_audio_anchor`**
+VoxCeleb 特别规则：
 
-- 目标：音频上下文相似或连续，但视觉发生明显变化。
-- `edit_text` 只描述视觉变化，不能提 audio、speech、music、sound、voice、transcript。
-- 合格风格：同一新闻/节目/比赛/直播音频上下文中，画面从主播切到洪水航拍、比赛现场、室外事故画面等。
-- 科学作用：验证“音频作为上下文锚点”是否帮助视觉 CVR。A 线不一定要求 audio-on 明显强于 audio-off。
+- `raw/voxceleb/vox2_mp4/dev/` 是主 B 线可用视频。
+- `raw/voxceleb/vox1/` 是 wav/txt，不进入主 B 线。
+- `raw/voxceleb/vox2_aac/` 是纯音频，不进入主 B 线。
+- 6-9s 的 VoxCeleb mp4 会按父目录聚合成 single-source group。
+- 父目录内少于 2 个有效 mp4 时，不写入最终 clips/groups manifest。
+- 完整 6-9s mp4 用 hardlink/copy 写入 clip cache，避免对百万级短 mp4 做 ffmpeg 重编码。
 
-**B 线：`speech_audio_content`**
-
-- 目标：视觉上下文尽量锁定，主要差异来自说话内容、音乐或清楚的非语音音频事件。
-- `edit_text` 只能描述声音内容变化，尤其是 speech topic/content 的变化。
-- 合格风格：同一人物、同一直播/演讲/访谈/比赛转播场景中，前一个 10 秒讲预算，后一个 10 秒讲医疗；或同类比赛画面中 target 有明显欢呼、掌声、音乐、环境声。
-- 科学作用：这是证明 audio 有效的主线。预期 e5/audio-on 在 B 线上应强于 audio-off，因为不听声音很难检索对。
-
-## 4. 关键原则
-
-1. 不改旧 943 条数据，不改 raw 视频，不 remux，不生成视频。
-2. B 线不能复用旧普通视觉描述来做正式数据；B 线必须使用 fresh audio-focused annotation。
-3. 同源文件夹内枚举所有时间顺序 pair，不只取相邻 pair。
-4. 本地规则只做候选排序、日志记录和少量不可救硬边界；不要让本地第二层规则提前杀掉可能正确的样本。
-5. 最终是否接受，必须由 Omni final verifier 再看 ref/tgt 视频、听音频后决定。
-6. B 线 accepted 样本全部保留，后续再通过人工审核、训练/测试划分和评测分桶来筛选。
-7. `avatar` 这类单视频约 10 秒的数据不能在当前 single-source 方案里直接产出 B pair；它需要后续按人物/类别/metadata 做跨视频分组。
-
-## 5. 总流程
+## 4. 总流程
 
 ```mermaid
 flowchart TD
-    A["raw datasets<br/>mp4 videos"] --> B["build_audio_cvr_8_12s_clips<br/>8-12s, default 10s"]
-    B --> C["clips/audio_cvr_8_12s<br/>per-source folders"]
+    A["raw datasets<br/>daily / worldsense / hdtf / avatar / vggsound / vgg_monoaudio / voxceleb"] --> B["build_audio_cvr_6_9s_clips<br/>6-9s, default 8s"]
+    B --> C["clips/audio_cvr_6_9s<br/>single-source groups"]
     C --> D["fresh audio-focused Omni annotation"]
     D --> E["single_source_annotations.jsonl"]
-    E --> F["mine-single-source-pairs<br/>enumerate C(n,2) per source"]
-    F --> G["split-candidates<br/>B uses audio_first"]
+    E --> F["enumerate C(n,2) pairs per group"]
+    F --> G["B candidate mining<br/>audio_first ranking"]
     G --> H["B shards<br/>parallel proposal"]
-    H --> I["b_audio_blind_review_v2<br/>audio delta -> audio edit -> audio-only verify -> video shortcut check -> full AV consistency"]
-    I --> J["accepted/rejected progress<br/>flush per sample"]
+    H --> I["b_audio_blind_review_v2"]
+    I --> I1["audio delta first"]
+    I1 --> I2["audio-only edit generation"]
+    I2 --> I3["audio-only final judge"]
+    I3 --> I4["video-only shortcut judge"]
+    I4 --> I5["full AV consistency judge"]
+    I5 --> J["accepted/rejected progress<br/>flush per sample"]
     J --> K["merge-line-results<br/>keep_all_b=true"]
     K --> L["b_speech_audio_content_triplets.jsonl"]
     L --> M["manual_review/B"]
 ```
 
-## 6. B 线最新方法
+## 5. B 线最新方法：`b_audio_blind_review_v2`
 
-B 线当前使用：
+运行参数：
 
 ```text
 --audio-dataset-line speech_audio_content
@@ -113,168 +153,216 @@ B 线当前使用：
 --keep-all-b
 ```
 
-`b_audio_blind_review_v2` 的核心逻辑：
+核心思想：先闭眼听，再看画面查捷径。
 
-- 先判断 ref/tgt 音频差异是否真的存在，要求 `audio_delta_strength >= 0.60`。
-- `edit_text` 必须来自 audio-only evidence，不能来自视觉 caption 或 full AV 阶段。
-- 再做 audio-only final judge，确认 reference 不满足 edit、target 满足 edit。
-- 再做 video-only shortcut judge。如果不听声音、只看画面就能定位 target，则拒绝。
-- 最后做 full AV consistency，只审核 edit 是否仍成立，不允许重写成视觉 edit。
+### 5.1 Audio Delta First
 
-B 线可以接受：
+只输入 ref/target 音频，判断声音差异是否真实、具体、可检索。
 
-- 同一人物、同一直播/演讲/访谈场景，说话主题改变。
-- 同一比赛或同类转播画面，target 出现明显欢呼、掌声、音乐或环境声。
-- 视觉有轻微姿态、镜头、动作变化，只要仍是同一场景/同一人/同类视角，并且音频是主差异。
+必须满足：
 
-B 线必须拒绝：
+- `audio_delta_strength >= 0.60`
+- 差异类型是 `speech`、`music` 或 `sound_event`
+- 不是 `speech changed`、`different sentence`、`A to B`、`unintelligible` 这类空话
 
-- 主差异是视觉场景、主体、动作、物体、字幕、镜头远近。
-- `edit_text` 描述视觉变化。
-- 只写 `speech changed`、`different sentence`、`unintelligible`、`A to B` 这类空话。
-- reference 也满足 edit，或者 target 不满足 edit。
+### 5.2 Audio-Only Edit Generation
+
+`edit_text` 只能根据 audio-only evidence 生成。
+
+合格格式：
+
+```text
+change the speech from discussing {specific ref topic} to discussing {specific target topic}
+change the voice from saying "{specific ref phrase}" to saying "{specific target phrase}"
+replace {specific ref sound/music} with {specific target sound/music}
+add {specific target sound/event} to the audio
+remove {specific ref sound/event} from the audio
+```
+
+禁止：
+
+- 写视觉变化。
+- 写 `target audio`、`speech content changed`、`different tone` 这类空洞文本。
+- from/to 内容相同或几乎相同。
+- reference 本来就满足 edit。
+
+### 5.3 Audio-Only Final Judge
+
+仍然只听音频，确认：
+
+- `reference_satisfies_edit=false`
+- `target_satisfies_edit=true`
+- `audio_difference_specific=true`
+- `edit_text_audio_only=true`
+
+如果这一关不通过，不能导出。
+
+### 5.4 Video-Only Shortcut Judge
+
+只看静音视频或要求模型忽略声音，判断是否存在视觉捷径。
+
+如果不听声音、只看画面就能定位 target，则拒绝，reason 为：
+
+```text
+visual_shortcut_risk
+```
+
+典型拒绝：
+
+- `SUBSCRIBE` 按钮、字幕、屏幕文字。
+- 人物微笑、手势、走出画面。
+- card front/back、物体出现/消失。
+- close-up/wide shot 这类镜头变化。
+
+### 5.5 Full AV Consistency Judge
+
+最后输入完整 ref/target 视频和 audio-only edit_text。
+
+这个阶段只允许审核：
+
+- 音频 edit 是否仍然成立。
+- 视觉上下文是否足够相近。
+- 是否存在明显视觉捷径。
+
+不允许 full AV 阶段重写 edit_text，也不允许把样本改成视觉 CVR。
+
+## 6. 缓存和断点续跑原则
+
+所有阶段都必须“边产出边落盘”。
+
+- 切片：每个 mp4 先写临时文件，成功后原子替换。
+- VoxCeleb 短 mp4：完整 6-9s mp4 使用 hardlink/copy，不走 ffmpeg 重编码。
+- annotation：每条写入 `single_source_annotations.jsonl`，中断后按 `clip_id` 复用。
+- propose：每条写入 `accepted_progress_*.jsonl` 或 `rejected_progress_*.jsonl`。
+- merge：可以从 ranked/progress JSONL 重新生成 summary 和 review bundle。
+
+如果进程中断，不要删除 `RUN_ROOT`，不要删除 clip cache。优先重启 vLLM 后用同一个 run 目录续跑。
 
 ## 7. 服务器正式运行
 
-当前推荐用四张卡 `0,1,2,3` 启动 Qwen3-Omni 服务，并用高并发但受控的配置跑 B 线。服务器 AI 只能运行命令，不能改代码。
+推荐直接按更详细的交接文档执行：
 
-执行命令：
+```text
+doc/audio_cvr_large_scale_handoff_20260514.md
+```
+
+核心命令形态如下：
 
 ```bash
 cd /data02/usr/wangqihao/Demo/test/cvr_clean_main
 git pull --ff-only origin main
 
-test -f scripts/run_audio_cvr_v1_b_first_4gpu_fast.sh || { echo "missing fast runner"; exit 1; }
+source /data02/usr/wangqihao/miniconda3/etc/profile.d/conda.sh
+conda activate omni_src
 
 mkdir -p logs
 
-LOG=logs/audio_cvr_v1_b_first_4gpu_fast_$(date +%Y%m%d_%H%M%S).log
+RUN_ROOT=/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs/audio_cvr_bline_6_9s_full_$(date +%Y%m%d_%H%M%S)
+LOG=logs/audio_cvr_bline_6_9s_full_$(date +%Y%m%d_%H%M%S).log
 
-setsid nohup bash scripts/run_audio_cvr_v1_b_first_4gpu_fast.sh \
-  --root /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval \
-  --single-source-root /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_8_12s \
+setsid nohup bash scripts/run_audio_cvr_bline_6_9s_full_4gpu.sh \
+  --run-root "$RUN_ROOT" \
+  --start-omni auto \
   --gpu-ids 0,1,2,3 \
   --tensor-parallel-size 4 \
   --max-model-len 16384 \
   --max-num-seqs 8 \
+  --clip-seconds 8 \
+  --min-clip-seconds 6 \
+  --max-clip-seconds 9 \
   --propose-shards 64 \
   --propose-parallel-jobs 8 \
   --concurrency 4 \
   --request-timeout-seconds 240 \
   --shard-timeout-seconds 10800 \
-  --start-omni auto \
+  --target-b-count 1000000 \
   > "$LOG" 2>&1 < /dev/null &
 
-echo $! | tee logs/audio_cvr_v1_b_first_4gpu_fast.pid
+echo $! | tee logs/audio_cvr_bline_6_9s_full.pid
+echo "$RUN_ROOT"
 echo "$LOG"
 ```
 
-默认并发策略：
+并发策略：
 
-- vLLM：`GPU 0,1,2,3`，`tensor-parallel-size=4`。
-- vLLM context：`max-model-len=16384`，避免 final verifier 轻微超 8192 后整条 fallback。
-- vLLM batch：`max-num-seqs=8`。
-- annotation：`concurrency=4`，因为这是长多模态请求，过高并发容易让 vLLM 假死。
-- proposal：`propose-parallel-jobs=8`，这是主要提速点。
-- shards：`64`，让失败/超时可以更细粒度恢复。
+- Qwen3-Omni：GPU `0,1,2,3`，TP=4。
+- `max-model-len=16384`，避免 final verifier 超过 8192 后整条失败。
+- annotation 并发 `4`，长多模态请求不宜太高。
+- propose 并发 `8`，主要提速点。
+- shard 数 `64`，便于细粒度恢复。
 
-如果四卡 16384 OOM，则只把 `--max-model-len` 降到 `12288`；不要先降 B 线质量规则。
+如果四卡 16384 OOM，优先把 `--max-model-len` 降到 `12288`，不要先放宽 B 线质量规则。
 
 ## 8. 监控命令
 
-查看主日志：
-
 ```bash
 cd /data02/usr/wangqihao/Demo/test/cvr_clean_main
-tail -f "$(ls -t logs/audio_cvr_v1_b_first_4gpu_fast_*.log | head -1)"
-```
 
-查看 GPU：
+PID=$(cat logs/audio_cvr_bline_6_9s_full.pid)
+ps -p "$PID" -o pid,pgid,stat,etime,cmd || true
 
-```bash
+LOG=$(ls -t logs/audio_cvr_bline_6_9s_full_*.log | head -1)
+tail -100 "$LOG"
+
+RUN_ROOT=$(ls -td runs/audio_cvr_bline_6_9s_full_* | head -1)
+echo "$RUN_ROOT"
+
+cat /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s/_manifests/audio_cvr_6_9s_summary.json 2>/dev/null || true
+wc -l "$RUN_ROOT/single_source_annotations.jsonl" 2>/dev/null || true
+wc -l "$RUN_ROOT/b_candidates.jsonl" 2>/dev/null || true
+cat "$RUN_ROOT"/b_shards/accepted_progress_*.jsonl 2>/dev/null | wc -l
+cat "$RUN_ROOT"/b_shards/rejected_progress_*.jsonl 2>/dev/null | wc -l
 nvidia-smi -i 0,1,2,3
 ```
 
-查看进度：
+如果 `/v1/models` 能返回，但 `/v1/chat/completions` 超时且 GPU 长期 0%，判断为 vLLM 假死。此时不要改代码，回传日志；需要重启 8093 服务后，用同一个 `RUN_ROOT` 续跑。
+
+## 9. 验收命令
 
 ```bash
 cd /data02/usr/wangqihao/Demo/test/cvr_clean_main
-LATEST=$(ls -td runs/audio_cvr_v1_b_first_* | head -1)
-echo "$LATEST"
+RUN_ROOT=$(ls -td runs/audio_cvr_bline_6_9s_full_* | head -1)
+echo "$RUN_ROOT"
 
-wc -l "$LATEST/single_source_annotations.jsonl" 2>/dev/null || true
-wc -l "$LATEST/b_candidates.jsonl" 2>/dev/null || true
-cat "$LATEST"/b_shards/accepted_progress_*.jsonl 2>/dev/null | wc -l
-cat "$LATEST"/b_shards/rejected_progress_*.jsonl 2>/dev/null | wc -l
-cat "$LATEST/summary.json" 2>/dev/null || true
+cat "$RUN_ROOT/summary.json"
+wc -l "$RUN_ROOT/b_speech_audio_content_triplets.jsonl"
+ls "$RUN_ROOT/manual_review/B" | head
+find "$RUN_ROOT/manual_review/B" -maxdepth 2 -type f | head -30
+
+cat /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s/_manifests/audio_cvr_6_9s_summary.json
 ```
 
-如果 `/v1/models` 能返回但 `/v1/chat/completions` 超时、GPU 长期 0%，判定为 vLLM 假死。此时停止当前 pipeline，重启 8093 服务，再用同一个 `RUN_ROOT` 从 shard 继续，不要重跑 annotation。
+验收重点：
 
-## 9. 降并发恢复
+- `b_speech_audio_content_triplets.jsonl` 存在且有样本。
+- `manual_review/B/` 有可审查样本。
+- 日志中不能持续大量出现 `Input length exceeds`、`fallback_pair_proposal`、`timeout`、`Connection refused`。
+- summary 中 B 线 profile 是 `b_audio_blind_review_v2`。
 
-如果 proposal 阶段在 `8` 并发下持续 timeout，可以复用同一个 `RUN_ROOT` 降到 `4` 并发重跑 proposal，不重跑 annotation：
+## 10. 禁止事项
 
-```bash
-cd /data02/usr/wangqihao/Demo/test/cvr_clean_main
-RUN_ROOT=$(ls -td runs/audio_cvr_v1_b_first_* | head -1)
+服务器执行人员必须遵守：
 
-setsid nohup bash scripts/run_audio_lines_single_source_reuse.sh \
-  --root /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval \
-  --single-source-root /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_8_12s \
-  --reuse-run-root "$RUN_ROOT" \
-  --skip-annotation-refresh \
-  --run-b-only \
-  --base-url http://127.0.0.1:8093/v1 \
-  --model qwen3-omni-30b-a3b-instruct \
-  --target-b-count 1000000 \
-  --propose-shards 64 \
-  --propose-parallel-jobs 4 \
-  --request-timeout-seconds 240 \
-  --shard-timeout-seconds 10800 \
-  --audio-line-quality-profile b_audio_blind_review_v2 \
-  --acceptance-profile b_audio_blind_review_v2 \
-  --b-candidate-mode audio_first \
-  --min-clips-per-folder 2 \
-  --min-group-clips 2 \
-  --keep-all-b \
-  > logs/audio_cvr_v1_b_first_resume_$(date +%Y%m%d_%H%M%S).log 2>&1 < /dev/null &
-```
-
-## 10. 验收命令
-
-```bash
-cd /data02/usr/wangqihao/Demo/test/cvr_clean_main
-LATEST=$(ls -td runs/audio_cvr_v1_b_first_* | head -1)
-echo "$LATEST"
-
-cat "$LATEST/summary.json"
-cat "$LATEST/audio_line_candidate_summary.json"
-wc -l "$LATEST/single_source_annotations.jsonl"
-wc -l "$LATEST/b_candidates.jsonl"
-wc -l "$LATEST/b_speech_audio_content_triplets.jsonl"
-
-ls "$LATEST/manual_review/B" | head
-head -3 "$LATEST/b_speech_audio_content_triplets.jsonl"
-```
-
-验收标准：
-
-- `summary.json` 中 `keep_all_b=true`。
-- `b_speech_audio_content_triplets.jsonl` 保留所有 accepted B 样本。
-- `manual_review/B/` 已生成，可直接人工抽查。
-- 日志中不能大量出现 `fallback_pair_proposal`、`Input length exceeds max_model_len`、`Connection refused`。
-- 本轮不生成 A 线，不修改旧 943 数据，不启动 e5。
+- 不要改代码。
+- 不要改原始 raw 数据。
+- 不要覆盖旧 `clips/audio_cvr_8_12s/`。
+- 不要删除 `clips/audio_cvr_6_9s/` 或当前 `RUN_ROOT`。
+- 不要跑 A 线。
+- 不要跑 e5、AVIGATE、agent。
+- 不要启动 VACE 或任何视频生成模型。
+- 不要把纯 ASR / 纯音频数据混入主 B 线。
 
 ## 11. 后续 A 线
 
-A 线等 B 线完成后再做。原因：
+A 线等 B 线完成后再做。
 
-- 8093 的 Qwen3-Omni 是共享瓶颈。
-- B 线是最难、最能证明 audio 有效的主线。
-- 同时开 A 线会抢 vLLM，增加假死和超时风险。
+原因：
 
-A 线后续应复用 B 线已经生成的 `single_source_annotations.jsonl`，不要重跑 annotation。A 线数量出来后，再决定 A/B/旧 943 数据如何做 train/val/test 分配。
+- B 线是最能证明 audio 有效的主线。
+- B 线更难，需要先稳定方法和数据质量。
+- Qwen3-Omni 是共享瓶颈，同时跑 A/B 会增加 vLLM 假死和超时风险。
+
+后续 A 线应复用 B 线已经生成的 `single_source_annotations.jsonl`，不要重复跑 annotation。A 线数量出来后，再决定 A/B/旧 943 如何做 train/val/test 配比。
 
 ## 12. 后续 e5/audio 评测原则
 
@@ -284,3 +372,47 @@ A 线后续应复用 B 线已经生成的 `single_source_annotations.jsonl`，�
 - `audio_off`：reference query 和 target gallery 都关闭视频音频。
 
 不能只关 reference/query 的音频，否则实验结论不干净。
+
+B 线的预期结果：
+
+- 如果模型真的利用 audio，`audio_on` 应明显强于 `audio_off`。
+- 如果 `audio_on` 没有优势，说明当前 backbone 存在音频-视频-文本对齐不足，这是后续训练 e5/omni embedding 的主要动机。
+
+## 13. B 线反 ASR 退化分层
+
+B 线不再把 ASR-risk 样本简单删除，而是先全量收集，再分层使用。这样既保留训练量，也避免主 benchmark 被质疑成 ASR retrieval。
+
+核心定义：
+
+```text
+B 线不是 audio determines target，
+而是 audio edit under preserved video context determines target。
+```
+
+merge 阶段会给每条 B accepted 样本写入：
+
+- `split_tier`: `main`、`extended` 或 `diagnostic`。
+- `benchmark_eligible`: 只有 `main` 为 true。
+- `training_eligible`: `main` 和 `extended` 为 true。
+- `diagnostic_reason`: 解释为什么样本降级为诊断集。
+- `b_subtype`: `speech_topic_in_video_context`、`music` 或 `sound_event`。
+- `video_context_strength`、`asr_degeneracy_risk`、`audio_delta_strength`、`visual_shortcut_risk`、`audio_only_solvability`、`full_av_required`。
+
+新增输出文件：
+
+```text
+b_all_audio_cvr_triplets.jsonl
+b_main_audio_cvr_triplets.jsonl
+b_extended_audio_cvr_triplets.jsonl
+b_diagnostic_asr_risk_triplets.jsonl
+```
+
+兼容文件 `b_speech_audio_content_triplets.jsonl` 仍然保留，内容等同所有 B accepted。
+
+三层含义：
+
+- `B-main`：低 ASR 风险、高视频语境、强 audio delta，用于论文主 benchmark。
+- `B-extended`：中等风险、质量合格，用于训练或预训练 audio-aware retriever。
+- `B-diagnostic`：ASR-risk、generic talking-head、transcript-like edit 等样本，不进主表，只做附录和诊断。
+
+`B-main` 会优先保留 `music` 和 `sound_event`，并限制 `speech_topic_in_video_context` 占比，避免 speech 主导主测试集。

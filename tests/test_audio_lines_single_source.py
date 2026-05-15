@@ -792,7 +792,18 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                         "difference": {"type": "speech" if subtype.startswith("speech") else "audio_event"},
                         "accepted": True,
                         "b_subtype": subtype,
-                        "quality": {"b_subtype": subtype},
+                        "audio_delta_strength": 0.82,
+                        "video_context_strength": 0.72,
+                        "asr_degeneracy_risk": 0.18,
+                        "visual_shortcut_risk": False,
+                        "audio_only_solvability": 0.50,
+                        "full_av_required": True,
+                        "quality": {
+                            "b_subtype": subtype,
+                            "audio_delta_strength": 0.82,
+                            "video_context_strength": 0.72,
+                            "asr_degeneracy_risk": 0.18,
+                        },
                     }
                 )
             self._write_jsonl(b_shards / "accepted_progress_01.jsonl", accepted)
@@ -815,10 +826,24 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 for line in (run_root / "b_music_triplets.jsonl").read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            self.assertEqual(4, len(selected))
-            self.assertLessEqual(len(speech), 2)
+            main = [
+                json.loads(line)
+                for line in (run_root / "b_main_audio_cvr_triplets.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            extended = [
+                json.loads(line)
+                for line in (run_root / "b_extended_audio_cvr_triplets.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(6, len(selected))
+            self.assertEqual(4, len(speech))
             self.assertEqual(2, len(music))
+            self.assertEqual(3, len(main))
+            self.assertEqual(3, len(extended))
+            self.assertLessEqual(sum(1 for record in main if record["b_subtype"] == "speech_topic_in_video_context"), 1)
             self.assertIn("b_context_cvr_summary_path", summary)
+            self.assertEqual(3, summary["b_main_count"])
 
     def test_merge_b_line_can_keep_all_accepted_records_for_large_b_build(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -837,7 +862,17 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                         "difference": {"type": "speech"},
                         "accepted": True,
                         "b_subtype": "speech_topic_in_video_context",
-                        "quality": {"b_subtype": "speech_topic_in_video_context"},
+                        "audio_delta_strength": 0.65,
+                        "video_context_strength": 0.50,
+                        "asr_degeneracy_risk": 0.40,
+                        "visual_shortcut_risk": False,
+                        "audio_only_solvability": 0.55,
+                        "quality": {
+                            "b_subtype": "speech_topic_in_video_context",
+                            "audio_delta_strength": 0.65,
+                            "video_context_strength": 0.50,
+                            "asr_degeneracy_risk": 0.40,
+                        },
                     }
                 )
             self._write_jsonl(b_shards / "ranked_01.jsonl", accepted)
@@ -852,6 +887,79 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual(6, len(selected))
             self.assertEqual(6, summary["b_exported_count"])
             self.assertTrue(summary["keep_all_b"])
+            self.assertEqual({"extended": 6}, summary["b_split_tier_counts"])
+
+    def test_merge_b_line_exports_main_extended_and_diagnostic_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_root = root / "run"
+            b_shards = run_root / "b_shards"
+            b_shards.mkdir(parents=True)
+            accepted = [
+                {
+                    "proposal_id": "main_music",
+                    "reference_video": "ref1.mp4",
+                    "target_video": "tgt1.mp4",
+                    "edit_text": "replace quiet guitar music with upbeat piano music",
+                    "difference": {"type": "audio_event"},
+                    "accepted": True,
+                    "b_subtype": "music",
+                    "audio_delta_strength": 0.90,
+                    "video_context_strength": 0.80,
+                    "asr_degeneracy_risk": 0.10,
+                    "visual_shortcut_risk": False,
+                    "audio_only_solvability": 0.50,
+                    "full_av_required": True,
+                    "quality": {"b_subtype": "music"},
+                },
+                {
+                    "proposal_id": "extended_speech",
+                    "reference_video": "ref2.mp4",
+                    "target_video": "tgt2.mp4",
+                    "edit_text": "change the commentary from introducing players to describing the goal",
+                    "difference": {"type": "speech"},
+                    "accepted": True,
+                    "b_subtype": "speech_topic_in_video_context",
+                    "audio_delta_strength": 0.64,
+                    "video_context_strength": 0.50,
+                    "asr_degeneracy_risk": 0.45,
+                    "visual_shortcut_risk": False,
+                    "audio_only_solvability": 0.55,
+                    "quality": {"b_subtype": "speech_topic_in_video_context"},
+                },
+                {
+                    "proposal_id": "diagnostic_asr",
+                    "reference_video": "ref3.mp4",
+                    "target_video": "tgt3.mp4",
+                    "edit_text": "change the voice from saying \"hello there\" to saying \"goodbye now\"",
+                    "difference": {"type": "speech"},
+                    "accepted": True,
+                    "b_subtype": "speech_topic_in_video_context",
+                    "audio_delta_strength": 0.90,
+                    "video_context_strength": 0.30,
+                    "asr_degeneracy_risk": 0.82,
+                    "visual_shortcut_risk": False,
+                    "audio_only_solvability": 0.92,
+                    "speech_role": "asr_only",
+                    "quality": {"b_subtype": "speech_topic_in_video_context"},
+                },
+            ]
+            self._write_jsonl(b_shards / "ranked_01.jsonl", accepted)
+
+            summary = merge_line_results(run_root=run_root, target_a_count=0, target_b_count=3, keep_all_b=True)
+
+            all_rows = [json.loads(line) for line in (run_root / "b_all_audio_cvr_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            main_rows = [json.loads(line) for line in (run_root / "b_main_audio_cvr_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            extended_rows = [json.loads(line) for line in (run_root / "b_extended_audio_cvr_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            diagnostic_rows = [json.loads(line) for line in (run_root / "b_diagnostic_asr_risk_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+
+            self.assertEqual(["main", "extended", "diagnostic"], [record["split_tier"] for record in all_rows])
+            self.assertEqual(["main_music"], [record["proposal_id"] for record in main_rows])
+            self.assertEqual(["extended_speech"], [record["proposal_id"] for record in extended_rows])
+            self.assertEqual(["diagnostic_asr"], [record["proposal_id"] for record in diagnostic_rows])
+            self.assertFalse(diagnostic_rows[0]["benchmark_eligible"])
+            self.assertIn("asr_degeneracy_risk_high", diagnostic_rows[0]["diagnostic_reason"])
+            self.assertEqual({"main": 1, "extended": 1, "diagnostic": 1}, summary["b_split_tier_counts"])
 
     def test_a_omni_first_keeps_audio_anchor_pairs_for_omni_visual_judging(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
