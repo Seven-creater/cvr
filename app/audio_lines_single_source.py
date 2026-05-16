@@ -13,9 +13,14 @@ from app.composed_data import (
     AUDIO_MATTERS_ACCEPTANCE_PROFILE,
     SPEECH_AUDIO_CONTENT_LINE,
     VISUAL_AUDIO_ANCHOR_LINE,
+    _append_jsonl_record,
     _build_proposal_id,
+    _boolish,
+    _call_omni_with_retries,
     _dedupe_strings,
     _display_path,
+    _extract_audio_only_cache,
+    _extract_video_only_cache,
     _load_jsonl,
     _non_speech_audio_event_score,
     _normalize_list,
@@ -29,6 +34,7 @@ from app.composed_data import (
     _write_jsonl,
     probe_media,
 )
+from app.composed_omni import OpenAIComposedDataClient
 
 
 VIDEO_SUFFIXES = {".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
@@ -585,6 +591,543 @@ def merge_line_results(
         encoding="utf-8",
     )
     return summary
+
+
+def augment_b_inverse(
+    *,
+    run_root: str | Path,
+    input_path: str | Path | None = None,
+    root: str | Path | None = None,
+    max_records: int | None = None,
+    base_url: str,
+    api_key: str,
+    model: str,
+    timeout_seconds: float = 180.0,
+    omni_retries: int = 2,
+    fail_on_transient_omni_errors: bool = False,
+) -> dict[str, Any]:
+    run_root_path = Path(run_root)
+    root_path = _infer_cvr_root(run_root_path, root)
+    input_file = Path(input_path) if input_path else run_root_path / "b_main_audio_cvr_triplets.jsonl"
+    records = [record for record in _load_jsonl(input_file) if bool(record.get("accepted", True))]
+    if max_records and max_records > 0:
+        records = records[:max_records]
+
+    candidates_path = run_root_path / "b_inverse_candidates.jsonl"
+    accepted_path = run_root_path / "b_inverse_accepted.jsonl"
+    rejected_path = run_root_path / "b_inverse_rejected.jsonl"
+    train_path = run_root_path / "b_train_bidirectional_triplets.jsonl"
+    for path in (candidates_path, accepted_path, rejected_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    client = OpenAIComposedDataClient(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout_seconds=timeout_seconds,
+    )
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+
+    for index, record in enumerate(records, start=1):
+        inverse_edit = _inverse_b_line_edit_text(str(record.get("edit_text") or record.get("audio_only_edit_text") or ""))
+        candidate = _build_inverse_candidate_record(record, inverse_edit=inverse_edit, index=index)
+        candidates.append(candidate)
+        _append_jsonl_record(candidates_path, candidate)
+        if not inverse_edit.get("ok"):
+            candidate["inverse_accept"] = False
+            candidate["accepted"] = False
+            candidate["inverse_reject_reason"] = inverse_edit.get("reject_reason", "inverse_edit_not_parseable")
+            rejected.append(candidate)
+            _append_jsonl_record(rejected_path, candidate)
+            print(
+                f"[augment-b-inverse] {index}/{len(records)} rejected parse proposal_id={record.get('proposal_id', '')} "
+                f"reason={candidate['inverse_reject_reason']}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+
+        try:
+            checked = _verify_inverse_candidate(
+                candidate,
+                root=root_path,
+                run_root=run_root_path,
+                client=client,
+                omni_retries=omni_retries,
+                fail_on_transient_omni_errors=fail_on_transient_omni_errors,
+            )
+        except Exception as exc:
+            if fail_on_transient_omni_errors:
+                raise
+            checked = dict(candidate)
+            checked["inverse_accept"] = False
+            checked["accepted"] = False
+            checked["inverse_reject_reason"] = f"inverse_verification_error: {type(exc).__name__}: {exc}"
+
+        if bool(checked.get("inverse_accept")):
+            accepted.append(checked)
+            _append_jsonl_record(accepted_path, checked)
+        else:
+            rejected.append(checked)
+            _append_jsonl_record(rejected_path, checked)
+        print(
+            f"[augment-b-inverse] {index}/{len(records)} accepted={bool(checked.get('inverse_accept'))} "
+            f"proposal_id={checked.get('proposal_id', '')} reason={checked.get('inverse_reject_reason', '')}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    forward_train = [_forward_train_record(record) for record in records]
+    _write_jsonl(train_path, forward_train + accepted)
+    summary = {
+        "run_root": str(run_root_path),
+        "input_path": str(input_file),
+        "root": str(root_path),
+        "input_count": len(records),
+        "candidate_count": len(candidates),
+        "accepted_count": len(accepted),
+        "rejected_count": len(rejected),
+        "outputs": {
+            "candidates": str(candidates_path),
+            "accepted": str(accepted_path),
+            "rejected": str(rejected_path),
+            "train_bidirectional": str(train_path),
+        },
+        "reject_reason_counts": dict(Counter(str(record.get("inverse_reject_reason") or "unknown")[:180] for record in rejected)),
+    }
+    (run_root_path / "b_inverse_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
+def _infer_cvr_root(run_root: Path, explicit_root: str | Path | None) -> Path:
+    if explicit_root:
+        return Path(explicit_root)
+    for path in (run_root / "annotation_reuse_report.json", run_root / "summary.json"):
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        for key in ("root",):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return Path(value)
+    return Path("/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval")
+
+
+def _build_inverse_candidate_record(record: dict[str, Any], *, inverse_edit: dict[str, Any], index: int) -> dict[str, Any]:
+    forward_pair_id = str(record.get("proposal_id") or record.get("candidate_id") or record.get("pair_group_id") or f"forward_{index:06d}")
+    ref_video = str(record.get("reference_video", "")).strip()
+    tgt_video = str(record.get("target_video", "")).strip()
+    ref_clip_id = str(record.get("reference_clip_id", "")).strip()
+    tgt_clip_id = str(record.get("target_clip_id", "")).strip()
+    inverse_pair_group_id = _inverse_pair_group_id(record)
+    pair_group_id = str(record.get("pair_group_id") or inverse_pair_group_id).strip()
+    edit_metadata = _b_line_edit_metadata(str(inverse_edit.get("edit_text", "")).strip(), direction="inverse")
+    candidate = dict(record)
+    candidate.update(
+        {
+            "proposal_id": f"inverse_{forward_pair_id}",
+            "is_inverse": True,
+            "derived_from_inverse": True,
+            "audio_delta_training_record": True,
+            "forward_pair_id": forward_pair_id,
+            "inverse_pair_group_id": inverse_pair_group_id,
+            "pair_group_id": pair_group_id,
+            "split_group_id": _source_split_group_id(record),
+            "forward_edit_text": str(record.get("edit_text", "")).strip(),
+            "inverse_edit_text": str(inverse_edit.get("edit_text", "")).strip(),
+            "inverse_generation_rule": str(inverse_edit.get("rule", "")).strip(),
+            "direction": "inverse",
+            "edit_type": edit_metadata["edit_type"],
+            "audio_delta_type": edit_metadata["audio_delta_type"],
+            "old_audio": edit_metadata["old_audio"],
+            "new_audio": edit_metadata["new_audio"],
+            "edit_metadata": edit_metadata,
+            "reference_video": tgt_video,
+            "target_video": ref_video,
+            "reference_clip_id": tgt_clip_id,
+            "target_clip_id": ref_clip_id,
+            "reference_caption": str(record.get("target_caption", "")).strip(),
+            "target_caption": str(record.get("reference_caption", "")).strip(),
+            "audio_only_reference_content": str(record.get("audio_only_target_content", "")).strip(),
+            "audio_only_target_content": str(record.get("audio_only_reference_content", "")).strip(),
+            "edit_text": str(inverse_edit.get("edit_text", "")).strip(),
+            "benchmark_eligible": False,
+            "training_eligible": bool(inverse_edit.get("ok")),
+            "split_tier": "extended" if inverse_edit.get("ok") else "diagnostic",
+            "audio_delta_hard_negatives": _audio_delta_hard_negatives(record, reference_video=tgt_video),
+            "visual_constraint": _visual_constraint_payload(record),
+            "shortcut_label": _shortcut_label(record),
+            "source_disjoint_group_id": _source_split_group_id(record),
+        }
+    )
+    quality = dict(candidate.get("quality") if isinstance(candidate.get("quality"), dict) else {})
+    quality.update({"split_tier": candidate["split_tier"], "benchmark_eligible": False, "training_eligible": candidate["training_eligible"]})
+    candidate["quality"] = quality
+    return candidate
+
+
+def _verify_inverse_candidate(
+    candidate: dict[str, Any],
+    *,
+    root: Path,
+    run_root: Path,
+    client: OpenAIComposedDataClient,
+    omni_retries: int,
+    fail_on_transient_omni_errors: bool,
+) -> dict[str, Any]:
+    checked = dict(candidate)
+    reference_path = _resolve_under_root(root, str(checked.get("reference_video", "")))
+    target_path = _resolve_under_root(root, str(checked.get("target_video", "")))
+    reference_clip_id = str(checked.get("reference_clip_id") or Path(str(checked.get("reference_video", ""))).stem)
+    target_clip_id = str(checked.get("target_clip_id") or Path(str(checked.get("target_video", ""))).stem)
+    reference_audio_path = _extract_audio_only_cache(video_path=reference_path, cache_dir=run_root / "inverse_audio_only_cache", clip_id=reference_clip_id)
+    target_audio_path = _extract_audio_only_cache(video_path=target_path, cache_dir=run_root / "inverse_audio_only_cache", clip_id=target_clip_id)
+    reference_video_only_path = _extract_video_only_cache(video_path=reference_path, cache_dir=run_root / "inverse_video_only_cache", clip_id=reference_clip_id)
+    target_video_only_path = _extract_video_only_cache(video_path=target_path, cache_dir=run_root / "inverse_video_only_cache", clip_id=target_clip_id)
+    inverse_edit_text = str(checked.get("inverse_edit_text") or checked.get("edit_text") or "").strip()
+    inverse_proposal = _inverse_audio_only_proposal(checked)
+    local_gate_report = _inverse_local_gate_report(checked)
+
+    audio_verify, raw_audio_verify = _call_omni_with_retries(
+        label=f"inverse_audio_only_verify:{checked.get('proposal_id', '')}",
+        retries=omni_retries,
+        fail_on_transient=fail_on_transient_omni_errors,
+        func=lambda: client.verify_b_line_audio_only_edit(
+            reference_audio_path=str(reference_audio_path),
+            target_audio_path=str(target_audio_path),
+            edit_text=inverse_edit_text,
+            audio_only_proposal=inverse_proposal,
+        ),
+    )
+    video_shortcut, raw_video_shortcut = _call_omni_with_retries(
+        label=f"inverse_video_only_shortcut:{checked.get('proposal_id', '')}",
+        retries=omni_retries,
+        fail_on_transient=fail_on_transient_omni_errors,
+        func=lambda: client.verify_b_line_video_only_shortcut(
+            reference_clip_path=str(reference_video_only_path),
+            target_clip_path=str(target_video_only_path),
+            edit_text=inverse_edit_text,
+            audio_only_evidence={"inverse_proposal": inverse_proposal, "inverse_audio_only_verification": audio_verify},
+            local_gate_report=local_gate_report,
+        ),
+    )
+    full_av, raw_full_av = _call_omni_with_retries(
+        label=f"inverse_full_av_consistency:{checked.get('proposal_id', '')}",
+        retries=omni_retries,
+        fail_on_transient=fail_on_transient_omni_errors,
+        func=lambda: client.verify_b_line_full_av_consistency(
+            reference_clip_path=str(reference_path),
+            target_clip_path=str(target_path),
+            edit_text=inverse_edit_text,
+            audio_only_evidence={"inverse_proposal": inverse_proposal, "inverse_audio_only_verification": audio_verify},
+            local_gate_report=local_gate_report,
+        ),
+    )
+    issues = _inverse_verification_issues(audio_verify, video_shortcut, full_av)
+    accepted = not issues
+    checked.update(
+        {
+            "accepted": accepted,
+            "inverse_accept": accepted,
+            "final_omni_accept": accepted,
+            "model_accepted": accepted,
+            "inverse_reject_reason": "" if accepted else "; ".join(issues),
+            "inverse_audio_only_proposal": inverse_proposal,
+            "inverse_audio_only_verification": audio_verify,
+            "raw_inverse_audio_only_verification": raw_audio_verify,
+            "inverse_video_only_shortcut": video_shortcut,
+            "raw_inverse_video_only_shortcut": raw_video_shortcut,
+            "inverse_full_av_consistency": full_av,
+            "raw_inverse_full_av_consistency": raw_full_av,
+            "audio_only_verification": audio_verify,
+            "video_only_shortcut": video_shortcut,
+            "full_av_consistency": full_av,
+            "single_source_pair_acceptance_issues": issues,
+            "split_tier": "extended" if accepted else "diagnostic",
+            "benchmark_eligible": False,
+            "training_eligible": accepted,
+        }
+    )
+    quality = dict(checked.get("quality") if isinstance(checked.get("quality"), dict) else {})
+    quality.update({"split_tier": checked["split_tier"], "benchmark_eligible": False, "training_eligible": accepted})
+    checked["quality"] = quality
+    return checked
+
+
+def _inverse_audio_only_proposal(record: dict[str, Any]) -> dict[str, Any]:
+    difference_type = str((record.get("difference") or {}).get("type", "") if isinstance(record.get("difference"), dict) else "").strip()
+    if difference_type not in {"speech", "audio_event"}:
+        delta_type = str(record.get("audio_delta_type", "")).strip()
+        difference_type = "speech" if delta_type in {"speech", "speech_topic"} else "audio_event"
+    return {
+        "accept": True,
+        "difference_type": difference_type,
+        "b_subtype": record.get("b_subtype", ""),
+        "reference_audio_content": str(record.get("audio_only_reference_content", "")).strip(),
+        "target_audio_content": str(record.get("audio_only_target_content", "")).strip(),
+        "edit_text": str(record.get("inverse_edit_text") or record.get("edit_text") or "").strip(),
+        "audio_difference_specific": True,
+        "edit_text_audio_only": True,
+        "confidence": max(0.7, _score_float(record.get("confidence"))),
+        "evidence": _dedupe_strings(["inverse edit generated from accepted forward B-line sample"] + _normalize_list(record.get("audio_evidence", []))),
+        "reject_reason": "",
+    }
+
+
+def _inverse_local_gate_report(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "passed": True,
+        "hard_reject": [],
+        "review_required": ["inverse_reverification"],
+        "difference_type": str((record.get("difference") or {}).get("type", "") if isinstance(record.get("difference"), dict) else ""),
+        "confidence": _score_float(record.get("confidence")),
+        "acceptance_profile": "b_audio_blind_review_v2_inverse",
+        "audio_dataset_line": SPEECH_AUDIO_CONTENT_LINE,
+        "visual_context_type": str(record.get("video_context_type", "")),
+        "video_context_strength": _score_float(record.get("video_context_strength")),
+        "asr_degeneracy_risk": _score_float(record.get("asr_degeneracy_risk")),
+        "is_inverse": True,
+        "forward_pair_id": record.get("forward_pair_id", ""),
+    }
+
+
+def _inverse_verification_issues(audio_verify: dict[str, Any], video_shortcut: dict[str, Any], full_av: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    if not _boolish(audio_verify.get("accept")):
+        reason = str(audio_verify.get("reject_reason", "")).strip()
+        issues.append("inverse_audio_only_verification_reject" + (f": {reason}" if reason else ""))
+    if _boolish(audio_verify.get("reference_satisfies_edit")):
+        issues.append("inverse_audio_only_reference_satisfies_edit")
+    if not _boolish(audio_verify.get("target_satisfies_edit")):
+        issues.append("inverse_audio_only_target_missing_edit")
+    if not _boolish(audio_verify.get("audio_difference_specific")):
+        issues.append("inverse_audio_only_difference_not_specific")
+    if not _boolish(audio_verify.get("edit_text_audio_only")):
+        issues.append("inverse_audio_only_edit_text_not_audio_only")
+    if _score_float(audio_verify.get("confidence")) < 0.70:
+        issues.append(f"inverse_audio_only_confidence_below_threshold: {_score_float(audio_verify.get('confidence')):.2f} < 0.70")
+    if not _boolish(video_shortcut.get("accept")):
+        reason = str(video_shortcut.get("reject_reason", "")).strip()
+        issues.append("inverse_video_only_shortcut_reject" + (f": {reason}" if reason else ""))
+    if _boolish(video_shortcut.get("visual_shortcut_risk")):
+        issues.append("inverse_video_only_shortcut_risk")
+    if _boolish(video_shortcut.get("can_identify_target_without_audio")):
+        issues.append("inverse_video_only_can_identify_target_without_audio")
+    if _score_float(video_shortcut.get("confidence")) < 0.60:
+        issues.append(f"inverse_video_only_confidence_below_threshold: {_score_float(video_shortcut.get('confidence')):.2f} < 0.60")
+    if not _boolish(full_av.get("accept")):
+        reason = str(full_av.get("reject_reason", "")).strip()
+        issues.append("inverse_full_av_consistency_reject" + (f": {reason}" if reason else ""))
+    if not _boolish(full_av.get("visual_context_preserved")):
+        issues.append("inverse_full_av_visual_context_not_preserved")
+    if _boolish(full_av.get("visual_shortcut_risk")):
+        issues.append("inverse_full_av_visual_shortcut_risk")
+    if not _boolish(full_av.get("audio_edit_still_valid")):
+        issues.append("inverse_full_av_audio_edit_not_valid")
+    if _score_float(full_av.get("confidence")) < 0.60:
+        issues.append(f"inverse_full_av_confidence_below_threshold: {_score_float(full_av.get('confidence')):.2f} < 0.60")
+    return _dedupe_strings(issues)
+
+
+def _forward_train_record(record: dict[str, Any]) -> dict[str, Any]:
+    forward = dict(record)
+    edit_metadata = _b_line_edit_metadata(str(forward.get("edit_text") or forward.get("audio_only_edit_text") or ""), direction="forward")
+    forward.setdefault("is_inverse", False)
+    forward.setdefault("derived_from_inverse", False)
+    forward["audio_delta_training_record"] = True
+    forward["direction"] = "forward"
+    forward["edit_type"] = edit_metadata["edit_type"]
+    forward["audio_delta_type"] = edit_metadata["audio_delta_type"]
+    forward["old_audio"] = edit_metadata["old_audio"]
+    forward["new_audio"] = edit_metadata["new_audio"]
+    forward["edit_metadata"] = edit_metadata
+    forward["pair_group_id"] = str(forward.get("pair_group_id") or _inverse_pair_group_id(forward)).strip()
+    forward["inverse_pair_group_id"] = str(forward.get("inverse_pair_group_id") or _inverse_pair_group_id(forward)).strip()
+    forward["split_group_id"] = _source_split_group_id(forward)
+    forward["source_disjoint_group_id"] = _source_split_group_id(forward)
+    forward["audio_delta_hard_negatives"] = _audio_delta_hard_negatives(forward, reference_video=str(forward.get("reference_video", "")).strip())
+    forward["visual_constraint"] = _visual_constraint_payload(forward)
+    forward["shortcut_label"] = _shortcut_label(forward)
+    forward.setdefault("training_eligible", True)
+    return forward
+
+
+def _inverse_pair_group_id(record: dict[str, Any]) -> str:
+    ref = str(record.get("reference_clip_id") or record.get("reference_video") or "").strip()
+    tgt = str(record.get("target_clip_id") or record.get("target_video") or "").strip()
+    group = str(record.get("group_id") or record.get("source_id") or "").strip()
+    pair_key = "::".join(sorted([ref, tgt]))
+    return f"inverse_pair_{_stable_hash(group + '::' + pair_key)[:16]}"
+
+
+def _source_split_group_id(record: dict[str, Any]) -> str:
+    for key in ("source_clip_id", "group_id", "reuse_source_folder", "source_path"):
+        value = str(record.get(key) or "").strip()
+        if value:
+            return f"source_{_stable_hash(value)[:16]}"
+    source = record.get("source") if isinstance(record.get("source"), dict) else {}
+    value = str(source.get("url") or source.get("path") or "").strip()
+    if value:
+        return f"source_{_stable_hash(value)[:16]}"
+    return _inverse_pair_group_id(record)
+
+
+def _b_line_edit_metadata(edit_text: str, *, direction: str) -> dict[str, Any]:
+    text = " ".join(str(edit_text or "").strip().split())
+    parsed = _parse_b_line_edit_components(text)
+    return {
+        "edit_type": parsed["edit_type"],
+        "audio_delta_type": parsed["audio_delta_type"],
+        "old_audio": parsed["old_audio"],
+        "new_audio": parsed["new_audio"],
+        "direction": direction,
+        "edit_text": text,
+        "parse_ok": bool(parsed["parse_ok"]),
+    }
+
+
+def _parse_b_line_edit_components(edit_text: str) -> dict[str, Any]:
+    text = " ".join(str(edit_text or "").strip().split())
+    defaults = {"edit_type": "unknown", "audio_delta_type": "unknown", "old_audio": "", "new_audio": "", "parse_ok": False}
+    patterns = [
+        (r"^change the speech from discussing (?P<a>.+?) to discussing (?P<b>.+)$", "replace", "speech_topic"),
+        (r"^change the voice from saying [\"'](?P<a>.+?)[\"'] to saying [\"'](?P<b>.+?)[\"']$", "replace", "speech_phrase"),
+        (r"^change the singing from [\"']?(?P<a>.+?)[\"']? to [\"']?(?P<b>.+?)[\"']?$", "replace", "music"),
+        (r"^replace (?P<a>.+?) with (?P<b>.+?)(?: in the audio)?$", "replace", "sound_event"),
+    ]
+    for pattern, edit_type, audio_delta_type in patterns:
+        match = re.match(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        old_audio = _clean_inverse_endpoint(match.group("a"))
+        new_audio = _clean_inverse_endpoint(match.group("b"))
+        return {
+            "edit_type": edit_type,
+            "audio_delta_type": audio_delta_type,
+            "old_audio": old_audio,
+            "new_audio": new_audio,
+            "parse_ok": not bool(_inverse_endpoint_issue(old_audio, new_audio)),
+        }
+    add_match = re.match(r"^add (?P<x>.+?)(?: to the audio)?$", text, flags=re.IGNORECASE)
+    if add_match:
+        new_audio = _clean_inverse_endpoint(add_match.group("x"))
+        return {"edit_type": "add", "audio_delta_type": "sound_event", "old_audio": "none_or_weaker", "new_audio": new_audio, "parse_ok": not bool(_inverse_endpoint_issue(new_audio, "valid_target"))}
+    remove_match = re.match(r"^remove (?P<x>.+?)(?: from the audio)?$", text, flags=re.IGNORECASE)
+    if remove_match:
+        old_audio = _clean_inverse_endpoint(remove_match.group("x"))
+        return {"edit_type": "remove", "audio_delta_type": "sound_event", "old_audio": old_audio, "new_audio": "none_or_weaker", "parse_ok": not bool(_inverse_endpoint_issue(old_audio, "valid_target"))}
+    for word in ("increase", "decrease"):
+        match = re.match(rf"^{word} (?P<x>.+?)(?: in the audio)?$", text, flags=re.IGNORECASE)
+        if match:
+            audio = _clean_inverse_endpoint(match.group("x"))
+            return {"edit_type": word, "audio_delta_type": "sound_event", "old_audio": f"{word}_source_state", "new_audio": audio, "parse_ok": not bool(_inverse_endpoint_issue(audio, "valid_target"))}
+    return defaults
+
+
+def _audio_delta_hard_negatives(record: dict[str, Any], *, reference_video: str) -> list[dict[str, str]]:
+    negatives: list[dict[str, str]] = []
+    if reference_video:
+        negatives.append({"type": "reference", "video": reference_video})
+    labels = ["visual_hard", "audio_hard", "asr_hard"]
+    raw_negatives = [str(item).strip() for item in record.get("hard_negatives", []) if str(item).strip()] if isinstance(record.get("hard_negatives"), list) else []
+    for label, video in zip(labels, raw_negatives):
+        if video and video != reference_video:
+            negatives.append({"type": label, "video": video})
+    return negatives
+
+
+def _visual_constraint_payload(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "visual_context_similarity": _b_line_metric(record, "visual_context_similarity"),
+        "video_context_strength": _b_line_metric(record, "video_context_strength"),
+        "visual_shortcut_risk": _b_line_visual_shortcut_risk(record),
+        "video_only_can_identify_target": _b_line_bool(record, "video_only_can_identify_target_without_audio")
+        or _b_line_bool(record, "can_identify_target_without_audio"),
+    }
+
+
+def _shortcut_label(record: dict[str, Any]) -> str:
+    tier = str(record.get("split_tier") or "").strip()
+    if tier == "diagnostic":
+        reasons = " ".join(_normalize_list(record.get("diagnostic_reason", []))).lower()
+        if "asr" in reasons:
+            return "ASR-like"
+        if "visual" in reasons:
+            return "visual-shortcut"
+        return "ambiguous"
+    if _b_line_audio_only_solvability(
+        record,
+        asr_degeneracy_risk=_b_line_metric(record, "asr_degeneracy_risk"),
+        audio_delta_strength=_b_line_metric(record, "audio_delta_strength"),
+    ) >= 0.85:
+        return "audio-only-shortcut"
+    return "clean_audio_delta"
+
+
+def _inverse_b_line_edit_text(edit_text: str) -> dict[str, Any]:
+    text = " ".join(str(edit_text or "").strip().split())
+    if not text:
+        return {"ok": False, "edit_text": "", "rule": "", "reject_reason": "inverse_edit_not_parseable: empty edit_text"}
+    patterns = [
+        (r"^change the speech from discussing (?P<a>.+?) to discussing (?P<b>.+)$", "speech_discussing", "change the speech from discussing {b} to discussing {a}"),
+        (r"^change the voice from saying [\"'](?P<a>.+?)[\"'] to saying [\"'](?P<b>.+?)[\"']$", "voice_saying", 'change the voice from saying "{b}" to saying "{a}"'),
+        (r"^change the singing from [\"']?(?P<a>.+?)[\"']? to [\"']?(?P<b>.+?)[\"']?$", "singing", 'change the singing from "{b}" to "{a}"'),
+        (r"^replace (?P<a>.+?) with (?P<b>.+?)(?: in the audio)?$", "replace_audio", "replace {b} with {a}"),
+    ]
+    for pattern, rule, template in patterns:
+        match = re.match(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        left = _clean_inverse_endpoint(match.group("a"))
+        right = _clean_inverse_endpoint(match.group("b"))
+        issue = _inverse_endpoint_issue(left, right)
+        if issue:
+            return {"ok": False, "edit_text": "", "rule": rule, "reject_reason": issue}
+        return {"ok": True, "edit_text": template.format(a=left, b=right), "rule": rule, "reject_reason": ""}
+    add_match = re.match(r"^add (?P<x>.+?)(?: to the audio)?$", text, flags=re.IGNORECASE)
+    if add_match:
+        endpoint = _clean_inverse_endpoint(add_match.group("x"))
+        issue = _inverse_endpoint_issue(endpoint, "valid_target")
+        if issue:
+            return {"ok": False, "edit_text": "", "rule": "add_to_remove", "reject_reason": issue}
+        return {"ok": True, "edit_text": f"remove {endpoint} from the audio", "rule": "add_to_remove", "reject_reason": ""}
+    remove_match = re.match(r"^remove (?P<x>.+?)(?: from the audio)?$", text, flags=re.IGNORECASE)
+    if remove_match:
+        endpoint = _clean_inverse_endpoint(remove_match.group("x"))
+        issue = _inverse_endpoint_issue(endpoint, "valid_target")
+        if issue:
+            return {"ok": False, "edit_text": "", "rule": "remove_to_add", "reject_reason": issue}
+        return {"ok": True, "edit_text": f"add {endpoint} to the audio", "rule": "remove_to_add", "reject_reason": ""}
+    for left_word, right_word in (("increase", "decrease"), ("decrease", "increase")):
+        match = re.match(rf"^{left_word} (?P<x>.+?)(?: in the audio)?$", text, flags=re.IGNORECASE)
+        if match:
+            endpoint = _clean_inverse_endpoint(match.group("x"))
+            issue = _inverse_endpoint_issue(endpoint, "valid_target")
+            if issue:
+                return {"ok": False, "edit_text": "", "rule": f"{left_word}_to_{right_word}", "reject_reason": issue}
+            return {"ok": True, "edit_text": f"{right_word} {endpoint} in the audio", "rule": f"{left_word}_to_{right_word}", "reject_reason": ""}
+    return {"ok": False, "edit_text": "", "rule": "", "reject_reason": "inverse_edit_not_parseable"}
+
+
+def _clean_inverse_endpoint(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().strip("\"'., ")).strip()
+
+
+def _inverse_endpoint_issue(left: str, right: str) -> str:
+    if not left or not right:
+        return "inverse_edit_not_parseable: empty endpoint"
+    if left.lower() == right.lower():
+        return "inverse_edit_not_parseable: identical endpoints"
+    hollow = {"speech", "audio", "sound", "noise", "unknown", "unintelligible", "not transcribed", "different sentence", "speaking"}
+    if left.lower() in hollow or right.lower() in hollow:
+        return "inverse_edit_not_parseable: hollow endpoint"
+    return ""
 
 
 def _assign_b_line_tiers(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1623,6 +2166,18 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--target-a-count", type=int, default=8)
     merge.add_argument("--target-b-count", type=int, default=8)
     merge.add_argument("--keep-all-b", action="store_true")
+
+    inverse = subparsers.add_parser("augment-b-inverse")
+    inverse.add_argument("--run-root", required=True)
+    inverse.add_argument("--input-path")
+    inverse.add_argument("--root")
+    inverse.add_argument("--max-records", type=int)
+    inverse.add_argument("--base-url", required=True)
+    inverse.add_argument("--api-key", default="EMPTY")
+    inverse.add_argument("--model", required=True)
+    inverse.add_argument("--timeout-seconds", type=float, default=180.0)
+    inverse.add_argument("--omni-retries", type=int, default=2)
+    inverse.add_argument("--fail-on-transient-omni-errors", action="store_true")
     return parser
 
 
@@ -1669,6 +2224,19 @@ def main() -> None:
             target_a_count=args.target_a_count,
             target_b_count=args.target_b_count,
             keep_all_b=args.keep_all_b,
+        )
+    elif args.command == "augment-b-inverse":
+        result = augment_b_inverse(
+            run_root=args.run_root,
+            input_path=args.input_path,
+            root=args.root,
+            max_records=args.max_records,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            timeout_seconds=args.timeout_seconds,
+            omni_retries=args.omni_retries,
+            fail_on_transient_omni_errors=args.fail_on_transient_omni_errors,
         )
     else:
         raise ValueError(f"unsupported command: {args.command}")

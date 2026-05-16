@@ -7,9 +7,11 @@ from pathlib import Path
 from unittest import mock
 
 from app.audio_lines_single_source import (
+    augment_b_inverse,
     merge_line_results,
     prepare_existing_single_source_clips,
     split_audio_line_candidates,
+    _inverse_b_line_edit_text,
 )
 from app.composed_data import (
     ensure_layout,
@@ -2795,6 +2797,185 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual(1, summary["b_ranked_count"])
             self.assertEqual(["a1"], [record["proposal_id"] for record in a_exported])
             self.assertEqual(["b1"], [record["proposal_id"] for record in b_exported])
+
+    def test_inverse_edit_text_generation_is_edit_type_aware(self) -> None:
+        self.assertEqual(
+            "change the speech from discussing the mayor's remarks to discussing the bakery opening",
+            _inverse_b_line_edit_text("change the speech from discussing the bakery opening to discussing the mayor's remarks")["edit_text"],
+        )
+        self.assertEqual(
+            "remove crowd cheering from the audio",
+            _inverse_b_line_edit_text("add crowd cheering to the audio")["edit_text"],
+        )
+        self.assertEqual(
+            "replace applause with quiet room ambience",
+            _inverse_b_line_edit_text("replace quiet room ambience with applause")["edit_text"],
+        )
+        self.assertFalse(_inverse_b_line_edit_text("change the speech from discussing speaking to discussing speaking")["ok"])
+
+    def test_augment_b_inverse_accepts_reverified_inverse_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_root = root / "run"
+            input_path = run_root / "b_main_audio_cvr_triplets.jsonl"
+            self._write_jsonl(
+                input_path,
+                [
+                    {
+                        "proposal_id": "b_forward_1",
+                        "candidate_id": "c1",
+                        "accepted": True,
+                        "split_tier": "main",
+                        "reference_clip_id": "ref",
+                        "target_clip_id": "tgt",
+                        "reference_video": str(root / "clips" / "ref.mp4"),
+                        "target_video": str(root / "clips" / "tgt.mp4"),
+                        "edit_text": "change the speech from discussing the bakery opening to discussing the mayor's remarks",
+                        "difference": {"type": "speech"},
+                        "audio_only_reference_content": "speech about the bakery opening",
+                        "audio_only_target_content": "speech about the mayor's remarks",
+                        "b_subtype": "speech_topic_in_video_context",
+                        "hard_negatives": ["clips/visual_hard.mp4", "clips/audio_hard.mp4", "clips/asr_hard.mp4"],
+                        "quality": {"video_context_strength": 0.8, "asr_degeneracy_risk": 0.2},
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.verify_b_line_audio_only_edit.return_value = (
+                {
+                    "accept": True,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "audio_difference_specific": True,
+                    "edit_text_audio_only": True,
+                    "confidence": 0.91,
+                    "evidence": ["the inverse target contains bakery-opening speech"],
+                },
+                {"raw": "audio"},
+            )
+            client.verify_b_line_video_only_shortcut.return_value = (
+                {
+                    "accept": True,
+                    "visual_shortcut_risk": False,
+                    "can_identify_target_without_audio": False,
+                    "visual_context_preserved": True,
+                    "confidence": 0.82,
+                    "evidence": ["video-only view cannot identify the audio topic"],
+                },
+                {"raw": "video"},
+            )
+            client.verify_b_line_full_av_consistency.return_value = (
+                {
+                    "accept": True,
+                    "visual_context_preserved": True,
+                    "visual_shortcut_risk": False,
+                    "audio_edit_still_valid": True,
+                    "confidence": 0.87,
+                    "evidence": ["full AV is consistent with the inverse audio edit"],
+                },
+                {"raw": "full"},
+            )
+
+            with mock.patch("app.audio_lines_single_source.OpenAIComposedDataClient", return_value=client), mock.patch(
+                "app.audio_lines_single_source._extract_audio_only_cache",
+                side_effect=lambda video_path, cache_dir, clip_id: cache_dir / f"{clip_id}.wav",
+            ), mock.patch(
+                "app.audio_lines_single_source._extract_video_only_cache",
+                side_effect=lambda video_path, cache_dir, clip_id: cache_dir / f"{clip_id}.mp4",
+            ):
+                summary = augment_b_inverse(
+                    run_root=run_root,
+                    input_path=input_path,
+                    root=root,
+                    max_records=1,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            accepted = [json.loads(line) for line in (run_root / "b_inverse_accepted.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            train = [json.loads(line) for line in (run_root / "b_train_bidirectional_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, summary["accepted_count"])
+            self.assertEqual(1, len(accepted))
+            self.assertEqual(2, len(train))
+            self.assertTrue(accepted[0]["is_inverse"])
+            self.assertEqual("tgt", accepted[0]["reference_clip_id"])
+            self.assertEqual("ref", accepted[0]["target_clip_id"])
+            self.assertEqual(
+                "change the speech from discussing the mayor's remarks to discussing the bakery opening",
+                accepted[0]["edit_text"],
+            )
+            self.assertEqual("extended", accepted[0]["split_tier"])
+            self.assertFalse(accepted[0]["benchmark_eligible"])
+            self.assertTrue(accepted[0]["training_eligible"])
+            self.assertEqual("inverse", accepted[0]["direction"])
+            self.assertEqual("replace", accepted[0]["edit_type"])
+            self.assertEqual("speech_topic", accepted[0]["audio_delta_type"])
+            self.assertEqual("the mayor's remarks", accepted[0]["old_audio"])
+            self.assertEqual("the bakery opening", accepted[0]["new_audio"])
+            self.assertEqual(accepted[0]["pair_group_id"], accepted[0]["inverse_pair_group_id"])
+            self.assertIn({"type": "reference", "video": str(root / "clips" / "tgt.mp4")}, accepted[0]["audio_delta_hard_negatives"])
+            self.assertEqual("clean_audio_delta", accepted[0]["shortcut_label"])
+            self.assertEqual("forward", train[0]["direction"])
+            self.assertEqual("inverse", train[1]["direction"])
+            self.assertEqual("the bakery opening", train[0]["old_audio"])
+            self.assertEqual("the mayor's remarks", train[0]["new_audio"])
+
+    def test_augment_b_inverse_rejects_video_only_shortcut(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_root = root / "run"
+            input_path = run_root / "b_main_audio_cvr_triplets.jsonl"
+            self._write_jsonl(
+                input_path,
+                [
+                    {
+                        "proposal_id": "b_forward_2",
+                        "accepted": True,
+                        "reference_clip_id": "ref",
+                        "target_clip_id": "tgt",
+                        "reference_video": str(root / "ref.mp4"),
+                        "target_video": str(root / "tgt.mp4"),
+                        "edit_text": "add crowd cheering to the audio",
+                        "difference": {"type": "audio_event"},
+                    }
+                ],
+            )
+            client = mock.Mock()
+            client.verify_b_line_audio_only_edit.return_value = (
+                {"accept": True, "reference_satisfies_edit": False, "target_satisfies_edit": True, "audio_difference_specific": True, "edit_text_audio_only": True, "confidence": 0.9},
+                {},
+            )
+            client.verify_b_line_video_only_shortcut.return_value = (
+                {"accept": False, "visual_shortcut_risk": True, "can_identify_target_without_audio": True, "visual_context_preserved": True, "confidence": 0.9, "reject_reason": "visual shortcut"},
+                {},
+            )
+            client.verify_b_line_full_av_consistency.return_value = (
+                {"accept": True, "visual_context_preserved": True, "visual_shortcut_risk": False, "audio_edit_still_valid": True, "confidence": 0.9},
+                {},
+            )
+
+            with mock.patch("app.audio_lines_single_source.OpenAIComposedDataClient", return_value=client), mock.patch(
+                "app.audio_lines_single_source._extract_audio_only_cache",
+                side_effect=lambda video_path, cache_dir, clip_id: cache_dir / f"{clip_id}.wav",
+            ), mock.patch(
+                "app.audio_lines_single_source._extract_video_only_cache",
+                side_effect=lambda video_path, cache_dir, clip_id: cache_dir / f"{clip_id}.mp4",
+            ):
+                summary = augment_b_inverse(
+                    run_root=run_root,
+                    input_path=input_path,
+                    root=root,
+                    max_records=1,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                )
+
+            rejected = [json.loads(line) for line in (run_root / "b_inverse_rejected.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(0, summary["accepted_count"])
+            self.assertEqual(1, len(rejected))
+            self.assertIn("inverse_video_only_shortcut_risk", rejected[0]["inverse_reject_reason"])
 
 
 if __name__ == "__main__":

@@ -416,3 +416,55 @@ b_diagnostic_asr_risk_triplets.jsonl
 - `B-diagnostic`：ASR-risk、generic talking-head、transcript-like edit 等样本，不进主表，只做附录和诊断。
 
 `B-main` 会优先保留 `music` 和 `sound_event`，并限制 `speech_topic_in_video_context` 占比，避免 speech 主导主测试集。
+
+## 14. B 线 inverse augmentation 与 AudioDelta 训练记录
+
+inverse augmentation 是 B 线后处理，不替代 `b_audio_blind_review_v2` 正向构造流程。正向 accepted 后，系统可以尝试生成反向样本：
+
+```text
+forward: reference audio A -> target audio B, edit_text = A -> B
+inverse: reference audio B -> target audio A, edit_text = B -> A
+```
+
+反向样本不能自动继承正向 accepted，必须重新通过：
+
+- audio-only verifier：确认新 reference 不满足 inverse edit，new target 满足 inverse edit。
+- video-only shortcut judge：确认不听声音不能定位 target。
+- full AV consistency：确认完整视频中 inverse edit 仍成立。
+
+新增后处理命令：
+
+```bash
+python3 -m app.audio_lines_single_source augment-b-inverse \
+  --run-root "$RUN_ROOT" \
+  --input-path "$RUN_ROOT/b_main_audio_cvr_triplets.jsonl" \
+  --max-records 20 \
+  --base-url http://127.0.0.1:8093/v1 \
+  --api-key EMPTY \
+  --model qwen3-omni-30b-a3b-instruct
+```
+
+新增输出：
+
+```text
+b_inverse_candidates.jsonl
+b_inverse_accepted.jsonl
+b_inverse_rejected.jsonl
+b_train_bidirectional_triplets.jsonl
+b_inverse_summary.json
+```
+
+`b_train_bidirectional_triplets.jsonl` 是训练用文件，包含正向样本和通过复验的反向样本。clean benchmark 不默认翻倍，`b_main_audio_cvr_triplets.jsonl` 仍保留原始方向。
+
+为服务 AudioDelta-E5，每条训练记录会补充结构化字段：
+
+- `direction`: `forward` 或 `inverse`。
+- `edit_type`: `add`、`remove`、`replace`、`increase`、`decrease` 或 `unknown`。
+- `audio_delta_type`: `speech_topic`、`speech_phrase`、`music` 或 `sound_event`。
+- `old_audio` / `new_audio`: edit-type-aware delta loss 使用的端点。
+- `audio_delta_hard_negatives`: typed hard negatives，包括 `reference`、`visual_hard`、`audio_hard`、`asr_hard`。
+- `visual_constraint`: 视觉语境与视觉捷径诊断字段。
+- `shortcut_label`: `clean_audio_delta`、`ASR-like`、`visual-shortcut`、`audio-only-shortcut` 或 `ambiguous`。
+- `source_disjoint_group_id`、`pair_group_id`、`inverse_pair_group_id`: 用于 source-disjoint 和 pair-group-disjoint split。
+
+训练推荐使用正向 + 反向；val/test 默认每个 `pair_group_id` 只保留一个方向，避免泄漏和重复统计。

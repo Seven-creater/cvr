@@ -214,7 +214,48 @@ cat /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/au
 
 兼容输出 `b_speech_audio_content_triplets.jsonl` 等同所有 B accepted。论文主表优先使用 `b_main_audio_cvr_triplets.jsonl`，训练可使用 `b_extended_audio_cvr_triplets.jsonl` 或 main+extended 的组合。
 
-## 11. 禁止事项
+## 11. B 线 inverse augmentation 后处理
+
+inverse augmentation 只在 B 线正向构造完成后运行。它不会覆盖原始 B 线输出，也不会把 `b_main_audio_cvr_triplets.jsonl` 直接翻倍。用途是生成训练用正反双向样本，并检验 edit direction。
+
+服务器 smoke 命令：
+
+```bash
+cd /data02/usr/wangqihao/Demo/test/cvr_clean_main
+RUN_ROOT=$(ls -td runs/audio_cvr_bline_6_9s_full_* | head -1)
+echo "$RUN_ROOT"
+
+setsid nohup python3 -m app.audio_lines_single_source augment-b-inverse \
+  --run-root "$RUN_ROOT" \
+  --input-path "$RUN_ROOT/b_main_audio_cvr_triplets.jsonl" \
+  --max-records 20 \
+  --base-url http://127.0.0.1:8093/v1 \
+  --api-key EMPTY \
+  --model qwen3-omni-30b-a3b-instruct \
+  --timeout-seconds 180 \
+  --omni-retries 2 \
+  > logs/b_inverse_smoke_$(date +%Y%m%d_%H%M%S).log 2>&1 < /dev/null &
+```
+
+验收：
+
+```bash
+cat "$RUN_ROOT/b_inverse_summary.json"
+wc -l "$RUN_ROOT/b_inverse_candidates.jsonl"
+wc -l "$RUN_ROOT/b_inverse_accepted.jsonl"
+wc -l "$RUN_ROOT/b_inverse_rejected.jsonl"
+wc -l "$RUN_ROOT/b_train_bidirectional_triplets.jsonl"
+head -3 "$RUN_ROOT/b_inverse_accepted.jsonl"
+```
+
+注意：
+
+- 反向样本必须重新通过 audio-only verifier、video-only shortcut judge、full AV consistency。
+- `b_train_bidirectional_triplets.jsonl` 可用于训练 AudioDelta-E5。
+- val/test 默认不要同时放同一个 `pair_group_id` 的正反两个方向。
+- 如果 inverse accepted 很少，不要强行放宽；这说明部分音频 edit 不严格可逆。
+
+## 12. 禁止事项
 
 服务器执行人员必须遵守：
 
@@ -227,7 +268,7 @@ cat /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/au
 - 不要启动 VACE 或任何视频生成模型。
 - 不要把纯 ASR / 纯音频数据混入 `B-main`；如产生 ASR-risk 样本，应保留在 diagnostic tier。
 
-## 12. 失败时回传信息
+## 13. 失败时回传信息
 
 如果失败，回传以下信息，不要现场 patch：
 
