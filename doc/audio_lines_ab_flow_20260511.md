@@ -1,15 +1,9 @@
 # Audio Dataset A/B Lines 构造流程
 
 日期：2026-05-11
-更新：2026-05-15
+更新：2026-05-16
 
-这份文档说明当前 Audio-CVR 数据集的 A/B 两条线如何构造、为什么这样构造、服务器大规模运行应该如何调度，以及后续 e5/agent 实验应该如何使用这些数据。它不替代旧的 943 条 visual CVR 数据集，不修改任何原始 raw 视频；它是在旧 CVR “同源切片、两两比较、Omni proposal + Omni final verify” 方法基础上，为音频敏感检索新增的安全扩展。
-
-更细的服务器交接命令见：
-
-```text
-doc/audio_cvr_large_scale_handoff_20260514.md
-```
+这份文档说明当前 Audio-CVR 数据集的 A/B 两条线如何构造、为什么这样构造、以及最终会产出哪些文件和字段。它不替代旧的 943 条 visual CVR 数据集，不修改任何原始 raw 视频；它是在旧 CVR “同源切片、两两比较、Omni proposal + Omni final verify” 方法基础上，为音频敏感检索新增的安全扩展。
 
 ## 1. 当前结论
 
@@ -20,8 +14,7 @@ doc/audio_cvr_large_scale_handoff_20260514.md
 - 切片窗口改为 `6-9s`，默认 `8s`，输出到新目录 `clips/audio_cvr_6_9s/`。
 - 所有 raw datasets 都要先经过 B 线；只要 B 线 accepted，先全部保留，后续再人工审核、训练/验证/测试划分。
 - A 线暂时不大规模跑；等 B 线做好后，再根据 A 线可产出数量和研究叙事做合理分配。
-- 大规模运行入口是 `scripts/run_audio_cvr_bline_6_9s_full_4gpu.sh`。
-- 服务器执行人员只运行命令，不改代码。
+- 本文只写方法和产物，不写部署或执行命令。
 
 ## 2. 任务定义
 
@@ -71,33 +64,17 @@ reference_video + audio edit_text -> target_video
 - 同一比赛画面中，target 出现明显欢呼或掌声。
 - 同类画面中，背景音乐从安静吉他变成更强的演奏或另一种音乐。
 
-## 3. 数据根目录和数据集清单
+## 3. 数据目录逻辑和数据集清单
 
-固定根目录：
-
-```text
-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval
-```
-
-raw datasets 目录：
+本文只描述相对目录逻辑，不写机器执行细节。
 
 ```text
-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/raw
+raw/
+clips/audio_cvr_6_9s/
+runs/audio_cvr_bline_6_9s_full_<timestamp>/
 ```
 
-当前大规模 B 线切片输出：
-
-```text
-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s
-```
-
-运行输出：
-
-```text
-/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs/audio_cvr_bline_6_9s_full_<timestamp>
-```
-
-服务器 raw 数据集结构必须按下表理解，不能只扫 `video/` 子目录。
+raw 数据集结构必须按下表理解，不能只扫 `video/` 子目录。
 
 | 数据集 | 必扫视频目录 | 规模和时长 | 本轮处理规则 |
 |---|---|---:|---|
@@ -226,7 +203,7 @@ visual_shortcut_risk
 
 不允许 full AV 阶段重写 edit_text，也不允许把样本改成视觉 CVR。
 
-## 6. 缓存和断点续跑原则
+## 6. 产物和缓存原则
 
 所有阶段都必须“边产出边落盘”。
 
@@ -236,123 +213,172 @@ visual_shortcut_risk
 - propose：每条写入 `accepted_progress_*.jsonl` 或 `rejected_progress_*.jsonl`。
 - merge：可以从 ranked/progress JSONL 重新生成 summary 和 review bundle。
 
-如果进程中断，不要删除 `RUN_ROOT`，不要删除 clip cache。优先重启 vLLM 后用同一个 run 目录续跑。
+## 7. 完整产物清单
 
-## 7. 服务器正式运行
+### 7.1 Clip cache
 
-推荐直接按更详细的交接文档执行：
+`clips/audio_cvr_6_9s/` 是新的切片缓存，不覆盖旧 `clips/audio_cvr_8_12s/`。
 
-```text
-doc/audio_cvr_large_scale_handoff_20260514.md
-```
+主要产物：
 
-核心命令形态如下：
+- 每个 source group 一个文件夹，里面是 6-9s clip，默认 8s。
+- 每个 clip 保留原视频的音频轨，后续 B 线需要听声音。
+- VoxCeleb 这类 6-9s 短 mp4 直接 hardlink/copy 到 cache，避免重编码。
+- `_manifests/audio_cvr_6_9s_summary.json`：记录数据集来源、source 数、clip 数、跳过原因、切片参数。
+- `_manifests/audio_cvr_6_9s_clips.jsonl`：每行一个 clip，包含 `clip_id`、`dataset`、`source_id`、`output_path`、`duration_seconds`、`group_id`。
+- `_manifests/audio_cvr_6_9s_groups.jsonl`：每行一个 single-source group，包含同一原视频或同一父目录下的 clip 列表。
 
-```bash
-cd /data02/usr/wangqihao/Demo/test/cvr_clean_main
-git pull --ff-only origin main
+### 7.2 Annotation cache
 
-source /data02/usr/wangqihao/miniconda3/etc/profile.d/conda.sh
-conda activate omni_src
+annotation 阶段的目标是让 Omni 对每个 clip 做 audio-focused 描述。后续 A/B 线都应该复用这批描述。
 
-mkdir -p logs
+主要产物：
 
-RUN_ROOT=/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs/audio_cvr_bline_6_9s_full_$(date +%Y%m%d_%H%M%S)
-LOG=logs/audio_cvr_bline_6_9s_full_$(date +%Y%m%d_%H%M%S).log
+- `single_source_annotations.jsonl`：核心 clip 描述，每行一个 6-9s clip。
+- `single_source_whole_annotation.jsonl`：如果存在 whole/window 级视频，则记录整体上下文。
+- `clips_to_annotate.jsonl`：需要标注的 clip manifest。
+- `audio_refresh_clips.jsonl`：需要重新 audio-focused 描述的 clip。
+- `annotation_reuse_report.json/jsonl`：记录哪些 annotation 被复用、哪些缺失、哪些需要刷新。
 
-setsid nohup bash scripts/run_audio_cvr_bline_6_9s_full_4gpu.sh \
-  --run-root "$RUN_ROOT" \
-  --start-omni auto \
-  --gpu-ids 0,1,2,3 \
-  --tensor-parallel-size 4 \
-  --max-model-len 16384 \
-  --max-num-seqs 8 \
-  --clip-seconds 8 \
-  --min-clip-seconds 6 \
-  --max-clip-seconds 9 \
-  --propose-shards 64 \
-  --propose-parallel-jobs 8 \
-  --concurrency 4 \
-  --request-timeout-seconds 240 \
-  --shard-timeout-seconds 10800 \
-  --target-b-count 1000000 \
-  > "$LOG" 2>&1 < /dev/null &
+每条 annotation 重点字段：
 
-echo $! | tee logs/audio_cvr_bline_6_9s_full.pid
-echo "$RUN_ROOT"
-echo "$LOG"
-```
+- `clip_id`、`output_path`、`dataset`、`source_clip_id`、`group_id`。
+- `summary`、`subjects`、`actions`、`scene`、`attributes`。
+- `speech`、`speakers_and_transcript`、`speech_topic_or_step`、`speech_role`。
+- `audio_events`、`non_speech_audio_events`、`music_description`、`ambient_sound`。
+- `video_context_type`、`video_context_strength`、`asr_degeneracy_risk`。
 
-并发策略：
+### 7.3 Candidate files
 
-- Qwen3-Omni：GPU `0,1,2,3`，TP=4。
-- `max-model-len=16384`，避免 final verifier 超过 8192 后整条失败。
-- annotation 并发 `4`，长多模态请求不宜太高。
-- propose 并发 `8`，主要提速点。
-- shard 数 `64`，便于细粒度恢复。
+candidate 阶段在同一个 group 内枚举 pair。一个 5 段 source video 理论上会产生 `5*4/2=10` 个候选 pair。
 
-如果四卡 16384 OOM，优先把 `--max-model-len` 降到 `12288`，不要先放宽 B 线质量规则。
+主要产物：
 
-## 8. 监控命令
+- `a_candidates.jsonl`：A 线候选，强调视觉差异大、音频上下文相似。
+- `b_candidates.jsonl`：B 线候选，强调视觉上下文保留、声音差异强。
+- `split_candidates_summary.json`：记录 A/B 候选数、拒绝原因、candidate ranking 参数。
 
-```bash
-cd /data02/usr/wangqihao/Demo/test/cvr_clean_main
+每条 B candidate 重点字段：
 
-PID=$(cat logs/audio_cvr_bline_6_9s_full.pid)
-ps -p "$PID" -o pid,pgid,stat,etime,cmd || true
+- `reference_clip_id`、`target_clip_id`、`reference_video`、`target_video`。
+- `audio_dataset_line=speech_audio_content`。
+- `scores` 和 `quality`：包含 `visual_context_similarity`、`visual_delta_strength`、`video_context_strength`、`asr_degeneracy_risk`。
+- `difference`：候选阶段的粗差异提示，不作为最终 edit_text。
 
-LOG=$(ls -t logs/audio_cvr_bline_6_9s_full_*.log | head -1)
-tail -100 "$LOG"
+### 7.4 Proposal shards and progress
 
-RUN_ROOT=$(ls -td runs/audio_cvr_bline_6_9s_full_* | head -1)
-echo "$RUN_ROOT"
+proposal 阶段将候选分成多个 shard。每条样本都会立刻写 progress，避免中断后全部重跑。
 
-cat /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s/_manifests/audio_cvr_6_9s_summary.json 2>/dev/null || true
-wc -l "$RUN_ROOT/single_source_annotations.jsonl" 2>/dev/null || true
-wc -l "$RUN_ROOT/b_candidates.jsonl" 2>/dev/null || true
-cat "$RUN_ROOT"/b_shards/accepted_progress_*.jsonl 2>/dev/null | wc -l
-cat "$RUN_ROOT"/b_shards/rejected_progress_*.jsonl 2>/dev/null | wc -l
-nvidia-smi -i 0,1,2,3
-```
+主要产物：
 
-如果 `/v1/models` 能返回，但 `/v1/chat/completions` 超时且 GPU 长期 0%，判断为 vLLM 假死。此时不要改代码，回传日志；需要重启 8093 服务后，用同一个 `RUN_ROOT` 续跑。
+- `b_shards/b_shard_*.jsonl`：每个 shard 的输入候选。
+- `b_shards/ranked_*.jsonl`：每个 shard 的完整模型输出。
+- `b_shards/accepted_progress_*.jsonl`：逐条落盘的 accepted 样本。
+- `b_shards/rejected_progress_*.jsonl`：逐条落盘的 rejected 样本和拒绝原因。
 
-## 9. 验收命令
+每条 ranked/progress 重点字段：
 
-```bash
-cd /data02/usr/wangqihao/Demo/test/cvr_clean_main
-RUN_ROOT=$(ls -td runs/audio_cvr_bline_6_9s_full_* | head -1)
-echo "$RUN_ROOT"
+- `accepted`、`final_omni_accept`、`single_source_pair_acceptance_issues`。
+- `edit_text`：最终可检索音频编辑文本。
+- `audio_delta_analysis`：audio-only delta first 的结果。
+- `audio_edit_generation`：audio-only edit text 生成结果。
+- `audio_only_verification`：只听声音的 final judge。
+- `video_only_shortcut`：只看静音视频的视觉捷径判断。
+- `full_av_consistency`：完整音视频一致性审核。
+- `audio_only_reference_content`、`audio_only_target_content`。
+- `video_context_strength`、`asr_degeneracy_risk`、`visual_shortcut_risk`、`audio_delta_strength`。
+- `hard_negatives`：候选阶段或后处理得到的难负样本路径。
 
-cat "$RUN_ROOT/summary.json"
-wc -l "$RUN_ROOT/b_speech_audio_content_triplets.jsonl"
-ls "$RUN_ROOT/manual_review/B" | head
-find "$RUN_ROOT/manual_review/B" -maxdepth 2 -type f | head -30
+### 7.5 Merge outputs
 
-cat /data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s/_manifests/audio_cvr_6_9s_summary.json
-```
+merge 阶段把 shard 结果合并成正式数据文件。
 
-验收重点：
+核心兼容输出：
 
-- `b_speech_audio_content_triplets.jsonl` 存在且有样本。
-- `manual_review/B/` 有可审查样本。
-- 日志中不能持续大量出现 `Input length exceeds`、`fallback_pair_proposal`、`timeout`、`Connection refused`。
-- summary 中 B 线 profile 是 `b_audio_blind_review_v2`。
+- `b_speech_audio_content_triplets.jsonl`：所有 B accepted 样本，兼容旧命名。
+- `b_all_audio_cvr_triplets.jsonl`：所有 B accepted 样本，语义更明确。
 
-## 10. 禁止事项
+分层输出：
 
-服务器执行人员必须遵守：
+- `b_main_audio_cvr_triplets.jsonl`：主 benchmark。低 ASR 风险、高视频语境、强 audio delta。
+- `b_extended_audio_cvr_triplets.jsonl`：训练/预训练候选。质量合格但风险略高或 speech 比例受限。
+- `b_diagnostic_asr_risk_triplets.jsonl`：ASR-risk、generic talking-head、transcript-like edit 等诊断样本。
 
-- 不要改代码。
-- 不要改原始 raw 数据。
-- 不要覆盖旧 `clips/audio_cvr_8_12s/`。
-- 不要删除 `clips/audio_cvr_6_9s/` 或当前 `RUN_ROOT`。
-- 不要跑 A 线。
-- 不要跑 e5、AVIGATE、agent。
-- 不要启动 VACE 或任何视频生成模型。
-- 不要把纯 ASR / 纯音频数据混入主 B 线。
+按 subtype 输出：
 
-## 11. 后续 A 线
+- `b_speech_context_triplets.jsonl`
+- `b_music_triplets.jsonl`
+- `b_sound_event_triplets.jsonl`
+
+统计输出：
+
+- `summary.json`：总览 A/B ranked、accepted、tier 数量、subtype 分布、拒绝原因。
+- `b_context_cvr_summary.json`：B 线专用统计，包括 tier 分布、ASR-risk 分布、speech/music/sound_event 数量。
+
+### 7.6 Manual review bundle
+
+manual review 用于人工抽查样本质量。
+
+主要产物：
+
+- `manual_review/B/sample_*/reference.mp4`
+- `manual_review/B/sample_*/target.mp4`
+- `manual_review/B/sample_*/edit_text.txt`
+- `manual_review/B/sample_*/metadata.json`
+
+`metadata.json` 必须能看到：
+
+- `split_tier`、`benchmark_eligible`、`training_eligible`。
+- `b_subtype`、`diagnostic_reason`。
+- `audio_only_reference_content`、`audio_only_target_content`。
+- `audio_delta_analysis`、`audio_only_verification`、`video_only_shortcut`、`full_av_consistency`。
+- `video_context_strength`、`asr_degeneracy_risk`、`visual_shortcut_risk`。
+
+### 7.7 Inverse augmentation outputs
+
+inverse augmentation 是后处理，只用于训练增强和 edit direction 学习，不直接让 clean benchmark 翻倍。
+
+主要产物：
+
+- `b_inverse_candidates.jsonl`：尝试反向的样本。
+- `b_inverse_accepted.jsonl`：通过反向三层复验的样本。
+- `b_inverse_rejected.jsonl`：反向失败样本和原因。
+- `b_train_bidirectional_triplets.jsonl`：训练用正向 + 反向合集。
+- `b_inverse_summary.json`：反向尝试数、接受数、拒绝原因分布。
+
+每条 inverse 样本重点字段：
+
+- `is_inverse=true`、`derived_from_inverse=true`。
+- `forward_pair_id`、`inverse_pair_group_id`。
+- `forward_edit_text`、`inverse_edit_text`。
+- `inverse_generation_rule`。
+- `inverse_audio_only_verification`、`inverse_video_only_shortcut`、`inverse_full_av_consistency`。
+- `inverse_accept`、`inverse_reject_reason`。
+
+### 7.8 AudioDelta-E5 training fields
+
+为了服务后续 AudioDelta-E5，每条 B 线训练记录不只保存 triplet，还要保存结构化训练字段。
+
+核心字段：
+
+- `direction`: `forward` 或 `inverse`。
+- `edit_type`: `add`、`remove`、`replace`、`increase`、`decrease` 或 `unknown`。
+- `audio_delta_type`: `speech_topic`、`speech_phrase`、`music` 或 `sound_event`。
+- `old_audio`、`new_audio`：edit-type-aware delta loss 使用的端点。
+- `audio_delta_hard_negatives`: typed hard negatives，包括 `reference`、`visual_hard`、`audio_hard`、`asr_hard`。
+- `visual_constraint`: 视觉语境和视觉捷径诊断。
+- `shortcut_label`: `clean_audio_delta`、`ASR-like`、`visual-shortcut`、`audio-only-shortcut` 或 `ambiguous`。
+- `source_disjoint_group_id`、`pair_group_id`、`inverse_pair_group_id`。
+
+这些字段对应后续训练和实验：
+
+- `edit_type`、`old_audio`、`new_audio` 支持 edit-type-aware delta。
+- `audio_delta_hard_negatives` 支持 hard negative curriculum。
+- `reference` hard negative 支持 reference-as-negative。
+- `source_disjoint_group_id` 和 `inverse_pair_group_id` 支持无泄漏 split。
+- `shortcut_label` 支持 shortcut diagnosis。
+
+## 8. 后续 A 线
 
 A 线等 B 线完成后再做。
 
@@ -360,11 +386,11 @@ A 线等 B 线完成后再做。
 
 - B 线是最能证明 audio 有效的主线。
 - B 线更难，需要先稳定方法和数据质量。
-- Qwen3-Omni 是共享瓶颈，同时跑 A/B 会增加 vLLM 假死和超时风险。
+- Qwen3-Omni 是共享模型瓶颈，同时跑 A/B 会增加长多模态请求的排队和超时风险。
 
 后续 A 线应复用 B 线已经生成的 `single_source_annotations.jsonl`，不要重复跑 annotation。A 线数量出来后，再决定 A/B/旧 943 如何做 train/val/test 配比。
 
-## 12. 后续 e5/audio 评测原则
+## 9. 后续 e5/audio 评测原则
 
 后续 e5/audio 评测必须严格对照：
 
@@ -378,7 +404,7 @@ B 线的预期结果：
 - 如果模型真的利用 audio，`audio_on` 应明显强于 `audio_off`。
 - 如果 `audio_on` 没有优势，说明当前 backbone 存在音频-视频-文本对齐不足，这是后续训练 e5/omni embedding 的主要动机。
 
-## 13. B 线反 ASR 退化分层
+## 10. B 线反 ASR 退化分层
 
 B 线不再把 ASR-risk 样本简单删除，而是先全量收集，再分层使用。这样既保留训练量，也避免主 benchmark 被质疑成 ASR retrieval。
 
@@ -417,7 +443,7 @@ b_diagnostic_asr_risk_triplets.jsonl
 
 `B-main` 会优先保留 `music` 和 `sound_event`，并限制 `speech_topic_in_video_context` 占比，避免 speech 主导主测试集。
 
-## 14. B 线 inverse augmentation 与 AudioDelta 训练记录
+## 11. B 线 inverse augmentation 与 AudioDelta 训练记录
 
 inverse augmentation 是 B 线后处理，不替代 `b_audio_blind_review_v2` 正向构造流程。正向 accepted 后，系统可以尝试生成反向样本：
 
@@ -432,17 +458,7 @@ inverse: reference audio B -> target audio A, edit_text = B -> A
 - video-only shortcut judge：确认不听声音不能定位 target。
 - full AV consistency：确认完整视频中 inverse edit 仍成立。
 
-新增后处理命令：
-
-```bash
-python3 -m app.audio_lines_single_source augment-b-inverse \
-  --run-root "$RUN_ROOT" \
-  --input-path "$RUN_ROOT/b_main_audio_cvr_triplets.jsonl" \
-  --max-records 20 \
-  --base-url http://127.0.0.1:8093/v1 \
-  --api-key EMPTY \
-  --model qwen3-omni-30b-a3b-instruct
-```
+新增后处理入口是 `augment-b-inverse`。它读取 `b_main_audio_cvr_triplets.jsonl` 或指定的 B 线输入文件，输出反向候选、反向 accepted/rejected，以及训练用正反双向合集。
 
 新增输出：
 
