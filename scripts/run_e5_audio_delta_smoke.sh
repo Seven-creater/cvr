@@ -14,6 +14,7 @@ BATCH_SIZE=${BATCH_SIZE:-4}
 LEARNING_RATE=${LEARNING_RATE:-0.001}
 DEVICE=${DEVICE:-cuda}
 MOCK_ENCODER=${MOCK_ENCODER:-0}
+SYNTHETIC_SMOKE=${SYNTHETIC_SMOKE:-0}
 
 usage() {
   cat <<'USAGE'
@@ -28,7 +29,9 @@ Options:
   --max-eval-records N      Few-shot eval record count, default 4.
   --train-steps N           Adapter steps, default 20.
   --batch-size N            Adapter batch size, default 4.
+  --device cpu|cuda         Training device, default cuda.
   --mock-encoder            Use deterministic fake embeddings for code smoke only.
+  --synthetic-smoke         Create tiny synthetic records and force mock encoder.
 USAGE
 }
 
@@ -52,7 +55,9 @@ while [ "$#" -gt 0 ]; do
     --max-eval-records) MAX_EVAL_RECORDS="$2"; shift 2 ;;
     --train-steps) TRAIN_STEPS="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+    --device) DEVICE="$2"; shift 2 ;;
     --mock-encoder) MOCK_ENCODER=1; shift ;;
+    --synthetic-smoke) SYNTHETIC_SMOKE=1; MOCK_ENCODER=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[e5-audio-delta-smoke] unknown argument: $1" >&2; usage; exit 1 ;;
   esac
@@ -60,7 +65,50 @@ done
 
 cd "$REPO_ROOT"
 
-if [ -z "$DATASET_RUN_ROOT" ]; then
+if [ "$SYNTHETIC_SMOKE" = "1" ]; then
+  DATASET_RUN_ROOT="$RUN_ROOT/synthetic_dataset_run"
+  mkdir -p "$DATASET_RUN_ROOT"
+  python3 - "$DATASET_RUN_ROOT/b_all_audio_cvr_triplets.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+rows = []
+for index in range(1, 5):
+    old_audio = f"reference topic {index}"
+    new_audio = f"target topic {index}"
+    rows.append({
+        "sample_id": f"synthetic_b_{index:03d}",
+        "reference_video": f"/synthetic/reference_{index:03d}.mp4",
+        "target_video": f"/synthetic/target_{index:03d}.mp4",
+        "edit_text": f"change the speech from discussing {old_audio} to discussing {new_audio}",
+        "edit_type": "replace",
+        "audio_delta_type": "speech_topic",
+        "old_audio": old_audio,
+        "new_audio": new_audio,
+        "direction": "forward",
+        "split_tier": "extended",
+        "raw_source_id": f"synthetic_source_{index:03d}",
+        "pair_group_id": f"synthetic_pair_{index:03d}",
+        "inverse_pair_group_id": f"synthetic_pair_{index:03d}",
+        "shortcut_label": "synthetic_code_smoke",
+        "audio_delta_strength": 0.8,
+        "video_context_strength": 0.7,
+        "asr_degeneracy_risk": 0.2,
+        "visual_shortcut_risk": 0.1,
+        "full_av_required": True,
+        "audio_delta_hard_negatives": [
+            {"type": "reference_negative", "video": f"/synthetic/reference_{index:03d}.mp4"},
+            {"type": "visual_hard", "video": f"/synthetic/visual_hard_{index:03d}.mp4"},
+            {"type": "audio_hard", "video": f"/synthetic/audio_hard_{index:03d}.mp4"},
+            {"type": "asr_hard", "video": f"/synthetic/asr_hard_{index:03d}.mp4"},
+        ],
+    })
+out.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+print(f"[e5-audio-delta-smoke] wrote synthetic records: {out} rows={len(rows)}")
+PY
+elif [ -z "$DATASET_RUN_ROOT" ]; then
   DATASET_RUN_ROOT=""
   shopt -s nullglob
   candidates=( "$RUNS_ROOT"/audio_cvr_bline_6_9s_full_* "$RUNS_ROOT"/audio_cvr_ab_6_9s_minimal_* )
@@ -85,6 +133,8 @@ echo "[e5-audio-delta-smoke] repo=$REPO_ROOT"
 echo "[e5-audio-delta-smoke] dataset_run_root=$DATASET_RUN_ROOT"
 echo "[e5-audio-delta-smoke] run_root=$RUN_ROOT"
 echo "[e5-audio-delta-smoke] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "[e5-audio-delta-smoke] synthetic_smoke=$SYNTHETIC_SMOKE"
+echo "[e5-audio-delta-smoke] mock_encoder=$MOCK_ENCODER"
 echo "[e5-audio-delta-smoke] discovered training files:"
 find "$DATASET_RUN_ROOT" -maxdepth 2 -type f \( \
   -name 'train.jsonl' -o \
