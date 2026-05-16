@@ -333,7 +333,7 @@ class ScriptTests(unittest.TestCase):
         smoke_script = Path("scripts/run_e5_audio_delta_smoke.sh").read_text(encoding="utf-8")
 
         self.assertIn("ENV_NAME=${ENV_NAME:-e5_train}", env_script)
-        self.assertIn("TORCH_VERSION=${TORCH_VERSION:-2.4.1}", env_script)
+        self.assertIn("TORCH_VERSION=${TORCH_VERSION:-2.5.1}", env_script)
         self.assertIn("TORCH_CUDA_INDEX=${TORCH_CUDA_INDEX:-https://download.pytorch.org/whl/cu121}", env_script)
         self.assertIn("torch.version.cuda", env_script)
         self.assertIn("sentence-transformers[image,audio,video]>=5.4", env_script)

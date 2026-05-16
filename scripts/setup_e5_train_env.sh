@@ -4,7 +4,7 @@ set -euo pipefail
 CONDA_SH=${CONDA_SH:-/data02/usr/wangqihao/miniconda3/etc/profile.d/conda.sh}
 ENV_NAME=${ENV_NAME:-e5_train}
 PYTHON_VERSION=${PYTHON_VERSION:-3.10}
-TORCH_VERSION=${TORCH_VERSION:-2.4.1}
+TORCH_VERSION=${TORCH_VERSION:-2.5.1}
 TORCH_CUDA_INDEX=${TORCH_CUDA_INDEX:-https://download.pytorch.org/whl/cu121}
 
 if [ ! -f "$CONDA_SH" ]; then
