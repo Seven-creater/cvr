@@ -1,0 +1,761 @@
+﻿# AudioDelta-E5 训练方法记录
+
+日期：2026-05-17
+
+## 1. 目标
+
+AudioDelta-E5 的目标是解决当前 Omni-CVR / composed video retrieval 中音频模态利用不足的问题。现有方法往往以 video-text retrieval 为主，audio 要么没有进入主检索模型，要么被额外模型转写成文本后再拼进 edit text。这样会导致模型没有真正学习：
+
+```text
+reference video/audio + edit_text -> target video/audio
+```
+
+特别是 B 线 Audio-CVR 中，目标不是做 ASR retrieval，而是让模型学习：
+
+```text
+target_audio 相比 reference_audio 是否按照 edit_text 发生了正确变化，
+同时这个变化发生在保留的视频语境中。
+```
+
+因此训练框架从普通 E5 embedding adapter 升级为 AudioDelta-E5 training framework。
+
+---
+
+## 2. 训练数据输入
+
+训练入口读取 B-line 构造出的结构化样本，而不是旧的 B-line 产物。默认读取以下新格式文件：
+
+```text
+b_splits/train.jsonl
+b_train_bidirectional_triplets.jsonl
+b_main_audio_cvr_triplets.jsonl
+b_extended_audio_cvr_triplets.jsonl
+b_all_audio_cvr_triplets.jsonl
+```
+
+旧的 `audio_ab_fresh800_omni_first_*` 不再自动参与训练，因为旧 B-line 没有经过最新 blind review v2、anti-ASR 分层、hard negative、AudioDelta 字段补全，容易污染训练。
+
+每条训练样本需要尽量包含：
+
+```json
+{
+  "reference_video": "...",
+  "target_video": "...",
+  "edit_text": "change the speech from discussing X to discussing Y",
+  "edit_type": "replace",
+  "audio_delta_type": "speech_topic | music | sound_event | ambient",
+  "old_audio": "discussing X",
+  "new_audio": "discussing Y",
+  "direction": "forward | inverse",
+  "split_tier": "main | extended | diagnostic",
+  "raw_source_id": "...",
+  "pair_group_id": "...",
+  "inverse_pair_group_id": "...",
+  "shortcut_label": "clean_audio_delta | asr_like | visual_shortcut | ...",
+  "audio_delta_strength": 0.0,
+  "video_context_strength": 0.0,
+  "asr_degeneracy_risk": 0.0,
+  "visual_shortcut_risk": 0.0,
+  "audio_delta_hard_negatives": [
+    {"type": "reference_negative", "video": "..."},
+    {"type": "visual_hard", "video": "..."},
+    {"type": "audio_hard", "video": "..."},
+    {"type": "asr_hard", "video": "..."}
+  ]
+}
+```
+
+这些字段直接服务训练目标，而不是只为了保存 triplet。
+
+---
+
+## 3. 基础训练流程
+
+当前训练链路为：
+
+```text
+prepare
+  -> cache-embeddings
+  -> train-adapter
+  -> eval
+```
+
+### 3.1 prepare
+
+`prepare` 负责从 B-line run 中读取训练记录，去重，并输出：
+
+```text
+records/train.jsonl
+records/eval.jsonl
+records/summary.json
+```
+
+它只接受新 B-line tier/split 输出。旧 B-line subtype 文件不再作为默认训练输入。
+
+### 3.2 cache-embeddings
+
+`cache-embeddings` 使用 e5-omni-7B 编码：
+
+```text
+query          = reference_video + edit_text
+target         = target_video
+reference      = reference_video
+edit           = edit_text
+old_audio      = old_audio / reference audio content
+new_audio      = new_audio / target audio content
+negative       = hard negative videos
+```
+
+一个关键修复是：视频不能作为裸字符串传给 `encode_document`。裸 mp4 字符串会被 sentence-transformers / Qwen2.5-Omni processor 误送进 audio feature extractor，导致错误。因此现在所有视频输入统一包装为：
+
+```python
+{"video": video_path}
+```
+
+query 则包装为：
+
+```python
+{"video": reference_video, "text": "Edit the reference video so that: ..."}
+```
+
+### 3.3 train-adapter
+
+`train-adapter` 在冻结 E5-Omni embedding 的前提下训练轻量 projection adapter：
+
+```text
+query_proj
+ doc_proj
+ edit_proj
+```
+
+它相当于 RET-token / retrieval pooling 的工程版第一阶段：先不改 tokenizer、不动 E5 主干，只学习检索空间中的 query/doc/edit 投影。
+
+### 3.4 eval
+
+`eval` 输出：
+
+```text
+summary.json
+comparison.md
+```
+
+报告内容包括：
+
+```text
+base_e5_global
+audio_delta_adapter_global
+base_e5_local
+base_e5_global_local
+audio_delta_adapter_local
+audio_delta_adapter_global_local
+```
+
+并按以下字段分组：
+
+```text
+split_tier
+audio_delta_type
+shortcut_label
+```
+
+---
+
+## 4. 八个核心设计如何落地
+
+### 4.1 Audio-delta loss
+
+目的：让模型学习 target audio 相比 reference audio 是否按照 edit_text 发生了变化。
+
+基础形式：
+
+```text
+delta(q,d) = sim(a_t, e) - sim(a_r, e)
+L_delta = max(0, m - delta)
+```
+
+对 add / increase：
+
+```text
+target 更接近 edit sound
+reference 更远离 edit sound
+```
+
+对 remove / decrease：
+
+```text
+reference 更接近 edit sound
+target 更远离 edit sound
+```
+
+对 replace：
+
+```text
+reference -> old_audio
+target    -> new_audio
+```
+
+---
+
+### 4.2 Hard negative curriculum
+
+训练样本中支持四类负样本：
+
+```text
+reference_negative: reference 本身
+visual_hard:        画面像，但声音不满足 edit
+audio_hard:         声音像，但视频上下文不对
+asr_hard:           speech 关键词像，但不是正确 target
+```
+
+代码中设置 curriculum stage：
+
+```text
+stage 1: reference_negative
+stage 2: + visual_hard
+stage 3: + audio_hard
+stage 4: + asr_hard
+```
+
+这样训练可以从容易负样本逐步过渡到更难的 shortcut negative。
+
+---
+
+### 4.3 Reference-as-negative
+
+reference 是“尚未发生 edit 的视频”，因此不能是答案。
+
+训练目标：
+
+```text
+s(query, target) > s(query, reference)
+```
+
+对应 loss：
+
+```text
+L_ref = max(0, m_ref - s(q, target) + s(q, reference))
+```
+
+这个 loss 对 CVR 特别重要，因为 reference 和 target 通常非常接近，模型容易把 reference 当成候选答案。
+
+---
+
+### 4.4 Edit-type-aware delta
+
+不同 edit 类型不能使用同一个训练逻辑。
+
+当前支持：
+
+```text
+add
+remove
+increase
+decrease
+replace
+```
+
+replace 是最重要的情况，例如：
+
+```text
+change the speech from discussing X to discussing Y
+```
+
+训练约束为：
+
+```text
+reference 接近 old_audio
+target 接近 new_audio
+target 不应接近 old_audio
+reference 不应接近 new_audio
+```
+
+这直接对应 B-line 中 speech topic / music / sound event 的方向性变化。
+
+---
+
+### 4.5 Local temporal segment matching
+
+这是本轮重点补充的部分。
+
+问题：全局视频向量可能丢失短暂事件。例如 edit_text 描述的是：
+
+```text
+某一句话
+一小段掌声
+短暂蜂鸣声
+音乐中某个瞬间变化
+```
+
+如果把整段视频压成一个全局向量，短时事件可能被平均掉。
+
+当前实现支持 `--local-segments N`，例如：
+
+```bash
+--local-segments 2
+```
+
+缓存时会得到：
+
+```text
+target_segments:    [num_samples, num_segments, dim]
+reference_segments: [num_samples, num_segments, dim]
+negative_segments:  [num_samples, num_negatives, num_segments, dim]
+```
+
+当前支持两种 local segment 模式：
+
+```text
+prompt: 对同一个视频加入 temporal focus instruction，适合 smoke 和快速调试。
+ffmpeg: 在 cache 阶段把视频切成真实子片段，再分别编码，适合正式 1k+ 训练。
+```
+
+`ffmpeg` 模式只写入当前训练 run 的 cache，例如：
+
+```text
+embedding_cache/local_media_cache/
+```
+
+不修改原视频，也不覆盖 B-line 数据集产物。
+
+检索分数：
+
+```text
+s_global(q, d) = q · d_global
+s_local(q, d)  = max_t q · d_segment_t
+s_mix(q, d)    = (1 - alpha) * s_global + alpha * s_local
+```
+
+正式训练建议使用 `--local-segment-mode ffmpeg --local-segments 2/3`。如果只是验证代码链路，仍建议使用 `prompt`，避免缓存阶段过慢。
+
+---
+
+### 4.6 RET-token / latent pooling 的工程版
+
+真正修改 E5 tokenizer 加 `[RET]` token 成本较高，也会影响模型兼容性。
+
+当前先实现轻量工程版：
+
+```text
+query_proj
+ doc_proj
+ edit_proj
+```
+
+也就是在 E5 生成 embedding 之后学习检索空间投影。
+
+这一步的作用：
+
+```text
+先验证 AudioDelta loss 和 hard negatives 是否有收益，
+再决定是否进入 LoRA / RET-token 级别微调。
+```
+
+当前 `train-lora` 仍是 dry-run plan，不阻塞 adapter 框架。
+
+---
+
+### 4.7 Source-disjoint split
+
+新增 `build-splits` 命令，按 source / pair group 分组切分，避免泄漏。
+
+硬规则：
+
+```text
+同一个 raw_source_id 不能跨 train / val / test
+同一个 pair_group_id 的正向和反向不能跨 split
+同一个 inverse_pair_group_id 不能跨 split
+test_main 每个 pair group 只保留一个方向
+inverse 样本进入 train 或 test_inverse_diagnostic
+```
+
+输出：
+
+```text
+b_splits/train.jsonl
+b_splits/val.jsonl
+b_splits/test_main.jsonl
+b_splits/test_inverse_diagnostic.jsonl
+b_splits/diagnostic.jsonl
+b_splits/split_summary.json
+```
+
+---
+
+### 4.8 Shortcut diagnosis
+
+评估阶段不只报告 overall R@K，而是分组报告：
+
+```text
+by_split_tier
+by_audio_delta_type
+by_shortcut_label
+```
+
+这样可以区分：
+
+```text
+B-main
+B-extended
+B-diagnostic
+speech_topic
+music
+sound_event
+clean_audio_delta
+ASR-like
+visual-shortcut
+```
+
+这一步很重要，因为 B-line 很容易退化成 ASR retrieval。分组报告能证明主结果不是由 ASR-like 样本虚高造成。
+
+---
+
+## 5. V2 Research Profile
+
+V1 已经跑通端到端训练；V2 不是替换 V1，而是新增显式 profile：
+
+```bash
+--training-profile v2_research
+```
+
+默认仍是：
+
+```bash
+--training-profile v1
+```
+
+这样做是为了控制复杂度：所有新 loss 都必须能单独关闭，避免“模块很多但贡献说不清楚”。
+
+### 5.1 Hardness-weighted negatives
+
+固定 margin hard negative loss 对所有 negative 一视同仁。V2 新增按难度加权：
+
+```text
+w_j = clip(softmax(s(q,d_j-) / tau_hard) * num_neg, w_min, w_max)
+```
+
+默认只对：
+
+```text
+visual_hard
+audio_hard
+asr_hard
+```
+
+加权；`reference_negative` 仍走固定 margin。这样避免 reference 这个必需负样本被过度放大。
+
+新增日志项：
+
+```text
+loss_hw_hn
+effective_negative_count
+```
+
+### 5.2 Multi-positive / Multi-view contrastive
+
+训练阶段用：
+
+```text
+positive_group_id = inverse_pair_group_id or pair_group_id
+```
+
+同组正向 / 反向样本可互为 multi-positive：
+
+```text
+L_multi_pos = -log sum_{p in P+} exp(sim(q,p)/tau)
+              / sum_{x in batch} exp(sim(q,x)/tau)
+```
+
+硬规则：
+
+```text
+train 可以启用 multi-positive
+val/test 不启用 multi-positive
+test_main 每个 pair_group 只保留一个方向
+```
+
+这避免反向样本把评测指标虚高。
+
+### 5.3 CORAL modality alignment
+
+V2 先实现轻量分布对齐，不直接引入真实 audio-only processor：
+
+```text
+doc side  = target/reference projection
+edit side = edit/old_audio/new_audio projection
+L_coral = ||Cov(doc) - Cov(edit)||_F^2 / (4*d*d)
+```
+
+它的目的不是替代 audio-delta loss，而是缓解 doc/edit 投影空间的分布偏移。
+
+风险：alignment 过强可能伤害 clean_audio_delta。因此默认权重很小：
+
+```text
+lambda_coral_align = 0.05
+```
+
+后续必须在 `B-main clean_audio_delta` 上确认没有副作用。
+
+### 5.4 Memory bank / larger negatives
+
+V2 支持一个 detached target embedding memory bank：
+
+```text
+--memory-bank-size 4096
+```
+
+训练前 `warmup_ratio` 内不启用 memory bank，避免早期 embedding 还不稳定时污染训练。
+
+它只用于 train，不参与 eval。显存压力可通过降低：
+
+```text
+memory_bank_size
+batch_size
+local_segments
+```
+
+控制。
+
+### 5.5 False-negative filtering
+
+V2 不删除原始 negative metadata，而是在训练时赋予有效权重：
+
+```text
+同 pair_group / inverse_pair_group: weight = 0
+高相似疑似 false negative: weight = false_negative_soft_weight
+普通 negative: weight = 1
+```
+
+默认：
+
+```text
+false_negative_sim_threshold = 0.92
+false_negative_soft_weight = 0.15
+```
+
+这部分必须谨慎调参。阈值过低会把真正有用的 hard negative 软化，阈值过高又过滤不掉假负样本。
+
+### 5.6 Schedule
+
+V2 新增：
+
+```text
+warmup + cosine learning rate
+temperature annealing
+```
+
+每步日志写入：
+
+```text
+lr
+temperature
+memory_bank_size
+全部 loss 项
+```
+
+这让后续调参时能判断到底是 loss 本身失效，还是优化 schedule 不稳定。
+
+---
+
+## 6. Ablation 设计
+
+新增 `run-ablations` 命令，自动运行：
+
+```text
+full_v2
+without_hardness_weighting
+without_multi_positive
+without_coral_align
+without_memory_bank
+without_false_negative_filtering
+without_local_ffmpeg
+v1_loss_only
+```
+
+输出：
+
+```text
+ablations/summary.json
+ablations/comparison.md
+```
+
+对应论文实验中的 strong ablation：每个模块是否真的贡献效果，都可以单独关闭验证。
+
+如果只想复现 V1 ablation，可以使用：
+
+```bash
+python -m app.e5_audio_delta_train run-ablations --training-profile v1 ...
+```
+
+---
+
+## 7. 复杂度与风险控制
+
+V2 模块明显比 V1 复杂，因此必须遵守以下顺序：
+
+```text
+1. 先跑 v1，确认数据、缓存、adapter、eval 正常。
+2. 再跑 v2_research，但只用 50 条样本。
+3. 看 loss_curve.jsonl：loss_hw_hn / loss_multi_positive / loss_coral_align / loss_memory_bank 是否稳定。
+4. 再跑 ablation，而不是直接宣称 full_v2 有效。
+5. 通过 50 -> 200 -> 1k 三档后，才考虑 LoRA。
+```
+
+特别注意：
+
+```text
+Hardness weighting: 需要调 tau_hard 和 clip 上下界。
+Multi-positive: 只允许 train，必须依赖 source/pair disjoint split。
+CORAL: 权重必须小，重点检查 clean_audio_delta 是否下降。
+Memory bank: 容易增加显存和过时 negative 风险，warmup 后再启用。
+False-negative filtering: 阈值要通过 diagnostic split 调。
+LoRA: 必须在 frozen adapter + projection head 稳定后再开。
+```
+
+换句话说，V2 是研究 profile，不是盲目全开的大规模默认训练配置。
+
+---
+
+## 8. 已经解决的工程难点
+
+### 6.1 CUDA / PyTorch / Transformers 兼容
+
+服务器 driver 是 CUDA 12.2 级别，不能使用 CUDA 13 wheel。最开始安装最新 torch 时，真实 E5 加载失败。
+
+解决方式：固定 PyTorch 三件套到 CUDA 12.1 wheel：
+
+```text
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+index-url=https://download.pytorch.org/whl/cu121
+```
+
+并在安装 sentence-transformers 等依赖后，再强制重装一次三件套，避免 pip 把 torchvision / torchaudio 换成不匹配版本。
+
+---
+
+### 6.2 视频路径被误当成音频数组
+
+真实 E5 smoke 中曾出现：
+
+```text
+ValueError: could not convert string to float: '...mp4'
+```
+
+原因是裸 mp4 路径字符串被传给了 audio feature extractor。
+
+解决方式：所有视频输入必须包装成：
+
+```python
+{"video": video_path}
+```
+
+不能直接传：
+
+```python
+"video.mp4"
+```
+
+query 则必须是：
+
+```python
+{"video": reference_video, "text": edit_text}
+```
+
+---
+
+### 6.3 旧 B-line 数据污染
+
+旧 B-line 质量不够，且缺少新字段。如果训练脚本自动选择旧 run，会导致训练目标不干净。
+
+解决方式：训练脚本只自动识别新的 Audio-CVR B-line 输出：
+
+```text
+audio_cvr_bline_6_9s_full_*
+audio_cvr_ab_6_9s_minimal_*
+```
+
+并且只读取新格式文件。
+
+---
+
+### 6.4 Local segment 的实现成本
+
+直接用 ffmpeg 把每个视频切成多个子片段，训练缓存会变慢，文件数量也会膨胀。
+
+当前解决方式：V1 先使用“局部时间视图编码”，即对同一视频加不同 temporal segment focus instruction，得到局部向量。这样接口先跑通，后续可替换成真实子片段编码。
+
+---
+
+## 9. 当前验证状态
+
+已通过：
+
+```text
+synthetic smoke: CPU + mock encoder
+real E5 smoke: GPU + e5-omni-7B + local_segments=2
+cache-embeddings: global + local embeddings
+train-adapter: full loss suite
+eval: global / local / global+local
+```
+
+本地测试：
+
+```text
+python -m unittest discover -v
+397 tests OK
+```
+
+真实服务器 smoke 结果：
+
+```text
+prepare: OK
+cache-embeddings: OK
+train-adapter: loss 正常收敛
+eval: global/local/global+local 全链路通过
+```
+
+---
+
+## 10. 后续建议
+
+短期：
+
+```text
+1. 等 B-line 大规模数据构造完成。
+2. 先用 50-100 条跑 adapter。
+3. 跑 run-ablations，确认各模块开关正常。
+4. 再用 `v2_research` 跑 50 -> 200 -> 1k。
+5. 每一档都先看 grouped recall 和 diagnostics，再决定是否放大。
+```
+
+中期：
+
+```text
+1. 正式训练启用 `--local-segment-mode ffmpeg`。
+2. 对 B-main / B-extended / B-diagnostic 分别训练与评估。
+3. 增加 embedding 可视化，例如 UMAP / t-SNE，检查 CORAL 是否真的改善模态分布。
+```
+
+长期：
+
+```text
+1. 从 adapter 进入 LoRA 微调。
+2. 尝试真正的 RET-token / latent pooling。
+3. 训练 AudioDelta-E5 full model。
+4. 和 agent 路线结合：agent 负责音频证据解释和 rerank。
+```
+
+---
+
+## 11. 一句话总结
+
+AudioDelta-E5 训练框架的核心不是“让 E5 多看一点音频”，而是让模型显式学习：
+
+```text
+target audio/video 相比 reference audio/video，
+是否按照 edit_text 发生了正确的、有方向的音频变化，
+并且这种变化发生在保留的视频语境中。
+```
+
+当前 V1 已经实现了训练所需的主要结构：Audio-delta loss、hard negatives、reference negative、edit-type-aware delta、local temporal matching、source-disjoint split、shortcut diagnosis 和 ablation。

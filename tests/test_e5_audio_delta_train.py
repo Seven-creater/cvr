@@ -15,6 +15,13 @@ from app.e5_audio_delta_train import (
     run_ablations,
     train_adapter,
     train_lora_plan,
+    _coral_loss,
+    _false_negative_weights,
+    _hardness_weights,
+    _import_torch,
+    _multi_positive_loss,
+    _scheduled_learning_rate,
+    _scheduled_temperature,
     _video_payload,
 )
 
@@ -170,6 +177,113 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertGreaterEqual(len(summary["rows"]), 3)
             self.assertTrue((root / "ablations" / "comparison.md").exists())
 
+    def test_v2_research_profile_logs_new_losses_and_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [
+                self._record("sample_1", source="source_a", pair="pair_shared"),
+                self._record("sample_2", source="source_b", pair="pair_shared", direction="inverse"),
+            ]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows[:1])
+            cache_embeddings(records_dir=records_dir, output_dir=root / "embedding_cache", mock_encoder=True, local_segments=2)
+
+            summary = train_adapter(
+                cache_dir=root / "embedding_cache",
+                output_dir=root / "adapter",
+                steps=3,
+                batch_size=2,
+                device="cpu",
+                training_profile="v2_research",
+                memory_bank_size=8,
+            )
+            loss_rows = [json.loads(line) for line in (root / "adapter" / "loss_curve.jsonl").read_text(encoding="utf-8").splitlines()]
+
+            self.assertEqual("v2_research", summary["training_profile"])
+            self.assertIn("loss_hw_hn", loss_rows[-1])
+            self.assertIn("loss_multi_positive", loss_rows[-1])
+            self.assertIn("loss_coral_align", loss_rows[-1])
+            self.assertIn("loss_memory_bank", loss_rows[-1])
+            self.assertIn("temperature", loss_rows[-1])
+            self.assertGreater(loss_rows[-1]["memory_bank_size"], 0)
+
+    def test_cache_ffmpeg_mode_is_scoped_to_cache_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            self._write_jsonl(records_dir / "train.jsonl", [self._record("sample_1", source="source_a", pair="pair_a")])
+            self._write_jsonl(records_dir / "eval.jsonl", [self._record("sample_1", source="source_a", pair="pair_a")])
+
+            summary = cache_embeddings(
+                records_dir=records_dir,
+                output_dir=root / "embedding_cache",
+                mock_encoder=True,
+                local_segments=2,
+                local_segment_mode="ffmpeg",
+                local_segment_cache_dir=root / "local_cache",
+            )
+
+            self.assertEqual("ffmpeg", summary["local_segment_mode"])
+            self.assertEqual([1, 2, 32], summary["train"]["target_segments_shape"])
+            self.assertFalse(Path("/tmp/sample_1_ref.mp4").exists())
+
+    def test_hardness_weights_prioritize_high_similarity_negatives(self) -> None:
+        torch = _import_torch()
+        records = [load_audio_delta_records_from_rows([self._record("sample_1", source="source_a", pair="pair_a")])[0]]
+        neg_scores = torch.tensor([[0.1, 0.9, 0.2, 0.3]], dtype=torch.float32)
+        active = torch.ones_like(neg_scores)
+
+        weights = _hardness_weights(torch, records, neg_scores, active, temperature=0.07, weight_min=0.25, weight_max=4.0)
+
+        self.assertGreater(float(weights[0, 1]), float(weights[0, 2]))
+        self.assertGreaterEqual(float(weights.min()), 0.25)
+        self.assertLessEqual(float(weights.max()), 4.0)
+
+    def test_multi_positive_and_coral_helpers_are_stable(self) -> None:
+        torch = _import_torch()
+        logits = torch.tensor([[4.0, 4.0, 0.1], [4.0, 4.0, 0.2], [0.1, 0.2, 4.0]], dtype=torch.float32)
+        groups = torch.tensor([1, 1, 2], dtype=torch.int64)
+
+        multi_loss = _multi_positive_loss(torch, logits, groups)
+        coral_one = _coral_loss(torch, torch.ones(1, 4), torch.ones(1, 4))
+        coral_many = _coral_loss(torch, torch.eye(4), torch.flip(torch.eye(4), dims=[0]))
+
+        self.assertLess(float(multi_loss), 0.2)
+        self.assertEqual(0.0, float(coral_one))
+        self.assertGreaterEqual(float(coral_many), 0.0)
+
+    def test_false_negative_filter_soft_weights_high_similarity(self) -> None:
+        torch = _import_torch()
+        record = load_audio_delta_records_from_rows(
+            [
+                self._record(
+                    "sample_1",
+                    source="source_a",
+                    pair="pair_a",
+                    negatives=[
+                        {"type": "reference_negative", "video": "/tmp/ref.mp4"},
+                        {"type": "visual_hard", "video": "/tmp/vh.mp4", "pair_group_id": "pair_a"},
+                        {"type": "audio_hard", "video": "/tmp/ah.mp4"},
+                    ],
+                )
+            ]
+        )[0]
+        scores = torch.tensor([[0.99, 0.99, 0.95, 0.1]], dtype=torch.float32)
+
+        weights = _false_negative_weights(torch, [record], scores, threshold=0.92, soft_weight=0.15)
+
+        self.assertEqual(1.0, float(weights[0, 0]))
+        self.assertEqual(0.0, float(weights[0, 1]))
+        self.assertEqual(0.15, round(float(weights[0, 2]), 2))
+
+    def test_schedule_helpers(self) -> None:
+        self.assertLess(_scheduled_learning_rate(base_lr=1.0, step=1, total_steps=10, warmup_steps=2, min_ratio=0.1), 1.0)
+        self.assertAlmostEqual(0.07, _scheduled_temperature(step=1, total_steps=10, start=0.07, end=0.03))
+        self.assertAlmostEqual(0.03, _scheduled_temperature(step=10, total_steps=10, start=0.07, end=0.03))
+
     def _record(
         self,
         sample_id: str,
@@ -181,6 +295,7 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
         new_audio: str = "the mayor's remarks",
         direction: str = "forward",
         shortcut_label: str = "clean_audio_delta",
+        negatives: list[dict[str, str]] | None = None,
     ) -> dict[str, object]:
         return {
             "sample_id": sample_id,
@@ -202,7 +317,7 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             "asr_degeneracy_risk": 0.20,
             "visual_shortcut_risk": 0.10,
             "full_av_required": True,
-            "audio_delta_hard_negatives": [
+            "audio_delta_hard_negatives": negatives or [
                 {"type": "reference_negative", "video": f"/tmp/{sample_id}_ref.mp4"},
                 {"type": "visual_hard", "video": f"/tmp/{sample_id}_vh.mp4"},
                 {"type": "audio_hard", "video": f"/tmp/{sample_id}_ah.mp4"},
@@ -222,6 +337,13 @@ class _SpyEncoder:
     def encode_document(self, inputs: list[object]) -> list[list[float]]:
         self.inputs.extend(inputs)
         return [[1.0, 0.0, 0.0, 0.0] for _ in inputs]
+
+
+def load_audio_delta_records_from_rows(rows: list[dict[str, object]]):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        path = Path(temp_dir) / "records.jsonl"
+        path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+        return load_audio_delta_records(path)
 
 
 if __name__ == "__main__":
