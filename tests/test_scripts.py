@@ -338,7 +338,7 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("modelscope download", env_script)
         self.assertNotIn("vllm.entrypoints.openai.api_server", env_script)
 
-        self.assertIn("GPU_IDS=${GPU_IDS:-4,5,6,7}", smoke_script)
+        self.assertIn("GPU_IDS=${GPU_IDS:-0,1,2,3}", smoke_script)
         self.assertIn("MAX_TRAIN_RECORDS=${MAX_TRAIN_RECORDS:-8}", smoke_script)
         self.assertIn("MAX_EVAL_RECORDS=${MAX_EVAL_RECORDS:-4}", smoke_script)
         self.assertIn("python3 -m app.e5_audio_delta_train prepare", smoke_script)
