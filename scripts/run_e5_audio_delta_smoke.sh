@@ -15,6 +15,7 @@ LEARNING_RATE=${LEARNING_RATE:-0.001}
 DEVICE=${DEVICE:-cuda}
 MOCK_ENCODER=${MOCK_ENCODER:-0}
 SYNTHETIC_SMOKE=${SYNTHETIC_SMOKE:-0}
+LOCAL_SEGMENTS=${LOCAL_SEGMENTS:-0}
 
 usage() {
   cat <<'USAGE'
@@ -30,6 +31,7 @@ Options:
   --train-steps N           Adapter steps, default 20.
   --batch-size N            Adapter batch size, default 4.
   --device cpu|cuda         Training device, default cuda.
+  --local-segments N        Cache N temporal local views per video, default 0.
   --mock-encoder            Use deterministic fake embeddings for code smoke only.
   --synthetic-smoke         Create tiny synthetic records and force mock encoder.
 USAGE
@@ -56,6 +58,7 @@ while [ "$#" -gt 0 ]; do
     --train-steps) TRAIN_STEPS="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
+    --local-segments) LOCAL_SEGMENTS="$2"; shift 2 ;;
     --mock-encoder) MOCK_ENCODER=1; shift ;;
     --synthetic-smoke) SYNTHETIC_SMOKE=1; MOCK_ENCODER=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -135,6 +138,7 @@ echo "[e5-audio-delta-smoke] run_root=$RUN_ROOT"
 echo "[e5-audio-delta-smoke] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "[e5-audio-delta-smoke] synthetic_smoke=$SYNTHETIC_SMOKE"
 echo "[e5-audio-delta-smoke] mock_encoder=$MOCK_ENCODER"
+echo "[e5-audio-delta-smoke] local_segments=$LOCAL_SEGMENTS"
 echo "[e5-audio-delta-smoke] discovered training files:"
 find "$DATASET_RUN_ROOT" -maxdepth 2 -type f \( \
   -name 'train.jsonl' -o \
@@ -164,6 +168,7 @@ python3 -m app.e5_audio_delta_train cache-embeddings \
   --records-dir "$RUN_ROOT/records" \
   --output-dir "$RUN_ROOT/embedding_cache" \
   --device "$DEVICE" \
+  --local-segments "$LOCAL_SEGMENTS" \
   "${cache_args[@]}"
 
 python3 -m app.e5_audio_delta_train train-adapter \

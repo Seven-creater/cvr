@@ -7,10 +7,12 @@ import unittest
 
 from app.e5_audio_delta_train import (
     DEFAULT_DATA_ROOT,
+    build_splits,
     cache_embeddings,
     eval_adapter,
     load_audio_delta_records,
     prepare_records,
+    run_ablations,
     train_adapter,
     train_lora_plan,
     _video_payload,
@@ -62,6 +64,7 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
                 records_dir=records_dir,
                 output_dir=root / "embedding_cache",
                 mock_encoder=True,
+                local_segments=2,
             )
             train_summary = train_adapter(
                 cache_dir=root / "embedding_cache",
@@ -78,10 +81,13 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             )
 
             self.assertEqual([2, 32], cache_summary["train"]["embedding_shape"])
+            self.assertEqual([2, 2, 32], cache_summary["train"]["target_segments_shape"])
             self.assertTrue((root / "adapter" / "adapter.pt").exists())
             self.assertTrue((root / "adapter" / "loss_curve.jsonl").exists())
             self.assertEqual(2, train_summary["steps"])
             self.assertEqual(1, eval_summary["eval_count"])
+            self.assertTrue(eval_summary["has_local_segments"])
+            self.assertIn("by_audio_delta_type", eval_summary)
             self.assertTrue((root / "eval" / "comparison.md").exists())
 
     def test_real_encoder_inputs_wrap_video_paths_as_multimodal_payloads(self) -> None:
@@ -117,6 +123,53 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertIn("q_proj", plan["default_target_modules"])
             self.assertTrue((Path(temp_dir) / "lora" / "lora_plan.json").exists())
 
+    def test_build_splits_is_source_and_pair_disjoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_run = root / "dataset_run"
+            self._write_jsonl(
+                dataset_run / "b_all_audio_cvr_triplets.jsonl",
+                [
+                    self._record("s1_a", source="source_1", pair="pair_1"),
+                    self._record("s1_b_inverse", source="source_1", pair="pair_1", direction="inverse"),
+                    self._record("s2_a", source="source_2", pair="pair_2"),
+                    self._record("s3_a", source="source_3", pair="pair_3", split_tier="diagnostic", shortcut_label="asr_like"),
+                    self._record("s4_a", source="source_4", pair="pair_4"),
+                ],
+            )
+
+            summary = build_splits(run_root=dataset_run, output_dir=root / "splits", train_ratio=0.5, val_ratio=0.25, seed=1)
+
+            self.assertEqual([], summary["leakage_checks"]["raw_source_cross_split_leaks"])
+            self.assertEqual([], summary["leakage_checks"]["pair_group_cross_split_leaks"])
+            self.assertTrue(summary["leakage_checks"]["test_main_unique_pair_groups"])
+            self.assertTrue((root / "splits" / "train.jsonl").exists())
+            self.assertTrue((root / "splits" / "diagnostic.jsonl").exists())
+
+    def test_run_ablations_writes_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            train_rows = [
+                self._record("sample_1", source="source_a", pair="pair_a"),
+                self._record("sample_2", source="source_b", pair="pair_b", old_audio="quiet room ambience", new_audio="crowd cheering"),
+            ]
+            self._write_jsonl(records_dir / "train.jsonl", train_rows)
+            self._write_jsonl(records_dir / "eval.jsonl", train_rows)
+            cache_embeddings(records_dir=records_dir, output_dir=root / "embedding_cache", mock_encoder=True, local_segments=1)
+
+            summary = run_ablations(
+                cache_dir=root / "embedding_cache",
+                output_dir=root / "ablations",
+                steps=1,
+                batch_size=2,
+                device="cpu",
+            )
+
+            self.assertGreaterEqual(len(summary["rows"]), 3)
+            self.assertTrue((root / "ablations" / "comparison.md").exists())
+
     def _record(
         self,
         sample_id: str,
@@ -126,6 +179,8 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
         split_tier: str = "main",
         old_audio: str = "the bakery opening",
         new_audio: str = "the mayor's remarks",
+        direction: str = "forward",
+        shortcut_label: str = "clean_audio_delta",
     ) -> dict[str, object]:
         return {
             "sample_id": sample_id,
@@ -136,12 +191,12 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             "audio_delta_type": "speech_topic",
             "old_audio": old_audio,
             "new_audio": new_audio,
-            "direction": "forward",
+            "direction": direction,
             "split_tier": split_tier,
             "raw_source_id": source,
             "pair_group_id": pair,
             "inverse_pair_group_id": pair,
-            "shortcut_label": "clean_audio_delta",
+            "shortcut_label": shortcut_label,
             "audio_delta_strength": 0.82,
             "video_context_strength": 0.72,
             "asr_degeneracy_risk": 0.20,

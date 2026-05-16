@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -24,6 +25,22 @@ DEFAULT_RUNS_ROOT = "/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs"
 DEFAULT_DATA_ROOT = "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval"
 QUERY_TEMPLATE = "Edit the reference video so that: {edit_text}"
 DEFAULT_NEGATIVE_TYPES = ("reference_negative", "visual_hard", "audio_hard", "asr_hard")
+DEFAULT_LOSS_OPTIONS = {
+    "disable_delta_loss": False,
+    "disable_hard_negatives": False,
+    "disable_reference_negative": False,
+    "disable_edit_type_loss": False,
+    "disable_local_segments": False,
+    "disable_global_local_mix": False,
+    "local_mix_weight": 0.5,
+    "curriculum_stage": 4,
+}
+NEGATIVE_CURRICULUM_STAGE = {
+    "reference_negative": 1,
+    "visual_hard": 2,
+    "audio_hard": 3,
+    "asr_hard": 4,
+}
 
 
 @dataclass(frozen=True)
@@ -116,6 +133,7 @@ def cache_embeddings(
     batch_size: int = 1,
     video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     video_fps: int = 1,
+    local_segments: int = 0,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     records_root = Path(records_dir)
@@ -147,6 +165,7 @@ def cache_embeddings(
         encoder=encoder,
         output_root=output_root,
         runtime_info=runtime_info,
+        local_segments=local_segments,
         progress=progress,
     )
     eval_summary = _cache_split_embeddings(
@@ -155,12 +174,14 @@ def cache_embeddings(
         encoder=encoder,
         output_root=output_root,
         runtime_info=runtime_info,
+        local_segments=local_segments,
         progress=progress,
     )
     summary = {
         "records_dir": str(records_root),
         "output_dir": str(output_root),
         "runtime": runtime_info,
+        "local_segments": local_segments,
         "train": train_summary,
         "eval": eval_summary,
     }
@@ -177,6 +198,14 @@ def train_adapter(
     learning_rate: float = 1e-3,
     seed: int = 13,
     device: str = "cuda",
+    disable_delta_loss: bool = False,
+    disable_hard_negatives: bool = False,
+    disable_reference_negative: bool = False,
+    disable_edit_type_loss: bool = False,
+    disable_local_segments: bool = False,
+    disable_global_local_mix: bool = False,
+    local_mix_weight: float = 0.5,
+    curriculum_stage: int = 4,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     torch = _import_torch()
@@ -195,6 +224,16 @@ def train_adapter(
     tensors = {key: torch.as_tensor(value, dtype=torch.float32, device=device_obj) for key, value in data.items()}
     count = int(tensors["query"].shape[0])
     rng = random.Random(seed)
+    loss_options = _loss_options(
+        disable_delta_loss=disable_delta_loss,
+        disable_hard_negatives=disable_hard_negatives,
+        disable_reference_negative=disable_reference_negative,
+        disable_edit_type_loss=disable_edit_type_loss,
+        disable_local_segments=disable_local_segments,
+        disable_global_local_mix=disable_global_local_mix,
+        local_mix_weight=local_mix_weight,
+        curriculum_stage=curriculum_stage,
+    )
     losses_path = output_root / "loss_curve.jsonl"
     with losses_path.open("w", encoding="utf-8") as losses_file:
         for step in range(1, max(1, steps) + 1):
@@ -202,7 +241,7 @@ def train_adapter(
             batch = {key: value[indices] if value.shape[0] == count else value for key, value in tensors.items()}
             batch_records = [records[index] for index in indices]
             optimizer.zero_grad(set_to_none=True)
-            losses = _adapter_losses(torch, model, batch, batch_records)
+            losses = _adapter_losses(torch, model, batch, batch_records, loss_options)
             loss = losses["total"]
             if not torch.isfinite(loss):
                 raise RuntimeError(f"non-finite adapter loss at step {step}: {float(loss.detach().cpu())}")
@@ -221,6 +260,7 @@ def train_adapter(
         "learning_rate": learning_rate,
         "seed": seed,
         "device": str(device_obj),
+        "loss_options": loss_options,
         "losses_path": str(losses_path),
         "adapter_path": str(adapter_path),
     }
@@ -237,6 +277,9 @@ def eval_adapter(
     output_dir: str | Path,
     topk: tuple[int, ...] = (1, 5, 10),
     device: str = "cuda",
+    disable_local_segments: bool = False,
+    disable_global_local_mix: bool = False,
+    local_mix_weight: float = 0.5,
 ) -> dict[str, Any]:
     torch = _import_torch()
     cache_root = Path(cache_dir)
@@ -248,8 +291,11 @@ def eval_adapter(
     if not records:
         raise ValueError("eval records are empty")
     topk = _normalize_topk(topk)
-    base_scores = _normalize_np(data["query"]) @ _normalize_np(data["target"]).T
+    base_scores = _score_matrix_np(data["query"], data["target"])
     base = _recall_from_scores(base_scores, topk=topk)
+    has_local = _has_local_segments(data) and not disable_local_segments
+    base_local_scores = _local_score_matrix_np(data["query"], data["target_segments"]) if has_local else None
+    base_mix_scores = _mix_scores(base_scores, base_local_scores, local_mix_weight, disable_global_local_mix)
     dim = int(data["query"].shape[1])
     device_obj = _torch_device(torch, device)
     model = _AudioDeltaAdapter(torch, dim).to(device_obj)
@@ -262,17 +308,37 @@ def eval_adapter(
         adapted_query = model.query(query)
         adapted_target = model.doc(target)
         adapted_scores = (adapted_query @ adapted_target.T).detach().cpu().numpy()
+        adapted_local_scores = None
+        if has_local:
+            target_segments = model.doc(torch.as_tensor(data["target_segments"], dtype=torch.float32, device=device_obj))
+            adapted_local_scores = _local_score_matrix_torch(torch, adapted_query, target_segments).detach().cpu().numpy()
+        adapted_mix_scores = _mix_scores(adapted_scores, adapted_local_scores, local_mix_weight, disable_global_local_mix)
     adapted = _recall_from_scores(adapted_scores, topk=topk)
+    rows = [
+        {"method": "base_e5_global", **base},
+        {"method": "audio_delta_adapter_global", **adapted},
+    ]
+    if has_local and base_local_scores is not None and adapted_local_scores is not None:
+        rows.extend(
+            [
+                {"method": "base_e5_local", **_recall_from_scores(base_local_scores, topk=topk)},
+                {"method": "base_e5_global_local", **_recall_from_scores(base_mix_scores, topk=topk)},
+                {"method": "audio_delta_adapter_local", **_recall_from_scores(adapted_local_scores, topk=topk)},
+                {"method": "audio_delta_adapter_global_local", **_recall_from_scores(adapted_mix_scores, topk=topk)},
+            ]
+        )
     comparison = {
         "cache_dir": str(cache_root),
         "adapter_dir": str(adapter_root),
         "output_dir": str(output_root),
         "eval_count": len(records),
         "topk": list(topk),
-        "rows": [
-            {"method": "base_e5", **base},
-            {"method": "audio_delta_adapter", **adapted},
-        ],
+        "has_local_segments": has_local,
+        "local_mix_weight": local_mix_weight,
+        "rows": rows,
+        "by_split_tier": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "split_tier", topk),
+        "by_audio_delta_type": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "audio_delta_type", topk),
+        "by_shortcut_label": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "shortcut_label", topk),
     }
     (output_root / "summary.json").write_text(json.dumps(comparison, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (output_root / "comparison.md").write_text(_comparison_markdown(comparison), encoding="utf-8")
@@ -291,6 +357,137 @@ def train_lora_plan(*, output_dir: str | Path) -> dict[str, Any]:
     }
     (output_root / "lora_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return plan
+
+
+def build_splits(
+    *,
+    run_root: str | Path,
+    output_dir: str | Path | None = None,
+    input_paths: list[str | Path] | None = None,
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+    seed: int = 13,
+) -> dict[str, Any]:
+    dataset_root = Path(run_root)
+    output_root = Path(output_dir) if output_dir else dataset_root / "b_splits"
+    output_root.mkdir(parents=True, exist_ok=True)
+    paths = [Path(path) for path in input_paths] if input_paths else _default_train_paths(dataset_root)
+    records = _dedupe_records(_load_records_from_paths(paths))
+    if not records:
+        raise ValueError(f"no records found for split building from: {[str(path) for path in paths]}")
+    diagnostic = [record for record in records if _is_diagnostic_record(record)]
+    eligible = [record for record in records if record not in diagnostic]
+    groups: dict[str, list[AudioDeltaRecord]] = defaultdict(list)
+    for record in eligible:
+        groups[_split_group_id(record)].append(record)
+    group_ids = sorted(groups)
+    rng = random.Random(seed)
+    rng.shuffle(group_ids)
+    train_cut = int(len(group_ids) * train_ratio)
+    val_cut = train_cut + int(len(group_ids) * val_ratio)
+    split_group_ids = {
+        "train": set(group_ids[:train_cut]),
+        "val": set(group_ids[train_cut:val_cut]),
+        "test": set(group_ids[val_cut:]),
+    }
+    split_records = {
+        name: [record for group_id in sorted(group_ids_for_split) for record in groups[group_id]]
+        for name, group_ids_for_split in split_group_ids.items()
+    }
+    test_main = _one_direction_per_pair([record for record in split_records["test"] if record.split_tier == "main" and record.direction != "inverse"])
+    test_inverse = [record for record in split_records["test"] if record.direction == "inverse"]
+    outputs = {
+        "train": output_root / "train.jsonl",
+        "val": output_root / "val.jsonl",
+        "test_main": output_root / "test_main.jsonl",
+        "test_inverse_diagnostic": output_root / "test_inverse_diagnostic.jsonl",
+        "diagnostic": output_root / "diagnostic.jsonl",
+    }
+    _write_jsonl(outputs["train"], [asdict(record) for record in split_records["train"]])
+    _write_jsonl(outputs["val"], [asdict(record) for record in split_records["val"]])
+    _write_jsonl(outputs["test_main"], [asdict(record) for record in test_main])
+    _write_jsonl(outputs["test_inverse_diagnostic"], [asdict(record) for record in test_inverse])
+    _write_jsonl(outputs["diagnostic"], [asdict(record) for record in diagnostic])
+    summary = {
+        "dataset_run_root": str(dataset_root),
+        "output_dir": str(output_root),
+        "input_paths": [str(path) for path in paths],
+        "seed": seed,
+        "train_ratio": train_ratio,
+        "val_ratio": val_ratio,
+        "source_disjoint_group_count": len(group_ids),
+        "counts": {
+            "all": len(records),
+            "train": len(split_records["train"]),
+            "val": len(split_records["val"]),
+            "test_pool": len(split_records["test"]),
+            "test_main": len(test_main),
+            "test_inverse_diagnostic": len(test_inverse),
+            "diagnostic": len(diagnostic),
+        },
+        "outputs": {key: str(path) for key, path in outputs.items()},
+        "leakage_checks": _split_leakage_checks(split_records, test_main, test_inverse, diagnostic),
+    }
+    (output_root / "split_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
+def run_ablations(
+    *,
+    cache_dir: str | Path,
+    output_dir: str | Path,
+    steps: int = 10,
+    batch_size: int = 4,
+    learning_rate: float = 1e-3,
+    device: str = "cuda",
+    seed: int = 13,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    cache_root = Path(cache_dir)
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    configs = [
+        ("full", {}),
+        ("without_delta", {"disable_delta_loss": True}),
+        ("without_hard_negatives", {"disable_hard_negatives": True}),
+        ("without_reference_negative", {"disable_reference_negative": True}),
+        ("without_edit_type", {"disable_edit_type_loss": True}),
+        ("without_local_segments", {"disable_local_segments": True}),
+        ("global_only", {"disable_local_segments": True, "disable_global_local_mix": True}),
+    ]
+    rows: list[dict[str, Any]] = []
+    for name, overrides in configs:
+        _emit(progress, f"[e5-audio-delta] ablation {name} start")
+        adapter_dir = output_root / name / "adapter"
+        eval_dir = output_root / name / "eval"
+        train_summary = train_adapter(
+            cache_dir=cache_root,
+            output_dir=adapter_dir,
+            steps=steps,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            seed=seed,
+            device=device,
+            progress=progress,
+            **overrides,
+        )
+        eval_summary = eval_adapter(
+            cache_dir=cache_root,
+            adapter_dir=adapter_dir,
+            output_dir=eval_dir,
+            device=device,
+            disable_local_segments=bool(overrides.get("disable_local_segments", False)),
+            disable_global_local_mix=bool(overrides.get("disable_global_local_mix", False)),
+        )
+        adapted_row = next((row for row in eval_summary["rows"] if row["method"] == "audio_delta_adapter_global_local"), None)
+        if adapted_row is None:
+            adapted_row = next((row for row in eval_summary["rows"] if row["method"] == "audio_delta_adapter_global"), {})
+        rows.append({"ablation": name, "adapter_dir": str(adapter_dir), "eval_dir": str(eval_dir), "steps": train_summary["steps"], **adapted_row})
+        _emit(progress, f"[e5-audio-delta] ablation {name} done")
+    summary = {"cache_dir": str(cache_root), "output_dir": str(output_root), "rows": rows}
+    (output_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (output_root / "comparison.md").write_text(_ablation_markdown(summary), encoding="utf-8")
+    return summary
 
 
 def load_audio_delta_records(path: str | Path) -> list[AudioDeltaRecord]:
@@ -323,6 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
     cache.add_argument("--batch-size", type=int, default=1)
     cache.add_argument("--video-max-pixels", type=int, default=DEFAULT_VIDEO_MAX_PIXELS)
     cache.add_argument("--video-fps", type=int, default=1)
+    cache.add_argument("--local-segments", type=int, default=0, help="Encode this many temporal local views per video; 0 disables local cache.")
 
     train = subparsers.add_parser("train-adapter")
     train.add_argument("--cache-dir", required=True)
@@ -332,6 +530,14 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--learning-rate", type=float, default=1e-3)
     train.add_argument("--seed", type=int, default=13)
     train.add_argument("--device", default="cuda")
+    train.add_argument("--disable-delta-loss", action="store_true")
+    train.add_argument("--disable-hard-negatives", action="store_true")
+    train.add_argument("--disable-reference-negative", action="store_true")
+    train.add_argument("--disable-edit-type-loss", action="store_true")
+    train.add_argument("--disable-local-segments", action="store_true")
+    train.add_argument("--disable-global-local-mix", action="store_true")
+    train.add_argument("--local-mix-weight", type=float, default=0.5)
+    train.add_argument("--curriculum-stage", type=int, default=4)
 
     evaluate = subparsers.add_parser("eval")
     evaluate.add_argument("--cache-dir", required=True)
@@ -339,6 +545,26 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--output-dir", required=True)
     evaluate.add_argument("--topk", default="1,5,10")
     evaluate.add_argument("--device", default="cuda")
+    evaluate.add_argument("--disable-local-segments", action="store_true")
+    evaluate.add_argument("--disable-global-local-mix", action="store_true")
+    evaluate.add_argument("--local-mix-weight", type=float, default=0.5)
+
+    split = subparsers.add_parser("build-splits")
+    split.add_argument("--dataset-run-root", "--run-root", dest="dataset_run_root", required=True)
+    split.add_argument("--output-dir")
+    split.add_argument("--input-path", action="append", default=[])
+    split.add_argument("--train-ratio", type=float, default=0.8)
+    split.add_argument("--val-ratio", type=float, default=0.1)
+    split.add_argument("--seed", type=int, default=13)
+
+    ablate = subparsers.add_parser("run-ablations")
+    ablate.add_argument("--cache-dir", required=True)
+    ablate.add_argument("--output-dir", required=True)
+    ablate.add_argument("--steps", type=int, default=10)
+    ablate.add_argument("--batch-size", type=int, default=4)
+    ablate.add_argument("--learning-rate", type=float, default=1e-3)
+    ablate.add_argument("--device", default="cuda")
+    ablate.add_argument("--seed", type=int, default=13)
 
     lora = subparsers.add_parser("train-lora")
     lora.add_argument("--output-dir", required=True)
@@ -371,6 +597,7 @@ def main() -> None:
             batch_size=args.batch_size,
             video_max_pixels=args.video_max_pixels,
             video_fps=args.video_fps,
+            local_segments=args.local_segments,
             progress=progress,
         )
     elif args.command == "train-adapter":
@@ -382,6 +609,14 @@ def main() -> None:
             learning_rate=args.learning_rate,
             seed=args.seed,
             device=args.device,
+            disable_delta_loss=args.disable_delta_loss,
+            disable_hard_negatives=args.disable_hard_negatives,
+            disable_reference_negative=args.disable_reference_negative,
+            disable_edit_type_loss=args.disable_edit_type_loss,
+            disable_local_segments=args.disable_local_segments,
+            disable_global_local_mix=args.disable_global_local_mix,
+            local_mix_weight=args.local_mix_weight,
+            curriculum_stage=args.curriculum_stage,
             progress=progress,
         )
     elif args.command == "eval":
@@ -391,6 +626,29 @@ def main() -> None:
             output_dir=args.output_dir,
             topk=tuple(int(part.strip()) for part in str(args.topk).split(",") if part.strip()),
             device=args.device,
+            disable_local_segments=args.disable_local_segments,
+            disable_global_local_mix=args.disable_global_local_mix,
+            local_mix_weight=args.local_mix_weight,
+        )
+    elif args.command == "build-splits":
+        result = build_splits(
+            run_root=args.dataset_run_root,
+            output_dir=args.output_dir,
+            input_paths=args.input_path or None,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+        )
+    elif args.command == "run-ablations":
+        result = run_ablations(
+            cache_dir=args.cache_dir,
+            output_dir=args.output_dir,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            device=args.device,
+            seed=args.seed,
+            progress=progress,
         )
     elif args.command == "train-lora":
         result = train_lora_plan(output_dir=args.output_dir)
@@ -406,12 +664,17 @@ def _cache_split_embeddings(
     encoder: Any,
     output_root: Path,
     runtime_info: dict[str, Any],
+    local_segments: int,
     progress: Callable[[str], None] | None,
 ) -> dict[str, Any]:
     if not records:
         raise ValueError(f"{split} records are empty")
     arrays: dict[str, list[np.ndarray]] = {key: [] for key in ("query", "target", "reference", "edit", "old_audio", "new_audio")}
+    local_segments = max(0, int(local_segments))
+    target_segment_rows: list[np.ndarray] = []
+    reference_segment_rows: list[np.ndarray] = []
     negative_rows: list[list[np.ndarray]] = []
+    negative_segment_rows: list[list[np.ndarray]] = []
     negative_mask: list[list[float]] = []
     negative_types: list[list[str]] = []
     manifest_path = output_root / f"{split}_manifest.jsonl"
@@ -424,7 +687,11 @@ def _cache_split_embeddings(
             arrays["edit"].append(_encode_one(encoder, record.edit_text))
             arrays["old_audio"].append(_encode_one(encoder, record.old_audio or record.edit_text))
             arrays["new_audio"].append(_encode_one(encoder, record.new_audio or record.edit_text))
+            if local_segments > 0:
+                target_segment_rows.append(_encode_many(encoder, _local_video_payloads(record.target_video, role="target", count=local_segments)))
+                reference_segment_rows.append(_encode_many(encoder, _local_video_payloads(record.reference_video, role="reference", count=local_segments)))
             neg_vectors: list[np.ndarray] = []
+            neg_segment_vectors: list[np.ndarray] = []
             neg_mask_row: list[float] = []
             neg_type_row: list[str] = []
             for negative in _ordered_negatives(record):
@@ -432,19 +699,29 @@ def _cache_split_embeddings(
                 if not video:
                     continue
                 neg_vectors.append(_encode_one(encoder, _video_payload(video)))
+                if local_segments > 0:
+                    neg_segment_vectors.append(_encode_many(encoder, _local_video_payloads(video, role=str(negative.get("type", "negative")), count=local_segments)))
                 neg_mask_row.append(1.0)
                 neg_type_row.append(str(negative.get("type", "")).strip() or "unknown")
             while len(neg_vectors) < len(DEFAULT_NEGATIVE_TYPES):
                 neg_vectors.append(np.zeros_like(arrays["target"][-1]))
+                if local_segments > 0:
+                    neg_segment_vectors.append(np.zeros((local_segments, arrays["target"][-1].shape[0]), dtype=np.float32))
                 neg_mask_row.append(0.0)
                 neg_type_row.append("")
             negative_rows.append(neg_vectors[: len(DEFAULT_NEGATIVE_TYPES)])
+            if local_segments > 0:
+                negative_segment_rows.append(neg_segment_vectors[: len(DEFAULT_NEGATIVE_TYPES)])
             negative_mask.append(neg_mask_row[: len(DEFAULT_NEGATIVE_TYPES)])
             negative_types.append(neg_type_row[: len(DEFAULT_NEGATIVE_TYPES)])
             manifest_file.write(json.dumps({"sample_id": record.sample_id, "negative_types": neg_type_row}, ensure_ascii=False) + "\n")
             manifest_file.flush()
     stacked = {key: np.vstack(value).astype(np.float32) for key, value in arrays.items()}
     stacked["negative"] = np.asarray(negative_rows, dtype=np.float32)
+    if local_segments > 0:
+        stacked["target_segments"] = np.asarray(target_segment_rows, dtype=np.float32)
+        stacked["reference_segments"] = np.asarray(reference_segment_rows, dtype=np.float32)
+        stacked["negative_segments"] = np.asarray(negative_segment_rows, dtype=np.float32)
     stacked["negative_mask"] = np.asarray(negative_mask, dtype=np.float32)
     npz_path = output_root / f"{split}_embeddings.npz"
     np.savez(str(npz_path), **stacked)
@@ -455,6 +732,8 @@ def _cache_split_embeddings(
         "record_count": len(records),
         "embedding_shape": list(stacked["query"].shape),
         "negative_shape": list(stacked["negative"].shape),
+        "local_segments": local_segments,
+        "target_segments_shape": list(stacked["target_segments"].shape) if "target_segments" in stacked else None,
         "runtime": runtime_info,
         "embeddings_path": str(npz_path),
         "records_path": str(records_path),
@@ -464,7 +743,7 @@ def _cache_split_embeddings(
     return metadata
 
 
-def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list[AudioDeltaRecord]) -> dict[str, Any]:
+def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list[AudioDeltaRecord], options: dict[str, Any]) -> dict[str, Any]:
     query = model.query(batch["query"])
     target = model.doc(batch["target"])
     reference = model.doc(batch["reference"])
@@ -473,30 +752,87 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
     new_audio = model.edit(batch["new_audio"])
     negative = model.doc(batch["negative"])
     neg_mask = batch["negative_mask"]
-    logits = query @ target.T / 0.05
-    labels = torch.arange(logits.shape[0], device=logits.device)
-    loss_cvr = torch.nn.functional.cross_entropy(logits, labels)
-    pos = torch.sum(query * target, dim=-1)
-    ref = torch.sum(query * reference, dim=-1)
+    has_local = _batch_has_local(batch) and not options["disable_local_segments"]
+    target_segments = model.doc(batch["target_segments"]) if has_local else None
+    reference_segments = model.doc(batch["reference_segments"]) if has_local else None
+    negative_segments = model.doc(batch["negative_segments"]) if has_local else None
+    global_logits = query @ target.T
+    local_logits = _local_score_matrix_torch(torch, query, target_segments) if target_segments is not None else None
+    retrieval_logits = _mix_torch_scores(global_logits, local_logits, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"])) / 0.05
+    labels = torch.arange(retrieval_logits.shape[0], device=retrieval_logits.device)
+    loss_cvr = torch.nn.functional.cross_entropy(retrieval_logits, labels)
+    pos_global = torch.sum(query * target, dim=-1)
+    ref_global = torch.sum(query * reference, dim=-1)
+    pos_local = _paired_local_scores_torch(torch, query, target_segments) if target_segments is not None else None
+    ref_local = _paired_local_scores_torch(torch, query, reference_segments) if reference_segments is not None else None
+    pos = _mix_torch_scores(pos_global, pos_local, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"]))
+    ref = _mix_torch_scores(ref_global, ref_local, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"]))
     loss_ref = torch.relu(0.2 - pos + ref).mean()
-    neg_scores = torch.einsum("bd,bnd->bn", query, negative)
-    hn = torch.relu(0.2 - pos[:, None] + neg_scores) * neg_mask
-    loss_hn = hn.sum() / neg_mask.sum().clamp_min(1.0)
+    if options["disable_reference_negative"]:
+        loss_ref = torch.zeros((), device=retrieval_logits.device)
+    neg_scores_global = torch.einsum("bd,bnd->bn", query, negative)
+    neg_scores_local = _negative_local_scores_torch(torch, query, negative_segments) if negative_segments is not None else None
+    neg_scores = _mix_torch_scores(neg_scores_global, neg_scores_local, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"]))
+    curriculum_mask = _curriculum_mask(torch, records, neg_mask, int(options["curriculum_stage"]))
+    hn = torch.relu(0.2 - pos[:, None] + neg_scores) * curriculum_mask
+    loss_hn = hn.sum() / curriculum_mask.sum().clamp_min(1.0)
+    if options["disable_hard_negatives"]:
+        loss_hn = torch.zeros((), device=retrieval_logits.device)
     delta_losses: list[Any] = []
     edit_type_losses: list[Any] = []
     for index, record in enumerate(records):
         edit_type = _normalize_edit_type(record.edit_type, record.edit_text)
+        target_edit = _mix_torch_scores(
+            torch.sum(target[index] * edit[index], dim=-1),
+            _single_local_score_torch(torch, target_segments[index], edit[index]) if target_segments is not None else None,
+            float(options["local_mix_weight"]),
+            bool(options["disable_global_local_mix"]),
+        )
+        reference_edit = _mix_torch_scores(
+            torch.sum(reference[index] * edit[index], dim=-1),
+            _single_local_score_torch(torch, reference_segments[index], edit[index]) if reference_segments is not None else None,
+            float(options["local_mix_weight"]),
+            bool(options["disable_global_local_mix"]),
+        )
+        target_old = _mix_torch_scores(
+            torch.sum(target[index] * old_audio[index], dim=-1),
+            _single_local_score_torch(torch, target_segments[index], old_audio[index]) if target_segments is not None else None,
+            float(options["local_mix_weight"]),
+            bool(options["disable_global_local_mix"]),
+        )
+        target_new = _mix_torch_scores(
+            torch.sum(target[index] * new_audio[index], dim=-1),
+            _single_local_score_torch(torch, target_segments[index], new_audio[index]) if target_segments is not None else None,
+            float(options["local_mix_weight"]),
+            bool(options["disable_global_local_mix"]),
+        )
+        reference_old = _mix_torch_scores(
+            torch.sum(reference[index] * old_audio[index], dim=-1),
+            _single_local_score_torch(torch, reference_segments[index], old_audio[index]) if reference_segments is not None else None,
+            float(options["local_mix_weight"]),
+            bool(options["disable_global_local_mix"]),
+        )
+        reference_new = _mix_torch_scores(
+            torch.sum(reference[index] * new_audio[index], dim=-1),
+            _single_local_score_torch(torch, reference_segments[index], new_audio[index]) if reference_segments is not None else None,
+            float(options["local_mix_weight"]),
+            bool(options["disable_global_local_mix"]),
+        )
         if edit_type in {"remove", "decrease"}:
-            delta = torch.sum(reference[index] * edit[index]) - torch.sum(target[index] * edit[index])
+            delta = reference_edit - target_edit
             delta_losses.append(torch.relu(0.2 - delta))
         elif edit_type == "replace":
-            edit_type_losses.append(torch.relu(0.2 - torch.sum(target[index] * new_audio[index]) + torch.sum(target[index] * old_audio[index])))
-            edit_type_losses.append(torch.relu(0.2 - torch.sum(reference[index] * old_audio[index]) + torch.sum(reference[index] * new_audio[index])))
+            edit_type_losses.append(torch.relu(0.2 - target_new + target_old))
+            edit_type_losses.append(torch.relu(0.2 - reference_old + reference_new))
         else:
-            delta = torch.sum(target[index] * edit[index]) - torch.sum(reference[index] * edit[index])
+            delta = target_edit - reference_edit
             delta_losses.append(torch.relu(0.2 - delta))
-    loss_delta = torch.stack(delta_losses).mean() if delta_losses else torch.zeros((), device=logits.device)
-    loss_edit_type = torch.stack(edit_type_losses).mean() if edit_type_losses else torch.zeros((), device=logits.device)
+    loss_delta = torch.stack(delta_losses).mean() if delta_losses else torch.zeros((), device=retrieval_logits.device)
+    loss_edit_type = torch.stack(edit_type_losses).mean() if edit_type_losses else torch.zeros((), device=retrieval_logits.device)
+    if options["disable_delta_loss"]:
+        loss_delta = torch.zeros((), device=retrieval_logits.device)
+    if options["disable_edit_type_loss"]:
+        loss_edit_type = torch.zeros((), device=retrieval_logits.device)
     visual_sim = torch.sum(target * reference, dim=-1)
     loss_visual = torch.relu(0.05 - visual_sim).mean()
     total = loss_cvr + 0.5 * loss_delta + 0.5 * loss_hn + 0.3 * loss_ref + 0.3 * loss_edit_type + 0.05 * loss_visual
@@ -509,6 +845,100 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
         "loss_edit_type": loss_edit_type,
         "loss_visual": loss_visual,
     }
+
+
+def _loss_options(**overrides: Any) -> dict[str, Any]:
+    options = dict(DEFAULT_LOSS_OPTIONS)
+    options.update(overrides)
+    options["local_mix_weight"] = min(1.0, max(0.0, float(options["local_mix_weight"])))
+    options["curriculum_stage"] = max(1, min(4, int(options["curriculum_stage"])))
+    return options
+
+
+def _batch_has_local(batch: dict[str, Any]) -> bool:
+    return "target_segments" in batch and "reference_segments" in batch and "negative_segments" in batch
+
+
+def _has_local_segments(data: dict[str, np.ndarray]) -> bool:
+    return "target_segments" in data and data["target_segments"].ndim == 3 and data["target_segments"].shape[1] > 0
+
+
+def _score_matrix_np(query: np.ndarray, target: np.ndarray) -> np.ndarray:
+    return _normalize_np(query) @ _normalize_np(target).T
+
+
+def _local_score_matrix_np(query: np.ndarray, target_segments: np.ndarray) -> np.ndarray:
+    query_norm = _normalize_np(query)
+    flat_segments = target_segments.reshape(-1, target_segments.shape[-1])
+    segment_norm = _normalize_np(flat_segments).reshape(target_segments.shape)
+    return np.einsum("bd,nsd->bns", query_norm, segment_norm).max(axis=-1)
+
+
+def _mix_scores(global_scores: np.ndarray, local_scores: np.ndarray | None, local_mix_weight: float, disable_mix: bool) -> np.ndarray:
+    if local_scores is None or disable_mix:
+        return global_scores
+    weight = min(1.0, max(0.0, float(local_mix_weight)))
+    return ((1.0 - weight) * global_scores) + (weight * local_scores)
+
+
+def _local_score_matrix_torch(torch: Any, query: Any, target_segments: Any) -> Any:
+    return torch.einsum("bd,nsd->bns", query, target_segments).max(dim=-1).values
+
+
+def _paired_local_scores_torch(torch: Any, query: Any, target_segments: Any) -> Any:
+    return torch.einsum("bd,bsd->bs", query, target_segments).max(dim=-1).values
+
+
+def _negative_local_scores_torch(torch: Any, query: Any, negative_segments: Any) -> Any:
+    return torch.einsum("bd,bnsd->bns", query, negative_segments).max(dim=-1).values
+
+
+def _single_local_score_torch(torch: Any, segments: Any, vector: Any) -> Any:
+    return torch.einsum("sd,d->s", segments, vector).max()
+
+
+def _mix_torch_scores(global_scores: Any, local_scores: Any | None, local_mix_weight: float, disable_mix: bool) -> Any:
+    if local_scores is None or disable_mix:
+        return global_scores
+    weight = min(1.0, max(0.0, float(local_mix_weight)))
+    return ((1.0 - weight) * global_scores) + (weight * local_scores)
+
+
+def _curriculum_mask(torch: Any, records: list[AudioDeltaRecord], neg_mask: Any, curriculum_stage: int) -> Any:
+    keep_rows: list[list[float]] = []
+    for record in records:
+        negatives = _ordered_negatives(record)
+        row: list[float] = []
+        for index in range(len(DEFAULT_NEGATIVE_TYPES)):
+            if index >= len(negatives):
+                row.append(0.0)
+                continue
+            neg_type = str(negatives[index].get("type", ""))
+            required_stage = NEGATIVE_CURRICULUM_STAGE.get(neg_type, 4)
+            row.append(1.0 if required_stage <= curriculum_stage else 0.0)
+        keep_rows.append(row)
+    return neg_mask * torch.as_tensor(keep_rows, dtype=neg_mask.dtype, device=neg_mask.device)
+
+
+def _grouped_recall_summary(
+    base_scores: np.ndarray,
+    adapted_scores: np.ndarray,
+    records: list[AudioDeltaRecord],
+    field_name: str,
+    topk: tuple[int, ...],
+) -> dict[str, Any]:
+    groups: dict[str, list[int]] = defaultdict(list)
+    for index, record in enumerate(records):
+        groups[str(getattr(record, field_name, "unknown") or "unknown")].append(index)
+    result: dict[str, Any] = {}
+    for group, indices in sorted(groups.items()):
+        idx = np.asarray(indices, dtype=np.int64)
+        result[group] = {
+            "count": int(len(indices)),
+            "base_e5": _recall_from_scores(base_scores[np.ix_(idx, idx)], topk=topk),
+            "audio_delta_adapter": _recall_from_scores(adapted_scores[np.ix_(idx, idx)], topk=topk),
+        }
+    return result
 
 
 def _AudioDeltaAdapter(torch: Any, dim: int) -> Any:
@@ -630,6 +1060,61 @@ def _dedupe_records(records: list[AudioDeltaRecord]) -> list[AudioDeltaRecord]:
     return result
 
 
+def _is_diagnostic_record(record: AudioDeltaRecord) -> bool:
+    tier = str(record.split_tier or "").lower()
+    label = str(record.shortcut_label or "").lower()
+    return tier == "diagnostic" or "asr" in label or "shortcut" in label and record.visual_shortcut_risk > 0.5
+
+
+def _split_group_id(record: AudioDeltaRecord) -> str:
+    raw_source = str(record.raw_source_id or "").strip()
+    if raw_source:
+        return raw_source
+    return str(record.inverse_pair_group_id or record.pair_group_id or record.sample_id)
+
+
+def _one_direction_per_pair(records: list[AudioDeltaRecord]) -> list[AudioDeltaRecord]:
+    seen: set[str] = set()
+    result: list[AudioDeltaRecord] = []
+    for record in sorted(records, key=lambda item: (item.inverse_pair_group_id, item.sample_id)):
+        group = str(record.inverse_pair_group_id or record.pair_group_id or record.sample_id)
+        if group in seen:
+            continue
+        seen.add(group)
+        result.append(record)
+    return result
+
+
+def _split_leakage_checks(
+    split_records: dict[str, list[AudioDeltaRecord]],
+    test_main: list[AudioDeltaRecord],
+    test_inverse: list[AudioDeltaRecord],
+    diagnostic: list[AudioDeltaRecord],
+) -> dict[str, Any]:
+    source_to_split: dict[str, str] = {}
+    source_leaks: list[str] = []
+    pair_to_split: dict[str, str] = {}
+    pair_leaks: list[str] = []
+    for split_name, records in split_records.items():
+        for record in records:
+            source = _split_group_id(record)
+            if source in source_to_split and source_to_split[source] != split_name:
+                source_leaks.append(source)
+            source_to_split[source] = split_name
+            pair = str(record.inverse_pair_group_id or record.pair_group_id or record.sample_id)
+            if pair in pair_to_split and pair_to_split[pair] != split_name:
+                pair_leaks.append(pair)
+            pair_to_split[pair] = split_name
+    test_main_pairs = [str(record.inverse_pair_group_id or record.pair_group_id or record.sample_id) for record in test_main]
+    return {
+        "raw_source_cross_split_leaks": sorted(set(source_leaks)),
+        "pair_group_cross_split_leaks": sorted(set(pair_leaks)),
+        "test_main_unique_pair_groups": len(test_main_pairs) == len(set(test_main_pairs)),
+        "test_inverse_count": len(test_inverse),
+        "diagnostic_count": len(diagnostic),
+    }
+
+
 def _query_payload(record: AudioDeltaRecord) -> dict[str, str]:
     return {"video": _resolve_media_path(record.reference_video), "text": QUERY_TEMPLATE.format(edit_text=record.edit_text.strip().rstrip("."))}
 
@@ -656,6 +1141,27 @@ def _resolve_media_path(raw_path: str) -> str:
 
 def _encode_one(encoder: Any, payload: Any) -> np.ndarray:
     return _normalize_rows(encoder.encode_document([payload]))[0]
+
+
+def _encode_many(encoder: Any, payloads: list[Any]) -> np.ndarray:
+    return _normalize_rows(encoder.encode_document(payloads))
+
+
+def _local_video_payloads(video_path: str, *, role: str, count: int) -> list[dict[str, str]]:
+    resolved = _resolve_media_path(video_path)
+    total = max(1, int(count))
+    payloads: list[dict[str, str]] = []
+    for index in range(total):
+        payloads.append(
+            {
+                "video": resolved,
+                "text": (
+                    f"Focus on local temporal segment {index + 1} of {total} for the {role} video. "
+                    "Represent short-lived speech, music, sound events, and visual context in this segment."
+                ),
+            }
+        )
+    return payloads
 
 
 def _ordered_negatives(record: AudioDeltaRecord) -> list[dict[str, str]]:
@@ -705,6 +1211,18 @@ def _comparison_markdown(comparison: dict[str, Any]) -> str:
     ]
     for row in comparison["rows"]:
         lines.append(f"| {row['method']} | {_fmt(row.get('R@1'))} | {_fmt(row.get('R@5'))} | {_fmt(row.get('R@10'))} |")
+    return "\n".join(lines) + "\n"
+
+
+def _ablation_markdown(summary: dict[str, Any]) -> str:
+    lines = [
+        "# AudioDelta-E5 Ablation",
+        "",
+        "| Ablation | R@1 | R@5 | R@10 |",
+        "|---|---:|---:|---:|",
+    ]
+    for row in summary["rows"]:
+        lines.append(f"| {row['ablation']} | {_fmt(row.get('R@1'))} | {_fmt(row.get('R@5'))} | {_fmt(row.get('R@10'))} |")
     return "\n".join(lines) + "\n"
 
 
