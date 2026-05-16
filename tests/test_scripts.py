@@ -334,8 +334,13 @@ class ScriptTests(unittest.TestCase):
 
         self.assertIn("ENV_NAME=${ENV_NAME:-e5_train}", env_script)
         self.assertIn("TORCH_VERSION=${TORCH_VERSION:-2.5.1}", env_script)
+        self.assertIn("TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.20.1}", env_script)
+        self.assertIn("TORCHAUDIO_VERSION=${TORCHAUDIO_VERSION:-2.5.1}", env_script)
         self.assertIn("TORCH_CUDA_INDEX=${TORCH_CUDA_INDEX:-https://download.pytorch.org/whl/cu121}", env_script)
+        self.assertIn("pip uninstall -y torch torchvision torchaudio", env_script)
         self.assertIn("torch.version.cuda", env_script)
+        self.assertIn("torchvision.__version__", env_script)
+        self.assertIn("torchaudio.__version__", env_script)
         self.assertIn("sentence-transformers[image,audio,video]>=5.4", env_script)
         self.assertIn("peft", env_script)
         self.assertNotIn("modelscope download", env_script)
