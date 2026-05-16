@@ -94,6 +94,9 @@ VoxCeleb 特别规则：
 - 6-9s 的 VoxCeleb mp4 会按父目录聚合成 single-source group。
 - 父目录内少于 2 个有效 mp4 时，不写入最终 clips/groups manifest。
 - 完整 6-9s mp4 用 hardlink/copy 写入 clip cache，避免对百万级短 mp4 做 ffmpeg 重编码。
+- VoxCeleb 默认不直接进入 `B-main`，优先进入 `B-extended` 或 `B-diagnostic`。
+- VoxCeleb 只有在 `video_context_strength >= 0.70`、`asr_degeneracy_risk <= 0.30`、`visual_shortcut_risk=false`、`audio_only_verification.accept=true`、且 `video_only_shortcut.can_identify_target_without_audio=false` 时，才允许进入 `B-main`。
+- 这样做是为了避免 B 线被审稿人质疑成 talking-head speech retrieval 或 ASR retrieval。
 
 ## 4. 总流程
 
@@ -365,7 +368,8 @@ inverse augmentation 是后处理，只用于训练增强和 edit direction 学�
 - `edit_type`: `add`、`remove`、`replace`、`increase`、`decrease` 或 `unknown`。
 - `audio_delta_type`: `speech_topic`、`speech_phrase`、`music` 或 `sound_event`。
 - `old_audio`、`new_audio`：edit-type-aware delta loss 使用的端点。
-- `audio_delta_hard_negatives`: typed hard negatives，包括 `reference`、`visual_hard`、`audio_hard`、`asr_hard`。
+- `audio_delta_hard_negatives`: typed hard negatives，包括 `reference_negative`、`visual_hard`、`audio_hard`、`asr_hard`。
+- `hard_negative_missing_reasons`: 某类 hard negative 没挖到时的缺失原因。
 - `visual_constraint`: 视觉语境和视觉捷径诊断。
 - `shortcut_label`: `clean_audio_delta`、`ASR-like`、`visual-shortcut`、`audio-only-shortcut` 或 `ambiguous`。
 - `source_disjoint_group_id`、`pair_group_id`、`inverse_pair_group_id`。
@@ -374,9 +378,33 @@ inverse augmentation 是后处理，只用于训练增强和 edit direction 学�
 
 - `edit_type`、`old_audio`、`new_audio` 支持 edit-type-aware delta。
 - `audio_delta_hard_negatives` 支持 hard negative curriculum。
-- `reference` hard negative 支持 reference-as-negative。
+- `reference_negative` hard negative 支持 reference-as-negative。
 - `source_disjoint_group_id` 和 `inverse_pair_group_id` 支持无泄漏 split。
 - `shortcut_label` 支持 shortcut diagnosis。
+
+### 7.9 Hard negatives 生成逻辑
+
+`audio_delta_hard_negatives` 不只是保存若干路径，而是服务 AudioDelta-E5 的 typed hard negative curriculum。
+
+固定负样本：
+
+- `reference_negative`：reference 自己固定作为 negative，因为 reference 尚未发生 edit，不能是答案。
+
+可挖掘负样本：
+
+- `visual_hard`：同 source/group 内视觉相似，但 audio edit 不成立的 target。
+- `audio_hard`：audio 内容相似，但视频上下文不同的 target。
+- `asr_hard`：speech 关键词或主题相似，但不是正确 target pair 的 target。
+
+如果某类 hard negative 挖不到，不伪造样本；对应字段可以为空，但必须在 `hard_negative_missing_reasons` 中记录原因，例如：
+
+```json
+{
+  "visual_hard": "no_same_source_visual_candidate",
+  "audio_hard": "no_cross_context_audio_candidate",
+  "asr_hard": "no_speech_keyword_candidate"
+}
+```
 
 ## 8. 后续 A 线
 
@@ -438,12 +466,46 @@ b_diagnostic_asr_risk_triplets.jsonl
 三层含义：
 
 - `B-main`：低 ASR 风险、高视频语境、强 audio delta，用于论文主 benchmark。
-- `B-extended`：中等风险、质量合格，用于训练或预训练 audio-aware retriever。
-- `B-diagnostic`：ASR-risk、generic talking-head、transcript-like edit 等样本，不进主表，只做附录和诊断。
+  - `audio_delta_strength >= 0.70`
+  - `video_context_strength >= 0.45`
+  - `asr_degeneracy_risk <= 0.55`
+  - `visual_shortcut_risk=false`
+  - `audio_only_verification.accept=true`
+  - `video_only_shortcut.can_identify_target_without_audio=false`
+- `B-extended`：中等风险、质量合格，用于训练或预训练 audio-aware retriever，不进入主 benchmark。
+  - `audio_delta_strength >= 0.60`
+  - 允许中等 ASR risk，但不能有明显视觉捷径、空洞 edit_text 或 reference/target 方向错误。
+- `B-diagnostic`：ASR-like、visual shortcut、ambiguous、generic talking-head、transcript-like edit 等样本，不进主表，只做附录和诊断。
 
 `B-main` 会优先保留 `music` 和 `sound_event`，并限制 `speech_topic_in_video_context` 占比，避免 speech 主导主测试集。
 
-## 11. B 线 inverse augmentation 与 AudioDelta 训练记录
+## 11. Split 强规则：source-disjoint + pair-group-disjoint
+
+数据集切分不能随机按样本切，必须按 source 和 pair group 强约束切分。
+
+强规则：
+
+- train / val / test 必须按 `raw_source_id` 或 `source_disjoint_group_id` 分组切分。
+- 同一个 raw source 不能跨 split。
+- 同一个 `pair_group_id` 的正向和反向样本不能跨 split。
+- 同一个 `inverse_pair_group_id` 不能跨 train / val / test。
+- `test-main` 每个 `pair_group_id` 只保留一个方向。
+- inverse 样本默认只进入 `train` 或 `test-inverse diagnostic`，不直接进入 `test-main`。
+
+对应产物：
+
+```text
+b_splits/train.jsonl
+b_splits/val.jsonl
+b_splits/test_main.jsonl
+b_splits/test_inverse_diagnostic.jsonl
+b_splits/diagnostic.jsonl
+b_splits/split_summary.json
+```
+
+`split_summary.json` 必须记录 group 数量、各 split 数量和 `leakage_violations`。如果发现 raw source 或 pair group 跨 split，应该视为构造错误，而不是人工忽略。
+
+## 12. B 线 inverse augmentation 与 AudioDelta 训练记录
 
 inverse augmentation 是 B 线后处理，不替代 `b_audio_blind_review_v2` 正向构造流程。正向 accepted 后，系统可以尝试生成反向样本：
 
@@ -478,7 +540,8 @@ b_inverse_summary.json
 - `edit_type`: `add`、`remove`、`replace`、`increase`、`decrease` 或 `unknown`。
 - `audio_delta_type`: `speech_topic`、`speech_phrase`、`music` 或 `sound_event`。
 - `old_audio` / `new_audio`: edit-type-aware delta loss 使用的端点。
-- `audio_delta_hard_negatives`: typed hard negatives，包括 `reference`、`visual_hard`、`audio_hard`、`asr_hard`。
+- `audio_delta_hard_negatives`: typed hard negatives，包括 `reference_negative`、`visual_hard`、`audio_hard`、`asr_hard`。
+- `hard_negative_missing_reasons`: 某类 hard negative 没挖到时的原因。
 - `visual_constraint`: 视觉语境与视觉捷径诊断字段。
 - `shortcut_label`: `clean_audio_delta`、`ASR-like`、`visual-shortcut`、`audio-only-shortcut` 或 `ambiguous`。
 - `source_disjoint_group_id`、`pair_group_id`、`inverse_pair_group_id`: 用于 source-disjoint 和 pair-group-disjoint split。

@@ -8,6 +8,7 @@ from unittest import mock
 
 from app.audio_lines_single_source import (
     augment_b_inverse,
+    build_b_splits,
     merge_line_results,
     prepare_existing_single_source_clips,
     split_audio_line_candidates,
@@ -798,6 +799,8 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                         "video_context_strength": 0.72,
                         "asr_degeneracy_risk": 0.18,
                         "visual_shortcut_risk": False,
+                        "audio_only_verification": {"accept": True},
+                        "video_only_shortcut": {"can_identify_target_without_audio": False},
                         "audio_only_solvability": 0.50,
                         "full_av_required": True,
                         "quality": {
@@ -910,6 +913,8 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                     "video_context_strength": 0.80,
                     "asr_degeneracy_risk": 0.10,
                     "visual_shortcut_risk": False,
+                    "audio_only_verification": {"accept": True},
+                    "video_only_shortcut": {"can_identify_target_without_audio": False},
                     "audio_only_solvability": 0.50,
                     "full_av_required": True,
                     "quality": {"b_subtype": "music"},
@@ -926,6 +931,8 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                     "video_context_strength": 0.50,
                     "asr_degeneracy_risk": 0.45,
                     "visual_shortcut_risk": False,
+                    "audio_only_verification": {"accept": True},
+                    "video_only_shortcut": {"can_identify_target_without_audio": False},
                     "audio_only_solvability": 0.55,
                     "quality": {"b_subtype": "speech_topic_in_video_context"},
                 },
@@ -962,6 +969,208 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertFalse(diagnostic_rows[0]["benchmark_eligible"])
             self.assertIn("asr_degeneracy_risk_high", diagnostic_rows[0]["diagnostic_reason"])
             self.assertEqual({"main": 1, "extended": 1, "diagnostic": 1}, summary["b_split_tier_counts"])
+
+    def test_b_tier_thresholds_require_audio_only_and_guard_voxceleb_main(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_root = root / "run"
+            b_shards = run_root / "b_shards"
+            b_shards.mkdir(parents=True)
+            records = [
+                {
+                    "proposal_id": "main_loose_threshold",
+                    "reference_video": "ref1.mp4",
+                    "target_video": "tgt1.mp4",
+                    "edit_text": "replace quiet ambience with crowd cheering",
+                    "difference": {"type": "audio_event"},
+                    "accepted": True,
+                    "b_subtype": "sound_event",
+                    "audio_delta_strength": 0.70,
+                    "video_context_strength": 0.46,
+                    "asr_degeneracy_risk": 0.54,
+                    "visual_shortcut_risk": False,
+                    "audio_only_verification": {"accept": True},
+                    "video_only_shortcut": {"can_identify_target_without_audio": False},
+                    "quality": {"b_subtype": "sound_event"},
+                },
+                {
+                    "proposal_id": "no_audio_only_accept",
+                    "reference_video": "ref2.mp4",
+                    "target_video": "tgt2.mp4",
+                    "edit_text": "replace quiet ambience with applause",
+                    "difference": {"type": "audio_event"},
+                    "accepted": True,
+                    "b_subtype": "sound_event",
+                    "audio_delta_strength": 0.90,
+                    "video_context_strength": 0.80,
+                    "asr_degeneracy_risk": 0.10,
+                    "visual_shortcut_risk": False,
+                    "video_only_shortcut": {"can_identify_target_without_audio": False},
+                    "quality": {"b_subtype": "sound_event"},
+                },
+                {
+                    "proposal_id": "voxceleb_guarded",
+                    "dataset": "voxceleb",
+                    "reference_video": "raw/voxceleb/a/ref.mp4",
+                    "target_video": "raw/voxceleb/a/tgt.mp4",
+                    "edit_text": "replace quiet speech with applause",
+                    "difference": {"type": "audio_event"},
+                    "accepted": True,
+                    "b_subtype": "sound_event",
+                    "audio_delta_strength": 0.90,
+                    "video_context_strength": 0.60,
+                    "asr_degeneracy_risk": 0.20,
+                    "visual_shortcut_risk": False,
+                    "audio_only_verification": {"accept": True},
+                    "video_only_shortcut": {"can_identify_target_without_audio": False},
+                    "quality": {"b_subtype": "sound_event"},
+                },
+                {
+                    "proposal_id": "voxceleb_strong",
+                    "dataset": "voxceleb",
+                    "reference_video": "raw/voxceleb/b/ref.mp4",
+                    "target_video": "raw/voxceleb/b/tgt.mp4",
+                    "edit_text": "replace quiet room ambience with crowd cheering",
+                    "difference": {"type": "audio_event"},
+                    "accepted": True,
+                    "b_subtype": "sound_event",
+                    "audio_delta_strength": 0.92,
+                    "video_context_strength": 0.72,
+                    "asr_degeneracy_risk": 0.20,
+                    "visual_shortcut_risk": False,
+                    "audio_only_verification": {"accept": True},
+                    "video_only_shortcut": {"can_identify_target_without_audio": False},
+                    "quality": {"b_subtype": "sound_event"},
+                },
+            ]
+            self._write_jsonl(b_shards / "ranked_01.jsonl", records)
+
+            merge_line_results(run_root=run_root, target_a_count=0, target_b_count=4, keep_all_b=True)
+
+            all_rows = [json.loads(line) for line in (run_root / "b_all_audio_cvr_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            by_id = {record["proposal_id"]: record for record in all_rows}
+            self.assertEqual("main", by_id["main_loose_threshold"]["split_tier"])
+            self.assertEqual("extended", by_id["no_audio_only_accept"]["split_tier"])
+            self.assertIn("audio_only_verification_not_accepted", by_id["no_audio_only_accept"]["diagnostic_reason"])
+            self.assertEqual("extended", by_id["voxceleb_guarded"]["split_tier"])
+            self.assertIn("voxceleb_main_guard", by_id["voxceleb_guarded"]["diagnostic_reason"])
+            self.assertEqual("main", by_id["voxceleb_strong"]["split_tier"])
+
+    def test_merge_b_line_mines_typed_hard_negatives_and_missing_reasons(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_root = root / "run"
+            b_shards = run_root / "b_shards"
+            b_shards.mkdir(parents=True)
+            positive = {
+                "proposal_id": "positive",
+                "raw_source_id": "source_show_1",
+                "reference_video": "ref.mp4",
+                "target_video": "target.mp4",
+                "edit_text": "change the speech from discussing budget planning to discussing health services",
+                "difference": {"type": "speech"},
+                "accepted": True,
+                "b_subtype": "speech_topic_in_video_context",
+                "audio_delta_strength": 0.65,
+                "video_context_strength": 0.50,
+                "asr_degeneracy_risk": 0.40,
+                "visual_shortcut_risk": False,
+                "audio_only_verification": {"accept": True},
+                "video_only_shortcut": {"can_identify_target_without_audio": False},
+                "quality": {"b_subtype": "speech_topic_in_video_context"},
+            }
+            ranked = [
+                positive,
+                {
+                    "proposal_id": "visual_hard_candidate",
+                    "raw_source_id": "source_show_1",
+                    "target_video": "visual_hard.mp4",
+                    "edit_text": "change the speech from discussing sports to discussing weather",
+                    "difference": {"type": "speech"},
+                    "accepted": False,
+                    "b_subtype": "speech_topic_in_video_context",
+                    "visual_context_similarity": 0.90,
+                    "video_context_strength": 0.80,
+                    "audio_delta_strength": 0.20,
+                },
+                {
+                    "proposal_id": "audio_hard_candidate",
+                    "raw_source_id": "source_show_2",
+                    "target_video": "audio_hard.mp4",
+                    "edit_text": "change the speech from discussing budget planning to discussing health services",
+                    "difference": {"type": "speech"},
+                    "accepted": False,
+                    "b_subtype": "speech_topic_in_video_context",
+                    "audio_delta_strength": 0.80,
+                },
+                {
+                    "proposal_id": "asr_hard_candidate",
+                    "raw_source_id": "source_show_3",
+                    "target_video": "asr_hard.mp4",
+                    "edit_text": "change the speech from discussing budget planning to discussing public health",
+                    "difference": {"type": "speech"},
+                    "accepted": False,
+                    "b_subtype": "speech_topic_in_video_context",
+                    "audio_delta_strength": 0.70,
+                },
+            ]
+            self._write_jsonl(b_shards / "ranked_01.jsonl", ranked)
+
+            merge_line_results(run_root=run_root, target_a_count=0, target_b_count=1, keep_all_b=True)
+
+            row = [json.loads(line) for line in (run_root / "b_all_audio_cvr_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()][0]
+            negative_types = {item["type"] for item in row["audio_delta_hard_negatives"]}
+            self.assertIn("reference_negative", negative_types)
+            self.assertIn("visual_hard", negative_types)
+            self.assertIn("audio_hard", negative_types)
+            self.assertIn("asr_hard", negative_types)
+            self.assertEqual({}, row["hard_negative_missing_reasons"])
+
+            ranked_without_cross_source = [positive, ranked[1]]
+            self._write_jsonl(b_shards / "ranked_01.jsonl", ranked_without_cross_source)
+            merge_line_results(run_root=run_root, target_a_count=0, target_b_count=1, keep_all_b=True)
+            row = [json.loads(line) for line in (run_root / "b_all_audio_cvr_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()][0]
+            self.assertIn("audio_hard", row["hard_negative_missing_reasons"])
+            self.assertIn("asr_hard", row["hard_negative_missing_reasons"])
+
+    def test_build_b_splits_is_source_and_pair_group_disjoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_root = root / "run"
+            rows = []
+            for index in range(1, 7):
+                rows.append(
+                    {
+                        "proposal_id": f"main_{index}",
+                        "accepted": True,
+                        "split_tier": "main",
+                        "benchmark_eligible": True,
+                        "training_eligible": True,
+                        "raw_source_id": f"source_{index}",
+                        "pair_group_id": f"pair_{index}",
+                        "inverse_pair_group_id": f"pair_{index}",
+                        "reference_video": f"ref{index}.mp4",
+                        "target_video": f"tgt{index}.mp4",
+                        "edit_text": "replace quiet room ambience with crowd cheering",
+                    }
+                )
+            self._write_jsonl(run_root / "b_main_audio_cvr_triplets.jsonl", rows)
+            self._write_jsonl(run_root / "b_extended_audio_cvr_triplets.jsonl", [])
+            self._write_jsonl(run_root / "b_diagnostic_asr_risk_triplets.jsonl", [{"proposal_id": "diag", "raw_source_id": "source_diag", "pair_group_id": "pair_diag"}])
+            inverse = dict(rows[0])
+            inverse.update({"proposal_id": "inverse_main_1", "is_inverse": True, "derived_from_inverse": True, "direction": "inverse"})
+            self._write_jsonl(run_root / "b_inverse_accepted.jsonl", [inverse])
+
+            summary = build_b_splits(run_root=run_root, train_ratio=0.5, val_ratio=0.25, test_ratio=0.25)
+
+            self.assertEqual([], summary["leakage_violations"])
+            test_main = [json.loads(line) for line in (run_root / "b_splits" / "test_main.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            pair_groups = [record["pair_group_id"] for record in test_main]
+            self.assertEqual(len(pair_groups), len(set(pair_groups)))
+            self.assertTrue(all(not record.get("is_inverse") for record in test_main))
+            train = [json.loads(line) for line in (run_root / "b_splits" / "train.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            inverse_diag = [json.loads(line) for line in (run_root / "b_splits" / "test_inverse_diagnostic.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(1, sum(1 for record in train + inverse_diag if record.get("is_inverse")))
 
     def test_a_omni_first_keeps_audio_anchor_pairs_for_omni_visual_judging(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1242,13 +1451,11 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 },
                 {"raw": "full_av"},
             )
-            with (
-                mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client),
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client), \
                 mock.patch(
                     "app.composed_data._extract_audio_only_cache",
                     side_effect=[root / "clips" / "ref.wav", root / "clips" / "tgt.wav"],
-                ),
-            ):
+                ):
                 summary = propose_single_source_pairs(
                     root=root,
                     clip_annotations_path=annotations_path,
@@ -1345,13 +1552,11 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 },
                 {},
             )
-            with (
-                mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client),
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client), \
                 mock.patch(
                     "app.composed_data._extract_audio_only_cache",
                     side_effect=[root / "clips" / "ref.wav", root / "clips" / "tgt.wav"],
-                ),
-            ):
+                ):
                 summary = propose_single_source_pairs(
                     root=root,
                     clip_annotations_path=annotations_path,
@@ -1481,17 +1686,15 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 },
                 {"raw": "full_av"},
             )
-            with (
-                mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client),
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client), \
                 mock.patch(
                     "app.composed_data._extract_audio_only_cache",
                     side_effect=[root / "clips" / "ref.wav", root / "clips" / "tgt.wav"],
-                ),
+                ), \
                 mock.patch(
                     "app.composed_data._extract_video_only_cache",
                     side_effect=[root / "clips" / "ref_silent.mp4", root / "clips" / "tgt_silent.mp4"],
-                ),
-            ):
+                ):
                 summary = propose_single_source_pairs(
                     root=root,
                     clip_annotations_path=annotations_path,
@@ -1612,17 +1815,15 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 },
                 {},
             )
-            with (
-                mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client),
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", return_value=client), \
                 mock.patch(
                     "app.composed_data._extract_audio_only_cache",
                     side_effect=[root / "clips" / "ref.wav", root / "clips" / "tgt.wav"],
-                ),
+                ), \
                 mock.patch(
                     "app.composed_data._extract_video_only_cache",
                     side_effect=[root / "clips" / "ref_silent.mp4", root / "clips" / "tgt_silent.mp4"],
-                ),
-            ):
+                ):
                 summary = propose_single_source_pairs(
                     root=root,
                     clip_annotations_path=annotations_path,
@@ -2914,7 +3115,7 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual("the mayor's remarks", accepted[0]["old_audio"])
             self.assertEqual("the bakery opening", accepted[0]["new_audio"])
             self.assertEqual(accepted[0]["pair_group_id"], accepted[0]["inverse_pair_group_id"])
-            self.assertIn({"type": "reference", "video": str(root / "clips" / "tgt.mp4")}, accepted[0]["audio_delta_hard_negatives"])
+            self.assertIn({"type": "reference_negative", "video": str(root / "clips" / "tgt.mp4")}, accepted[0]["audio_delta_hard_negatives"])
             self.assertEqual("clean_audio_delta", accepted[0]["shortcut_label"])
             self.assertEqual("forward", train[0]["direction"])
             self.assertEqual("inverse", train[1]["direction"])

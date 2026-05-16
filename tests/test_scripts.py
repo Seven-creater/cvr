@@ -279,6 +279,7 @@ class ScriptTests(unittest.TestCase):
     def test_audio_cvr_6_9s_full_scripts_are_bline_handoff_ready(self) -> None:
         clip_script = Path("scripts/build_audio_cvr_6_9s_clips.sh").read_text(encoding="utf-8")
         run_script = Path("scripts/run_audio_cvr_bline_6_9s_full_4gpu.sh").read_text(encoding="utf-8")
+        audio_lines_module = Path("app/audio_lines_single_source.py").read_text(encoding="utf-8")
 
         self.assertIn("OUTPUT_ROOT=${OUTPUT_ROOT:-$ROOT/clips/audio_cvr_6_9s}", clip_script)
         self.assertIn("CLIP_SECONDS=${CLIP_SECONDS:-8}", clip_script)
@@ -303,9 +304,51 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("scripts/build_audio_cvr_6_9s_clips.sh", run_script)
         self.assertIn("scripts/run_audio_cvr_v1_b_first.sh", run_script)
         self.assertIn("--skip-clip-build", run_script)
+        self.assertIn("build-b-splits", audio_lines_module)
+        self.assertIn("b_splits", audio_lines_module)
         self.assertIn("--max-source-videos N", run_script)
         self.assertNotIn("VACE", run_script)
         self.assertNotIn("modelscope download", run_script)
+
+    def test_audio_cvr_ab_6_9s_full_script_runs_both_lines(self) -> None:
+        script = Path("scripts/run_audio_cvr_ab_6_9s_full_4gpu.sh").read_text(encoding="utf-8")
+
+        self.assertIn("audio_cvr_ab_6_9s_full_", script)
+        self.assertIn("SINGLE_SOURCE_ROOT=${SINGLE_SOURCE_ROOT:-$ROOT/clips/audio_cvr_6_9s}", script)
+        self.assertIn("scripts/build_audio_cvr_6_9s_clips.sh", script)
+        self.assertIn("AUDIO_DATASET_LINE=both", script)
+        self.assertIn("--audio-dataset-line both", script)
+        self.assertIn("--target-a-count \"$TARGET_A_COUNT\"", script)
+        self.assertIn("--target-b-count \"$TARGET_B_COUNT\"", script)
+        self.assertIn("--a-candidate-mode omni_first", script)
+        self.assertIn("--b-candidate-mode audio_first", script)
+        self.assertIn("--keep-all-b", script)
+        self.assertIn("build-b-splits", script)
+        self.assertIn("GPU_IDS=${GPU_IDS:-0,1,2,3}", script)
+        self.assertNotIn("--run-b-only", script)
+        self.assertNotIn("modelscope download", script)
+
+    def test_e5_audio_delta_train_scripts_are_smoke_only(self) -> None:
+        env_script = Path("scripts/setup_e5_train_env.sh").read_text(encoding="utf-8")
+        smoke_script = Path("scripts/run_e5_audio_delta_smoke.sh").read_text(encoding="utf-8")
+
+        self.assertIn("ENV_NAME=${ENV_NAME:-e5_train}", env_script)
+        self.assertIn("sentence-transformers[image,audio,video]>=5.4", env_script)
+        self.assertIn("peft", env_script)
+        self.assertNotIn("modelscope download", env_script)
+        self.assertNotIn("vllm.entrypoints.openai.api_server", env_script)
+
+        self.assertIn("GPU_IDS=${GPU_IDS:-4,5,6,7}", smoke_script)
+        self.assertIn("MAX_TRAIN_RECORDS=${MAX_TRAIN_RECORDS:-8}", smoke_script)
+        self.assertIn("MAX_EVAL_RECORDS=${MAX_EVAL_RECORDS:-4}", smoke_script)
+        self.assertIn("python3 -m app.e5_audio_delta_train prepare", smoke_script)
+        self.assertIn("python3 -m app.e5_audio_delta_train cache-embeddings", smoke_script)
+        self.assertIn("python3 -m app.e5_audio_delta_train train-adapter", smoke_script)
+        self.assertIn("python3 -m app.e5_audio_delta_train eval", smoke_script)
+        self.assertIn("--mock-encoder", smoke_script)
+        self.assertNotIn("8093", smoke_script)
+        self.assertNotIn("AVIGATE", smoke_script)
+        self.assertNotIn("vllm.entrypoints.openai.api_server", smoke_script)
 
     def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
         script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")

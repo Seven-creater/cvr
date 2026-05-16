@@ -531,7 +531,10 @@ def merge_line_results(
     a_ranked = _dedupe_line_records(_load_many_jsonl(root / "a_shards", "ranked_*.jsonl") + a_accepted_progress + a_rejected_progress)
     b_ranked = _dedupe_line_records(_load_many_jsonl(root / "b_shards", "ranked_*.jsonl") + b_accepted_progress + b_rejected_progress)
     a_accepted_all = [record for record in a_ranked if bool(record.get("accepted"))]
-    b_accepted_all = _assign_b_line_tiers([record for record in b_ranked if bool(record.get("accepted"))])
+    b_accepted_all = _assign_b_line_tiers(
+        [record for record in b_ranked if bool(record.get("accepted"))],
+        candidate_pool=b_ranked,
+    )
     a_selected = a_accepted_all[: max(0, target_a_count)]
     b_selected = b_accepted_all if keep_all_b else _select_b_line_records(b_accepted_all, target_b_count=target_b_count)
     b_main = [record for record in b_accepted_all if record.get("split_tier") == "main"]
@@ -591,6 +594,194 @@ def merge_line_results(
         encoding="utf-8",
     )
     return summary
+
+
+def build_b_splits(
+    *,
+    run_root: str | Path,
+    train_ratio: float = 0.80,
+    val_ratio: float = 0.10,
+    test_ratio: float = 0.10,
+) -> dict[str, Any]:
+    root = Path(run_root)
+    output_root = root / "b_splits"
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    main = [_forward_train_record(record) for record in _load_jsonl(root / "b_main_audio_cvr_triplets.jsonl")]
+    extended = [_forward_train_record(record) for record in _load_jsonl(root / "b_extended_audio_cvr_triplets.jsonl")]
+    diagnostic = [_forward_train_record(record) for record in _load_jsonl(root / "b_diagnostic_asr_risk_triplets.jsonl")]
+    inverse = [record for record in _load_jsonl(root / "b_inverse_accepted.jsonl") if bool(record.get("is_inverse"))]
+
+    split_records = [record for record in main + extended if not bool(record.get("is_inverse"))]
+    group_to_split = _source_disjoint_split_map(
+        [_source_split_group_id(record) for record in split_records],
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+    )
+
+    train: list[dict[str, Any]] = []
+    val: list[dict[str, Any]] = []
+    test_candidates: list[dict[str, Any]] = []
+    for record in split_records:
+        split_name = group_to_split.get(_source_split_group_id(record), "train")
+        record = dict(record)
+        record["dataset_split"] = split_name
+        if split_name == "train":
+            train.append(record)
+        elif split_name == "val":
+            val.append(record)
+        else:
+            test_candidates.append(record)
+
+    test_main = _one_direction_per_pair_group(
+        [record for record in test_candidates if record.get("split_tier") == "main" and not bool(record.get("is_inverse"))]
+    )
+
+    test_pair_groups = {str(record.get("pair_group_id") or "").strip() for record in test_main}
+    test_main.extend(
+        record for record in test_candidates if record.get("split_tier") != "main" and str(record.get("pair_group_id") or "").strip() not in test_pair_groups
+    )
+
+    test_inverse_diagnostic: list[dict[str, Any]] = []
+    for record in inverse:
+        record = dict(record)
+        source_group = _source_split_group_id(record)
+        split_name = group_to_split.get(source_group, "test")
+        if split_name == "train":
+            record["dataset_split"] = "train"
+            train.append(record)
+        else:
+            record["dataset_split"] = "test_inverse_diagnostic"
+            test_inverse_diagnostic.append(record)
+
+    for record in diagnostic:
+        record["dataset_split"] = "diagnostic"
+
+    _write_jsonl(output_root / "train.jsonl", train)
+    _write_jsonl(output_root / "val.jsonl", val)
+    _write_jsonl(output_root / "test_main.jsonl", test_main)
+    _write_jsonl(output_root / "test_inverse_diagnostic.jsonl", test_inverse_diagnostic)
+    _write_jsonl(output_root / "diagnostic.jsonl", diagnostic)
+
+    violations = _split_leakage_violations(
+        {
+            "train": train,
+            "val": val,
+            "test_main": test_main,
+            "test_inverse_diagnostic": test_inverse_diagnostic,
+        }
+    )
+    summary = {
+        "run_root": str(root),
+        "output_root": str(output_root),
+        "train_ratio": train_ratio,
+        "val_ratio": val_ratio,
+        "test_ratio": test_ratio,
+        "source_group_count": len(group_to_split),
+        "split_group_counts": dict(Counter(group_to_split.values())),
+        "train_count": len(train),
+        "val_count": len(val),
+        "test_main_count": len(test_main),
+        "test_inverse_diagnostic_count": len(test_inverse_diagnostic),
+        "diagnostic_count": len(diagnostic),
+        "leakage_violations": violations,
+        "outputs": {
+            "train": str(output_root / "train.jsonl"),
+            "val": str(output_root / "val.jsonl"),
+            "test_main": str(output_root / "test_main.jsonl"),
+            "test_inverse_diagnostic": str(output_root / "test_inverse_diagnostic.jsonl"),
+            "diagnostic": str(output_root / "diagnostic.jsonl"),
+        },
+    }
+    (output_root / "split_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if violations:
+        raise ValueError(f"B split leakage violations: {violations[:5]}")
+    return summary
+
+
+def _source_disjoint_split_map(
+    groups: list[str],
+    *,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+) -> dict[str, str]:
+    unique_groups = sorted({str(group or "").strip() for group in groups if str(group or "").strip()}, key=lambda item: _stable_hash(item))
+    total = len(unique_groups)
+    if total == 0:
+        return {}
+    train_ratio = max(0.0, float(train_ratio))
+    val_ratio = max(0.0, float(val_ratio))
+    test_ratio = max(0.0, float(test_ratio))
+    ratio_sum = train_ratio + val_ratio + test_ratio
+    if ratio_sum <= 0:
+        train_ratio, val_ratio, test_ratio = 0.80, 0.10, 0.10
+        ratio_sum = 1.0
+    train_ratio /= ratio_sum
+    val_ratio /= ratio_sum
+    train_count = int(total * train_ratio)
+    val_count = int(total * val_ratio)
+    if total >= 3:
+        train_count = max(1, train_count)
+        val_count = max(1, val_count)
+        if train_count + val_count >= total:
+            train_count = max(1, total - 2)
+            val_count = 1
+    elif total == 2:
+        train_count, val_count = 1, 0
+    else:
+        train_count, val_count = 1, 0
+    mapping: dict[str, str] = {}
+    for index, group in enumerate(unique_groups):
+        if index < train_count:
+            mapping[group] = "train"
+        elif index < train_count + val_count:
+            mapping[group] = "val"
+        else:
+            mapping[group] = "test"
+    return mapping
+
+
+def _one_direction_per_pair_group(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in sorted(records, key=lambda item: str(item.get("proposal_id") or item.get("candidate_id") or item.get("pair_group_id") or "")):
+        pair_group = str(record.get("pair_group_id") or _inverse_pair_group_id(record)).strip()
+        if pair_group in seen:
+            continue
+        seen.add(pair_group)
+        selected.append(record)
+    return selected
+
+
+def _split_leakage_violations(splits: dict[str, list[dict[str, Any]]]) -> list[str]:
+    violations: list[str] = []
+    source_to_splits: dict[str, set[str]] = defaultdict(set)
+    pair_to_splits: dict[str, set[str]] = defaultdict(set)
+    test_pairs: set[str] = set()
+    for split_name, records in splits.items():
+        for record in records:
+            source_to_splits[_source_split_group_id(record)].add(split_name)
+            pair_group = str(record.get("pair_group_id") or _inverse_pair_group_id(record)).strip()
+            inverse_group = str(record.get("inverse_pair_group_id") or pair_group).strip()
+            pair_to_splits[pair_group].add(split_name)
+            pair_to_splits[inverse_group].add(split_name)
+            if split_name == "test_main":
+                if bool(record.get("is_inverse")):
+                    violations.append(f"inverse_in_test_main:{record.get('proposal_id') or pair_group}")
+                if pair_group in test_pairs:
+                    violations.append(f"duplicate_pair_group_in_test_main:{pair_group}")
+                test_pairs.add(pair_group)
+    for source, names in source_to_splits.items():
+        train_val_test = names & {"train", "val", "test_main"}
+        if len(train_val_test) > 1:
+            violations.append(f"raw_source_cross_split:{source}:{','.join(sorted(train_val_test))}")
+    for pair_group, names in pair_to_splits.items():
+        train_val_test = names & {"train", "val", "test_main"}
+        if len(train_val_test) > 1:
+            violations.append(f"pair_group_cross_split:{pair_group}:{','.join(sorted(train_val_test))}")
+    return _dedupe_strings(violations)
 
 
 def augment_b_inverse(
@@ -761,6 +952,7 @@ def _build_inverse_candidate_record(record: dict[str, Any], *, inverse_edit: dic
             "training_eligible": bool(inverse_edit.get("ok")),
             "split_tier": "extended" if inverse_edit.get("ok") else "diagnostic",
             "audio_delta_hard_negatives": _audio_delta_hard_negatives(record, reference_video=tgt_video),
+            "hard_negative_missing_reasons": _hard_negative_missing_reasons(record),
             "visual_constraint": _visual_constraint_payload(record),
             "shortcut_label": _shortcut_label(record),
             "source_disjoint_group_id": _source_split_group_id(record),
@@ -952,6 +1144,7 @@ def _forward_train_record(record: dict[str, Any]) -> dict[str, Any]:
     forward["split_group_id"] = _source_split_group_id(forward)
     forward["source_disjoint_group_id"] = _source_split_group_id(forward)
     forward["audio_delta_hard_negatives"] = _audio_delta_hard_negatives(forward, reference_video=str(forward.get("reference_video", "")).strip())
+    forward["hard_negative_missing_reasons"] = _hard_negative_missing_reasons(forward)
     forward["visual_constraint"] = _visual_constraint_payload(forward)
     forward["shortcut_label"] = _shortcut_label(forward)
     forward.setdefault("training_eligible", True)
@@ -967,10 +1160,10 @@ def _inverse_pair_group_id(record: dict[str, Any]) -> str:
 
 
 def _source_split_group_id(record: dict[str, Any]) -> str:
-    for key in ("source_clip_id", "group_id", "reuse_source_folder", "source_path"):
+    for key in ("raw_source_id", "source_disjoint_group_id", "split_group_id", "source_clip_id", "group_id", "reuse_source_folder", "source_path"):
         value = str(record.get(key) or "").strip()
         if value:
-            return f"source_{_stable_hash(value)[:16]}"
+            return value if key in {"raw_source_id", "source_disjoint_group_id", "split_group_id"} and value.startswith("source_") else f"source_{_stable_hash(value)[:16]}"
     source = record.get("source") if isinstance(record.get("source"), dict) else {}
     value = str(source.get("url") or source.get("path") or "").strip()
     if value:
@@ -1030,16 +1223,157 @@ def _parse_b_line_edit_components(edit_text: str) -> dict[str, Any]:
     return defaults
 
 
-def _audio_delta_hard_negatives(record: dict[str, Any], *, reference_video: str) -> list[dict[str, str]]:
+def _audio_delta_hard_negatives(
+    record: dict[str, Any],
+    *,
+    reference_video: str,
+    candidate_pool: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
     negatives: list[dict[str, str]] = []
+    used = {str(record.get("target_video") or "").strip(), str(reference_video or "").strip()}
     if reference_video:
-        negatives.append({"type": "reference", "video": reference_video})
+        negatives.append({"type": "reference_negative", "video": reference_video})
+    existing = record.get("audio_delta_hard_negatives")
+    if isinstance(existing, list):
+        for item in existing:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("type") or "").strip()
+            video = str(item.get("video") or "").strip()
+            if label in {"visual_hard", "audio_hard", "asr_hard"} and video and video not in used:
+                negatives.append({"type": label, "video": video})
+                used.add(video)
     labels = ["visual_hard", "audio_hard", "asr_hard"]
     raw_negatives = [str(item).strip() for item in record.get("hard_negatives", []) if str(item).strip()] if isinstance(record.get("hard_negatives"), list) else []
     for label, video in zip(labels, raw_negatives):
-        if video and video != reference_video:
+        if video and video not in used:
             negatives.append({"type": label, "video": video})
+            used.add(video)
+    if candidate_pool:
+        for label, finder in (
+            ("visual_hard", _find_visual_hard_negative),
+            ("audio_hard", _find_audio_hard_negative),
+            ("asr_hard", _find_asr_hard_negative),
+        ):
+            if any(item.get("type") == label for item in negatives):
+                continue
+            candidate = finder(record, candidate_pool, used=used)
+            if candidate:
+                video = str(candidate.get("target_video") or candidate.get("video") or "").strip()
+                if video and video not in used:
+                    negatives.append({"type": label, "video": video, "proposal_id": str(candidate.get("proposal_id") or candidate.get("candidate_id") or "")})
+                    used.add(video)
     return negatives
+
+
+def _hard_negative_missing_reasons(record: dict[str, Any]) -> dict[str, str]:
+    existing_types = {
+        str(item.get("type") or "").strip()
+        for item in record.get("audio_delta_hard_negatives", [])
+        if isinstance(item, dict)
+    }
+    defaults = {
+        "visual_hard": "no_same_source_visual_candidate",
+        "audio_hard": "no_cross_context_audio_candidate",
+        "asr_hard": "no_speech_keyword_candidate",
+    }
+    return {label: reason for label, reason in defaults.items() if label not in existing_types}
+
+
+def _with_audio_delta_hard_negatives(record: dict[str, Any], candidate_pool: list[dict[str, Any]]) -> dict[str, Any]:
+    enriched = dict(record)
+    negatives = _audio_delta_hard_negatives(
+        enriched,
+        reference_video=str(enriched.get("reference_video") or "").strip(),
+        candidate_pool=candidate_pool,
+    )
+    enriched["audio_delta_hard_negatives"] = negatives
+    enriched["hard_negative_missing_reasons"] = _hard_negative_missing_reasons(enriched)
+    quality = dict(enriched.get("quality") if isinstance(enriched.get("quality"), dict) else {})
+    quality["audio_delta_hard_negatives"] = negatives
+    quality["hard_negative_missing_reasons"] = enriched["hard_negative_missing_reasons"]
+    enriched["quality"] = quality
+    return enriched
+
+
+def _find_visual_hard_negative(record: dict[str, Any], candidates: list[dict[str, Any]], *, used: set[str]) -> dict[str, Any] | None:
+    same_source = _source_split_group_id(record)
+    choices = [
+        candidate
+        for candidate in candidates
+        if _candidate_negative_video(candidate) not in used
+        and _source_split_group_id(candidate) == same_source
+        and _candidate_negative_video(candidate) != str(record.get("target_video") or "").strip()
+    ]
+    return _best_candidate(choices, key=lambda item: (_visual_similarity_score(record, item), -_b_line_metric(item, "audio_delta_strength")))
+
+
+def _find_audio_hard_negative(record: dict[str, Any], candidates: list[dict[str, Any]], *, used: set[str]) -> dict[str, Any] | None:
+    source = _source_split_group_id(record)
+    choices = [
+        candidate
+        for candidate in candidates
+        if _candidate_negative_video(candidate) not in used
+        and _source_split_group_id(candidate) != source
+        and _audio_text_overlap(record, candidate) > 0
+    ]
+    return _best_candidate(choices, key=lambda item: (_audio_text_overlap(record, item), _b_line_metric(item, "audio_delta_strength")))
+
+
+def _find_asr_hard_negative(record: dict[str, Any], candidates: list[dict[str, Any]], *, used: set[str]) -> dict[str, Any] | None:
+    if _b_line_record_subtype(record) != "speech_topic_in_video_context":
+        return None
+    choices = [
+        candidate
+        for candidate in candidates
+        if _candidate_negative_video(candidate) not in used
+        and _b_line_record_subtype(candidate) == "speech_topic_in_video_context"
+        and _speech_keyword_overlap(record, candidate) > 0
+    ]
+    return _best_candidate(choices, key=lambda item: (_speech_keyword_overlap(record, item), -int(_source_split_group_id(item) == _source_split_group_id(record))))
+
+
+def _best_candidate(candidates: list[dict[str, Any]], *, key) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+    return sorted(candidates, key=key, reverse=True)[0]
+
+
+def _candidate_negative_video(record: dict[str, Any]) -> str:
+    return str(record.get("target_video") or record.get("video") or "").strip()
+
+
+def _visual_similarity_score(left: dict[str, Any], right: dict[str, Any]) -> float:
+    return max(
+        _b_line_metric(right, "visual_context_similarity"),
+        min(_b_line_metric(left, "video_context_strength"), _b_line_metric(right, "video_context_strength")),
+    )
+
+
+def _audio_text_overlap(left: dict[str, Any], right: dict[str, Any]) -> float:
+    return _jaccard(_token_set(_audio_delta_text(left)), _token_set(_audio_delta_text(right)))
+
+
+def _speech_keyword_overlap(left: dict[str, Any], right: dict[str, Any]) -> float:
+    return _jaccard(_token_set(_speech_delta_text(left)), _token_set(_speech_delta_text(right)))
+
+
+def _audio_delta_text(record: dict[str, Any]) -> str:
+    return _annotation_text(
+        record,
+        (
+            "edit_text",
+            "audio_only_reference_content",
+            "audio_only_target_content",
+            "old_audio",
+            "new_audio",
+            "audio_evidence",
+        ),
+    )
+
+
+def _speech_delta_text(record: dict[str, Any]) -> str:
+    return _annotation_text(record, ("edit_text", "speech", "speech_topic_or_step", "audio_only_reference_content", "audio_only_target_content"))
 
 
 def _visual_constraint_payload(record: dict[str, Any]) -> dict[str, Any]:
@@ -1130,8 +1464,11 @@ def _inverse_endpoint_issue(left: str, right: str) -> str:
     return ""
 
 
-def _assign_b_line_tiers(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    tiered = [_b_line_record_with_tier(record) for record in records]
+def _assign_b_line_tiers(records: list[dict[str, Any]], *, candidate_pool: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    tiered = [
+        _with_audio_delta_hard_negatives(record, candidate_pool or records)
+        for record in (_b_line_record_with_tier(record) for record in records)
+    ]
     main_speech = [record for record in tiered if record.get("split_tier") == "main" and _b_line_record_subtype(record) == "speech_topic_in_video_context"]
     main_non_speech = [record for record in tiered if record.get("split_tier") == "main" and _b_line_record_subtype(record) in {"music", "sound_event"}]
     speech_cap_35 = int(len(main_non_speech) * 0.35 / 0.65) if main_non_speech else 0
@@ -1178,6 +1515,9 @@ def _b_line_record_tier(record: dict[str, Any]) -> dict[str, Any]:
     audio_only_solvability = _b_line_audio_only_solvability(record, asr_degeneracy_risk=asr_degeneracy_risk, audio_delta_strength=audio_delta_strength)
     full_av_required = _b_line_full_av_required(record, video_context_strength=video_context_strength, asr_degeneracy_risk=asr_degeneracy_risk, visual_shortcut_risk=visual_shortcut_risk)
     speech_role = _b_line_text_value(record, "speech_role")
+    audio_only_accept = _b_line_audio_only_accept(record)
+    can_identify_without_audio = _b_line_can_identify_target_without_audio(record)
+    voxceleb_record = _is_voxceleb_record(record)
     reasons: list[str] = []
     if bool(record.get("fallback")):
         reasons.append("fallback_pair_proposal")
@@ -1193,22 +1533,42 @@ def _b_line_record_tier(record: dict[str, Any]) -> dict[str, Any]:
         reasons.append("transcript_like_edit_text")
     if _b_line_hollow_audio_edit(record):
         reasons.append("hollow_audio_edit_text")
-    if visual_shortcut_risk > 0.35 or _b_line_bool(record, "can_identify_target_without_audio") or _b_line_bool(record, "video_only_can_identify_target_without_audio"):
+    if visual_shortcut_risk > 0.35 or can_identify_without_audio:
         reasons.append("visual_shortcut_risk")
+    if not audio_only_accept:
+        reasons.append("audio_only_verification_not_accepted")
+    if voxceleb_record and not _voxceleb_main_allowed(
+        video_context_strength=video_context_strength,
+        asr_degeneracy_risk=asr_degeneracy_risk,
+        visual_shortcut_risk=visual_shortcut_risk,
+        audio_only_accept=audio_only_accept,
+        can_identify_without_audio=can_identify_without_audio,
+    ):
+        reasons.append("voxceleb_main_guard")
 
     main_ready = (
         bool(record.get("accepted"))
         and not bool(record.get("fallback"))
         and subtype in {"speech_topic_in_video_context", "music", "sound_event"}
         and audio_delta_strength >= 0.70
-        and video_context_strength >= 0.60
-        and asr_degeneracy_risk <= 0.35
+        and video_context_strength >= 0.45
+        and asr_degeneracy_risk <= 0.55
         and visual_shortcut_risk <= 0.35
-        and not _b_line_bool(record, "can_identify_target_without_audio")
-        and not _b_line_bool(record, "video_only_can_identify_target_without_audio")
+        and audio_only_accept
+        and not can_identify_without_audio
         and (audio_only_solvability < 0.85 or full_av_required)
         and not _b_line_transcript_like_edit(record)
         and not _b_line_hollow_audio_edit(record)
+        and (
+            not voxceleb_record
+            or _voxceleb_main_allowed(
+                video_context_strength=video_context_strength,
+                asr_degeneracy_risk=asr_degeneracy_risk,
+                visual_shortcut_risk=visual_shortcut_risk,
+                audio_only_accept=audio_only_accept,
+                can_identify_without_audio=can_identify_without_audio,
+            )
+        )
     )
     extended_ready = (
         bool(record.get("accepted"))
@@ -1218,11 +1578,24 @@ def _b_line_record_tier(record: dict[str, Any]) -> dict[str, Any]:
         and video_context_strength >= 0.35
         and asr_degeneracy_risk <= 0.70
         and visual_shortcut_risk <= 0.35
-        and not _b_line_bool(record, "can_identify_target_without_audio")
-        and not _b_line_bool(record, "video_only_can_identify_target_without_audio")
+        and not can_identify_without_audio
         and not _b_line_hollow_audio_edit(record)
     )
-    if main_ready and not reasons:
+    main_blocking_reasons = {
+        "fallback_pair_proposal",
+        "unsupported_b_subtype",
+        "audio_only_solvability_high",
+        "transcript_like_edit_text",
+        "hollow_audio_edit_text",
+        "visual_shortcut_risk",
+        "audio_only_verification_not_accepted",
+        "voxceleb_main_guard",
+    }
+    blocks_main = any(
+        reason in main_blocking_reasons or any(reason.startswith(f"{prefix}:") for prefix in main_blocking_reasons)
+        for reason in reasons
+    )
+    if main_ready and not blocks_main:
         split_tier = "main"
     elif extended_ready:
         split_tier = "extended"
@@ -1324,6 +1697,7 @@ def _b_line_bool(record: dict[str, Any], key: str) -> bool:
         record,
         record.get("quality") if isinstance(record.get("quality"), dict) else {},
         record.get("final_omni_verification") if isinstance(record.get("final_omni_verification"), dict) else {},
+        record.get("audio_only_verification") if isinstance(record.get("audio_only_verification"), dict) else {},
         record.get("video_only_shortcut") if isinstance(record.get("video_only_shortcut"), dict) else {},
         record.get("full_av_consistency") if isinstance(record.get("full_av_consistency"), dict) else {},
     ):
@@ -1335,6 +1709,54 @@ def _b_line_bool(record: dict[str, Any], key: str) -> bool:
                 return float(value) >= 0.5
             return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
     return False
+
+
+def _b_line_audio_only_accept(record: dict[str, Any]) -> bool:
+    audio_verify = record.get("audio_only_verification") if isinstance(record.get("audio_only_verification"), dict) else {}
+    if "accept" in audio_verify:
+        return _boolish(audio_verify.get("accept"))
+    if "audio_only_accept" in record:
+        return _boolish(record.get("audio_only_accept"))
+    # Older accepted records may not carry the blind verifier object. Keep them eligible for
+    # extended/diagnostic, but require the explicit field for B-main.
+    return False
+
+
+def _b_line_can_identify_target_without_audio(record: dict[str, Any]) -> bool:
+    return _b_line_bool(record, "can_identify_target_without_audio") or _b_line_bool(record, "video_only_can_identify_target_without_audio")
+
+
+def _is_voxceleb_record(record: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            record.get("dataset"),
+            record.get("reference_video"),
+            record.get("target_video"),
+            record.get("source_id"),
+            record.get("group_id"),
+        )
+    )
+    quality = record.get("quality") if isinstance(record.get("quality"), dict) else {}
+    text += " " + " ".join(str(quality.get(key) or "") for key in ("dataset", "source_dataset", "raw_dataset"))
+    return "voxceleb" in text.lower()
+
+
+def _voxceleb_main_allowed(
+    *,
+    video_context_strength: float,
+    asr_degeneracy_risk: float,
+    visual_shortcut_risk: float,
+    audio_only_accept: bool,
+    can_identify_without_audio: bool,
+) -> bool:
+    return (
+        video_context_strength >= 0.70
+        and asr_degeneracy_risk <= 0.30
+        and visual_shortcut_risk <= 0.35
+        and audio_only_accept
+        and not can_identify_without_audio
+    )
 
 
 def _b_line_visual_shortcut_risk(record: dict[str, Any]) -> float:
@@ -2178,6 +2600,12 @@ def build_parser() -> argparse.ArgumentParser:
     inverse.add_argument("--timeout-seconds", type=float, default=180.0)
     inverse.add_argument("--omni-retries", type=int, default=2)
     inverse.add_argument("--fail-on-transient-omni-errors", action="store_true")
+
+    splits = subparsers.add_parser("build-b-splits")
+    splits.add_argument("--run-root", required=True)
+    splits.add_argument("--train-ratio", type=float, default=0.80)
+    splits.add_argument("--val-ratio", type=float, default=0.10)
+    splits.add_argument("--test-ratio", type=float, default=0.10)
     return parser
 
 
@@ -2237,6 +2665,13 @@ def main() -> None:
             timeout_seconds=args.timeout_seconds,
             omni_retries=args.omni_retries,
             fail_on_transient_omni_errors=args.fail_on_transient_omni_errors,
+        )
+    elif args.command == "build-b-splits":
+        result = build_b_splits(
+            run_root=args.run_root,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
         )
     else:
         raise ValueError(f"unsupported command: {args.command}")
