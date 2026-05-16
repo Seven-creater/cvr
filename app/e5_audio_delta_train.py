@@ -594,6 +594,7 @@ def _default_train_paths(root: Path) -> list[Path]:
         root / "b_train_bidirectional_triplets.jsonl",
         root / "b_main_audio_cvr_triplets.jsonl",
         root / "b_extended_audio_cvr_triplets.jsonl",
+        root / "b_all_audio_cvr_triplets.jsonl",
     ]
     return [path for path in candidates if path.exists()]
 
@@ -603,6 +604,8 @@ def _default_eval_paths(root: Path) -> list[Path]:
         root / "b_splits" / "val.jsonl",
         root / "b_splits" / "test_main.jsonl",
         root / "b_main_audio_cvr_triplets.jsonl",
+        root / "b_all_audio_cvr_triplets.jsonl",
+        root / "b_extended_audio_cvr_triplets.jsonl",
     ]
     return [path for path in candidates if path.exists()]
 

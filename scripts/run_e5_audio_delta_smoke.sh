@@ -32,6 +32,16 @@ Options:
 USAGE
 }
 
+has_audio_delta_records() {
+  local root="$1"
+  test -f "$root/b_splits/train.jsonl" && return 0
+  test -f "$root/b_train_bidirectional_triplets.jsonl" && return 0
+  test -f "$root/b_main_audio_cvr_triplets.jsonl" && return 0
+  test -f "$root/b_extended_audio_cvr_triplets.jsonl" && return 0
+  test -f "$root/b_all_audio_cvr_triplets.jsonl" && return 0
+  return 1
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dataset-run-root) DATASET_RUN_ROOT="$2"; shift 2 ;;
@@ -51,7 +61,18 @@ done
 cd "$REPO_ROOT"
 
 if [ -z "$DATASET_RUN_ROOT" ]; then
-  DATASET_RUN_ROOT=$(ls -td "$RUNS_ROOT"/audio_cvr_bline_6_9s_full_* "$RUNS_ROOT"/audio_ab_fresh800_omni_first_* 2>/dev/null | head -1 || true)
+  DATASET_RUN_ROOT=""
+  shopt -s nullglob
+  candidates=( "$RUNS_ROOT"/audio_cvr_bline_6_9s_full_* "$RUNS_ROOT"/audio_cvr_ab_6_9s_minimal_* )
+  shopt -u nullglob
+  if [ "${#candidates[@]}" -gt 0 ]; then
+    while IFS= read -r candidate; do
+      if has_audio_delta_records "$candidate"; then
+        DATASET_RUN_ROOT="$candidate"
+        break
+      fi
+    done < <(printf '%s\n' "${candidates[@]}" | xargs -r ls -td 2>/dev/null)
+  fi
 fi
 if [ -z "$DATASET_RUN_ROOT" ] || [ ! -d "$DATASET_RUN_ROOT" ]; then
   echo "[e5-audio-delta-smoke] missing dataset run root; pass --dataset-run-root" >&2
@@ -64,6 +85,16 @@ echo "[e5-audio-delta-smoke] repo=$REPO_ROOT"
 echo "[e5-audio-delta-smoke] dataset_run_root=$DATASET_RUN_ROOT"
 echo "[e5-audio-delta-smoke] run_root=$RUN_ROOT"
 echo "[e5-audio-delta-smoke] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "[e5-audio-delta-smoke] discovered training files:"
+find "$DATASET_RUN_ROOT" -maxdepth 2 -type f \( \
+  -name 'train.jsonl' -o \
+  -name 'test_main.jsonl' -o \
+  -name 'val.jsonl' -o \
+  -name 'b_train_bidirectional_triplets.jsonl' -o \
+  -name 'b_main_audio_cvr_triplets.jsonl' -o \
+  -name 'b_extended_audio_cvr_triplets.jsonl' -o \
+  -name 'b_all_audio_cvr_triplets.jsonl' \
+\) -print | sort
 
 python3 -m app.e5_audio_delta_train prepare \
   --dataset-run-root "$DATASET_RUN_ROOT" \
