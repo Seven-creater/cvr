@@ -21,6 +21,7 @@ from app.e5_cvr_eval import (
 
 
 DEFAULT_RUNS_ROOT = "/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs"
+DEFAULT_DATA_ROOT = "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval"
 QUERY_TEMPLATE = "Edit the reference video so that: {edit_text}"
 DEFAULT_NEGATIVE_TYPES = ("reference_negative", "visual_hard", "audio_hard", "asr_hard")
 
@@ -418,8 +419,8 @@ def _cache_split_embeddings(
         for index, record in enumerate(records, start=1):
             _emit(progress, f"[e5-audio-delta] cache {split} {index}/{len(records)} sample_id={record.sample_id}")
             arrays["query"].append(_encode_one(encoder, _query_payload(record)))
-            arrays["target"].append(_encode_one(encoder, record.target_video))
-            arrays["reference"].append(_encode_one(encoder, record.reference_video))
+            arrays["target"].append(_encode_one(encoder, _video_payload(record.target_video)))
+            arrays["reference"].append(_encode_one(encoder, _video_payload(record.reference_video)))
             arrays["edit"].append(_encode_one(encoder, record.edit_text))
             arrays["old_audio"].append(_encode_one(encoder, record.old_audio or record.edit_text))
             arrays["new_audio"].append(_encode_one(encoder, record.new_audio or record.edit_text))
@@ -430,7 +431,7 @@ def _cache_split_embeddings(
                 video = str(negative.get("video", "")).strip()
                 if not video:
                     continue
-                neg_vectors.append(_encode_one(encoder, video))
+                neg_vectors.append(_encode_one(encoder, _video_payload(video)))
                 neg_mask_row.append(1.0)
                 neg_type_row.append(str(negative.get("type", "")).strip() or "unknown")
             while len(neg_vectors) < len(DEFAULT_NEGATIVE_TYPES):
@@ -630,7 +631,27 @@ def _dedupe_records(records: list[AudioDeltaRecord]) -> list[AudioDeltaRecord]:
 
 
 def _query_payload(record: AudioDeltaRecord) -> dict[str, str]:
-    return {"video": record.reference_video, "text": QUERY_TEMPLATE.format(edit_text=record.edit_text.strip().rstrip("."))}
+    return {"video": _resolve_media_path(record.reference_video), "text": QUERY_TEMPLATE.format(edit_text=record.edit_text.strip().rstrip("."))}
+
+
+def _video_payload(video_path: str) -> dict[str, str]:
+    return {"video": _resolve_media_path(video_path)}
+
+
+def _resolve_media_path(raw_path: str) -> str:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return raw
+    path = Path(raw)
+    if path.is_absolute():
+        return str(path)
+    default_root = Path(DEFAULT_DATA_ROOT)
+    for candidate in (default_root / path, Path.cwd() / path):
+        if candidate.exists():
+            return str(candidate)
+    if raw.startswith(("clips/", "raw/", "raw_datasets/")):
+        return str(default_root / path)
+    return raw
 
 
 def _encode_one(encoder: Any, payload: Any) -> np.ndarray:

@@ -6,12 +6,14 @@ import tempfile
 import unittest
 
 from app.e5_audio_delta_train import (
+    DEFAULT_DATA_ROOT,
     cache_embeddings,
     eval_adapter,
     load_audio_delta_records,
     prepare_records,
     train_adapter,
     train_lora_plan,
+    _video_payload,
 )
 
 
@@ -82,6 +84,31 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertEqual(1, eval_summary["eval_count"])
             self.assertTrue((root / "eval" / "comparison.md").exists())
 
+    def test_real_encoder_inputs_wrap_video_paths_as_multimodal_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            self._write_jsonl(records_dir / "train.jsonl", [self._record("sample_1", source="source_a", pair="pair_a")])
+            self._write_jsonl(records_dir / "eval.jsonl", [self._record("sample_1", source="source_a", pair="pair_a")])
+            encoder = _SpyEncoder()
+
+            cache_embeddings(
+                records_dir=records_dir,
+                output_dir=root / "embedding_cache",
+                encoder=encoder,
+            )
+
+            bare_video_strings = [item for item in encoder.inputs if isinstance(item, str) and item.endswith(".mp4")]
+            self.assertEqual([], bare_video_strings)
+            self.assertTrue(any(isinstance(item, dict) and item.get("video", "").endswith("_ref.mp4") and "text" in item for item in encoder.inputs))
+            self.assertTrue(any(isinstance(item, dict) and item.get("video", "").endswith("_tgt.mp4") and "text" not in item for item in encoder.inputs))
+
+    def test_video_payload_resolves_relative_clip_paths_under_default_data_root(self) -> None:
+        payload = _video_payload("clips/audio_cvr_6_9s/example.mp4")
+
+        self.assertEqual(str(Path(DEFAULT_DATA_ROOT) / "clips/audio_cvr_6_9s/example.mp4"), payload["video"])
+
     def test_train_lora_plan_is_dry_run_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             plan = train_lora_plan(output_dir=Path(temp_dir) / "lora")
@@ -131,6 +158,15 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
     def _write_jsonl(self, path: Path, rows: list[dict[str, object]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+
+
+class _SpyEncoder:
+    def __init__(self) -> None:
+        self.inputs: list[object] = []
+
+    def encode_document(self, inputs: list[object]) -> list[list[float]]:
+        self.inputs.extend(inputs)
+        return [[1.0, 0.0, 0.0, 0.0] for _ in inputs]
 
 
 if __name__ == "__main__":
