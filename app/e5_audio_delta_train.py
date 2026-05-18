@@ -44,6 +44,16 @@ DEFAULT_LOSS_OPTIONS = {
     "enable_coral_align": False,
     "enable_memory_bank": False,
     "enable_false_negative_filtering": False,
+    "enable_modality_temperature": False,
+    "modality_temperature_init": 0.05,
+    "modality_temperature_min": 0.005,
+    "modality_temperature_max": 0.2,
+    "enable_quantile_negative_curriculum": False,
+    "negative_keep_ratio_start": 1.0,
+    "negative_keep_ratio_end": 0.5,
+    "negative_curriculum_warmup_ratio": 0.1,
+    "easy_negative_weight": 0.1,
+    "enable_batch_whitening": False,
     "temperature": 0.05,
     "lambda_delta": 0.5,
     "lambda_hn": 0.5,
@@ -54,6 +64,7 @@ DEFAULT_LOSS_OPTIONS = {
     "lambda_multi_positive": 0.0,
     "lambda_coral_align": 0.0,
     "lambda_memory_bank": 0.0,
+    "lambda_batch_whitening": 0.0,
     "false_negative_sim_threshold": 0.92,
     "false_negative_soft_weight": 0.15,
 }
@@ -249,10 +260,21 @@ def train_adapter(
     enable_coral_align: bool | None = None,
     enable_memory_bank: bool | None = None,
     enable_false_negative_filtering: bool | None = None,
+    enable_modality_temperature: bool | None = None,
+    modality_temperature_init: float = 0.05,
+    modality_temperature_min: float = 0.005,
+    modality_temperature_max: float = 0.2,
+    enable_quantile_negative_curriculum: bool | None = None,
+    negative_keep_ratio_start: float = 1.0,
+    negative_keep_ratio_end: float = 0.5,
+    negative_curriculum_warmup_ratio: float = 0.1,
+    easy_negative_weight: float = 0.1,
+    enable_batch_whitening: bool | None = None,
     lambda_hw_hn: float | None = None,
     lambda_multi_positive: float | None = None,
     lambda_coral_align: float | None = None,
     lambda_memory_bank: float | None = None,
+    lambda_batch_whitening: float | None = None,
     memory_bank_size: int = 4096,
     warmup_ratio: float = 0.05,
     min_learning_rate_ratio: float = 0.1,
@@ -273,7 +295,7 @@ def train_adapter(
     dim = int(data["query"].shape[1])
     device_obj = _torch_device(torch, device)
     torch.manual_seed(seed)
-    model = _AudioDeltaAdapter(torch, dim).to(device_obj)
+    model = _AudioDeltaAdapter(torch, dim, modality_temperature_init=modality_temperature_init).to(device_obj)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     tensors = {key: torch.as_tensor(value, dtype=torch.float32, device=device_obj) for key, value in data.items()}
     count = int(tensors["query"].shape[0])
@@ -285,10 +307,14 @@ def train_adapter(
         enable_coral_align=enable_coral_align,
         enable_memory_bank=enable_memory_bank,
         enable_false_negative_filtering=enable_false_negative_filtering,
+        enable_modality_temperature=enable_modality_temperature,
+        enable_quantile_negative_curriculum=enable_quantile_negative_curriculum,
+        enable_batch_whitening=enable_batch_whitening,
         lambda_hw_hn=lambda_hw_hn,
         lambda_multi_positive=lambda_multi_positive,
         lambda_coral_align=lambda_coral_align,
         lambda_memory_bank=lambda_memory_bank,
+        lambda_batch_whitening=lambda_batch_whitening,
     )
     loss_options = _loss_options(
         training_profile=training_profile,
@@ -305,6 +331,13 @@ def train_adapter(
         hardness_weight_max=hardness_weight_max,
         false_negative_sim_threshold=false_negative_sim_threshold,
         false_negative_soft_weight=false_negative_soft_weight,
+        modality_temperature_init=modality_temperature_init,
+        modality_temperature_min=modality_temperature_min,
+        modality_temperature_max=modality_temperature_max,
+        negative_keep_ratio_start=negative_keep_ratio_start,
+        negative_keep_ratio_end=negative_keep_ratio_end,
+        negative_curriculum_warmup_ratio=negative_curriculum_warmup_ratio,
+        easy_negative_weight=easy_negative_weight,
         **profile_options,
     )
     max_steps = max(1, steps)
@@ -333,6 +366,8 @@ def train_adapter(
             )
             step_loss_options = dict(loss_options)
             step_loss_options["temperature"] = temperature
+            step_loss_options["current_step"] = step
+            step_loss_options["total_steps"] = max_steps
             if loss_options["enable_memory_bank"] and step > warmup_steps and memory_bank:
                 step_loss_options["memory_bank"] = torch.cat(memory_bank, dim=0)
             else:
@@ -420,7 +455,7 @@ def eval_adapter(
     device_obj = _torch_device(torch, device)
     model = _AudioDeltaAdapter(torch, dim).to(device_obj)
     state = torch.load(adapter_root / "adapter.pt", map_location=device_obj)
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     model.eval()
     with torch.no_grad():
         query = torch.as_tensor(data["query"], dtype=torch.float32, device=device_obj)
@@ -588,12 +623,19 @@ def run_ablations(
     if training_profile == "v2_research":
         configs = [
             ("full_v2", {"training_profile": "v2_research"}),
+            ("without_modality_temperature", {"training_profile": "v2_research", "enable_modality_temperature": False}),
+            ("without_quantile_negative_curriculum", {"training_profile": "v2_research", "enable_quantile_negative_curriculum": False}),
+            ("without_false_negative_debiasing", {"training_profile": "v2_research", "enable_false_negative_filtering": False}),
             ("without_hardness_weighting", {"training_profile": "v2_research", "enable_hardness_weighting": False, "lambda_hw_hn": 0.0}),
             ("without_multi_positive", {"training_profile": "v2_research", "enable_multi_positive": False, "lambda_multi_positive": 0.0}),
             ("without_coral_align", {"training_profile": "v2_research", "enable_coral_align": False, "lambda_coral_align": 0.0}),
+            ("without_batch_whitening", {"training_profile": "v2_research", "enable_batch_whitening": False, "lambda_batch_whitening": 0.0}),
             ("without_memory_bank", {"training_profile": "v2_research", "enable_memory_bank": False, "lambda_memory_bank": 0.0}),
             ("without_false_negative_filtering", {"training_profile": "v2_research", "enable_false_negative_filtering": False}),
-            ("without_local_ffmpeg", {"training_profile": "v2_research", "disable_local_segments": True}),
+            ("without_local_segments", {"training_profile": "v2_research", "disable_local_segments": True}),
+            ("without_delta", {"training_profile": "v2_research", "disable_delta_loss": True}),
+            ("without_reference_negative", {"training_profile": "v2_research", "disable_reference_negative": True}),
+            ("without_hard_negatives", {"training_profile": "v2_research", "disable_hard_negatives": True}),
             (
                 "v1_loss_only",
                 {
@@ -603,6 +645,9 @@ def run_ablations(
                     "enable_coral_align": False,
                     "enable_memory_bank": False,
                     "enable_false_negative_filtering": False,
+                    "enable_modality_temperature": False,
+                    "enable_quantile_negative_curriculum": False,
+                    "enable_batch_whitening": False,
                 },
             ),
         ]
@@ -643,7 +688,25 @@ def run_ablations(
         adapted_row = next((row for row in eval_summary["rows"] if row["method"] == "audio_delta_adapter_global_local"), None)
         if adapted_row is None:
             adapted_row = next((row for row in eval_summary["rows"] if row["method"] == "audio_delta_adapter_global"), {})
-        rows.append({"ablation": name, "adapter_dir": str(adapter_dir), "eval_dir": str(eval_dir), "steps": train_summary["steps"], **adapted_row})
+        loss_tail = _last_jsonl_row(adapter_dir / "loss_curve.jsonl")
+        diagnostics = eval_summary.get("diagnostics_path")
+        rows.append(
+            {
+                "ablation": name,
+                "adapter_dir": str(adapter_dir),
+                "eval_dir": str(eval_dir),
+                "steps": train_summary["steps"],
+                **adapted_row,
+                "reference_negative_average_rank": (eval_summary.get("reference_rank_summary") or {}).get("mean_rank"),
+                "delta_score_pos_mean": (eval_summary.get("delta_score_distribution") or {}).get("mean"),
+                "delta_score_neg_mean": 0.0,
+                "effective_negative_count": loss_tail.get("effective_negative_count"),
+                "tau_text": loss_tail.get("tau_text"),
+                "tau_audio": loss_tail.get("tau_audio"),
+                "tau_video": loss_tail.get("tau_video"),
+                "diagnostics_path": diagnostics,
+            }
+        )
         _emit(progress, f"[e5-audio-delta] ablation {name} done")
     summary = {"cache_dir": str(cache_root), "output_dir": str(output_root), "rows": rows}
     (output_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -716,10 +779,24 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--disable-memory-bank", action="store_false", dest="enable_memory_bank")
     train.add_argument("--enable-false-negative-filtering", action="store_true", default=None)
     train.add_argument("--disable-false-negative-filtering", action="store_false", dest="enable_false_negative_filtering")
+    train.add_argument("--enable-modality-temperature", action="store_true", default=None)
+    train.add_argument("--disable-modality-temperature", action="store_false", dest="enable_modality_temperature")
+    train.add_argument("--modality-temperature-init", type=float, default=0.05)
+    train.add_argument("--modality-temperature-min", type=float, default=0.005)
+    train.add_argument("--modality-temperature-max", type=float, default=0.2)
+    train.add_argument("--enable-quantile-negative-curriculum", action="store_true", default=None)
+    train.add_argument("--disable-quantile-negative-curriculum", action="store_false", dest="enable_quantile_negative_curriculum")
+    train.add_argument("--negative-keep-ratio-start", type=float, default=1.0)
+    train.add_argument("--negative-keep-ratio-end", type=float, default=0.5)
+    train.add_argument("--negative-curriculum-warmup-ratio", type=float, default=0.1)
+    train.add_argument("--easy-negative-weight", type=float, default=0.1)
+    train.add_argument("--enable-batch-whitening", action="store_true", default=None)
+    train.add_argument("--disable-batch-whitening", action="store_false", dest="enable_batch_whitening")
     train.add_argument("--lambda-hw-hn", type=float)
     train.add_argument("--lambda-multi-positive", type=float)
     train.add_argument("--lambda-coral-align", type=float)
     train.add_argument("--lambda-memory-bank", type=float)
+    train.add_argument("--lambda-batch-whitening", type=float)
     train.add_argument("--memory-bank-size", type=int, default=4096)
     train.add_argument("--warmup-ratio", type=float, default=0.05)
     train.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
@@ -819,10 +896,21 @@ def main() -> None:
             enable_coral_align=args.enable_coral_align,
             enable_memory_bank=args.enable_memory_bank,
             enable_false_negative_filtering=args.enable_false_negative_filtering,
+            enable_modality_temperature=args.enable_modality_temperature,
+            modality_temperature_init=args.modality_temperature_init,
+            modality_temperature_min=args.modality_temperature_min,
+            modality_temperature_max=args.modality_temperature_max,
+            enable_quantile_negative_curriculum=args.enable_quantile_negative_curriculum,
+            negative_keep_ratio_start=args.negative_keep_ratio_start,
+            negative_keep_ratio_end=args.negative_keep_ratio_end,
+            negative_curriculum_warmup_ratio=args.negative_curriculum_warmup_ratio,
+            easy_negative_weight=args.easy_negative_weight,
+            enable_batch_whitening=args.enable_batch_whitening,
             lambda_hw_hn=args.lambda_hw_hn,
             lambda_multi_positive=args.lambda_multi_positive,
             lambda_coral_align=args.lambda_coral_align,
             lambda_memory_bank=args.lambda_memory_bank,
+            lambda_batch_whitening=args.lambda_batch_whitening,
             memory_bank_size=args.memory_bank_size,
             warmup_ratio=args.warmup_ratio,
             min_learning_rate_ratio=args.min_learning_rate_ratio,
@@ -1038,11 +1126,19 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
     target_segments = model.doc(batch["target_segments"]) if has_local else None
     reference_segments = model.doc(batch["reference_segments"]) if has_local else None
     negative_segments = model.doc(batch["negative_segments"]) if has_local else None
+    use_modality_temperature = bool(options["enable_modality_temperature"])
+    temperature = max(1e-6, float(options["temperature"]))
+    tau_query = _modality_tau(torch, model, ("text", "audio", "video"), options, fallback=temperature, device=query.device)
+    tau_target = _modality_tau(torch, model, ("audio", "video"), options, fallback=temperature, device=query.device)
+    tau_text = _modality_tau(torch, model, ("text",), options, fallback=temperature, device=query.device)
+    tau_audio = _modality_tau(torch, model, ("audio",), options, fallback=temperature, device=query.device)
+    tau_video = _modality_tau(torch, model, ("video",), options, fallback=temperature, device=query.device)
+    tau_cvr = _pair_tau(tau_query, tau_target)
+    tau_audio_text = _pair_tau(tau_audio, tau_text)
     global_logits = query @ target.T
     local_logits = _local_score_matrix_torch(torch, query, target_segments) if target_segments is not None else None
-    temperature = max(1e-6, float(options["temperature"]))
     retrieval_scores = _mix_torch_scores(global_logits, local_logits, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"]))
-    retrieval_logits = retrieval_scores / temperature
+    retrieval_logits = retrieval_scores / tau_cvr
     labels = torch.arange(retrieval_logits.shape[0], device=retrieval_logits.device)
     loss_cvr = torch.nn.functional.cross_entropy(retrieval_logits, labels)
     loss_multi_positive = _multi_positive_loss(torch, retrieval_logits, batch.get("positive_group_index")) if options["enable_multi_positive"] else torch.zeros((), device=retrieval_logits.device)
@@ -1052,41 +1148,61 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
     ref_local = _paired_local_scores_torch(torch, query, reference_segments) if reference_segments is not None else None
     pos = _mix_torch_scores(pos_global, pos_local, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"]))
     ref = _mix_torch_scores(ref_global, ref_local, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"]))
-    loss_ref = torch.relu(0.2 - pos + ref).mean()
+    pos_metric = _scale_for_modality_temperature(pos, tau_cvr, use_modality_temperature)
+    ref_metric = _scale_for_modality_temperature(ref, tau_cvr, use_modality_temperature)
+    loss_ref = torch.relu(0.2 - pos_metric + ref_metric).mean()
     if options["disable_reference_negative"]:
         loss_ref = torch.zeros((), device=retrieval_logits.device)
     neg_scores_global = torch.einsum("bd,bnd->bn", query, negative)
     neg_scores_local = _negative_local_scores_torch(torch, query, negative_segments) if negative_segments is not None else None
     neg_scores = _mix_torch_scores(neg_scores_global, neg_scores_local, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"]))
+    neg_metric = _scale_for_modality_temperature(neg_scores, tau_cvr, use_modality_temperature)
     curriculum_mask = _curriculum_mask(torch, records, neg_mask, int(options["curriculum_stage"]))
-    effective_mask = curriculum_mask
+    type_weight = curriculum_mask
     if "negative_effective_mask" in batch:
-        effective_mask = effective_mask * batch["negative_effective_mask"]
+        type_weight = type_weight * batch["negative_effective_mask"]
+    false_negative_weight = torch.ones_like(type_weight)
     if options["enable_false_negative_filtering"]:
-        effective_mask = effective_mask * _false_negative_weights(
+        false_negative_weight = _false_negative_weights(
             torch,
             records,
             neg_scores,
             threshold=float(options["false_negative_sim_threshold"]),
             soft_weight=float(options["false_negative_soft_weight"]),
         )
-    hn = torch.relu(0.2 - pos[:, None] + neg_scores) * effective_mask
+    base_negative_weight = type_weight * false_negative_weight
+    quantile_weight = _quantile_negative_curriculum_weights(
+        torch,
+        neg_metric,
+        base_negative_weight,
+        enabled=bool(options["enable_quantile_negative_curriculum"]),
+        step=int(options.get("current_step", 1)),
+        total_steps=int(options.get("total_steps", 1)),
+        warmup_ratio=float(options["negative_curriculum_warmup_ratio"]),
+        keep_ratio_start=float(options["negative_keep_ratio_start"]),
+        keep_ratio_end=float(options["negative_keep_ratio_end"]),
+        easy_weight=float(options["easy_negative_weight"]),
+    )
+    effective_mask = base_negative_weight * quantile_weight
+    margins = torch.relu(0.2 - pos_metric[:, None] + neg_metric)
+    hn = margins * effective_mask
     loss_hn = hn.sum() / effective_mask.sum().clamp_min(1.0)
     if options["disable_hard_negatives"]:
         loss_hn = torch.zeros((), device=retrieval_logits.device)
     loss_hw_hn = torch.zeros((), device=retrieval_logits.device)
+    hardness = torch.ones_like(effective_mask)
     if options["enable_hardness_weighting"] and not options["disable_hard_negatives"]:
-        margins = torch.relu(0.2 - pos[:, None] + neg_scores)
         hardness = _hardness_weights(
             torch,
             records,
-            neg_scores,
+            neg_metric,
             effective_mask,
             temperature=float(options["hardness_temperature"]),
             weight_min=float(options["hardness_weight_min"]),
             weight_max=float(options["hardness_weight_max"]),
         )
         loss_hw_hn = (margins * effective_mask * hardness).sum() / effective_mask.sum().clamp_min(1.0)
+    final_negative_weight = effective_mask * hardness
     delta_losses: list[Any] = []
     edit_type_losses: list[Any] = []
     for index, record in enumerate(records):
@@ -1097,36 +1213,42 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
             float(options["local_mix_weight"]),
             bool(options["disable_global_local_mix"]),
         )
+        target_edit = _scale_for_modality_temperature(target_edit, tau_audio_text, use_modality_temperature)
         reference_edit = _mix_torch_scores(
             torch.sum(reference[index] * edit[index], dim=-1),
             _single_local_score_torch(torch, reference_segments[index], edit[index]) if reference_segments is not None else None,
             float(options["local_mix_weight"]),
             bool(options["disable_global_local_mix"]),
         )
+        reference_edit = _scale_for_modality_temperature(reference_edit, tau_audio_text, use_modality_temperature)
         target_old = _mix_torch_scores(
             torch.sum(target[index] * old_audio[index], dim=-1),
             _single_local_score_torch(torch, target_segments[index], old_audio[index]) if target_segments is not None else None,
             float(options["local_mix_weight"]),
             bool(options["disable_global_local_mix"]),
         )
+        target_old = _scale_for_modality_temperature(target_old, tau_audio_text, use_modality_temperature)
         target_new = _mix_torch_scores(
             torch.sum(target[index] * new_audio[index], dim=-1),
             _single_local_score_torch(torch, target_segments[index], new_audio[index]) if target_segments is not None else None,
             float(options["local_mix_weight"]),
             bool(options["disable_global_local_mix"]),
         )
+        target_new = _scale_for_modality_temperature(target_new, tau_audio_text, use_modality_temperature)
         reference_old = _mix_torch_scores(
             torch.sum(reference[index] * old_audio[index], dim=-1),
             _single_local_score_torch(torch, reference_segments[index], old_audio[index]) if reference_segments is not None else None,
             float(options["local_mix_weight"]),
             bool(options["disable_global_local_mix"]),
         )
+        reference_old = _scale_for_modality_temperature(reference_old, tau_audio_text, use_modality_temperature)
         reference_new = _mix_torch_scores(
             torch.sum(reference[index] * new_audio[index], dim=-1),
             _single_local_score_torch(torch, reference_segments[index], new_audio[index]) if reference_segments is not None else None,
             float(options["local_mix_weight"]),
             bool(options["disable_global_local_mix"]),
         )
+        reference_new = _scale_for_modality_temperature(reference_new, tau_audio_text, use_modality_temperature)
         if edit_type in {"remove", "decrease"}:
             delta = reference_edit - target_edit
             delta_losses.append(torch.relu(0.2 - delta))
@@ -1144,8 +1266,25 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
         loss_edit_type = torch.zeros((), device=retrieval_logits.device)
     visual_sim = torch.sum(target * reference, dim=-1)
     loss_visual = torch.relu(0.05 - visual_sim).mean()
-    loss_coral_align = _coral_loss(torch, torch.cat([target, reference], dim=0), torch.cat([edit, old_audio, new_audio], dim=0)) if options["enable_coral_align"] else torch.zeros((), device=retrieval_logits.device)
-    loss_memory_bank = _memory_bank_loss(torch, pos, query, options.get("memory_bank"), temperature=temperature) if options["enable_memory_bank"] else torch.zeros((), device=retrieval_logits.device)
+    zero = torch.zeros((), device=retrieval_logits.device)
+    doc_for_align = torch.cat([target, reference], dim=0)
+    edit_for_align = torch.cat([edit, old_audio, new_audio], dim=0)
+    delta_vec = target - reference
+    loss_coral_doc_edit = _coral_loss(torch, doc_for_align, edit_for_align) if options["enable_coral_align"] else zero
+    loss_coral_delta_edit = _coral_loss(torch, delta_vec, edit) if options["enable_coral_align"] else zero
+    loss_coral_align = loss_coral_doc_edit + loss_coral_delta_edit
+    loss_batch_whitening = (
+        (
+            _batch_whitening_loss(torch, query)
+            + _batch_whitening_loss(torch, doc_for_align)
+            + _batch_whitening_loss(torch, edit_for_align)
+            + _batch_whitening_loss(torch, delta_vec)
+        )
+        / 4.0
+        if options["enable_batch_whitening"]
+        else zero
+    )
+    loss_memory_bank = _memory_bank_loss(torch, pos, query, options.get("memory_bank"), temperature=float(tau_cvr.detach().cpu())) if options["enable_memory_bank"] else zero
     total = (
         loss_cvr
         + float(options["lambda_delta"]) * loss_delta
@@ -1157,8 +1296,12 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
         + float(options["lambda_multi_positive"]) * loss_multi_positive
         + float(options["lambda_coral_align"]) * loss_coral_align
         + float(options["lambda_memory_bank"]) * loss_memory_bank
+        + float(options["lambda_batch_whitening"]) * loss_batch_whitening
     )
-    zero = torch.zeros((), device=retrieval_logits.device)
+    hard_score_mean, easy_score_mean = _hard_easy_score_means(torch, neg_metric, base_negative_weight, quantile_weight)
+    suspected_false_negative_count = ((false_negative_weight < 1.0) & (type_weight > 0)).sum()
+    kept_negative_count = ((quantile_weight >= 1.0) & (base_negative_weight > 0)).sum()
+    masked_easy_negative_count = ((quantile_weight < 1.0) & (base_negative_weight > 0)).sum()
     return {
         "total": total,
         "loss_cvr": loss_cvr,
@@ -1170,8 +1313,28 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
         "loss_hw_hn": loss_hw_hn,
         "loss_multi_positive": loss_multi_positive,
         "loss_coral_align": loss_coral_align,
+        "loss_coral_doc_edit": loss_coral_doc_edit,
+        "loss_coral_delta_edit": loss_coral_delta_edit,
+        "loss_batch_whitening": loss_batch_whitening,
         "loss_memory_bank": loss_memory_bank,
         "effective_negative_count": effective_mask.sum().detach() if "effective_mask" in locals() else zero,
+        "kept_negative_count": kept_negative_count.detach(),
+        "masked_easy_negative_count": masked_easy_negative_count.detach(),
+        "suspected_false_negative_count": suspected_false_negative_count.detach(),
+        "avg_negative_weight": final_negative_weight.mean().detach() if "final_negative_weight" in locals() else zero,
+        "avg_hard_negative_score": hard_score_mean.detach(),
+        "avg_easy_negative_score": easy_score_mean.detach(),
+        "tau_text": tau_text.detach(),
+        "tau_audio": tau_audio.detach(),
+        "tau_video": tau_video.detach(),
+        "tau_query": tau_query.detach(),
+        "tau_target": tau_target.detach(),
+        "tau_audio_text": tau_audio_text.detach(),
+        "effective_temperature_cvr": tau_cvr.detach(),
+        "effective_temperature_delta": tau_audio_text.detach(),
+        "cov_doc_trace": _covariance_trace(torch, doc_for_align).detach(),
+        "cov_edit_trace": _covariance_trace(torch, edit_for_align).detach(),
+        "cov_delta_trace": _covariance_trace(torch, delta_vec).detach(),
     }
 
 
@@ -1191,12 +1354,20 @@ def _loss_options(**overrides: Any) -> dict[str, Any]:
         "lambda_multi_positive",
         "lambda_coral_align",
         "lambda_memory_bank",
+        "lambda_batch_whitening",
         "hardness_temperature",
         "hardness_weight_min",
         "hardness_weight_max",
         "false_negative_sim_threshold",
         "false_negative_soft_weight",
         "temperature",
+        "modality_temperature_init",
+        "modality_temperature_min",
+        "modality_temperature_max",
+        "negative_keep_ratio_start",
+        "negative_keep_ratio_end",
+        "negative_curriculum_warmup_ratio",
+        "easy_negative_weight",
     ):
         options[key] = float(options[key])
     return options
@@ -1210,10 +1381,14 @@ def _training_profile_options(
     enable_coral_align: bool | None,
     enable_memory_bank: bool | None,
     enable_false_negative_filtering: bool | None,
+    enable_modality_temperature: bool | None,
+    enable_quantile_negative_curriculum: bool | None,
+    enable_batch_whitening: bool | None,
     lambda_hw_hn: float | None,
     lambda_multi_positive: float | None,
     lambda_coral_align: float | None,
     lambda_memory_bank: float | None,
+    lambda_batch_whitening: float | None,
 ) -> dict[str, Any]:
     profile = str(training_profile or "v1")
     if profile not in {"v1", "v2_research"}:
@@ -1223,12 +1398,16 @@ def _training_profile_options(
         "enable_hardness_weighting": enabled if enable_hardness_weighting is None else enable_hardness_weighting,
         "enable_multi_positive": enabled if enable_multi_positive is None else enable_multi_positive,
         "enable_coral_align": enabled if enable_coral_align is None else enable_coral_align,
-        "enable_memory_bank": enabled if enable_memory_bank is None else enable_memory_bank,
+        "enable_memory_bank": False if enable_memory_bank is None else enable_memory_bank,
         "enable_false_negative_filtering": enabled if enable_false_negative_filtering is None else enable_false_negative_filtering,
+        "enable_modality_temperature": enabled if enable_modality_temperature is None else enable_modality_temperature,
+        "enable_quantile_negative_curriculum": enabled if enable_quantile_negative_curriculum is None else enable_quantile_negative_curriculum,
+        "enable_batch_whitening": enabled if enable_batch_whitening is None else enable_batch_whitening,
         "lambda_hw_hn": 0.5 if enabled else 0.0,
         "lambda_multi_positive": 0.5 if enabled else 0.0,
         "lambda_coral_align": 0.05 if enabled else 0.0,
-        "lambda_memory_bank": 0.25 if enabled else 0.0,
+        "lambda_memory_bank": 0.0,
+        "lambda_batch_whitening": 0.01 if enabled else 0.0,
     }
     if lambda_hw_hn is not None:
         result["lambda_hw_hn"] = lambda_hw_hn
@@ -1238,6 +1417,8 @@ def _training_profile_options(
         result["lambda_coral_align"] = lambda_coral_align
     if lambda_memory_bank is not None:
         result["lambda_memory_bank"] = lambda_memory_bank
+    if lambda_batch_whitening is not None:
+        result["lambda_batch_whitening"] = lambda_batch_whitening
     return result
 
 
@@ -1271,15 +1452,102 @@ def _multi_positive_loss(torch: Any, logits: Any, positive_group_index: Any | No
     return (denominator - numerator).mean()
 
 
+def _modality_tau(torch: Any, model: Any, modalities: tuple[str, ...], options: dict[str, Any], *, fallback: float, device: Any) -> Any:
+    if not options.get("enable_modality_temperature") or not hasattr(model, "modality_temperature"):
+        return torch.as_tensor(float(fallback), dtype=torch.float32, device=device)
+    return model.modality_temperature(
+        modalities,
+        tau_min=float(options["modality_temperature_min"]),
+        tau_max=float(options["modality_temperature_max"]),
+    )
+
+
+def _pair_tau(left: Any, right: Any) -> Any:
+    return 0.5 * (left + right)
+
+
+def _scale_for_modality_temperature(score: Any, tau: Any, enabled: bool) -> Any:
+    return score / tau if enabled else score
+
+
+def _quantile_negative_curriculum_weights(
+    torch: Any,
+    neg_scores: Any,
+    active_weight: Any,
+    *,
+    enabled: bool,
+    step: int,
+    total_steps: int,
+    warmup_ratio: float,
+    keep_ratio_start: float,
+    keep_ratio_end: float,
+    easy_weight: float,
+) -> Any:
+    if not enabled or neg_scores.numel() == 0:
+        return torch.ones_like(active_weight)
+    warmup_steps = int(max(0, total_steps) * max(0.0, float(warmup_ratio)))
+    if step <= warmup_steps:
+        ratio = float(keep_ratio_start)
+    else:
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        ratio = float(keep_ratio_start) + (float(keep_ratio_end) - float(keep_ratio_start)) * min(1.0, max(0.0, progress))
+    ratio = min(1.0, max(0.0, ratio))
+    easy_weight = min(1.0, max(0.0, float(easy_weight)))
+    rows: list[Any] = []
+    for row_index in range(neg_scores.shape[0]):
+        row_active = active_weight[row_index] > 0
+        active_count = int(row_active.sum().detach().cpu())
+        if active_count <= 0:
+            rows.append(torch.zeros_like(active_weight[row_index]))
+            continue
+        keep_count = max(1, int(np.ceil(active_count * ratio)))
+        active_scores = neg_scores[row_index].detach().masked_fill(~row_active, -1e9)
+        keep_indices = torch.topk(active_scores, k=min(keep_count, active_scores.shape[0]), dim=0).indices
+        row = torch.full_like(active_weight[row_index], fill_value=easy_weight)
+        row = torch.where(row_active, row, torch.zeros_like(row))
+        row[keep_indices] = 1.0
+        rows.append(row)
+    return torch.stack(rows, dim=0)
+
+
+def _hard_easy_score_means(torch: Any, neg_scores: Any, active_weight: Any, quantile_weight: Any) -> tuple[Any, Any]:
+    active = active_weight > 0
+    hard = active & (quantile_weight >= 1.0)
+    easy = active & (quantile_weight < 1.0)
+    zero = torch.zeros((), device=neg_scores.device, dtype=neg_scores.dtype)
+    hard_mean = neg_scores[hard].mean() if bool(hard.any().detach().cpu()) else zero
+    easy_mean = neg_scores[easy].mean() if bool(easy.any().detach().cpu()) else zero
+    return hard_mean, easy_mean
+
+
+def _batch_covariance(torch: Any, value: Any) -> Any:
+    if value.shape[0] <= 1:
+        return torch.zeros((value.shape[-1], value.shape[-1]), device=value.device, dtype=value.dtype)
+    centered = value - value.mean(dim=0, keepdim=True)
+    return centered.T @ centered / max(1, value.shape[0] - 1)
+
+
 def _coral_loss(torch: Any, left: Any, right: Any) -> Any:
     if left.shape[0] <= 1 or right.shape[0] <= 1:
         return torch.zeros((), device=left.device)
-    left_centered = left - left.mean(dim=0, keepdim=True)
-    right_centered = right - right.mean(dim=0, keepdim=True)
-    left_cov = left_centered.T @ left_centered / max(1, left.shape[0] - 1)
-    right_cov = right_centered.T @ right_centered / max(1, right.shape[0] - 1)
+    left_cov = _batch_covariance(torch, left)
+    right_cov = _batch_covariance(torch, right)
     dim = max(1, int(left.shape[-1]))
-    return torch.mean((left_cov - right_cov) ** 2) / (4.0 * dim * dim)
+    return ((left_cov - right_cov) ** 2).sum() / (4.0 * dim * dim)
+
+
+def _batch_whitening_loss(torch: Any, value: Any) -> Any:
+    if value.shape[0] <= 1:
+        return torch.zeros((), device=value.device)
+    mean_loss = torch.sum(value.mean(dim=0) ** 2)
+    cov = _batch_covariance(torch, value)
+    identity = torch.eye(cov.shape[0], dtype=cov.dtype, device=cov.device)
+    dim = max(1, int(value.shape[-1]))
+    return mean_loss + ((cov - identity) ** 2).sum() / (dim * dim)
+
+
+def _covariance_trace(torch: Any, value: Any) -> Any:
+    return torch.trace(_batch_covariance(torch, value))
 
 
 def _memory_bank_loss(torch: Any, pos_scores: Any, query: Any, memory_bank: Any | None, *, temperature: float) -> Any:
@@ -1482,13 +1750,33 @@ def _rank_list_summary(ranks: list[int]) -> dict[str, Any]:
     }
 
 
-def _AudioDeltaAdapter(torch: Any, dim: int) -> Any:
+def _AudioDeltaAdapter(torch: Any, dim: int, *, modality_temperature_init: float = 0.05) -> Any:
+    class ModalityAwareTemperature(torch.nn.Module):
+        def __init__(self, init_tau: float = 0.05) -> None:
+            super().__init__()
+            init = float(np.log(max(1e-6, init_tau)))
+            self.log_tau_text = torch.nn.Parameter(torch.tensor(init, dtype=torch.float32))
+            self.log_tau_audio = torch.nn.Parameter(torch.tensor(init, dtype=torch.float32))
+            self.log_tau_video = torch.nn.Parameter(torch.tensor(init, dtype=torch.float32))
+
+        def forward(self, modalities: tuple[str, ...], *, tau_min: float, tau_max: float) -> Any:
+            params = {
+                "text": self.log_tau_text,
+                "audio": self.log_tau_audio,
+                "video": self.log_tau_video,
+            }
+            values = [torch.exp(params[name]).clamp(min=tau_min, max=tau_max) for name in modalities if name in params]
+            if not values:
+                values = [torch.exp(self.log_tau_text).clamp(min=tau_min, max=tau_max)]
+            return torch.stack(values).mean()
+
     class Adapter(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.query_proj = torch.nn.Linear(dim, dim, bias=False)
             self.doc_proj = torch.nn.Linear(dim, dim, bias=False)
             self.edit_proj = torch.nn.Linear(dim, dim, bias=False)
+            self.modality_temperature = ModalityAwareTemperature(modality_temperature_init)
             torch.nn.init.eye_(self.query_proj.weight)
             torch.nn.init.eye_(self.doc_proj.weight)
             torch.nn.init.eye_(self.edit_proj.weight)
@@ -1891,11 +2179,15 @@ def _ablation_markdown(summary: dict[str, Any]) -> str:
     lines = [
         "# AudioDelta-E5 Ablation",
         "",
-        "| Ablation | R@1 | R@5 | R@10 |",
-        "|---|---:|---:|---:|",
+        "| Ablation | R@1 | R@5 | R@10 | Ref Avg Rank | Delta Pos Mean | Delta Neg Mean | Effective Neg | Tau T | Tau A | Tau V |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summary["rows"]:
-        lines.append(f"| {row['ablation']} | {_fmt(row.get('R@1'))} | {_fmt(row.get('R@5'))} | {_fmt(row.get('R@10'))} |")
+        lines.append(
+            f"| {row['ablation']} | {_fmt(row.get('R@1'))} | {_fmt(row.get('R@5'))} | {_fmt(row.get('R@10'))} | "
+            f"{_fmt(row.get('reference_negative_average_rank'))} | {_fmt(row.get('delta_score_pos_mean'))} | {_fmt(row.get('delta_score_neg_mean'))} | "
+            f"{_fmt(row.get('effective_negative_count'))} | {_fmt(row.get('tau_text'))} | {_fmt(row.get('tau_audio'))} | {_fmt(row.get('tau_video'))} |"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -1956,6 +2248,18 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
+
+
+def _last_jsonl_row(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    rows = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not rows:
+        return {}
+    try:
+        return json.loads(rows[-1])
+    except json.JSONDecodeError:
+        return {}
 
 
 def _torch_device(torch: Any, raw: str) -> Any:

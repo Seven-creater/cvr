@@ -556,18 +556,268 @@ memory_bank_size
 
 ---
 
-## 6. Ablation 设计
+## 6. V2.1：e5-omni 风格训练优化
+
+V2.1 是在 V2 research profile 上做的增量升级，目标是借鉴 e5-omni / MMEB-V3 的三个关键训练思想：
+
+```text
+modality-aware temperature
+negative-aware contrastive learning
+batch-wise covariance regularization
+```
+
+对应论文依据包括：
+
+```text
+MMEB-V3 / e5-omni: modality-aware temperature、negative-aware contrastive loss、batch-wise covariance regularization
+Deep CORAL: covariance-level distribution alignment
+```
+
+本次实现原则：
+
+```text
+不改 prepare/cache/eval 主流程
+不改 E5 视频输入包装
+不启用 LoRA
+不重写训练脚本
+所有新增模块都必须可开关、可日志诊断、可 ablation
+```
+
+### 6.1 Modality-aware temperature calibration
+
+原先训练只使用全局 temperature：
+
+```text
+logits = scores / temperature
+```
+
+但 query / target / edit / audio delta 的模态组合不同，similarity logits 的 sharpness 不一定一致。因此 V2.1 新增可学习 temperature 模块：
+
+```text
+ModalityAwareTemperature
+  log_tau_text
+  log_tau_audio
+  log_tau_video
+```
+
+三类 temperature 通过 `exp(log_tau)` 得到，并 clamp 到：
+
+```text
+tau_min = 0.005
+tau_max = 0.2
+```
+
+模态组合定义为：
+
+```text
+query              = text + audio + video
+target/reference   = audio + video
+edit               = text
+audio delta        = audio vs text
+local segment      = audio + video
+```
+
+任意输入的 temperature：
+
+```text
+tau(x) = average(tau_m for m in modalities(x))
+```
+
+任意 pair 的 temperature：
+
+```text
+tau_pair(x, y) = 0.5 * (tau(x) + tau(y))
+```
+
+启用参数：
+
+```bash
+--enable-modality-temperature
+--modality-temperature-init 0.05
+--modality-temperature-min 0.005
+--modality-temperature-max 0.2
+```
+
+关闭时仍使用旧的全局 temperature，保证 V1/V2 旧实验可复现。
+
+训练日志新增：
+
+```text
+tau_text
+tau_audio
+tau_video
+tau_query
+tau_target
+tau_audio_text
+effective_temperature_cvr
+effective_temperature_delta
+```
+
+### 6.2 Quantile negative curriculum + debiasing
+
+原先 V2 已有 negative type curriculum：
+
+```text
+reference_negative -> visual_hard -> audio_hard -> asr_hard
+```
+
+V2.1 不删除这个阶段逻辑，而是在已启用的 negative type 内部继续做可控加权：训练前期保留所有 negatives，后期逐步聚焦 top-hard negatives，避免 easy negatives 长期占据 denominator。
+
+默认 schedule：
+
+```text
+negative_keep_ratio: 1.0 -> 0.5
+negative_curriculum_warmup_ratio: 0.1
+easy_negative_weight: 0.1
+```
+
+最终 negative weight：
+
+```text
+negative_weight =
+  type_weight
+  * hardness_weight
+  * quantile_mask_weight
+  * false_negative_weight
+```
+
+其中 false-negative debiasing 优先级最高：
+
+```text
+同 pair_group / inverse_pair_group: weight = 0
+疑似 false negative: weight = false_negative_soft_weight
+普通 negative: weight = 1
+```
+
+启用参数：
+
+```bash
+--enable-quantile-negative-curriculum
+--negative-keep-ratio-start 1.0
+--negative-keep-ratio-end 0.5
+--negative-curriculum-warmup-ratio 0.1
+--easy-negative-weight 0.1
+```
+
+训练日志新增：
+
+```text
+effective_negative_count
+kept_negative_count
+masked_easy_negative_count
+suspected_false_negative_count
+avg_negative_weight
+avg_hard_negative_score
+avg_easy_negative_score
+```
+
+### 6.3 CORAL alignment 拆分与 batch whitening
+
+V2 已经有 `enable_coral_align` 的初步接口，V2.1 将其拆成更贴合 AudioDelta 的两部分：
+
+```text
+loss_coral_doc_edit:
+  Cov(target/reference projection) 对齐 Cov(edit/old_audio/new_audio projection)
+
+loss_coral_delta_edit:
+  Cov(target - reference) 对齐 Cov(edit projection)
+```
+
+CORAL 形式：
+
+```text
+L_coral = || Cov(left) - Cov(right) ||_F^2 / (4 * d * d)
+```
+
+同时新增 batch whitening 正则：
+
+```text
+L_whiten = || mean(z) ||_2^2 + || Cov(z) - I ||_F^2 / d^2
+```
+
+默认辅助权重很小：
+
+```text
+lambda_coral_align = 0.05
+lambda_batch_whitening = 0.01
+```
+
+启用参数：
+
+```bash
+--enable-coral-align
+--lambda-coral-align 0.05
+--enable-batch-whitening
+--lambda-batch-whitening 0.01
+```
+
+训练日志新增：
+
+```text
+loss_coral_align
+loss_coral_doc_edit
+loss_coral_delta_edit
+loss_batch_whitening
+cov_doc_trace
+cov_edit_trace
+cov_delta_trace
+```
+
+### 6.4 V2.1 profile 默认行为
+
+`v1` 保持保守：
+
+```text
+enable_modality_temperature = false
+enable_quantile_negative_curriculum = false
+enable_batch_whitening = false
+enable_coral_align = false
+```
+
+`v2_research` 默认开启：
+
+```text
+enable_modality_temperature = true
+enable_quantile_negative_curriculum = true
+enable_false_negative_filtering = true
+enable_coral_align = true
+enable_batch_whitening = true
+enable_hardness_weighting = true
+```
+
+但 memory bank 默认关闭：
+
+```text
+enable_memory_bank = false
+```
+
+原因是 memory bank 对显存和稳定性更敏感，正式训练时可以显式打开：
+
+```bash
+--enable-memory-bank --lambda-memory-bank 0.25
+```
+
+---
+
+## 7. Ablation 设计
 
 新增 `run-ablations` 命令，自动运行：
 
 ```text
 full_v2
+without_modality_temperature
+without_quantile_negative_curriculum
+without_false_negative_debiasing
 without_hardness_weighting
 without_multi_positive
 without_coral_align
+without_batch_whitening
 without_memory_bank
 without_false_negative_filtering
-without_local_ffmpeg
+without_local_segments
+without_delta
+without_reference_negative
+without_hard_negatives
 v1_loss_only
 ```
 
@@ -576,9 +826,21 @@ v1_loss_only
 ```text
 ablations/summary.json
 ablations/comparison.md
+每个 ablation 子目录下的 adapter/loss_curve.jsonl
+每个 ablation 子目录下的 eval/summary.json
 ```
 
 对应论文实验中的 strong ablation：每个模块是否真的贡献效果，都可以单独关闭验证。
+
+`comparison.md` 除了 R@1/R@5/R@10，还会记录：
+
+```text
+reference_negative_average_rank
+delta_score_pos_mean
+delta_score_neg_mean
+effective_negative_count
+tau_text / tau_audio / tau_video
+```
 
 如果只想复现 V1 ablation，可以使用：
 
@@ -588,7 +850,7 @@ python -m app.e5_audio_delta_train run-ablations --training-profile v1 ...
 
 ---
 
-## 7. 复杂度与风险控制
+## 8. 复杂度与风险控制
 
 V2 模块明显比 V1 复杂，因此必须遵守以下顺序：
 
@@ -603,9 +865,11 @@ V2 模块明显比 V1 复杂，因此必须遵守以下顺序：
 特别注意：
 
 ```text
+Modality temperature: 必须检查 tau 是否始终在 clamp 范围内。
+Quantile curriculum: 需要观察 effective_negative_count 是否过低。
 Hardness weighting: 需要调 tau_hard 和 clip 上下界。
 Multi-positive: 只允许 train，必须依赖 source/pair disjoint split。
-CORAL: 权重必须小，重点检查 clean_audio_delta 是否下降。
+CORAL / whitening: 权重必须小，重点检查 clean_audio_delta 是否下降。
 Memory bank: 容易增加显存和过时 negative 风险，warmup 后再启用。
 False-negative filtering: 阈值要通过 diagnostic split 调。
 LoRA: 必须在 frozen adapter + projection head 稳定后再开。
@@ -615,7 +879,7 @@ LoRA: 必须在 frozen adapter + projection head 稳定后再开。
 
 ---
 
-## 8. 已经解决的工程难点
+## 9. 已经解决的工程难点
 
 ### 6.1 CUDA / PyTorch / Transformers 兼容
 
@@ -687,7 +951,7 @@ audio_cvr_ab_6_9s_minimal_*
 
 ---
 
-## 9. 当前验证状态
+## 10. 当前验证状态
 
 已通过：
 
@@ -703,7 +967,7 @@ eval: global / local / global+local
 
 ```text
 python -m unittest discover -v
-397 tests OK
+399 tests OK
 ```
 
 真实服务器 smoke 结果：
@@ -717,7 +981,7 @@ eval: global/local/global+local 全链路通过
 
 ---
 
-## 10. 后续建议
+## 11. 后续建议
 
 短期：
 
@@ -748,7 +1012,7 @@ eval: global/local/global+local 全链路通过
 
 ---
 
-## 11. 一句话总结
+## 12. 一句话总结
 
 AudioDelta-E5 训练框架的核心不是“让 E5 多看一点音频”，而是让模型显式学习：
 

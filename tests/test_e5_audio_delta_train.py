@@ -15,13 +15,17 @@ from app.e5_audio_delta_train import (
     run_ablations,
     train_adapter,
     train_lora_plan,
+    _batch_whitening_loss,
     _coral_loss,
     _false_negative_weights,
     _hardness_weights,
     _import_torch,
+    _modality_tau,
     _multi_positive_loss,
+    _quantile_negative_curriculum_weights,
     _scheduled_learning_rate,
     _scheduled_temperature,
+    _AudioDeltaAdapter,
     _video_payload,
 )
 
@@ -175,6 +179,10 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             )
 
             self.assertGreaterEqual(len(summary["rows"]), 3)
+            names = {row["ablation"] for row in summary["rows"]}
+            self.assertIn("without_modality_temperature", names)
+            self.assertIn("without_quantile_negative_curriculum", names)
+            self.assertIn("without_batch_whitening", names)
             self.assertTrue((root / "ablations" / "comparison.md").exists())
 
     def test_v2_research_profile_logs_new_losses_and_schedule(self) -> None:
@@ -197,6 +205,7 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
                 batch_size=2,
                 device="cpu",
                 training_profile="v2_research",
+                enable_memory_bank=True,
                 memory_bank_size=8,
             )
             loss_rows = [json.loads(line) for line in (root / "adapter" / "loss_curve.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -205,7 +214,14 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertIn("loss_hw_hn", loss_rows[-1])
             self.assertIn("loss_multi_positive", loss_rows[-1])
             self.assertIn("loss_coral_align", loss_rows[-1])
+            self.assertIn("loss_coral_doc_edit", loss_rows[-1])
+            self.assertIn("loss_coral_delta_edit", loss_rows[-1])
+            self.assertIn("loss_batch_whitening", loss_rows[-1])
             self.assertIn("loss_memory_bank", loss_rows[-1])
+            self.assertIn("tau_text", loss_rows[-1])
+            self.assertIn("effective_temperature_cvr", loss_rows[-1])
+            self.assertIn("kept_negative_count", loss_rows[-1])
+            self.assertIn("suspected_false_negative_count", loss_rows[-1])
             self.assertIn("temperature", loss_rows[-1])
             self.assertGreater(loss_rows[-1]["memory_bank_size"], 0)
 
@@ -242,6 +258,60 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
         self.assertGreaterEqual(float(weights.min()), 0.25)
         self.assertLessEqual(float(weights.max()), 4.0)
 
+    def test_modality_temperature_clamps_and_can_disable_to_global_temperature(self) -> None:
+        torch = _import_torch()
+        model = _AudioDeltaAdapter(torch, 4, modality_temperature_init=0.5)
+
+        enabled_tau = _modality_tau(
+            torch,
+            model,
+            ("text", "audio", "video"),
+            {
+                "enable_modality_temperature": True,
+                "modality_temperature_min": 0.005,
+                "modality_temperature_max": 0.2,
+            },
+            fallback=0.07,
+            device=torch.device("cpu"),
+        )
+        disabled_tau = _modality_tau(
+            torch,
+            model,
+            ("text", "audio", "video"),
+            {
+                "enable_modality_temperature": False,
+                "modality_temperature_min": 0.005,
+                "modality_temperature_max": 0.2,
+            },
+            fallback=0.07,
+            device=torch.device("cpu"),
+        )
+
+        self.assertAlmostEqual(0.2, float(enabled_tau.detach()), places=6)
+        self.assertAlmostEqual(0.07, float(disabled_tau.detach()), places=6)
+
+    def test_quantile_negative_curriculum_masks_easy_negatives_after_warmup(self) -> None:
+        torch = _import_torch()
+        scores = torch.tensor([[0.1, 0.9, 0.2, 0.3]], dtype=torch.float32)
+        active = torch.ones_like(scores)
+
+        weights = _quantile_negative_curriculum_weights(
+            torch,
+            scores,
+            active,
+            enabled=True,
+            step=10,
+            total_steps=10,
+            warmup_ratio=0.1,
+            keep_ratio_start=1.0,
+            keep_ratio_end=0.5,
+            easy_weight=0.1,
+        )
+
+        self.assertEqual(1.0, float(weights[0, 1]))
+        self.assertLess(float(weights[0, 0]), 1.0)
+        self.assertGreaterEqual(float(weights.min()), 0.0)
+
     def test_multi_positive_and_coral_helpers_are_stable(self) -> None:
         torch = _import_torch()
         logits = torch.tensor([[4.0, 4.0, 0.1], [4.0, 4.0, 0.2], [0.1, 0.2, 4.0]], dtype=torch.float32)
@@ -250,10 +320,14 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
         multi_loss = _multi_positive_loss(torch, logits, groups)
         coral_one = _coral_loss(torch, torch.ones(1, 4), torch.ones(1, 4))
         coral_many = _coral_loss(torch, torch.eye(4), torch.flip(torch.eye(4), dims=[0]))
+        whiten_one = _batch_whitening_loss(torch, torch.ones(1, 4))
+        whiten_many = _batch_whitening_loss(torch, torch.eye(4))
 
         self.assertLess(float(multi_loss), 0.2)
         self.assertEqual(0.0, float(coral_one))
         self.assertGreaterEqual(float(coral_many), 0.0)
+        self.assertEqual(0.0, float(whiten_one))
+        self.assertGreaterEqual(float(whiten_many), 0.0)
 
     def test_false_negative_filter_soft_weights_high_similarity(self) -> None:
         torch = _import_torch()
