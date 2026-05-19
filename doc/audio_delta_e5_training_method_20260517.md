@@ -781,20 +781,31 @@ enable_modality_temperature = true
 enable_quantile_negative_curriculum = true
 enable_false_negative_filtering = true
 enable_coral_align = true
-enable_batch_whitening = true
 enable_hardness_weighting = true
 ```
 
-但 memory bank 默认关闭：
+先不默认开启的探索项：
 
 ```text
+enable_multi_positive = false
 enable_memory_bank = false
+enable_batch_whitening = false
 ```
 
-原因是 memory bank 对显存和稳定性更敏感，正式训练时可以显式打开：
+这样默认 profile 只保留 e5-omni 明确对应的训练思想：
+
+```text
+modality-aware temperature
+negative-aware contrastive learning
+batch-wise covariance regularization / CORAL
+```
+
+`multi_positive`、`memory_bank`、`batch_whitening` 仍然保留代码和开关，但先作为后续可控实验项，不混入第一版默认训练。需要时可以显式打开：
 
 ```bash
+--enable-multi-positive --lambda-multi-positive 0.5
 --enable-memory-bank --lambda-memory-bank 0.25
+--enable-batch-whitening --lambda-batch-whitening 0.01
 ```
 
 ---
@@ -857,7 +868,7 @@ V2 模块明显比 V1 复杂，因此必须遵守以下顺序：
 ```text
 1. 先跑 v1，确认数据、缓存、adapter、eval 正常。
 2. 再跑 v2_research，但只用 50 条样本。
-3. 看 loss_curve.jsonl：loss_hw_hn / loss_multi_positive / loss_coral_align / loss_memory_bank 是否稳定。
+3. 看 loss_curve.jsonl：loss_hw_hn / loss_coral_align / modality temperature / effective negatives 是否稳定。
 4. 再跑 ablation，而不是直接宣称 full_v2 有效。
 5. 通过 50 -> 200 -> 1k 三档后，才考虑 LoRA。
 ```

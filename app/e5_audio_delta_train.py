@@ -1396,18 +1396,18 @@ def _training_profile_options(
     enabled = profile == "v2_research"
     result = {
         "enable_hardness_weighting": enabled if enable_hardness_weighting is None else enable_hardness_weighting,
-        "enable_multi_positive": enabled if enable_multi_positive is None else enable_multi_positive,
+        "enable_multi_positive": False if enable_multi_positive is None else enable_multi_positive,
         "enable_coral_align": enabled if enable_coral_align is None else enable_coral_align,
         "enable_memory_bank": False if enable_memory_bank is None else enable_memory_bank,
         "enable_false_negative_filtering": enabled if enable_false_negative_filtering is None else enable_false_negative_filtering,
         "enable_modality_temperature": enabled if enable_modality_temperature is None else enable_modality_temperature,
         "enable_quantile_negative_curriculum": enabled if enable_quantile_negative_curriculum is None else enable_quantile_negative_curriculum,
-        "enable_batch_whitening": enabled if enable_batch_whitening is None else enable_batch_whitening,
+        "enable_batch_whitening": False if enable_batch_whitening is None else enable_batch_whitening,
         "lambda_hw_hn": 0.5 if enabled else 0.0,
-        "lambda_multi_positive": 0.5 if enabled else 0.0,
+        "lambda_multi_positive": 0.0,
         "lambda_coral_align": 0.05 if enabled else 0.0,
         "lambda_memory_bank": 0.0,
-        "lambda_batch_whitening": 0.01 if enabled else 0.0,
+        "lambda_batch_whitening": 0.0,
     }
     if lambda_hw_hn is not None:
         result["lambda_hw_hn"] = lambda_hw_hn
