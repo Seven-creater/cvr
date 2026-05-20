@@ -211,10 +211,13 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             loss_rows = [json.loads(line) for line in (root / "adapter" / "loss_curve.jsonl").read_text(encoding="utf-8").splitlines()]
 
             self.assertEqual("v2_research", summary["training_profile"])
+            self.assertFalse(summary["loss_options"]["enable_hardness_weighting"])
             self.assertFalse(summary["loss_options"]["enable_multi_positive"])
             self.assertFalse(summary["loss_options"]["enable_batch_whitening"])
             self.assertTrue(summary["loss_options"]["enable_modality_temperature"])
             self.assertTrue(summary["loss_options"]["enable_coral_align"])
+            self.assertTrue(summary["loss_options"]["enable_quantile_negative_curriculum"])
+            self.assertTrue(summary["loss_options"]["enable_false_negative_filtering"])
             self.assertIn("loss_hw_hn", loss_rows[-1])
             self.assertIn("loss_multi_positive", loss_rows[-1])
             self.assertIn("loss_coral_align", loss_rows[-1])

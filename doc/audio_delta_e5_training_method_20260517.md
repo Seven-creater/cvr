@@ -781,12 +781,12 @@ enable_modality_temperature = true
 enable_quantile_negative_curriculum = true
 enable_false_negative_filtering = true
 enable_coral_align = true
-enable_hardness_weighting = true
 ```
 
 先不默认开启的探索项：
 
 ```text
+enable_hardness_weighting = false
 enable_multi_positive = false
 enable_memory_bank = false
 enable_batch_whitening = false
@@ -800,9 +800,10 @@ negative-aware contrastive learning
 batch-wise covariance regularization / CORAL
 ```
 
-`multi_positive`、`memory_bank`、`batch_whitening` 仍然保留代码和开关，但先作为后续可控实验项，不混入第一版默认训练。需要时可以显式打开：
+`hardness_weighting`、`multi_positive`、`memory_bank`、`batch_whitening` 仍然保留代码和开关，但先作为后续可控实验项，不混入第一版默认训练。需要时可以显式打开：
 
 ```bash
+--enable-hardness-weighting --lambda-hw-hn 0.5
 --enable-multi-positive --lambda-multi-positive 0.5
 --enable-memory-bank --lambda-memory-bank 0.25
 --enable-batch-whitening --lambda-batch-whitening 0.01
@@ -868,7 +869,7 @@ V2 模块明显比 V1 复杂，因此必须遵守以下顺序：
 ```text
 1. 先跑 v1，确认数据、缓存、adapter、eval 正常。
 2. 再跑 v2_research，但只用 50 条样本。
-3. 看 loss_curve.jsonl：loss_hw_hn / loss_coral_align / modality temperature / effective negatives 是否稳定。
+3. 看 loss_curve.jsonl：loss_coral_align / modality temperature / effective negatives 是否稳定。
 4. 再跑 ablation，而不是直接宣称 full_v2 有效。
 5. 通过 50 -> 200 -> 1k 三档后，才考虑 LoRA。
 ```
@@ -878,9 +879,10 @@ V2 模块明显比 V1 复杂，因此必须遵守以下顺序：
 ```text
 Modality temperature: 必须检查 tau 是否始终在 clamp 范围内。
 Quantile curriculum: 需要观察 effective_negative_count 是否过低。
-Hardness weighting: 需要调 tau_hard 和 clip 上下界。
+Hardness weighting: 默认关闭，后续如果打开，需要调 tau_hard 和 clip 上下界。
 Multi-positive: 只允许 train，必须依赖 source/pair disjoint split。
-CORAL / whitening: 权重必须小，重点检查 clean_audio_delta 是否下降。
+CORAL: 权重必须小，重点检查 clean_audio_delta 是否下降。
+Batch whitening: 默认关闭，后续作为单独实验项。
 Memory bank: 容易增加显存和过时 negative 风险，warmup 后再启用。
 False-negative filtering: 阈值要通过 diagnostic split 调。
 LoRA: 必须在 frozen adapter + projection head 稳定后再开。
