@@ -25,6 +25,7 @@ from app.e5_audio_delta_train import (
     _quantile_negative_curriculum_weights,
     _scheduled_learning_rate,
     _scheduled_temperature,
+    _training_profile_options,
     _AudioDeltaAdapter,
     _video_payload,
 )
@@ -211,16 +212,24 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             loss_rows = [json.loads(line) for line in (root / "adapter" / "loss_curve.jsonl").read_text(encoding="utf-8").splitlines()]
 
             self.assertEqual("v2_research", summary["training_profile"])
+            self.assertEqual("masked_dcl", summary["loss_options"]["contrastive_objective"])
             self.assertFalse(summary["loss_options"]["enable_hardness_weighting"])
             self.assertFalse(summary["loss_options"]["enable_multi_positive"])
-            self.assertFalse(summary["loss_options"]["enable_batch_whitening"])
+            self.assertTrue(summary["loss_options"]["enable_batch_whitening"])
             self.assertTrue(summary["loss_options"]["enable_modality_temperature"])
             self.assertTrue(summary["loss_options"]["enable_coral_align"])
             self.assertTrue(summary["loss_options"]["enable_quantile_negative_curriculum"])
             self.assertTrue(summary["loss_options"]["enable_false_negative_filtering"])
+            self.assertEqual(0.0, summary["loss_options"]["lambda_delta"])
+            self.assertEqual(0.0, summary["loss_options"]["lambda_ref"])
+            self.assertEqual(0.0, summary["loss_options"]["lambda_hn"])
+            self.assertEqual(0.0, summary["loss_options"]["lambda_edit_type"])
+            self.assertEqual(0.0, summary["loss_options"]["lambda_visual"])
             self.assertIn("loss_hw_hn", loss_rows[-1])
             self.assertIn("loss_multi_positive", loss_rows[-1])
+            self.assertIn("loss_masked_dcl", loss_rows[-1])
             self.assertIn("loss_coral_align", loss_rows[-1])
+            self.assertIn("loss_coral_query_target", loss_rows[-1])
             self.assertIn("loss_coral_doc_edit", loss_rows[-1])
             self.assertIn("loss_coral_delta_edit", loss_rows[-1])
             self.assertIn("loss_batch_whitening", loss_rows[-1])
@@ -230,7 +239,33 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertIn("kept_negative_count", loss_rows[-1])
             self.assertIn("suspected_false_negative_count", loss_rows[-1])
             self.assertIn("temperature", loss_rows[-1])
+            self.assertIn("whitening_enabled", loss_rows[-1])
             self.assertGreater(loss_rows[-1]["memory_bank_size"], 0)
+
+    def test_e5_omni_recipe_and_v2_research_profiles_match(self) -> None:
+        kwargs = dict(
+            enable_hardness_weighting=None,
+            enable_multi_positive=None,
+            enable_coral_align=None,
+            enable_memory_bank=None,
+            enable_false_negative_filtering=None,
+            enable_modality_temperature=None,
+            enable_quantile_negative_curriculum=None,
+            enable_batch_whitening=None,
+            lambda_hw_hn=None,
+            lambda_multi_positive=None,
+            lambda_coral_align=None,
+            lambda_memory_bank=None,
+            lambda_batch_whitening=None,
+        )
+        v2 = _training_profile_options(training_profile="v2_research", **kwargs)
+        recipe = _training_profile_options(training_profile="e5_omni_recipe", **kwargs)
+        self.assertEqual(v2, recipe)
+        self.assertEqual("masked_dcl", recipe["contrastive_objective"])
+        self.assertTrue(recipe["enable_batch_whitening"])
+        self.assertEqual(0.0, recipe["lambda_delta"])
+        self.assertEqual(0.0, recipe["lambda_ref"])
+        self.assertEqual(0.0, recipe["lambda_hn"])
 
     def test_cache_ffmpeg_mode_is_scoped_to_cache_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

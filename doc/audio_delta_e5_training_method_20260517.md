@@ -556,9 +556,9 @@ memory_bank_size
 
 ---
 
-## 6. V2.1：e5-omni 风格训练优化
+## 6. V2.1：严格对齐 e5-omni recipe 的 Stage-1
 
-V2.1 是在 V2 research profile 上做的增量升级，目标是借鉴 e5-omni / MMEB-V3 的三个关键训练思想：
+V2.1 当前阶段定义为 **Stage-1**。这一阶段的目标不是追求 AudioDelta-CVR 最优效果，而是先建立一个和 e5-omni / MMEB-V3 训练 recipe 对齐的干净基线。默认只保留三类训练思想：
 
 ```text
 modality-aware temperature
@@ -580,7 +580,8 @@ Deep CORAL: covariance-level distribution alignment
 不改 E5 视频输入包装
 不启用 LoRA
 不重写训练脚本
-所有新增模块都必须可开关、可日志诊断、可 ablation
+Stage-1 默认只开 e5-omni 三类核心思想
+AudioDelta 专属 loss 和其他探索项只保留代码和开关，不混入默认训练
 ```
 
 ### 6.1 Modality-aware temperature calibration
@@ -653,7 +654,7 @@ effective_temperature_cvr
 effective_temperature_delta
 ```
 
-### 6.2 Quantile negative curriculum + debiasing
+### 6.2 Masked DCL + negative curriculum + debiasing
 
 原先 V2 已有 negative type curriculum：
 
@@ -661,7 +662,11 @@ effective_temperature_delta
 reference_negative -> visual_hard -> audio_hard -> asr_hard
 ```
 
-V2.1 不删除这个阶段逻辑，而是在已启用的 negative type 内部继续做可控加权：训练前期保留所有 negatives，后期逐步聚焦 top-hard negatives，避免 easy negatives 长期占据 denominator。
+V2.1 不删除这个阶段逻辑，而是在已启用的 negative type 内部继续做可控加权：训练前期保留所有 negatives，后期逐步聚焦更容易混淆的 negatives，避免 easy negatives 长期占据 denominator。主 contrastive objective 从普通 CE 切到 masked DCL：
+
+```text
+contrastive_objective = masked_dcl
+```
 
 默认 schedule：
 
@@ -671,12 +676,11 @@ negative_curriculum_warmup_ratio: 0.1
 easy_negative_weight: 0.1
 ```
 
-最终 negative weight：
+进入 masked DCL denominator 的 negative weight：
 
 ```text
 negative_weight =
   type_weight
-  * hardness_weight
   * quantile_mask_weight
   * false_negative_weight
 ```
@@ -689,9 +693,14 @@ negative_weight =
 普通 negative: weight = 1
 ```
 
+注意：`hardness_weighting` 已保留为后续实验项，但 Stage-1 默认关闭。因此当前默认路径不包含 `hardness_weight`，只使用 negative type curriculum、quantile mask 和 false-negative debiasing。
+
 启用参数：
 
 ```bash
+--contrastive-objective masked_dcl
+--dcl-debias-prob 0.1
+--dcl-negative-floor 1e-6
 --enable-quantile-negative-curriculum
 --negative-keep-ratio-start 1.0
 --negative-keep-ratio-end 0.5
@@ -709,33 +718,32 @@ suspected_false_negative_count
 avg_negative_weight
 avg_hard_negative_score
 avg_easy_negative_score
+loss_masked_dcl
 ```
 
-### 6.3 CORAL alignment 拆分与 batch whitening
+### 6.3 Batch whitening + query-target CORAL
 
-V2 已经有 `enable_coral_align` 的初步接口，V2.1 将其拆成更贴合 AudioDelta 的两部分：
+V2.1 Stage-1 的对齐对象改为 e5 recipe 更直接的 query-target 表示空间：
 
 ```text
-loss_coral_doc_edit:
-  Cov(target/reference projection) 对齐 Cov(edit/old_audio/new_audio projection)
-
-loss_coral_delta_edit:
-  Cov(target - reference) 对齐 Cov(edit projection)
+loss_coral_query_target:
+  Cov(query projection) 对齐 Cov(target projection)
 ```
 
 CORAL 形式：
 
 ```text
-L_coral = || Cov(left) - Cov(right) ||_F^2 / (4 * d * d)
+L_coral = || Cov(query) - Cov(target) ||_F^2 / (4 * d * d)
 ```
 
-同时新增 batch whitening 正则：
+同时 Stage-1 默认启用 batch whitening 正则。whitening 统计从 `concat(query, target)` 计算，只作用于训练 loss，不改变 cache embedding，也不改变 eval 输入格式：
 
 ```text
 L_whiten = || mean(z) ||_2^2 + || Cov(z) - I ||_F^2 / d^2
+z = concat(query, target)
 ```
 
-默认辅助权重很小：
+默认辅助权重为：
 
 ```text
 lambda_coral_align = 0.05
@@ -755,9 +763,11 @@ lambda_batch_whitening = 0.01
 
 ```text
 loss_coral_align
-loss_coral_doc_edit
-loss_coral_delta_edit
+loss_coral_query_target
 loss_batch_whitening
+cov_query_trace
+cov_target_trace
+cov_query_target_gap
 cov_doc_trace
 cov_edit_trace
 cov_delta_trace
@@ -774,13 +784,17 @@ enable_batch_whitening = false
 enable_coral_align = false
 ```
 
-`v2_research` 默认开启：
+`e5_omni_recipe` 与当前 `v2_research` 默认行为一致。默认开启：
 
 ```text
+contrastive_objective = masked_dcl
 enable_modality_temperature = true
 enable_quantile_negative_curriculum = true
 enable_false_negative_filtering = true
 enable_coral_align = true
+enable_batch_whitening = true
+lambda_coral_align = 0.05
+lambda_batch_whitening = 0.01
 ```
 
 先不默认开启的探索项：
@@ -789,7 +803,21 @@ enable_coral_align = true
 enable_hardness_weighting = false
 enable_multi_positive = false
 enable_memory_bank = false
-enable_batch_whitening = false
+lambda_hw_hn = 0.0
+lambda_multi_positive = 0.0
+lambda_memory_bank = 0.0
+```
+
+同时默认关闭 AudioDelta 专属 loss：
+
+```text
+lambda_delta = 0.0
+lambda_hn = 0.0
+lambda_ref = 0.0
+lambda_edit_type = 0.0
+lambda_visual = 0.0
+disable_local_segments = true
+disable_global_local_mix = true
 ```
 
 这样默认 profile 只保留 e5-omni 明确对应的训练思想：
@@ -797,16 +825,15 @@ enable_batch_whitening = false
 ```text
 modality-aware temperature
 negative-aware contrastive learning
-batch-wise covariance regularization / CORAL
+batch whitening + query-target covariance / CORAL
 ```
 
-`hardness_weighting`、`multi_positive`、`memory_bank`、`batch_whitening` 仍然保留代码和开关，但先作为后续可控实验项，不混入第一版默认训练。需要时可以显式打开：
+`hardness_weighting`、`multi_positive`、`memory_bank`、以及 AudioDelta 专属 loss 仍然保留代码和开关，但先作为后续可控实验项，不混入 Stage-1 默认训练。需要时可以显式打开：
 
 ```bash
 --enable-hardness-weighting --lambda-hw-hn 0.5
 --enable-multi-positive --lambda-multi-positive 0.5
 --enable-memory-bank --lambda-memory-bank 0.25
---enable-batch-whitening --lambda-batch-whitening 0.01
 ```
 
 ---
@@ -831,6 +858,25 @@ without_delta
 without_reference_negative
 without_hard_negatives
 v1_loss_only
+```
+
+其中 Stage-1 最关键的有效 ablation 是：
+
+```text
+without_modality_temperature
+without_quantile_negative_curriculum
+without_false_negative_debiasing
+without_coral_align
+without_batch_whitening
+v1_loss_only
+```
+
+下面这些 ablation 是为后续探索项预留的；在 Stage-1 默认配置下，它们可能接近 no-op，只有显式打开对应模块后才有解释价值：
+
+```text
+without_hardness_weighting
+without_multi_positive
+without_memory_bank
 ```
 
 输出：
@@ -869,7 +915,7 @@ V2 模块明显比 V1 复杂，因此必须遵守以下顺序：
 ```text
 1. 先跑 v1，确认数据、缓存、adapter、eval 正常。
 2. 再跑 v2_research，但只用 50 条样本。
-3. 看 loss_curve.jsonl：loss_coral_align / modality temperature / effective negatives 是否稳定。
+3. 看 loss_curve.jsonl：loss_masked_dcl / loss_batch_whitening / loss_coral_query_target / modality temperature / effective negatives 是否稳定。
 4. 再跑 ablation，而不是直接宣称 full_v2 有效。
 5. 通过 50 -> 200 -> 1k 三档后，才考虑 LoRA。
 ```
@@ -881,8 +927,8 @@ Modality temperature: 必须检查 tau 是否始终在 clamp 范围内。
 Quantile curriculum: 需要观察 effective_negative_count 是否过低。
 Hardness weighting: 默认关闭，后续如果打开，需要调 tau_hard 和 clip 上下界。
 Multi-positive: 只允许 train，必须依赖 source/pair disjoint split。
-CORAL: 权重必须小，重点检查 clean_audio_delta 是否下降。
-Batch whitening: 默认关闭，后续作为单独实验项。
+CORAL: 默认开启，权重必须小，重点检查 clean_audio_delta 是否下降。
+Batch whitening: 默认开启，必须检查 loss 是否稳定、是否出现 NaN。
 Memory bank: 容易增加显存和过时 negative 风险，warmup 后再启用。
 False-negative filtering: 阈值要通过 diagnostic split 调。
 LoRA: 必须在 frozen adapter + projection head 稳定后再开。

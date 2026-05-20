@@ -28,6 +28,9 @@ QUERY_TEMPLATE = "Edit the reference video so that: {edit_text}"
 DEFAULT_NEGATIVE_TYPES = ("reference_negative", "visual_hard", "audio_hard", "asr_hard")
 DEFAULT_LOSS_OPTIONS = {
     "training_profile": "v1",
+    "contrastive_objective": "ce",
+    "dcl_debias_prob": 0.1,
+    "dcl_negative_floor": 1e-6,
     "disable_delta_loss": False,
     "disable_hard_negatives": False,
     "disable_reference_negative": False,
@@ -244,6 +247,9 @@ def train_adapter(
     seed: int = 13,
     device: str = "cuda",
     training_profile: str = "v1",
+    contrastive_objective: str | None = None,
+    dcl_debias_prob: float = 0.1,
+    dcl_negative_floor: float = 1e-6,
     disable_delta_loss: bool = False,
     disable_hard_negatives: bool = False,
     disable_reference_negative: bool = False,
@@ -318,6 +324,8 @@ def train_adapter(
     )
     loss_options = _loss_options(
         training_profile=training_profile,
+        dcl_debias_prob=dcl_debias_prob,
+        dcl_negative_floor=dcl_negative_floor,
         disable_delta_loss=disable_delta_loss,
         disable_hard_negatives=disable_hard_negatives,
         disable_reference_negative=disable_reference_negative,
@@ -340,6 +348,11 @@ def train_adapter(
         easy_negative_weight=easy_negative_weight,
         **profile_options,
     )
+    if contrastive_objective is not None:
+        loss_options["contrastive_objective"] = str(contrastive_objective)
+    if str(training_profile or "v1") in {"v2_research", "e5_omni_recipe"}:
+        loss_options["disable_local_segments"] = True
+        loss_options["disable_global_local_mix"] = True
     max_steps = max(1, steps)
     warmup_steps = int(max_steps * max(0.0, warmup_ratio))
     memory_bank: list[Any] = []
@@ -620,7 +633,7 @@ def run_ablations(
     cache_root = Path(cache_dir)
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
-    if training_profile == "v2_research":
+    if training_profile in {"v2_research", "e5_omni_recipe"}:
         configs = [
             ("full_v2", {"training_profile": "v2_research"}),
             ("without_modality_temperature", {"training_profile": "v2_research", "enable_modality_temperature": False}),
@@ -757,7 +770,10 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--learning-rate", type=float, default=1e-3)
     train.add_argument("--seed", type=int, default=13)
     train.add_argument("--device", default="cuda")
-    train.add_argument("--training-profile", choices=("v1", "v2_research"), default="v1")
+    train.add_argument("--training-profile", choices=("v1", "v2_research", "e5_omni_recipe"), default="v1")
+    train.add_argument("--contrastive-objective", choices=("ce", "masked_dcl"))
+    train.add_argument("--dcl-debias-prob", type=float, default=0.1)
+    train.add_argument("--dcl-negative-floor", type=float, default=1e-6)
     train.add_argument("--disable-delta-loss", action="store_true")
     train.add_argument("--disable-hard-negatives", action="store_true")
     train.add_argument("--disable-reference-negative", action="store_true")
@@ -831,7 +847,7 @@ def build_parser() -> argparse.ArgumentParser:
     ablate.add_argument("--learning-rate", type=float, default=1e-3)
     ablate.add_argument("--device", default="cuda")
     ablate.add_argument("--seed", type=int, default=13)
-    ablate.add_argument("--training-profile", choices=("v1", "v2_research"), default="v2_research")
+    ablate.add_argument("--training-profile", choices=("v1", "v2_research", "e5_omni_recipe"), default="v2_research")
 
     lora = subparsers.add_parser("train-lora")
     lora.add_argument("--output-dir", required=True)
@@ -880,6 +896,9 @@ def main() -> None:
             seed=args.seed,
             device=args.device,
             training_profile=args.training_profile,
+            contrastive_objective=args.contrastive_objective,
+            dcl_debias_prob=args.dcl_debias_prob,
+            dcl_negative_floor=args.dcl_negative_floor,
             disable_delta_loss=args.disable_delta_loss,
             disable_hard_negatives=args.disable_hard_negatives,
             disable_reference_negative=args.disable_reference_negative,
@@ -1140,7 +1159,8 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
     retrieval_scores = _mix_torch_scores(global_logits, local_logits, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"]))
     retrieval_logits = retrieval_scores / tau_cvr
     labels = torch.arange(retrieval_logits.shape[0], device=retrieval_logits.device)
-    loss_cvr = torch.nn.functional.cross_entropy(retrieval_logits, labels)
+    loss_ce = torch.nn.functional.cross_entropy(retrieval_logits, labels)
+    loss_cvr = loss_ce
     loss_multi_positive = _multi_positive_loss(torch, retrieval_logits, batch.get("positive_group_index")) if options["enable_multi_positive"] else torch.zeros((), device=retrieval_logits.device)
     pos_global = torch.sum(query * target, dim=-1)
     ref_global = torch.sum(query * reference, dim=-1)
@@ -1184,6 +1204,17 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
         easy_weight=float(options["easy_negative_weight"]),
     )
     effective_mask = base_negative_weight * quantile_weight
+    loss_masked_dcl, dcl_effective_negative_count = _masked_dcl_loss(
+        torch,
+        retrieval_logits,
+        neg_metric,
+        effective_mask,
+        batch.get("positive_group_index"),
+        debias_prob=float(options["dcl_debias_prob"]),
+        negative_floor=float(options["dcl_negative_floor"]),
+    )
+    if str(options.get("contrastive_objective", "ce")) == "masked_dcl":
+        loss_cvr = loss_masked_dcl
     margins = torch.relu(0.2 - pos_metric[:, None] + neg_metric)
     hn = margins * effective_mask
     loss_hn = hn.sum() / effective_mask.sum().clamp_min(1.0)
@@ -1270,17 +1301,14 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
     doc_for_align = torch.cat([target, reference], dim=0)
     edit_for_align = torch.cat([edit, old_audio, new_audio], dim=0)
     delta_vec = target - reference
-    loss_coral_doc_edit = _coral_loss(torch, doc_for_align, edit_for_align) if options["enable_coral_align"] else zero
+    loss_coral_query_target = _coral_loss(torch, query, target) if options["enable_coral_align"] else zero
+    loss_coral_doc_edit = _coral_loss(torch, doc_for_align, edit_for_align) if options["enable_coral_align"] and str(options.get("training_profile")) not in {"v2_research", "e5_omni_recipe"} else zero
     loss_coral_delta_edit = _coral_loss(torch, delta_vec, edit) if options["enable_coral_align"] else zero
-    loss_coral_align = loss_coral_doc_edit + loss_coral_delta_edit
+    if str(options.get("training_profile")) in {"v2_research", "e5_omni_recipe"}:
+        loss_coral_delta_edit = zero
+    loss_coral_align = loss_coral_query_target + loss_coral_doc_edit + loss_coral_delta_edit
     loss_batch_whitening = (
-        (
-            _batch_whitening_loss(torch, query)
-            + _batch_whitening_loss(torch, doc_for_align)
-            + _batch_whitening_loss(torch, edit_for_align)
-            + _batch_whitening_loss(torch, delta_vec)
-        )
-        / 4.0
+        _batch_whitening_loss(torch, torch.cat([query, target], dim=0))
         if options["enable_batch_whitening"]
         else zero
     )
@@ -1305,6 +1333,8 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
     return {
         "total": total,
         "loss_cvr": loss_cvr,
+        "loss_ce": loss_ce,
+        "loss_masked_dcl": loss_masked_dcl,
         "loss_delta": loss_delta,
         "loss_hn": loss_hn,
         "loss_ref": loss_ref,
@@ -1313,11 +1343,12 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
         "loss_hw_hn": loss_hw_hn,
         "loss_multi_positive": loss_multi_positive,
         "loss_coral_align": loss_coral_align,
+        "loss_coral_query_target": loss_coral_query_target,
         "loss_coral_doc_edit": loss_coral_doc_edit,
         "loss_coral_delta_edit": loss_coral_delta_edit,
         "loss_batch_whitening": loss_batch_whitening,
         "loss_memory_bank": loss_memory_bank,
-        "effective_negative_count": effective_mask.sum().detach() if "effective_mask" in locals() else zero,
+        "effective_negative_count": dcl_effective_negative_count.detach() if str(options.get("contrastive_objective", "ce")) == "masked_dcl" else effective_mask.sum().detach(),
         "kept_negative_count": kept_negative_count.detach(),
         "masked_easy_negative_count": masked_easy_negative_count.detach(),
         "suspected_false_negative_count": suspected_false_negative_count.detach(),
@@ -1333,8 +1364,14 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
         "effective_temperature_cvr": tau_cvr.detach(),
         "effective_temperature_delta": tau_audio_text.detach(),
         "cov_doc_trace": _covariance_trace(torch, doc_for_align).detach(),
+        "cov_query_trace": _covariance_trace(torch, query).detach(),
+        "cov_target_trace": _covariance_trace(torch, target).detach(),
+        "cov_query_target_gap": torch.abs(_covariance_trace(torch, query) - _covariance_trace(torch, target)).detach(),
         "cov_edit_trace": _covariance_trace(torch, edit_for_align).detach(),
         "cov_delta_trace": _covariance_trace(torch, delta_vec).detach(),
+        "whitening_mean_norm": torch.cat([query, target], dim=0).mean(dim=0).norm().detach(),
+        "whitening_cov_gap": _batch_whitening_loss(torch, torch.cat([query, target], dim=0)).detach(),
+        "whitening_enabled": torch.as_tensor(1.0 if options["enable_batch_whitening"] else 0.0, device=retrieval_logits.device),
     }
 
 
@@ -1344,6 +1381,7 @@ def _loss_options(**overrides: Any) -> dict[str, Any]:
     options["local_mix_weight"] = min(1.0, max(0.0, float(options["local_mix_weight"])))
     options["curriculum_stage"] = max(1, min(4, int(options["curriculum_stage"])))
     options["training_profile"] = str(options.get("training_profile") or "v1")
+    options["contrastive_objective"] = str(options.get("contrastive_objective") or "ce")
     for key in (
         "lambda_delta",
         "lambda_hn",
@@ -1355,6 +1393,8 @@ def _loss_options(**overrides: Any) -> dict[str, Any]:
         "lambda_coral_align",
         "lambda_memory_bank",
         "lambda_batch_whitening",
+        "dcl_debias_prob",
+        "dcl_negative_floor",
         "hardness_temperature",
         "hardness_weight_min",
         "hardness_weight_max",
@@ -1391,10 +1431,11 @@ def _training_profile_options(
     lambda_batch_whitening: float | None,
 ) -> dict[str, Any]:
     profile = str(training_profile or "v1")
-    if profile not in {"v1", "v2_research"}:
+    if profile not in {"v1", "v2_research", "e5_omni_recipe"}:
         raise ValueError(f"unknown training profile: {training_profile}")
-    enabled = profile == "v2_research"
+    enabled = profile in {"v2_research", "e5_omni_recipe"}
     result = {
+        "contrastive_objective": "masked_dcl" if enabled else "ce",
         "enable_hardness_weighting": False if enable_hardness_weighting is None else enable_hardness_weighting,
         "enable_multi_positive": False if enable_multi_positive is None else enable_multi_positive,
         "enable_coral_align": enabled if enable_coral_align is None else enable_coral_align,
@@ -1402,12 +1443,17 @@ def _training_profile_options(
         "enable_false_negative_filtering": enabled if enable_false_negative_filtering is None else enable_false_negative_filtering,
         "enable_modality_temperature": enabled if enable_modality_temperature is None else enable_modality_temperature,
         "enable_quantile_negative_curriculum": enabled if enable_quantile_negative_curriculum is None else enable_quantile_negative_curriculum,
-        "enable_batch_whitening": False if enable_batch_whitening is None else enable_batch_whitening,
+        "enable_batch_whitening": enabled if enable_batch_whitening is None else enable_batch_whitening,
+        "lambda_delta": 0.0 if enabled else DEFAULT_LOSS_OPTIONS["lambda_delta"],
+        "lambda_hn": 0.0 if enabled else DEFAULT_LOSS_OPTIONS["lambda_hn"],
+        "lambda_ref": 0.0 if enabled else DEFAULT_LOSS_OPTIONS["lambda_ref"],
+        "lambda_edit_type": 0.0 if enabled else DEFAULT_LOSS_OPTIONS["lambda_edit_type"],
+        "lambda_visual": 0.0 if enabled else DEFAULT_LOSS_OPTIONS["lambda_visual"],
         "lambda_hw_hn": 0.0,
         "lambda_multi_positive": 0.0,
         "lambda_coral_align": 0.05 if enabled else 0.0,
         "lambda_memory_bank": 0.0,
-        "lambda_batch_whitening": 0.0,
+        "lambda_batch_whitening": 0.01 if enabled else 0.0,
     }
     if lambda_hw_hn is not None:
         result["lambda_hw_hn"] = lambda_hw_hn
@@ -1450,6 +1496,58 @@ def _multi_positive_loss(torch: Any, logits: Any, positive_group_index: Any | No
     numerator = torch.logsumexp(masked, dim=1)
     denominator = torch.logsumexp(logits, dim=1)
     return (denominator - numerator).mean()
+
+
+def _masked_dcl_loss(
+    torch: Any,
+    retrieval_logits: Any,
+    explicit_negative_logits: Any,
+    explicit_negative_weight: Any,
+    positive_group_index: Any | None,
+    *,
+    debias_prob: float,
+    negative_floor: float,
+) -> tuple[Any, Any]:
+    if retrieval_logits.shape[0] == 0:
+        zero = torch.zeros((), device=retrieval_logits.device)
+        return zero, zero
+    debias_prob = min(0.95, max(0.0, float(debias_prob)))
+    negative_floor = max(1e-12, float(negative_floor))
+    batch_size = int(retrieval_logits.shape[0])
+    losses: list[Any] = []
+    effective_counts: list[Any] = []
+    for row_index in range(batch_size):
+        pos_logit = retrieval_logits[row_index, row_index]
+        row_logits: list[Any] = []
+        row_weights: list[Any] = []
+        for col_index in range(batch_size):
+            if col_index == row_index:
+                continue
+            weight = torch.ones((), dtype=retrieval_logits.dtype, device=retrieval_logits.device)
+            if positive_group_index is not None:
+                same_group = positive_group_index[row_index] == positive_group_index[col_index]
+                weight = torch.where(same_group, torch.zeros_like(weight), weight)
+            row_logits.append(retrieval_logits[row_index, col_index])
+            row_weights.append(weight)
+        for neg_index in range(explicit_negative_logits.shape[1]):
+            row_logits.append(explicit_negative_logits[row_index, neg_index])
+            row_weights.append(explicit_negative_weight[row_index, neg_index])
+        if not row_logits:
+            losses.append(torch.zeros((), dtype=retrieval_logits.dtype, device=retrieval_logits.device))
+            effective_counts.append(torch.zeros((), dtype=retrieval_logits.dtype, device=retrieval_logits.device))
+            continue
+        neg_logits = torch.stack(row_logits)
+        neg_weights = torch.stack(row_weights).to(dtype=retrieval_logits.dtype, device=retrieval_logits.device)
+        max_logit = torch.maximum(pos_logit, neg_logits.max())
+        pos_exp = torch.exp(pos_logit - max_logit)
+        neg_sum = (torch.exp(neg_logits - max_logit) * neg_weights).sum()
+        effective_count = neg_weights.sum()
+        if debias_prob > 0.0:
+            neg_sum = (neg_sum - debias_prob * effective_count * pos_exp) / max(1e-6, 1.0 - debias_prob)
+        neg_sum = torch.clamp(neg_sum, min=negative_floor)
+        losses.append(-(torch.log(pos_exp) - torch.log(pos_exp + neg_sum)))
+        effective_counts.append(effective_count)
+    return torch.stack(losses).mean(), torch.stack(effective_counts).mean()
 
 
 def _modality_tau(torch: Any, model: Any, modalities: tuple[str, ...], options: dict[str, Any], *, fallback: float, device: Any) -> Any:
