@@ -5,6 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import numpy as np
+
 from app.e5_audio_delta_train import (
     DEFAULT_DATA_ROOT,
     build_splits,
@@ -234,6 +236,45 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertTrue((root / "eval" / "adapter_geometry.json").exists())
             score_row = json.loads((root / "eval" / "per_query_scores.jsonl").read_text(encoding="utf-8").splitlines()[0])
             self.assertIsNotNone(score_row["reference_gallery_index"])
+
+    def test_cache_embeddings_can_reuse_old_cache_for_reference_negative_gallery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            old_records = root / "old_records"
+            old_records.mkdir()
+            rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            self._write_jsonl(old_records / "train.jsonl", rows)
+            self._write_jsonl(old_records / "eval.jsonl", rows)
+            self._write_jsonl(
+                old_records / "eval_gallery.jsonl",
+                [
+                    {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "raw_source_id": "source_a", "kind": "positive", "source_payload": {"sample_id": "sample_1"}},
+                    {"gallery_id": "distractor::1", "video": "/tmp/distractor_001.mp4", "raw_source_id": "other_source_1", "kind": "distractor"},
+                ],
+            )
+            old_cache = root / "old_cache"
+            cache_embeddings(records_dir=old_records, output_dir=old_cache, mock_encoder=True, local_segments=0)
+
+            new_records = root / "new_records"
+            new_records.mkdir()
+            self._write_jsonl(new_records / "train.jsonl", rows)
+            self._write_jsonl(new_records / "eval.jsonl", rows)
+            self._write_jsonl(
+                new_records / "eval_gallery.jsonl",
+                [
+                    {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "raw_source_id": "source_a", "kind": "positive", "source_payload": {"sample_id": "sample_1"}},
+                    {"gallery_id": "reference::sample_1", "video": "/tmp/sample_1_ref.mp4", "raw_source_id": "source_a", "kind": "reference_negative", "source_payload": {"sample_id": "sample_1"}},
+                    {"gallery_id": "distractor::1", "video": "/tmp/distractor_001.mp4", "raw_source_id": "other_source_1", "kind": "distractor"},
+                ],
+            )
+
+            summary = cache_embeddings(records_dir=new_records, output_dir=root / "new_cache", reuse_cache_from=old_cache)
+            data = dict(np.load(str(root / "new_cache" / "eval_embeddings.npz")))
+
+            self.assertEqual(str(old_cache), summary["reuse_cache_from"])
+            self.assertEqual([3, 32], list(data["gallery"].shape))
+            self.assertEqual([0], list(data["positive_gallery_index"]))
+            self.assertEqual([1], list(data["reference_gallery_index"]))
 
     def test_real_encoder_inputs_wrap_video_paths_as_multimodal_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

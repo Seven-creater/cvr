@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import random
+import shutil
 import subprocess
 import time
 from typing import Any, Callable
@@ -203,6 +204,7 @@ def cache_embeddings(
     *,
     records_dir: str | Path,
     output_dir: str | Path,
+    reuse_cache_from: str | Path | None = None,
     encoder: Any | None = None,
     mock_encoder: bool = False,
     e5_model: str = DEFAULT_E5_MODEL,
@@ -221,6 +223,13 @@ def cache_embeddings(
     records_root = Path(records_dir)
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+    if reuse_cache_from:
+        return _cache_embeddings_from_reuse(
+            records_root=records_root,
+            output_root=output_root,
+            reuse_cache_root=Path(reuse_cache_from),
+            progress=progress,
+        )
     if encoder is None:
         if mock_encoder:
             encoder = DeterministicEncoder()
@@ -965,6 +974,7 @@ def build_parser() -> argparse.ArgumentParser:
     cache = subparsers.add_parser("cache-embeddings")
     cache.add_argument("--records-dir", required=True)
     cache.add_argument("--output-dir", required=True)
+    cache.add_argument("--reuse-cache-from", help="Reuse an existing embedding cache and rebuild records/gallery indices without re-encoding media.")
     cache.add_argument("--mock-encoder", action="store_true")
     cache.add_argument("--e5-model", default=DEFAULT_E5_MODEL)
     cache.add_argument("--device", default="cuda")
@@ -1102,6 +1112,7 @@ def main() -> None:
         result = cache_embeddings(
             records_dir=args.records_dir,
             output_dir=args.output_dir,
+            reuse_cache_from=args.reuse_cache_from,
             mock_encoder=args.mock_encoder,
             e5_model=args.e5_model,
             device=args.device,
@@ -1414,6 +1425,199 @@ def _cache_split_embeddings(
     }
     (output_root / f"{split}_summary.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return metadata
+
+
+def _cache_embeddings_from_reuse(
+    *,
+    records_root: Path,
+    output_root: Path,
+    reuse_cache_root: Path,
+    progress: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    if not reuse_cache_root.exists():
+        raise FileNotFoundError(f"reuse cache not found: {reuse_cache_root}")
+    new_train_records = load_audio_delta_records(records_root / "train.jsonl")
+    new_eval_records = load_audio_delta_records(records_root / "eval.jsonl")
+    new_gallery_items = load_eval_gallery_items(records_root / "eval_gallery.jsonl") if (records_root / "eval_gallery.jsonl").exists() else []
+    if not new_train_records or not new_eval_records:
+        raise ValueError("records_dir must contain non-empty train.jsonl and eval.jsonl for cache reuse")
+
+    train_npz_path = reuse_cache_root / "train_embeddings.npz"
+    eval_npz_path = reuse_cache_root / "eval_embeddings.npz"
+    if not train_npz_path.exists() or not eval_npz_path.exists():
+        raise FileNotFoundError("reuse cache must contain train_embeddings.npz and eval_embeddings.npz")
+
+    old_train_records = load_audio_delta_records(reuse_cache_root / "train_records.jsonl")
+    old_eval_records = load_audio_delta_records(reuse_cache_root / "eval_records.jsonl")
+    old_train = np.load(str(train_npz_path), allow_pickle=False)
+    old_eval = np.load(str(eval_npz_path), allow_pickle=False)
+    train_indices = _reuse_record_indices(old_train_records, new_train_records)
+    eval_indices = _reuse_record_indices(old_eval_records, new_eval_records)
+
+    train_stacked = _select_reused_record_arrays(old_train, train_indices)
+    eval_stacked = _select_reused_record_arrays(old_eval, eval_indices)
+    if new_gallery_items:
+        old_gallery_items = load_eval_gallery_items(reuse_cache_root / "eval_gallery.jsonl")
+        gallery_vectors, positive_index, reference_index = _reused_gallery_arrays(old_eval, old_gallery_items, new_eval_records, new_gallery_items, eval_indices)
+        eval_stacked["gallery"] = gallery_vectors
+        eval_stacked["positive_gallery_index"] = np.asarray(positive_index, dtype=np.int64)
+        if reference_index:
+            eval_stacked["reference_gallery_index"] = np.asarray(reference_index, dtype=np.int64)
+        _write_jsonl(output_root / "eval_gallery.jsonl", [asdict(item) for item in new_gallery_items])
+
+    np.savez(str(output_root / "train_embeddings.npz"), **train_stacked)
+    np.savez(str(output_root / "eval_embeddings.npz"), **eval_stacked)
+    _write_jsonl(output_root / "train_records.jsonl", [asdict(record) for record in new_train_records])
+    _write_jsonl(output_root / "eval_records.jsonl", [asdict(record) for record in new_eval_records])
+    _copy_if_exists(reuse_cache_root / "train_manifest.jsonl", output_root / "train_manifest.jsonl")
+    _copy_if_exists(reuse_cache_root / "eval_manifest.jsonl", output_root / "eval_manifest.jsonl")
+
+    train_summary = _cache_metadata_from_arrays("train", output_root, train_stacked, old_summary_path=reuse_cache_root / "train_summary.json")
+    eval_summary = _cache_metadata_from_arrays("eval", output_root, eval_stacked, old_summary_path=reuse_cache_root / "eval_summary.json")
+    runtime = _read_json(reuse_cache_root / "summary.json").get("runtime", {"model_path": "reused-cache"})
+    summary = {
+        "records_dir": str(records_root),
+        "output_dir": str(output_root),
+        "reuse_cache_from": str(reuse_cache_root),
+        "runtime": runtime,
+        "local_segments": int(train_summary.get("local_segments") or 0),
+        "local_segment_mode": train_summary.get("local_segment_mode"),
+        "train": train_summary,
+        "eval": eval_summary,
+    }
+    (output_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _emit(progress, f"[e5-audio-delta] reused embedding cache from {reuse_cache_root}")
+    return summary
+
+
+def _reuse_record_key(record: AudioDeltaRecord) -> str:
+    return f"{record.sample_id}|{record.reference_video}|{record.target_video}|{record.edit_text}"
+
+
+def _reuse_record_indices(old_records: list[AudioDeltaRecord], new_records: list[AudioDeltaRecord]) -> list[int]:
+    lookup = {_reuse_record_key(record): index for index, record in enumerate(old_records)}
+    indices: list[int] = []
+    missing: list[str] = []
+    for record in new_records:
+        key = _reuse_record_key(record)
+        if key not in lookup:
+            missing.append(record.sample_id)
+            continue
+        indices.append(int(lookup[key]))
+    if missing:
+        raise ValueError(f"reuse cache missing embeddings for records: {missing[:5]}")
+    return indices
+
+
+def _select_reused_record_arrays(old_npz: Any, indices: list[int]) -> dict[str, np.ndarray]:
+    selected: dict[str, np.ndarray] = {}
+    record_keys = {
+        "query",
+        "target",
+        "reference",
+        "edit",
+        "old_audio",
+        "new_audio",
+        "negative",
+        "target_segments",
+        "reference_segments",
+        "negative_segments",
+        "negative_mask",
+        "negative_effective_mask",
+        "positive_group_index",
+    }
+    for key in old_npz.files:
+        value = old_npz[key]
+        if key in record_keys and value.shape and value.shape[0] >= max(indices, default=-1) + 1:
+            selected[key] = value[np.asarray(indices, dtype=np.int64)]
+    return selected
+
+
+def _reused_gallery_arrays(
+    old_eval: Any,
+    old_gallery_items: list[EvalGalleryItem],
+    new_eval_records: list[AudioDeltaRecord],
+    new_gallery_items: list[EvalGalleryItem],
+    eval_indices: list[int],
+) -> tuple[np.ndarray, list[int], list[int]]:
+    old_gallery_vectors = old_eval["gallery"] if "gallery" in old_eval.files else old_eval["target"]
+    gallery_by_media = {
+        _media_key(item.video): old_gallery_vectors[index]
+        for index, item in enumerate(old_gallery_items)
+        if index < old_gallery_vectors.shape[0]
+    }
+    target_by_sample = {record.sample_id: old_eval["target"][old_index] for record, old_index in zip(new_eval_records, eval_indices)}
+    reference_by_sample = {record.sample_id: old_eval["reference"][old_index] for record, old_index in zip(new_eval_records, eval_indices)}
+    target_by_media = {_media_key(record.target_video): old_eval["target"][old_index] for record, old_index in zip(new_eval_records, eval_indices)}
+    reference_by_media = {_media_key(record.reference_video): old_eval["reference"][old_index] for record, old_index in zip(new_eval_records, eval_indices)}
+    gallery_vectors: list[np.ndarray] = []
+    positive_index: list[int] = []
+    reference_index: list[int] = []
+    for item in new_gallery_items:
+        sample_id = _gallery_item_sample_id(item)
+        media_key = _media_key(item.video)
+        if item.kind == "positive" and sample_id in target_by_sample:
+            vector = target_by_sample[sample_id]
+        elif item.kind == "reference_negative" and sample_id in reference_by_sample:
+            vector = reference_by_sample[sample_id]
+        elif media_key in gallery_by_media:
+            vector = gallery_by_media[media_key]
+        elif media_key in target_by_media:
+            vector = target_by_media[media_key]
+        elif media_key in reference_by_media:
+            vector = reference_by_media[media_key]
+        else:
+            raise ValueError(f"reuse cache missing gallery embedding for {item.gallery_id}: {item.video}")
+        if item.kind == "positive":
+            positive_index.append(len(gallery_vectors))
+        if item.kind == "reference_negative":
+            reference_index.append(len(gallery_vectors))
+        gallery_vectors.append(np.asarray(vector, dtype=np.float32))
+    if len(positive_index) != len(new_eval_records):
+        raise ValueError("reused gallery must contain one positive item per eval record")
+    if reference_index and len(reference_index) != len(new_eval_records):
+        raise ValueError("reused gallery reference negatives must match eval record count")
+    return np.vstack(gallery_vectors).astype(np.float32), positive_index, reference_index
+
+
+def _gallery_item_sample_id(item: EvalGalleryItem) -> str:
+    payload = item.source_payload
+    nested = payload.get("source_payload") if isinstance(payload.get("source_payload"), dict) else {}
+    return str(payload.get("sample_id") or nested.get("sample_id") or "").strip()
+
+
+def _cache_metadata_from_arrays(split: str, output_root: Path, stacked: dict[str, np.ndarray], *, old_summary_path: Path) -> dict[str, Any]:
+    old_summary = _read_json(old_summary_path)
+    metadata = {
+        "split": split,
+        "record_count": int(stacked["query"].shape[0]),
+        "embedding_shape": list(stacked["query"].shape),
+        "negative_shape": list(stacked["negative"].shape) if "negative" in stacked else None,
+        "gallery_shape": list(stacked["gallery"].shape) if "gallery" in stacked else None,
+        "local_segments": int(old_summary.get("local_segments") or 0),
+        "local_segment_mode": old_summary.get("local_segment_mode"),
+        "local_segment_cache_dir": old_summary.get("local_segment_cache_dir"),
+        "target_segments_shape": list(stacked["target_segments"].shape) if "target_segments" in stacked else None,
+        "gallery_segments_shape": list(stacked["gallery_segments"].shape) if "gallery_segments" in stacked else None,
+        "runtime": old_summary.get("runtime", {"model_path": "reused-cache"}),
+        "embeddings_path": str(output_root / f"{split}_embeddings.npz"),
+        "records_path": str(output_root / f"{split}_records.jsonl"),
+        "manifest_path": str(output_root / f"{split}_manifest.jsonl"),
+        "reused": True,
+    }
+    (output_root / f"{split}_summary.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return metadata
+
+
+def _copy_if_exists(source: Path, target: Path) -> None:
+    if source.exists():
+        shutil.copyfile(source, target)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list[AudioDeltaRecord], options: dict[str, Any]) -> dict[str, Any]:
