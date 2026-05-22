@@ -501,7 +501,9 @@ def eval_adapter(
     base_scores = _score_matrix_np(data["query"], gallery)
     base = _recall_from_scores(base_scores, topk=topk, positive_index=positive_gallery_index)
     has_local = _has_local_segments(data) and not disable_local_segments
-    gallery_segments = data["gallery_segments"] if "gallery_segments" in data else data["target_segments"]
+    gallery_segments = None
+    if has_local:
+        gallery_segments = data["gallery_segments"] if "gallery_segments" in data else data["target_segments"]
     base_local_scores = _local_score_matrix_np(data["query"], gallery_segments) if has_local else None
     base_mix_scores = _mix_scores(base_scores, base_local_scores, local_mix_weight, disable_global_local_mix)
     dim = int(data["query"].shape[1])

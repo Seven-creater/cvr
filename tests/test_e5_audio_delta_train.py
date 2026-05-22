@@ -169,6 +169,30 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertIn("R@1", eval_summary["rows"][0])
             self.assertTrue((root / "eval" / "comparison.md").read_text(encoding="utf-8").count("gallery_count"))
 
+    def test_eval_large_gallery_without_local_segments_does_not_require_segment_arrays(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            eval_rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            self._write_jsonl(records_dir / "train.jsonl", eval_rows)
+            self._write_jsonl(records_dir / "eval.jsonl", eval_rows)
+            self._write_jsonl(
+                records_dir / "eval_gallery.jsonl",
+                [
+                    {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "raw_source_id": "source_a", "kind": "positive"},
+                    {"gallery_id": "distractor::1", "video": "/tmp/distractor_001.mp4", "raw_source_id": "other_source_1", "kind": "distractor"},
+                ],
+            )
+
+            cache_embeddings(records_dir=records_dir, output_dir=root / "embedding_cache", mock_encoder=True, local_segments=0)
+            train_adapter(cache_dir=root / "embedding_cache", output_dir=root / "adapter", steps=1, batch_size=1, device="cpu")
+            eval_summary = eval_adapter(cache_dir=root / "embedding_cache", adapter_dir=root / "adapter", output_dir=root / "eval", device="cpu")
+
+            self.assertFalse(eval_summary["has_local_segments"])
+            self.assertEqual(2, eval_summary["gallery_count"])
+            self.assertIn("R@1", eval_summary["rows"][0])
+
     def test_real_encoder_inputs_wrap_video_paths_as_multimodal_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
