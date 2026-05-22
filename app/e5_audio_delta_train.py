@@ -1551,8 +1551,8 @@ def _reused_gallery_arrays(
     target_by_media = {_media_key(record.target_video): old_eval["target"][old_index] for record, old_index in zip(new_eval_records, eval_indices)}
     reference_by_media = {_media_key(record.reference_video): old_eval["reference"][old_index] for record, old_index in zip(new_eval_records, eval_indices)}
     gallery_vectors: list[np.ndarray] = []
-    positive_index: list[int] = []
-    reference_index: list[int] = []
+    positive_by_sample: dict[str, int] = {}
+    reference_by_sample_index: dict[str, int] = {}
     for item in new_gallery_items:
         sample_id = _gallery_item_sample_id(item)
         media_key = _media_key(item.video)
@@ -1569,10 +1569,20 @@ def _reused_gallery_arrays(
         else:
             raise ValueError(f"reuse cache missing gallery embedding for {item.gallery_id}: {item.video}")
         if item.kind == "positive":
-            positive_index.append(len(gallery_vectors))
+            positive_by_sample[sample_id] = len(gallery_vectors)
         if item.kind == "reference_negative":
-            reference_index.append(len(gallery_vectors))
+            reference_by_sample_index[sample_id] = len(gallery_vectors)
         gallery_vectors.append(np.asarray(vector, dtype=np.float32))
+    positive_index = [
+        int(positive_by_sample[record.sample_id])
+        for record in new_eval_records
+        if record.sample_id in positive_by_sample
+    ]
+    reference_index = [
+        int(reference_by_sample_index[record.sample_id])
+        for record in new_eval_records
+        if record.sample_id in reference_by_sample_index
+    ]
     if len(positive_index) != len(new_eval_records):
         raise ValueError("reused gallery must contain one positive item per eval record")
     if reference_index and len(reference_index) != len(new_eval_records):

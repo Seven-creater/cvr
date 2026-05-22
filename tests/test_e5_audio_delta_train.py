@@ -242,13 +242,17 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             root = Path(temp_dir)
             old_records = root / "old_records"
             old_records.mkdir()
-            rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            rows = [
+                self._record("sample_1", source="source_a", pair="pair_a"),
+                self._record("sample_2", source="source_b", pair="pair_b"),
+            ]
             self._write_jsonl(old_records / "train.jsonl", rows)
             self._write_jsonl(old_records / "eval.jsonl", rows)
             self._write_jsonl(
                 old_records / "eval_gallery.jsonl",
                 [
                     {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "raw_source_id": "source_a", "kind": "positive", "source_payload": {"sample_id": "sample_1"}},
+                    {"gallery_id": "positive::sample_2", "video": "/tmp/sample_2_tgt.mp4", "raw_source_id": "source_b", "kind": "positive", "source_payload": {"sample_id": "sample_2"}},
                     {"gallery_id": "distractor::1", "video": "/tmp/distractor_001.mp4", "raw_source_id": "other_source_1", "kind": "distractor"},
                 ],
             )
@@ -262,9 +266,11 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self._write_jsonl(
                 new_records / "eval_gallery.jsonl",
                 [
-                    {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "raw_source_id": "source_a", "kind": "positive", "source_payload": {"sample_id": "sample_1"}},
+                    {"gallery_id": "positive::sample_2", "video": "/tmp/sample_2_tgt.mp4", "raw_source_id": "source_b", "kind": "positive", "source_payload": {"sample_id": "sample_2"}},
                     {"gallery_id": "reference::sample_1", "video": "/tmp/sample_1_ref.mp4", "raw_source_id": "source_a", "kind": "reference_negative", "source_payload": {"sample_id": "sample_1"}},
+                    {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "raw_source_id": "source_a", "kind": "positive", "source_payload": {"sample_id": "sample_1"}},
                     {"gallery_id": "distractor::1", "video": "/tmp/distractor_001.mp4", "raw_source_id": "other_source_1", "kind": "distractor"},
+                    {"gallery_id": "reference::sample_2", "video": "/tmp/sample_2_ref.mp4", "raw_source_id": "source_b", "kind": "reference_negative", "source_payload": {"sample_id": "sample_2"}},
                 ],
             )
 
@@ -272,9 +278,9 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             data = dict(np.load(str(root / "new_cache" / "eval_embeddings.npz")))
 
             self.assertEqual(str(old_cache), summary["reuse_cache_from"])
-            self.assertEqual([3, 32], list(data["gallery"].shape))
-            self.assertEqual([0], list(data["positive_gallery_index"]))
-            self.assertEqual([1], list(data["reference_gallery_index"]))
+            self.assertEqual([5, 32], list(data["gallery"].shape))
+            self.assertEqual([2, 0], list(data["positive_gallery_index"]))
+            self.assertEqual([1, 4], list(data["reference_gallery_index"]))
 
     def test_real_encoder_inputs_wrap_video_paths_as_multimodal_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
