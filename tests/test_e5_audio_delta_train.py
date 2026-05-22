@@ -60,6 +60,47 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertEqual("the mayor's remarks", records[0].new_audio)
             self.assertEqual("reference_negative", records[0].hard_negatives[0]["type"])
 
+    def test_prepare_can_build_eval_gallery_with_random_distractors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_run = root / "dataset_run"
+            dataset_run.mkdir()
+            self._write_jsonl(
+                dataset_run / "b_main_audio_cvr_triplets.jsonl",
+                [
+                    self._record("main_1", source="source_a", pair="pair_a"),
+                    self._record("main_2", source="source_b", pair="pair_b", split_tier="extended"),
+                ],
+            )
+            self._write_jsonl(
+                dataset_run / "single_source_annotations.jsonl",
+                [
+                    {"clip_id": "d1", "output_path": "/tmp/distractor_001.mp4", "source_clip_id": "other_source_1"},
+                    {"clip_id": "d2", "output_path": "/tmp/distractor_002.mp4", "source_clip_id": "other_source_2"},
+                    {"clip_id": "d3", "output_path": "/tmp/distractor_003.mp4", "source_clip_id": "other_source_3"},
+                    {"clip_id": "d4", "output_path": "/tmp/distractor_004.mp4", "source_clip_id": "other_source_4"},
+                ],
+            )
+
+            summary = prepare_records(
+                run_root=dataset_run,
+                output_dir=root / "records",
+                max_train_records=2,
+                max_eval_records=1,
+                eval_gallery_size=4,
+                distractor_seed=7,
+            )
+
+            gallery = [json.loads(line) for line in (root / "records" / "eval_gallery.jsonl").read_text(encoding="utf-8").splitlines()]
+            positive_indices = json.loads((root / "records" / "eval_gallery_positive_indices.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(4, summary["eval_gallery"]["gallery_count"])
+            self.assertEqual(1, summary["eval_gallery"]["positive_count"])
+            self.assertEqual(3, summary["eval_gallery"]["distractor_count"])
+            self.assertEqual(4, len(gallery))
+            self.assertEqual(1, len(positive_indices["positive_gallery_index"]))
+            self.assertTrue(any(item["kind"] == "distractor" for item in gallery))
+
     def test_cache_train_and_eval_adapter_smoke_with_mock_encoder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -101,6 +142,32 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertTrue(eval_summary["has_local_segments"])
             self.assertIn("by_audio_delta_type", eval_summary)
             self.assertTrue((root / "eval" / "comparison.md").exists())
+
+    def test_eval_can_score_small_query_set_against_larger_gallery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            eval_rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            self._write_jsonl(records_dir / "train.jsonl", eval_rows)
+            self._write_jsonl(records_dir / "eval.jsonl", eval_rows)
+            self._write_jsonl(
+                records_dir / "eval_gallery.jsonl",
+                [
+                    {"gallery_id": "distractor::1", "video": "/tmp/distractor_001.mp4", "raw_source_id": "other_source_1", "kind": "distractor"},
+                    {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "raw_source_id": "source_a", "kind": "positive"},
+                    {"gallery_id": "distractor::2", "video": "/tmp/distractor_002.mp4", "raw_source_id": "other_source_2", "kind": "distractor"},
+                ],
+            )
+
+            cache_embeddings(records_dir=records_dir, output_dir=root / "embedding_cache", mock_encoder=True, local_segments=1)
+            train_adapter(cache_dir=root / "embedding_cache", output_dir=root / "adapter", steps=1, batch_size=1, device="cpu")
+            eval_summary = eval_adapter(cache_dir=root / "embedding_cache", adapter_dir=root / "adapter", output_dir=root / "eval", device="cpu")
+
+            self.assertEqual(1, eval_summary["eval_count"])
+            self.assertEqual(3, eval_summary["gallery_count"])
+            self.assertIn("R@1", eval_summary["rows"][0])
+            self.assertTrue((root / "eval" / "comparison.md").read_text(encoding="utf-8").count("gallery_count"))
 
     def test_real_encoder_inputs_wrap_video_paths_as_multimodal_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

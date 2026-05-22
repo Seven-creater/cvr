@@ -938,6 +938,53 @@ LoRA: 必须在 frozen adapter + projection head 稳定后再开。
 
 ---
 
+## 8.1 Pilot 评估扩池说明
+
+为了在小样本阶段更真实地观察 recipe 训练后的检索变化，当前训练脚本支持一个 **pilot-only** 的评估扩池模式：
+
+```text
+query 数量保持很小
+eval gallery 额外加入随机 distractor videos
+典型用法：30 个 query + 约 970 个随机干扰视频
+```
+
+这个模式的目的只有一个：避免在 `32 query / 32 target` 这类极小候选池上得到虚高指标，便于早期判断 recipe 是否真的有泛化趋势。
+
+必须注意：
+
+```text
+这不是最终 benchmark protocol
+这不是全量数据集完成后的正式 test 设计
+这不是训练集构造逻辑
+```
+
+推荐把它理解成：
+
+```text
+small-data pilot evaluation mode
+```
+
+当前实现约束：
+
+```text
+1. 只在 prepare/eval 阶段扩 gallery，不改 train records。
+2. distractor 默认从当前 run 的 annotation / segment manifest 中随机抽。
+3. 自动避开 train/eval 已使用的 reference/target/hard negative。
+4. 默认尽量避开当前 eval query 的 raw_source_id，减少同源泄漏。
+5. summary.json 中会显式写出:
+   eval_protocol = pilot_only_random_distractor_gallery
+```
+
+等全量 Audio-CVR 数据集完成后，应回到正式 split 与正式 gallery：
+
+```text
+train / val / test_main / diagnostic
+真实大 gallery
+不再依赖随机 distractor 扩池
+```
+
+---
+
 ## 9. 已经解决的工程难点
 
 ### 6.1 CUDA / PyTorch / Transformers 兼容

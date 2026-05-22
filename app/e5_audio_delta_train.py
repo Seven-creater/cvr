@@ -104,6 +104,15 @@ class AudioDeltaRecord:
     source_payload: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class EvalGalleryItem:
+    gallery_id: str
+    video: str
+    raw_source_id: str
+    kind: str
+    source_payload: dict[str, Any]
+
+
 class DeterministicEncoder:
     def __init__(self, dim: int = 32) -> None:
         self.dim = dim
@@ -121,6 +130,9 @@ def prepare_records(
     eval_paths: list[str | Path] | None = None,
     max_train_records: int = 8,
     max_eval_records: int = 4,
+    eval_gallery_size: int = 0,
+    distractor_pool_path: str | Path | None = None,
+    distractor_seed: int = 13,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     dataset_root = Path(run_root)
@@ -142,6 +154,22 @@ def prepare_records(
     eval_path = output_root / "eval.jsonl"
     _write_jsonl(train_path, [asdict(record) for record in train_records])
     _write_jsonl(eval_path, [asdict(record) for record in eval_records])
+    gallery_summary: dict[str, Any] | None = None
+    gallery_path = output_root / "eval_gallery.jsonl"
+    if eval_gallery_size and eval_gallery_size > 0:
+        gallery_items, positive_indices, gallery_summary = _build_eval_gallery(
+            dataset_root=dataset_root,
+            train_records=train_records,
+            eval_records=eval_records,
+            total_gallery_size=eval_gallery_size,
+            distractor_pool_path=distractor_pool_path,
+            seed=distractor_seed,
+        )
+        _write_jsonl(gallery_path, [asdict(item) for item in gallery_items])
+        (output_root / "eval_gallery_positive_indices.json").write_text(
+            json.dumps({"positive_gallery_index": positive_indices}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     summary = {
         "dataset_run_root": str(dataset_root),
         "output_dir": str(output_root),
@@ -149,7 +177,14 @@ def prepare_records(
         "eval_count": len(eval_records),
         "train_paths": [str(path) for path in train_paths],
         "eval_paths": [str(path) for path in eval_paths],
-        "outputs": {"train": str(train_path), "eval": str(eval_path)},
+        "outputs": {
+            "train": str(train_path),
+            "eval": str(eval_path),
+            "eval_gallery": str(gallery_path) if gallery_summary else None,
+            "eval_gallery_positive_indices": str(output_root / "eval_gallery_positive_indices.json") if gallery_summary else None,
+        },
+        "eval_gallery": gallery_summary,
+        "eval_protocol": "pilot_only_random_distractor_gallery" if gallery_summary else "default_aligned_eval_targets",
     }
     (output_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     _emit(progress, f"[e5-audio-delta] prepared train={len(train_records)} eval={len(eval_records)} records_dir={output_root}")
@@ -198,6 +233,7 @@ def cache_embeddings(
         runtime_info = {"model_path": "injected-encoder", "video_audio_mode": VIDEO_AUDIO_MODE_ON}
     train_records = load_audio_delta_records(records_root / "train.jsonl")
     eval_records = load_audio_delta_records(records_root / "eval.jsonl")
+    eval_gallery = load_eval_gallery_items(records_root / "eval_gallery.jsonl") if (records_root / "eval_gallery.jsonl").exists() else []
     train_summary = _cache_split_embeddings(
         records=train_records,
         split="train",
@@ -213,6 +249,7 @@ def cache_embeddings(
     eval_summary = _cache_split_embeddings(
         records=eval_records,
         split="eval",
+        eval_gallery=eval_gallery,
         encoder=encoder,
         output_root=output_root,
         runtime_info=runtime_info,
@@ -458,11 +495,14 @@ def eval_adapter(
     records = load_audio_delta_records(cache_root / "eval_records.jsonl")
     if not records:
         raise ValueError("eval records are empty")
+    positive_gallery_index = np.asarray(data["positive_gallery_index"], dtype=np.int64) if "positive_gallery_index" in data else np.arange(len(records), dtype=np.int64)
     topk = _normalize_topk(topk)
-    base_scores = _score_matrix_np(data["query"], data["target"])
-    base = _recall_from_scores(base_scores, topk=topk)
+    gallery = data["gallery"] if "gallery" in data else data["target"]
+    base_scores = _score_matrix_np(data["query"], gallery)
+    base = _recall_from_scores(base_scores, topk=topk, positive_index=positive_gallery_index)
     has_local = _has_local_segments(data) and not disable_local_segments
-    base_local_scores = _local_score_matrix_np(data["query"], data["target_segments"]) if has_local else None
+    gallery_segments = data["gallery_segments"] if "gallery_segments" in data else data["target_segments"]
+    base_local_scores = _local_score_matrix_np(data["query"], gallery_segments) if has_local else None
     base_mix_scores = _mix_scores(base_scores, base_local_scores, local_mix_weight, disable_global_local_mix)
     dim = int(data["query"].shape[1])
     device_obj = _torch_device(torch, device)
@@ -472,7 +512,7 @@ def eval_adapter(
     model.eval()
     with torch.no_grad():
         query = torch.as_tensor(data["query"], dtype=torch.float32, device=device_obj)
-        target = torch.as_tensor(data["target"], dtype=torch.float32, device=device_obj)
+        target = torch.as_tensor(gallery, dtype=torch.float32, device=device_obj)
         reference = torch.as_tensor(data["reference"], dtype=torch.float32, device=device_obj)
         negative = torch.as_tensor(data["negative"], dtype=torch.float32, device=device_obj)
         adapted_query = model.query(query)
@@ -484,10 +524,10 @@ def eval_adapter(
         adapted_negative_scores = torch.einsum("bd,bnd->bn", adapted_query, adapted_negative).detach().cpu().numpy()
         adapted_local_scores = None
         if has_local:
-            target_segments = model.doc(torch.as_tensor(data["target_segments"], dtype=torch.float32, device=device_obj))
+            target_segments = model.doc(torch.as_tensor(gallery_segments, dtype=torch.float32, device=device_obj))
             adapted_local_scores = _local_score_matrix_torch(torch, adapted_query, target_segments).detach().cpu().numpy()
         adapted_mix_scores = _mix_scores(adapted_scores, adapted_local_scores, local_mix_weight, disable_global_local_mix)
-    adapted = _recall_from_scores(adapted_scores, topk=topk)
+    adapted = _recall_from_scores(adapted_scores, topk=topk, positive_index=positive_gallery_index)
     rows = [
         {"method": "base_e5_global", **base},
         {"method": "audio_delta_adapter_global", **adapted},
@@ -495,10 +535,10 @@ def eval_adapter(
     if has_local and base_local_scores is not None and adapted_local_scores is not None:
         rows.extend(
             [
-                {"method": "base_e5_local", **_recall_from_scores(base_local_scores, topk=topk)},
-                {"method": "base_e5_global_local", **_recall_from_scores(base_mix_scores, topk=topk)},
-                {"method": "audio_delta_adapter_local", **_recall_from_scores(adapted_local_scores, topk=topk)},
-                {"method": "audio_delta_adapter_global_local", **_recall_from_scores(adapted_mix_scores, topk=topk)},
+                {"method": "base_e5_local", **_recall_from_scores(base_local_scores, topk=topk, positive_index=positive_gallery_index)},
+                {"method": "base_e5_global_local", **_recall_from_scores(base_mix_scores, topk=topk, positive_index=positive_gallery_index)},
+                {"method": "audio_delta_adapter_local", **_recall_from_scores(adapted_local_scores, topk=topk, positive_index=positive_gallery_index)},
+                {"method": "audio_delta_adapter_global_local", **_recall_from_scores(adapted_mix_scores, topk=topk, positive_index=positive_gallery_index)},
             ]
         )
     comparison = {
@@ -506,16 +546,17 @@ def eval_adapter(
         "adapter_dir": str(adapter_root),
         "output_dir": str(output_root),
         "eval_count": len(records),
+        "gallery_count": int(gallery.shape[0]),
         "topk": list(topk),
         "has_local_segments": has_local,
         "local_mix_weight": local_mix_weight,
         "rows": rows,
-        "by_split_tier": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "split_tier", topk),
-        "by_audio_delta_type": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "audio_delta_type", topk),
-        "by_shortcut_label": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "shortcut_label", topk),
+        "by_split_tier": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "split_tier", topk, positive_index=positive_gallery_index),
+        "by_audio_delta_type": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "audio_delta_type", topk, positive_index=positive_gallery_index),
+        "by_shortcut_label": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "shortcut_label", topk, positive_index=positive_gallery_index),
         "reference_rank_summary": _reference_rank_summary(adapted_mix_scores, adapted_reference_scores),
-        "delta_score_distribution": _delta_score_distribution(adapted_mix_scores, adapted_reference_scores),
-        "hard_negative_recall_by_type": _hard_negative_recall_by_type(adapted_scores, adapted_negative_scores, records),
+        "delta_score_distribution": _delta_score_distribution(adapted_mix_scores, adapted_reference_scores, positive_index=positive_gallery_index),
+        "hard_negative_recall_by_type": _hard_negative_recall_by_type(adapted_scores, adapted_negative_scores, records, positive_index=positive_gallery_index),
         "diagnostics_path": str(output_root / "diagnostics.json"),
     }
     (output_root / "summary.json").write_text(json.dumps(comparison, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -734,6 +775,33 @@ def load_audio_delta_records(path: str | Path) -> list[AudioDeltaRecord]:
     return [_record_from_payload(json.loads(line), line_number=index) for index, line in enumerate(root.read_text(encoding="utf-8-sig").splitlines(), start=1) if line.strip()]
 
 
+def load_eval_gallery_items(path: str | Path) -> list[EvalGalleryItem]:
+    root = Path(path)
+    if not root.exists():
+        return []
+    items: list[EvalGalleryItem] = []
+    for index, line in enumerate(root.read_text(encoding="utf-8-sig").splitlines(), start=1):
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        if not isinstance(payload, dict):
+            raise ValueError(f"{root} line {index}: expected a JSON object")
+        gallery_id = _first_text(payload, "gallery_id", default=f"gallery_{index:06d}")
+        video = _first_text(payload, "video", "target_video", "output_path", "path")
+        if not video:
+            raise ValueError(f"{root} line {index}: missing gallery video path")
+        items.append(
+            EvalGalleryItem(
+                gallery_id=gallery_id,
+                video=video,
+                raw_source_id=_first_text(payload, "raw_source_id", "source_clip_id", "group_id", default=gallery_id),
+                kind=_first_text(payload, "kind", default="distractor"),
+                source_payload=dict(payload),
+            )
+        )
+    return items
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a small AudioDelta adapter on e5-omni embeddings")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -745,6 +813,17 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--eval-path", action="append", default=[])
     prepare.add_argument("--max-train-records", type=int, default=8)
     prepare.add_argument("--max-eval-records", type=int, default=4)
+    prepare.add_argument(
+        "--eval-gallery-size",
+        type=int,
+        default=0,
+        help="Pilot-only: expand eval gallery with random distractors for small-data recipe checks; not for final full-dataset benchmark.",
+    )
+    prepare.add_argument(
+        "--distractor-pool-path",
+        help="Pilot-only distractor pool JSONL. Defaults to the current run's annotation/segment manifests.",
+    )
+    prepare.add_argument("--distractor-seed", type=int, default=13)
 
     cache = subparsers.add_parser("cache-embeddings")
     cache.add_argument("--records-dir", required=True)
@@ -866,6 +945,9 @@ def main() -> None:
             eval_paths=args.eval_path or None,
             max_train_records=args.max_train_records,
             max_eval_records=args.max_eval_records,
+            eval_gallery_size=args.eval_gallery_size,
+            distractor_pool_path=args.distractor_pool_path,
+            distractor_seed=args.distractor_seed,
             progress=progress,
         )
     elif args.command == "cache-embeddings":
@@ -982,6 +1064,7 @@ def _cache_split_embeddings(
     *,
     records: list[AudioDeltaRecord],
     split: str,
+    eval_gallery: list[EvalGalleryItem] | None = None,
     encoder: Any,
     output_root: Path,
     runtime_info: dict[str, Any],
@@ -1005,6 +1088,7 @@ def _cache_split_embeddings(
     negative_effective_mask: list[list[float]] = []
     negative_types: list[list[str]] = []
     positive_group_ids: list[str] = []
+    gallery_items = list(eval_gallery or [])
     manifest_path = output_root / f"{split}_manifest.jsonl"
     with manifest_path.open("w", encoding="utf-8") as manifest_file:
         for index, record in enumerate(records, start=1):
@@ -1110,6 +1194,38 @@ def _cache_split_embeddings(
     stacked["negative_mask"] = np.asarray(negative_mask, dtype=np.float32)
     stacked["negative_effective_mask"] = np.asarray(negative_effective_mask, dtype=np.float32)
     stacked["positive_group_index"] = np.asarray(_positive_group_indices(positive_group_ids), dtype=np.int64)
+    if split == "eval" and gallery_items:
+        gallery_vectors: list[np.ndarray] = []
+        gallery_segment_rows: list[np.ndarray] = []
+        positive_gallery_index: list[int] = []
+        gallery_records_path = output_root / "eval_gallery.jsonl"
+        _write_jsonl(gallery_records_path, [asdict(item) for item in gallery_items])
+        gallery_lookup = {item.gallery_id: index for index, item in enumerate(gallery_items)}
+        for item_index, item in enumerate(gallery_items, start=1):
+            _emit(progress, f"[e5-audio-delta] cache eval gallery {item_index}/{len(gallery_items)} gallery_id={item.gallery_id}")
+            gallery_vectors.append(_encode_one(encoder, _video_payload(item.video)))
+            if local_segments > 0:
+                gallery_segment_rows.append(
+                    _encode_many(
+                        encoder,
+                        _local_video_payloads(
+                            item.video,
+                            role=item.kind or "gallery",
+                            count=local_segments,
+                            mode=local_segment_mode,
+                            cache_root=local_cache_root,
+                            sample_id=item.gallery_id,
+                            segment_overlap=segment_overlap,
+                        ),
+                    )
+                )
+        for record in records:
+            gallery_id = f"positive::{record.sample_id}"
+            positive_gallery_index.append(int(gallery_lookup[gallery_id]))
+        stacked["gallery"] = np.vstack(gallery_vectors).astype(np.float32)
+        stacked["positive_gallery_index"] = np.asarray(positive_gallery_index, dtype=np.int64)
+        if local_segments > 0:
+            stacked["gallery_segments"] = np.asarray(gallery_segment_rows, dtype=np.float32)
     npz_path = output_root / f"{split}_embeddings.npz"
     np.savez(str(npz_path), **stacked)
     records_path = output_root / f"{split}_records.jsonl"
@@ -1119,10 +1235,12 @@ def _cache_split_embeddings(
         "record_count": len(records),
         "embedding_shape": list(stacked["query"].shape),
         "negative_shape": list(stacked["negative"].shape),
+        "gallery_shape": list(stacked["gallery"].shape) if "gallery" in stacked else None,
         "local_segments": local_segments,
         "local_segment_mode": local_segment_mode,
         "local_segment_cache_dir": str(local_cache_root) if local_segments > 0 and local_segment_mode == "ffmpeg" else None,
         "target_segments_shape": list(stacked["target_segments"].shape) if "target_segments" in stacked else None,
+        "gallery_segments_shape": list(stacked["gallery_segments"].shape) if "gallery_segments" in stacked else None,
         "runtime": runtime_info,
         "embeddings_path": str(npz_path),
         "records_path": str(records_path),
@@ -1783,6 +1901,7 @@ def _grouped_recall_summary(
     records: list[AudioDeltaRecord],
     field_name: str,
     topk: tuple[int, ...],
+    positive_index: np.ndarray,
 ) -> dict[str, Any]:
     groups: dict[str, list[int]] = defaultdict(list)
     for index, record in enumerate(records):
@@ -1792,8 +1911,8 @@ def _grouped_recall_summary(
         idx = np.asarray(indices, dtype=np.int64)
         result[group] = {
             "count": int(len(indices)),
-            "base_e5": _recall_from_scores(base_scores[np.ix_(idx, idx)], topk=topk),
-            "audio_delta_adapter": _recall_from_scores(adapted_scores[np.ix_(idx, idx)], topk=topk),
+            "base_e5": _recall_from_scores(base_scores[idx], topk=topk, positive_index=positive_index[idx]),
+            "audio_delta_adapter": _recall_from_scores(adapted_scores[idx], topk=topk, positive_index=positive_index[idx]),
         }
     return result
 
@@ -1806,8 +1925,8 @@ def _reference_rank_summary(scores: np.ndarray, reference_scores: np.ndarray) ->
     return _rank_list_summary(ranks)
 
 
-def _delta_score_distribution(scores: np.ndarray, reference_scores: np.ndarray) -> dict[str, Any]:
-    deltas = np.asarray([scores[index, index] - reference_scores[index] for index in range(scores.shape[0])], dtype=np.float32)
+def _delta_score_distribution(scores: np.ndarray, reference_scores: np.ndarray, *, positive_index: np.ndarray) -> dict[str, Any]:
+    deltas = np.asarray([scores[index, int(positive_index[index])] - reference_scores[index] for index in range(scores.shape[0])], dtype=np.float32)
     if deltas.size == 0:
         return {"count": 0}
     return {
@@ -1820,10 +1939,10 @@ def _delta_score_distribution(scores: np.ndarray, reference_scores: np.ndarray) 
     }
 
 
-def _hard_negative_recall_by_type(scores: np.ndarray, negative_scores: np.ndarray, records: list[AudioDeltaRecord]) -> dict[str, Any]:
+def _hard_negative_recall_by_type(scores: np.ndarray, negative_scores: np.ndarray, records: list[AudioDeltaRecord], *, positive_index: np.ndarray) -> dict[str, Any]:
     buckets: dict[str, list[bool]] = defaultdict(list)
     for row_index, record in enumerate(records):
-        positive = float(scores[row_index, row_index])
+        positive = float(scores[row_index, int(positive_index[row_index])])
         negatives = _ordered_negatives(record)
         for neg_index, negative in enumerate(negatives[: negative_scores.shape[1]]):
             neg_type = str(negative.get("type", "unknown") or "unknown")
@@ -1977,6 +2096,103 @@ def _default_eval_paths(root: Path) -> list[Path]:
     return [path for path in candidates if path.exists()]
 
 
+def _default_distractor_pool_paths(root: Path) -> list[Path]:
+    candidates = [
+        root / "single_source_annotations.jsonl",
+        root / "extracted_single_source_clips.jsonl",
+    ]
+    return [path for path in candidates if path.exists()]
+
+
+def _build_eval_gallery(
+    *,
+    dataset_root: Path,
+    train_records: list[AudioDeltaRecord],
+    eval_records: list[AudioDeltaRecord],
+    total_gallery_size: int,
+    distractor_pool_path: str | Path | None,
+    seed: int,
+) -> tuple[list[EvalGalleryItem], list[int], dict[str, Any]]:
+    desired_total = max(len(eval_records), int(total_gallery_size))
+    positives: list[EvalGalleryItem] = [
+        EvalGalleryItem(
+            gallery_id=f"positive::{record.sample_id}",
+            video=record.target_video,
+            raw_source_id=str(record.raw_source_id or record.sample_id),
+            kind="positive",
+            source_payload={"sample_id": record.sample_id, "pair_group_id": record.pair_group_id},
+        )
+        for record in eval_records
+    ]
+    forbidden_video_keys = {
+        _media_key(record.reference_video)
+        for record in (*train_records, *eval_records)
+    }
+    forbidden_video_keys.update(_media_key(record.target_video) for record in (*train_records, *eval_records))
+    for record in (*train_records, *eval_records):
+        for negative in record.hard_negatives:
+            video = str(negative.get("video") or "").strip()
+            if video:
+                forbidden_video_keys.add(_media_key(video))
+    forbidden_source_ids = {str(record.raw_source_id or "").strip() for record in eval_records if str(record.raw_source_id or "").strip()}
+    pool_paths = [Path(distractor_pool_path)] if distractor_pool_path else _default_distractor_pool_paths(dataset_root)
+    distractor_candidates = _load_distractor_pool(pool_paths)
+    distractors: list[EvalGalleryItem] = []
+    seen_gallery_keys = {_media_key(item.video) for item in positives}
+    rng = random.Random(seed)
+    rng.shuffle(distractor_candidates)
+    for payload in distractor_candidates:
+        video = _first_text(payload, "output_path", "video", "video_path", "clip_path", "path", "target_video", "reference_video")
+        if not video:
+            continue
+        video_key = _media_key(video)
+        source_id = _first_text(payload, "raw_source_id", "source_clip_id", "group_id", default="")
+        if video_key in forbidden_video_keys or video_key in seen_gallery_keys:
+            continue
+        if source_id and source_id in forbidden_source_ids:
+            continue
+        gallery_id = _first_text(payload, "clip_id", "gallery_id", default=f"distractor_{len(distractors):06d}")
+        distractors.append(
+            EvalGalleryItem(
+                gallery_id=f"distractor::{gallery_id}",
+                video=video,
+                raw_source_id=source_id or gallery_id,
+                kind="distractor",
+                source_payload=dict(payload),
+            )
+        )
+        seen_gallery_keys.add(video_key)
+        if len(positives) + len(distractors) >= desired_total:
+            break
+    gallery_items = positives + distractors
+    rng.shuffle(gallery_items)
+    gallery_lookup = {item.gallery_id: index for index, item in enumerate(gallery_items)}
+    positive_indices = [int(gallery_lookup[f"positive::{record.sample_id}"]) for record in eval_records]
+    summary = {
+        "gallery_count": len(gallery_items),
+        "positive_count": len(positives),
+        "distractor_count": len(distractors),
+        "requested_gallery_size": int(total_gallery_size),
+        "pool_paths": [str(path) for path in pool_paths],
+        "forbidden_source_count": len(forbidden_source_ids),
+    }
+    return gallery_items, positive_indices, summary
+
+
+def _load_distractor_pool(paths: list[Path]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                rows.append(payload)
+    return rows
+
+
 def _load_records_from_paths(paths: list[str | Path]) -> list[AudioDeltaRecord]:
     records: list[AudioDeltaRecord] = []
     for path in paths:
@@ -1994,6 +2210,10 @@ def _dedupe_records(records: list[AudioDeltaRecord]) -> list[AudioDeltaRecord]:
         seen.add(key)
         result.append(record)
     return result
+
+
+def _media_key(raw_path: str) -> str:
+    return _resolve_media_path(raw_path).replace("\\", "/").lower()
 
 
 def _is_diagnostic_record(record: AudioDeltaRecord) -> bool:
@@ -2246,14 +2466,19 @@ def _normalize_edit_type(raw: str, edit_text: str) -> str:
     return value or "replace"
 
 
-def _recall_from_scores(scores: np.ndarray, *, topk: tuple[int, ...]) -> dict[str, float]:
+def _recall_from_scores(scores: np.ndarray, *, topk: tuple[int, ...], positive_index: np.ndarray | None = None) -> dict[str, float]:
     total = scores.shape[0]
+    if positive_index is None:
+        positive_index = np.arange(total, dtype=np.int64)
+    positive_index = np.asarray(positive_index, dtype=np.int64)
+    if positive_index.shape[0] != total:
+        raise ValueError("positive_index size must match query count")
     order = np.argsort(-scores, axis=1, kind="stable")
     result: dict[str, float] = {}
     for k in topk:
         hits = 0
         for index in range(total):
-            if index in order[index, : min(k, scores.shape[1])]:
+            if int(positive_index[index]) in order[index, : min(k, scores.shape[1])]:
                 hits += 1
         result[f"R@{k}"] = round(hits / max(1, total), 4)
     return result
@@ -2264,6 +2489,7 @@ def _comparison_markdown(comparison: dict[str, Any]) -> str:
         "# AudioDelta-E5 Smoke Evaluation",
         "",
         f"- eval_count: `{comparison['eval_count']}`",
+        f"- gallery_count: `{comparison.get('gallery_count', comparison['eval_count'])}`",
         "",
         "| Method | R@1 | R@5 | R@10 |",
         "|---|---:|---:|---:|",
