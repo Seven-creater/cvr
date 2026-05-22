@@ -131,6 +131,7 @@ def prepare_records(
     max_train_records: int = 8,
     max_eval_records: int = 4,
     eval_gallery_size: int = 0,
+    eval_gallery_include_reference_negative: bool = False,
     distractor_pool_path: str | Path | None = None,
     distractor_seed: int = 13,
     progress: Callable[[str], None] | None = None,
@@ -162,12 +163,13 @@ def prepare_records(
             train_records=train_records,
             eval_records=eval_records,
             total_gallery_size=eval_gallery_size,
+            include_reference_negative=eval_gallery_include_reference_negative,
             distractor_pool_path=distractor_pool_path,
             seed=distractor_seed,
         )
         _write_jsonl(gallery_path, [asdict(item) for item in gallery_items])
         (output_root / "eval_gallery_positive_indices.json").write_text(
-            json.dumps({"positive_gallery_index": positive_indices}, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(positive_indices, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
     summary = {
@@ -184,7 +186,13 @@ def prepare_records(
             "eval_gallery_positive_indices": str(output_root / "eval_gallery_positive_indices.json") if gallery_summary else None,
         },
         "eval_gallery": gallery_summary,
-        "eval_protocol": "pilot_only_random_distractor_gallery" if gallery_summary else "default_aligned_eval_targets",
+        "eval_protocol": (
+            "pilot_only_random_distractor_gallery_with_reference_negative"
+            if gallery_summary and eval_gallery_include_reference_negative
+            else "pilot_only_random_distractor_gallery"
+            if gallery_summary
+            else "default_aligned_eval_targets"
+        ),
     }
     (output_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     _emit(progress, f"[e5-audio-delta] prepared train={len(train_records)} eval={len(eval_records)} records_dir={output_root}")
@@ -481,6 +489,7 @@ def eval_adapter(
     adapter_dir: str | Path,
     output_dir: str | Path,
     topk: tuple[int, ...] = (1, 5, 10),
+    save_topk: int = 0,
     device: str = "cuda",
     disable_local_segments: bool = False,
     disable_global_local_mix: bool = False,
@@ -496,10 +505,17 @@ def eval_adapter(
     if not records:
         raise ValueError("eval records are empty")
     positive_gallery_index = np.asarray(data["positive_gallery_index"], dtype=np.int64) if "positive_gallery_index" in data else np.arange(len(records), dtype=np.int64)
+    reference_gallery_index = np.asarray(data["reference_gallery_index"], dtype=np.int64) if "reference_gallery_index" in data else None
     topk = _normalize_topk(topk)
     gallery = data["gallery"] if "gallery" in data else data["target"]
+    gallery_items = _eval_gallery_items_for_output(cache_root, records, gallery.shape[0])
     base_scores = _score_matrix_np(data["query"], gallery)
     base = _recall_from_scores(base_scores, topk=topk, positive_index=positive_gallery_index)
+    base_reference_scores = (
+        _index_scores(base_scores, reference_gallery_index)
+        if reference_gallery_index is not None
+        else np.diag(_score_matrix_np(data["query"], data["reference"]))
+    )
     has_local = _has_local_segments(data) and not disable_local_segments
     gallery_segments = None
     if has_local:
@@ -515,10 +531,12 @@ def eval_adapter(
     with torch.no_grad():
         query = torch.as_tensor(data["query"], dtype=torch.float32, device=device_obj)
         target = torch.as_tensor(gallery, dtype=torch.float32, device=device_obj)
+        paired_target = torch.as_tensor(data["target"], dtype=torch.float32, device=device_obj)
         reference = torch.as_tensor(data["reference"], dtype=torch.float32, device=device_obj)
         negative = torch.as_tensor(data["negative"], dtype=torch.float32, device=device_obj)
         adapted_query = model.query(query)
         adapted_target = model.doc(target)
+        adapted_paired_target = model.doc(paired_target)
         adapted_reference = model.doc(reference)
         adapted_negative = model.doc(negative)
         adapted_scores = (adapted_query @ adapted_target.T).detach().cpu().numpy()
@@ -529,6 +547,8 @@ def eval_adapter(
             target_segments = model.doc(torch.as_tensor(gallery_segments, dtype=torch.float32, device=device_obj))
             adapted_local_scores = _local_score_matrix_torch(torch, adapted_query, target_segments).detach().cpu().numpy()
         adapted_mix_scores = _mix_scores(adapted_scores, adapted_local_scores, local_mix_weight, disable_global_local_mix)
+        adapter_geometry = _adapter_geometry_diagnostics(torch, model, query, paired_target, reference, adapted_query, adapted_paired_target, adapted_reference)
+    adapted_reference_mix_scores = _index_scores(adapted_mix_scores, reference_gallery_index) if reference_gallery_index is not None else adapted_reference_scores
     adapted = _recall_from_scores(adapted_scores, topk=topk, positive_index=positive_gallery_index)
     rows = [
         {"method": "base_e5_global", **base},
@@ -552,24 +572,59 @@ def eval_adapter(
         "topk": list(topk),
         "has_local_segments": has_local,
         "local_mix_weight": local_mix_weight,
+        "has_reference_gallery_index": reference_gallery_index is not None,
         "rows": rows,
         "by_split_tier": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "split_tier", topk, positive_index=positive_gallery_index),
         "by_audio_delta_type": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "audio_delta_type", topk, positive_index=positive_gallery_index),
         "by_shortcut_label": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "shortcut_label", topk, positive_index=positive_gallery_index),
-        "reference_rank_summary": _reference_rank_summary(adapted_mix_scores, adapted_reference_scores),
-        "delta_score_distribution": _delta_score_distribution(adapted_mix_scores, adapted_reference_scores, positive_index=positive_gallery_index),
+        "reference_rank_summary": _reference_rank_summary(adapted_mix_scores, adapted_reference_mix_scores),
+        "base_reference_rank_summary": _reference_rank_summary(base_mix_scores, base_reference_scores),
+        "target_beats_reference": {
+            "base_e5": _target_beats_reference_summary(base_mix_scores, base_reference_scores, positive_index=positive_gallery_index),
+            "audio_delta_adapter": _target_beats_reference_summary(adapted_mix_scores, adapted_reference_mix_scores, positive_index=positive_gallery_index),
+        },
+        "delta_score_distribution": _delta_score_distribution(adapted_mix_scores, adapted_reference_mix_scores, positive_index=positive_gallery_index),
+        "base_delta_score_distribution": _delta_score_distribution(base_mix_scores, base_reference_scores, positive_index=positive_gallery_index),
         "hard_negative_recall_by_type": _hard_negative_recall_by_type(adapted_scores, adapted_negative_scores, records, positive_index=positive_gallery_index),
         "diagnostics_path": str(output_root / "diagnostics.json"),
+        "score_diagnostics_path": str(output_root / "score_diagnostics.json"),
+        "adapter_geometry_path": str(output_root / "adapter_geometry.json"),
     }
+    if int(save_topk) > 0:
+        comparison["per_query_topk_path"] = str(output_root / "per_query_topk.jsonl")
+        comparison["per_query_scores_path"] = str(output_root / "per_query_scores.jsonl")
+    score_diagnostics = _score_diagnostics(
+        base_scores=base_mix_scores,
+        adapted_scores=adapted_mix_scores,
+        positive_index=positive_gallery_index,
+        reference_index=reference_gallery_index,
+    )
     (output_root / "summary.json").write_text(json.dumps(comparison, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     diagnostics = {
         "reference_rank_summary": comparison["reference_rank_summary"],
+        "base_reference_rank_summary": comparison["base_reference_rank_summary"],
+        "target_beats_reference": comparison["target_beats_reference"],
         "delta_score_distribution": comparison["delta_score_distribution"],
+        "base_delta_score_distribution": comparison["base_delta_score_distribution"],
         "hard_negative_recall_by_type": comparison["hard_negative_recall_by_type"],
         "by_shortcut_label": comparison["by_shortcut_label"],
         "by_split_tier": comparison["by_split_tier"],
+        "score_diagnostics": score_diagnostics,
     }
     (output_root / "diagnostics.json").write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (output_root / "score_diagnostics.json").write_text(json.dumps(score_diagnostics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (output_root / "adapter_geometry.json").write_text(json.dumps(adapter_geometry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if int(save_topk) > 0:
+        _write_eval_topk_outputs(
+            output_root=output_root,
+            records=records,
+            gallery_items=gallery_items,
+            base_scores=base_mix_scores,
+            adapted_scores=adapted_mix_scores,
+            positive_index=positive_gallery_index,
+            reference_index=reference_gallery_index,
+            save_topk=int(save_topk),
+        )
     (output_root / "comparison.md").write_text(_comparison_markdown(comparison), encoding="utf-8")
     return comparison
 
@@ -770,6 +825,81 @@ def run_ablations(
     return summary
 
 
+def run_stability_grid(
+    *,
+    cache_dir: str | Path,
+    output_dir: str | Path,
+    steps_grid: tuple[int, ...] = (10, 20, 40, 80),
+    learning_rate_grid: tuple[float, ...] = (1e-4, 3e-4, 1e-3),
+    batch_size: int = 8,
+    device: str = "cuda",
+    seed: int = 13,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    cache_root = Path(cache_dir)
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    for steps in steps_grid:
+        for learning_rate in learning_rate_grid:
+            name = f"steps{int(steps)}_lr{str(float(learning_rate)).replace('.', 'p').replace('-', 'm')}"
+            _emit(progress, f"[e5-audio-delta] stability {name} start")
+            adapter_dir = output_root / name / "adapter"
+            eval_dir = output_root / name / "eval"
+            train_summary = train_adapter(
+                cache_dir=cache_root,
+                output_dir=adapter_dir,
+                steps=int(steps),
+                batch_size=batch_size,
+                learning_rate=float(learning_rate),
+                seed=seed,
+                device=device,
+                training_profile="e5_omni_recipe",
+                progress=progress,
+            )
+            eval_summary = eval_adapter(
+                cache_dir=cache_root,
+                adapter_dir=adapter_dir,
+                output_dir=eval_dir,
+                device=device,
+                save_topk=0,
+            )
+            adapted_row = next((row for row in eval_summary["rows"] if row["method"] == "audio_delta_adapter_global_local"), None)
+            if adapted_row is None:
+                adapted_row = next((row for row in eval_summary["rows"] if row["method"] == "audio_delta_adapter_global"), {})
+            base_row = next((row for row in eval_summary["rows"] if row["method"] == "base_e5_global_local"), None)
+            if base_row is None:
+                base_row = next((row for row in eval_summary["rows"] if row["method"] == "base_e5_global"), {})
+            target_beats = eval_summary.get("target_beats_reference") or {}
+            rows.append(
+                {
+                    "name": name,
+                    "steps": int(steps),
+                    "learning_rate": float(learning_rate),
+                    "adapter_dir": str(adapter_dir),
+                    "eval_dir": str(eval_dir),
+                    "base_R@1": base_row.get("R@1"),
+                    "adapter_R@1": adapted_row.get("R@1"),
+                    "adapter_R@5": adapted_row.get("R@5"),
+                    "adapter_R@10": adapted_row.get("R@10"),
+                    "base_target_beats_reference_rate": (target_beats.get("base_e5") or {}).get("target_beats_reference_rate"),
+                    "adapter_target_beats_reference_rate": (target_beats.get("audio_delta_adapter") or {}).get("target_beats_reference_rate"),
+                    "adapter_target_minus_reference_mean": (target_beats.get("audio_delta_adapter") or {}).get("target_minus_reference_mean"),
+                    "loss_final": _last_jsonl_row(adapter_dir / "loss_curve.jsonl").get("loss"),
+                    "train_summary": str(adapter_dir / "train_summary.json"),
+                    "eval_summary": str(eval_dir / "summary.json"),
+                    "score_diagnostics": str(eval_dir / "score_diagnostics.json"),
+                    "adapter_geometry": str(eval_dir / "adapter_geometry.json"),
+                    "steps_completed": train_summary.get("steps"),
+                }
+            )
+            _emit(progress, f"[e5-audio-delta] stability {name} done")
+    summary = {"cache_dir": str(cache_root), "output_dir": str(output_root), "rows": rows}
+    (output_root / "stability_grid_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (output_root / "stability_grid_comparison.md").write_text(_stability_grid_markdown(summary), encoding="utf-8")
+    return summary
+
+
 def load_audio_delta_records(path: str | Path) -> list[AudioDeltaRecord]:
     root = Path(path)
     if not root.exists():
@@ -820,6 +950,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Pilot-only: expand eval gallery with random distractors for small-data recipe checks; not for final full-dataset benchmark.",
+    )
+    prepare.add_argument(
+        "--eval-gallery-include-reference-negative",
+        action="store_true",
+        help="Pilot-only: include each eval reference video in the expanded gallery as a directionality negative.",
     )
     prepare.add_argument(
         "--distractor-pool-path",
@@ -907,6 +1042,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--adapter-dir", required=True)
     evaluate.add_argument("--output-dir", required=True)
     evaluate.add_argument("--topk", default="1,5,10")
+    evaluate.add_argument("--save-topk", type=int, default=0)
     evaluate.add_argument("--device", default="cuda")
     evaluate.add_argument("--disable-local-segments", action="store_true")
     evaluate.add_argument("--disable-global-local-mix", action="store_true")
@@ -930,6 +1066,15 @@ def build_parser() -> argparse.ArgumentParser:
     ablate.add_argument("--seed", type=int, default=13)
     ablate.add_argument("--training-profile", choices=("v1", "v2_research", "e5_omni_recipe"), default="v2_research")
 
+    stability = subparsers.add_parser("stability-grid")
+    stability.add_argument("--cache-dir", required=True)
+    stability.add_argument("--output-dir", required=True)
+    stability.add_argument("--steps-grid", default="10,20,40,80")
+    stability.add_argument("--learning-rate-grid", default="1e-4,3e-4,1e-3")
+    stability.add_argument("--batch-size", type=int, default=8)
+    stability.add_argument("--device", default="cuda")
+    stability.add_argument("--seed", type=int, default=13)
+
     lora = subparsers.add_parser("train-lora")
     lora.add_argument("--output-dir", required=True)
     lora.add_argument("--dry-run", action="store_true", default=True)
@@ -948,6 +1093,7 @@ def main() -> None:
             max_train_records=args.max_train_records,
             max_eval_records=args.max_eval_records,
             eval_gallery_size=args.eval_gallery_size,
+            eval_gallery_include_reference_negative=args.eval_gallery_include_reference_negative,
             distractor_pool_path=args.distractor_pool_path,
             distractor_seed=args.distractor_seed,
             progress=progress,
@@ -1029,6 +1175,7 @@ def main() -> None:
             adapter_dir=args.adapter_dir,
             output_dir=args.output_dir,
             topk=tuple(int(part.strip()) for part in str(args.topk).split(",") if part.strip()),
+            save_topk=args.save_topk,
             device=args.device,
             disable_local_segments=args.disable_local_segments,
             disable_global_local_mix=args.disable_global_local_mix,
@@ -1053,6 +1200,17 @@ def main() -> None:
             device=args.device,
             seed=args.seed,
             training_profile=args.training_profile,
+            progress=progress,
+        )
+    elif args.command == "stability-grid":
+        result = run_stability_grid(
+            cache_dir=args.cache_dir,
+            output_dir=args.output_dir,
+            steps_grid=tuple(int(part.strip()) for part in str(args.steps_grid).split(",") if part.strip()),
+            learning_rate_grid=tuple(float(part.strip()) for part in str(args.learning_rate_grid).split(",") if part.strip()),
+            batch_size=args.batch_size,
+            device=args.device,
+            seed=args.seed,
             progress=progress,
         )
     elif args.command == "train-lora":
@@ -1200,6 +1358,7 @@ def _cache_split_embeddings(
         gallery_vectors: list[np.ndarray] = []
         gallery_segment_rows: list[np.ndarray] = []
         positive_gallery_index: list[int] = []
+        reference_gallery_index: list[int] = []
         gallery_records_path = output_root / "eval_gallery.jsonl"
         _write_jsonl(gallery_records_path, [asdict(item) for item in gallery_items])
         gallery_lookup = {item.gallery_id: index for index, item in enumerate(gallery_items)}
@@ -1224,8 +1383,13 @@ def _cache_split_embeddings(
         for record in records:
             gallery_id = f"positive::{record.sample_id}"
             positive_gallery_index.append(int(gallery_lookup[gallery_id]))
+            reference_id = f"reference::{record.sample_id}"
+            if reference_id in gallery_lookup:
+                reference_gallery_index.append(int(gallery_lookup[reference_id]))
         stacked["gallery"] = np.vstack(gallery_vectors).astype(np.float32)
         stacked["positive_gallery_index"] = np.asarray(positive_gallery_index, dtype=np.int64)
+        if len(reference_gallery_index) == len(records):
+            stacked["reference_gallery_index"] = np.asarray(reference_gallery_index, dtype=np.int64)
         if local_segments > 0:
             stacked["gallery_segments"] = np.asarray(gallery_segment_rows, dtype=np.float32)
     npz_path = output_root / f"{split}_embeddings.npz"
@@ -1955,6 +2119,234 @@ def _hard_negative_recall_by_type(scores: np.ndarray, negative_scores: np.ndarra
     }
 
 
+def _index_scores(scores: np.ndarray, index: np.ndarray | None) -> np.ndarray:
+    if index is None:
+        raise ValueError("index is required")
+    index = np.asarray(index, dtype=np.int64)
+    if index.shape[0] != scores.shape[0]:
+        raise ValueError("index size must match query count")
+    return np.asarray([scores[row, int(index[row])] for row in range(scores.shape[0])], dtype=np.float32)
+
+
+def _target_beats_reference_summary(scores: np.ndarray, reference_scores: np.ndarray, *, positive_index: np.ndarray) -> dict[str, Any]:
+    positive_scores = _index_scores(scores, positive_index)
+    deltas = positive_scores - reference_scores
+    return {
+        "count": int(deltas.size),
+        "target_beats_reference_rate": round(float((deltas > 0).mean()), 4) if deltas.size else 0.0,
+        "target_minus_reference_mean": round(float(deltas.mean()), 6) if deltas.size else 0.0,
+        "target_minus_reference_median": round(float(np.median(deltas)), 6) if deltas.size else 0.0,
+        "target_minus_reference_min": round(float(deltas.min()), 6) if deltas.size else 0.0,
+        "target_minus_reference_max": round(float(deltas.max()), 6) if deltas.size else 0.0,
+    }
+
+
+def _score_diagnostics(
+    *,
+    base_scores: np.ndarray,
+    adapted_scores: np.ndarray,
+    positive_index: np.ndarray,
+    reference_index: np.ndarray | None,
+) -> dict[str, Any]:
+    positive_index = np.asarray(positive_index, dtype=np.int64)
+    base_target = _index_scores(base_scores, positive_index)
+    adapted_target = _index_scores(adapted_scores, positive_index)
+    base_reference = _index_scores(base_scores, reference_index) if reference_index is not None else None
+    adapted_reference = _index_scores(adapted_scores, reference_index) if reference_index is not None else None
+    base_distractor = _non_positive_scores(base_scores, positive_index, reference_index)
+    adapted_distractor = _non_positive_scores(adapted_scores, positive_index, reference_index)
+    return {
+        "base_e5": {
+            "target": _score_distribution(base_target),
+            "reference": _score_distribution(base_reference),
+            "distractor": _score_distribution(base_distractor),
+            "target_minus_reference": _score_distribution(base_target - base_reference) if base_reference is not None else {"count": 0},
+        },
+        "audio_delta_adapter": {
+            "target": _score_distribution(adapted_target),
+            "reference": _score_distribution(adapted_reference),
+            "distractor": _score_distribution(adapted_distractor),
+            "target_minus_reference": _score_distribution(adapted_target - adapted_reference) if adapted_reference is not None else {"count": 0},
+        },
+    }
+
+
+def _non_positive_scores(scores: np.ndarray, positive_index: np.ndarray, reference_index: np.ndarray | None) -> np.ndarray:
+    values: list[float] = []
+    reference_lookup = np.asarray(reference_index, dtype=np.int64) if reference_index is not None else None
+    for row in range(scores.shape[0]):
+        blocked = {int(positive_index[row])}
+        if reference_lookup is not None:
+            blocked.add(int(reference_lookup[row]))
+        values.extend(float(scores[row, col]) for col in range(scores.shape[1]) if col not in blocked)
+    return np.asarray(values, dtype=np.float32)
+
+
+def _score_distribution(values: np.ndarray | None) -> dict[str, Any]:
+    if values is None:
+        return {"count": 0}
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return {"count": 0}
+    return {
+        "count": int(arr.size),
+        "mean": round(float(arr.mean()), 6),
+        "std": round(float(arr.std()), 6),
+        "min": round(float(arr.min()), 6),
+        "median": round(float(np.median(arr)), 6),
+        "max": round(float(arr.max()), 6),
+    }
+
+
+def _eval_gallery_items_for_output(cache_root: Path, records: list[AudioDeltaRecord], gallery_count: int) -> list[EvalGalleryItem]:
+    gallery_path = cache_root / "eval_gallery.jsonl"
+    if gallery_path.exists():
+        items = load_eval_gallery_items(gallery_path)
+        if len(items) == gallery_count:
+            return items
+    return [
+        EvalGalleryItem(
+            gallery_id=f"positive::{record.sample_id}",
+            video=record.target_video,
+            raw_source_id=record.raw_source_id,
+            kind="positive",
+            source_payload={"sample_id": record.sample_id, "audio_delta_type": record.audio_delta_type, "split_tier": record.split_tier},
+        )
+        for record in records
+    ]
+
+
+def _write_eval_topk_outputs(
+    *,
+    output_root: Path,
+    records: list[AudioDeltaRecord],
+    gallery_items: list[EvalGalleryItem],
+    base_scores: np.ndarray,
+    adapted_scores: np.ndarray,
+    positive_index: np.ndarray,
+    reference_index: np.ndarray | None,
+    save_topk: int,
+) -> None:
+    topk = max(1, int(save_topk))
+    reference_lookup = np.asarray(reference_index, dtype=np.int64) if reference_index is not None else None
+    topk_rows: list[dict[str, Any]] = []
+    score_rows: list[dict[str, Any]] = []
+    for row, record in enumerate(records):
+        positive = int(positive_index[row])
+        reference = int(reference_lookup[row]) if reference_lookup is not None else None
+        base_order = np.argsort(-base_scores[row], kind="stable")
+        adapted_order = np.argsort(-adapted_scores[row], kind="stable")
+        topk_rows.append(
+            {
+                "query_index": row,
+                "sample_id": record.sample_id,
+                "edit_text": record.edit_text,
+                "reference_video": record.reference_video,
+                "target_video": record.target_video,
+                "audio_delta_type": record.audio_delta_type,
+                "base_target_rank": _rank_of_index(base_order, positive),
+                "adapter_target_rank": _rank_of_index(adapted_order, positive),
+                "base_topk": [
+                    _topk_gallery_row(rank + 1, int(index), float(base_scores[row, int(index)]), gallery_items, positive, reference)
+                    for rank, index in enumerate(base_order[: min(topk, base_scores.shape[1])])
+                ],
+                "adapter_topk": [
+                    _topk_gallery_row(rank + 1, int(index), float(adapted_scores[row, int(index)]), gallery_items, positive, reference)
+                    for rank, index in enumerate(adapted_order[: min(topk, adapted_scores.shape[1])])
+                ],
+            }
+        )
+        base_reference_score = float(base_scores[row, reference]) if reference is not None else None
+        adapted_reference_score = float(adapted_scores[row, reference]) if reference is not None else None
+        score_rows.append(
+            {
+                "query_index": row,
+                "sample_id": record.sample_id,
+                "edit_text": record.edit_text,
+                "audio_delta_type": record.audio_delta_type,
+                "positive_gallery_index": positive,
+                "reference_gallery_index": reference,
+                "base_target_rank": _rank_of_index(base_order, positive),
+                "adapter_target_rank": _rank_of_index(adapted_order, positive),
+                "base_target_score": float(base_scores[row, positive]),
+                "adapter_target_score": float(adapted_scores[row, positive]),
+                "base_reference_score": base_reference_score,
+                "adapter_reference_score": adapted_reference_score,
+                "base_target_minus_reference": float(base_scores[row, positive] - base_reference_score) if base_reference_score is not None else None,
+                "adapter_target_minus_reference": float(adapted_scores[row, positive] - adapted_reference_score) if adapted_reference_score is not None else None,
+                "base_top1": _topk_gallery_row(1, int(base_order[0]), float(base_scores[row, int(base_order[0])]), gallery_items, positive, reference),
+                "adapter_top1": _topk_gallery_row(1, int(adapted_order[0]), float(adapted_scores[row, int(adapted_order[0])]), gallery_items, positive, reference),
+            }
+        )
+    _write_jsonl(output_root / "per_query_topk.jsonl", topk_rows)
+    _write_jsonl(output_root / "per_query_scores.jsonl", score_rows)
+
+
+def _rank_of_index(order: np.ndarray, index: int) -> int:
+    matches = np.where(order == int(index))[0]
+    return int(matches[0] + 1) if matches.size else int(order.shape[0] + 1)
+
+
+def _topk_gallery_row(
+    rank: int,
+    gallery_index: int,
+    score: float,
+    gallery_items: list[EvalGalleryItem],
+    positive_index: int,
+    reference_index: int | None,
+) -> dict[str, Any]:
+    item = gallery_items[gallery_index] if gallery_index < len(gallery_items) else None
+    payload = item.source_payload if item else {}
+    video = item.video if item else ""
+    return {
+        "rank": int(rank),
+        "gallery_index": int(gallery_index),
+        "score": round(float(score), 6),
+        "gallery_id": item.gallery_id if item else f"gallery_{gallery_index:06d}",
+        "video": video,
+        "kind": item.kind if item else "",
+        "is_target": int(gallery_index) == int(positive_index),
+        "is_reference": reference_index is not None and int(gallery_index) == int(reference_index),
+        "source_id": item.raw_source_id if item else "",
+        "audio_delta_type": _first_text(payload, "audio_delta_type", "b_subtype", default=""),
+        "dataset": _dataset_from_payload_or_path(payload, video),
+    }
+
+
+def _dataset_from_payload_or_path(payload: dict[str, Any], video: str) -> str:
+    explicit = _first_text(payload, "dataset", "source_dataset", default="")
+    if explicit:
+        return explicit
+    lower = str(video).replace("\\", "/").lower()
+    for name in ("daily_omni", "worldsense", "vggsound", "vgg_monoaudio", "voxceleb", "avatar", "hdtf"):
+        if name in lower:
+            return name
+    return ""
+
+
+def _adapter_geometry_diagnostics(torch: Any, model: Any, query: Any, target: Any, reference: Any, adapted_query: Any, adapted_target: Any, adapted_reference: Any) -> dict[str, Any]:
+    with torch.no_grad():
+        dim = int(query.shape[-1])
+        identity = torch.eye(dim, dtype=model.query_proj.weight.dtype, device=model.query_proj.weight.device)
+        query_norms = torch.linalg.norm(query, dim=-1).detach().cpu().numpy()
+        target_norms = torch.linalg.norm(target, dim=-1).detach().cpu().numpy()
+        adapted_query_norms = torch.linalg.norm(adapted_query, dim=-1).detach().cpu().numpy()
+        adapted_target_norms = torch.linalg.norm(adapted_target, dim=-1).detach().cpu().numpy()
+        adapted_reference_norms = torch.linalg.norm(adapted_reference, dim=-1).detach().cpu().numpy()
+        return {
+            "query_proj_minus_identity_norm": round(float(torch.linalg.norm(model.query_proj.weight - identity).detach().cpu()), 6),
+            "doc_proj_minus_identity_norm": round(float(torch.linalg.norm(model.doc_proj.weight - identity).detach().cpu()), 6),
+            "edit_proj_minus_identity_norm": round(float(torch.linalg.norm(model.edit_proj.weight - identity).detach().cpu()), 6),
+            "base_query_norm": _score_distribution(query_norms),
+            "base_target_norm": _score_distribution(target_norms),
+            "adapted_query_norm": _score_distribution(adapted_query_norms),
+            "adapted_target_norm": _score_distribution(adapted_target_norms),
+            "adapted_reference_norm": _score_distribution(adapted_reference_norms),
+            "adapted_query_target_cosine": _score_distribution((adapted_query * adapted_target[: adapted_query.shape[0]]).sum(dim=-1).detach().cpu().numpy()),
+            "adapted_query_reference_cosine": _score_distribution((adapted_query * adapted_reference).sum(dim=-1).detach().cpu().numpy()),
+        }
+
+
 def _rank_list_summary(ranks: list[int]) -> dict[str, Any]:
     if not ranks:
         return {"count": 0}
@@ -2112,20 +2504,43 @@ def _build_eval_gallery(
     train_records: list[AudioDeltaRecord],
     eval_records: list[AudioDeltaRecord],
     total_gallery_size: int,
+    include_reference_negative: bool,
     distractor_pool_path: str | Path | None,
     seed: int,
-) -> tuple[list[EvalGalleryItem], list[int], dict[str, Any]]:
-    desired_total = max(len(eval_records), int(total_gallery_size))
+) -> tuple[list[EvalGalleryItem], dict[str, list[int]], dict[str, Any]]:
     positives: list[EvalGalleryItem] = [
         EvalGalleryItem(
             gallery_id=f"positive::{record.sample_id}",
             video=record.target_video,
             raw_source_id=str(record.raw_source_id or record.sample_id),
             kind="positive",
-            source_payload={"sample_id": record.sample_id, "pair_group_id": record.pair_group_id},
+            source_payload={
+                "sample_id": record.sample_id,
+                "pair_group_id": record.pair_group_id,
+                "audio_delta_type": record.audio_delta_type,
+                "split_tier": record.split_tier,
+            },
         )
         for record in eval_records
     ]
+    references: list[EvalGalleryItem] = []
+    if include_reference_negative:
+        references = [
+            EvalGalleryItem(
+                gallery_id=f"reference::{record.sample_id}",
+                video=record.reference_video,
+                raw_source_id=str(record.raw_source_id or record.sample_id),
+                kind="reference_negative",
+                source_payload={
+                    "sample_id": record.sample_id,
+                    "pair_group_id": record.pair_group_id,
+                    "audio_delta_type": record.audio_delta_type,
+                    "split_tier": record.split_tier,
+                },
+            )
+            for record in eval_records
+        ]
+    desired_total = max(len(positives) + len(references), int(total_gallery_size))
     forbidden_video_keys = {
         _media_key(record.reference_video)
         for record in (*train_records, *eval_records)
@@ -2140,7 +2555,8 @@ def _build_eval_gallery(
     pool_paths = [Path(distractor_pool_path)] if distractor_pool_path else _default_distractor_pool_paths(dataset_root)
     distractor_candidates = _load_distractor_pool(pool_paths)
     distractors: list[EvalGalleryItem] = []
-    seen_gallery_keys = {_media_key(item.video) for item in positives}
+    fixed_items = positives + references
+    seen_gallery_keys = {_media_key(item.video) for item in fixed_items}
     rng = random.Random(seed)
     rng.shuffle(distractor_candidates)
     for payload in distractor_candidates:
@@ -2164,21 +2580,24 @@ def _build_eval_gallery(
             )
         )
         seen_gallery_keys.add(video_key)
-        if len(positives) + len(distractors) >= desired_total:
+        if len(fixed_items) + len(distractors) >= desired_total:
             break
-    gallery_items = positives + distractors
+    gallery_items = fixed_items + distractors
     rng.shuffle(gallery_items)
     gallery_lookup = {item.gallery_id: index for index, item in enumerate(gallery_items)}
     positive_indices = [int(gallery_lookup[f"positive::{record.sample_id}"]) for record in eval_records]
+    reference_indices = [int(gallery_lookup[f"reference::{record.sample_id}"]) for record in eval_records] if include_reference_negative else []
     summary = {
         "gallery_count": len(gallery_items),
         "positive_count": len(positives),
+        "reference_negative_count": len(references),
         "distractor_count": len(distractors),
         "requested_gallery_size": int(total_gallery_size),
+        "include_reference_negative": bool(include_reference_negative),
         "pool_paths": [str(path) for path in pool_paths],
         "forbidden_source_count": len(forbidden_source_ids),
     }
-    return gallery_items, positive_indices, summary
+    return gallery_items, {"positive_gallery_index": positive_indices, "reference_gallery_index": reference_indices}, summary
 
 
 def _load_distractor_pool(paths: list[Path]) -> list[dict[str, Any]]:
@@ -2513,6 +2932,22 @@ def _ablation_markdown(summary: dict[str, Any]) -> str:
             f"| {row['ablation']} | {_fmt(row.get('R@1'))} | {_fmt(row.get('R@5'))} | {_fmt(row.get('R@10'))} | "
             f"{_fmt(row.get('reference_negative_average_rank'))} | {_fmt(row.get('delta_score_pos_mean'))} | {_fmt(row.get('delta_score_neg_mean'))} | "
             f"{_fmt(row.get('effective_negative_count'))} | {_fmt(row.get('tau_text'))} | {_fmt(row.get('tau_audio'))} | {_fmt(row.get('tau_video'))} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _stability_grid_markdown(summary: dict[str, Any]) -> str:
+    lines = [
+        "# AudioDelta-E5 Stability Grid",
+        "",
+        "| Run | Steps | LR | Base R@1 | Adapter R@1 | Adapter R@5 | Adapter Ref Beat | Final Loss |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in summary["rows"]:
+        lines.append(
+            f"| {row['name']} | {row['steps']} | {_fmt(row['learning_rate'])} | {_fmt(row.get('base_R@1'))} | "
+            f"{_fmt(row.get('adapter_R@1'))} | {_fmt(row.get('adapter_R@5'))} | "
+            f"{_fmt(row.get('adapter_target_beats_reference_rate'))} | {_fmt(row.get('loss_final'))} |"
         )
     return "\n".join(lines) + "\n"
 

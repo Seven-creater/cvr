@@ -13,6 +13,7 @@ from app.e5_audio_delta_train import (
     load_audio_delta_records,
     prepare_records,
     run_ablations,
+    run_stability_grid,
     train_adapter,
     train_lora_plan,
     _batch_whitening_loss,
@@ -101,6 +102,39 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertEqual(1, len(positive_indices["positive_gallery_index"]))
             self.assertTrue(any(item["kind"] == "distractor" for item in gallery))
 
+    def test_prepare_can_include_reference_negative_in_eval_gallery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_run = root / "dataset_run"
+            dataset_run.mkdir()
+            self._write_jsonl(dataset_run / "b_main_audio_cvr_triplets.jsonl", [self._record("main_1", source="source_a", pair="pair_a")])
+            self._write_jsonl(
+                dataset_run / "single_source_annotations.jsonl",
+                [
+                    {"clip_id": "d1", "output_path": "/tmp/distractor_001.mp4", "source_clip_id": "other_source_1"},
+                    {"clip_id": "d2", "output_path": "/tmp/distractor_002.mp4", "source_clip_id": "other_source_2"},
+                ],
+            )
+
+            summary = prepare_records(
+                run_root=dataset_run,
+                output_dir=root / "records",
+                max_train_records=1,
+                max_eval_records=1,
+                eval_gallery_size=4,
+                eval_gallery_include_reference_negative=True,
+                distractor_seed=7,
+            )
+
+            gallery = [json.loads(line) for line in (root / "records" / "eval_gallery.jsonl").read_text(encoding="utf-8").splitlines()]
+            indices = json.loads((root / "records" / "eval_gallery_positive_indices.json").read_text(encoding="utf-8"))
+
+            self.assertEqual("pilot_only_random_distractor_gallery_with_reference_negative", summary["eval_protocol"])
+            self.assertEqual(1, summary["eval_gallery"]["reference_negative_count"])
+            self.assertEqual(1, len(indices["positive_gallery_index"]))
+            self.assertEqual(1, len(indices["reference_gallery_index"]))
+            self.assertTrue(any(item["kind"] == "reference_negative" for item in gallery))
+
     def test_cache_train_and_eval_adapter_smoke_with_mock_encoder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -181,17 +215,25 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
                 records_dir / "eval_gallery.jsonl",
                 [
                     {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "raw_source_id": "source_a", "kind": "positive"},
+                    {"gallery_id": "reference::sample_1", "video": "/tmp/sample_1_ref.mp4", "raw_source_id": "source_a", "kind": "reference_negative"},
                     {"gallery_id": "distractor::1", "video": "/tmp/distractor_001.mp4", "raw_source_id": "other_source_1", "kind": "distractor"},
                 ],
             )
 
             cache_embeddings(records_dir=records_dir, output_dir=root / "embedding_cache", mock_encoder=True, local_segments=0)
             train_adapter(cache_dir=root / "embedding_cache", output_dir=root / "adapter", steps=1, batch_size=1, device="cpu")
-            eval_summary = eval_adapter(cache_dir=root / "embedding_cache", adapter_dir=root / "adapter", output_dir=root / "eval", device="cpu")
+            eval_summary = eval_adapter(cache_dir=root / "embedding_cache", adapter_dir=root / "adapter", output_dir=root / "eval", device="cpu", save_topk=2)
 
             self.assertFalse(eval_summary["has_local_segments"])
-            self.assertEqual(2, eval_summary["gallery_count"])
+            self.assertTrue(eval_summary["has_reference_gallery_index"])
+            self.assertEqual(3, eval_summary["gallery_count"])
             self.assertIn("R@1", eval_summary["rows"][0])
+            self.assertTrue((root / "eval" / "per_query_topk.jsonl").exists())
+            self.assertTrue((root / "eval" / "per_query_scores.jsonl").exists())
+            self.assertTrue((root / "eval" / "score_diagnostics.json").exists())
+            self.assertTrue((root / "eval" / "adapter_geometry.json").exists())
+            score_row = json.loads((root / "eval" / "per_query_scores.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            self.assertIsNotNone(score_row["reference_gallery_index"])
 
     def test_real_encoder_inputs_wrap_video_paths_as_multimodal_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -276,6 +318,32 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertIn("without_quantile_negative_curriculum", names)
             self.assertIn("without_batch_whitening", names)
             self.assertTrue((root / "ablations" / "comparison.md").exists())
+
+    def test_stability_grid_reuses_cache_and_writes_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [
+                self._record("sample_1", source="source_a", pair="pair_a"),
+                self._record("sample_2", source="source_b", pair="pair_b"),
+            ]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows[:1])
+            cache_embeddings(records_dir=records_dir, output_dir=root / "embedding_cache", mock_encoder=True, local_segments=0)
+
+            summary = run_stability_grid(
+                cache_dir=root / "embedding_cache",
+                output_dir=root / "stability",
+                steps_grid=(1,),
+                learning_rate_grid=(1e-3,),
+                batch_size=1,
+                device="cpu",
+            )
+
+            self.assertEqual(1, len(summary["rows"]))
+            self.assertTrue((root / "stability" / "stability_grid_summary.json").exists())
+            self.assertTrue((root / "stability" / "stability_grid_comparison.md").exists())
 
     def test_v2_research_profile_logs_new_losses_and_schedule(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
