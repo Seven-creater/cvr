@@ -137,6 +137,53 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertEqual(1, len(indices["reference_gallery_index"]))
             self.assertTrue(any(item["kind"] == "reference_negative" for item in gallery))
 
+    def test_prepare_can_build_typed_and_local_audio_cvr_galleries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_run = root / "dataset_run"
+            dataset_run.mkdir()
+            record = self._record(
+                "main_1",
+                source="source_a",
+                pair="pair_a",
+                negatives=[
+                    {"type": "reference_negative", "video": "/tmp/main_1_ref.mp4", "source_id": "source_a", "satisfies_edit": "false"},
+                    {"type": "visual_hard", "video": "/tmp/main_1_visual.mp4", "source_id": "source_a", "satisfies_edit": "false"},
+                    {"type": "audio_hard", "video": "/tmp/main_1_audio.mp4", "source_id": "source_b", "satisfies_edit": "false"},
+                    {"type": "asr_hard", "video": "/tmp/main_1_asr.mp4", "source_id": "source_c", "satisfies_edit": "true"},
+                ],
+            )
+            self._write_jsonl(dataset_run / "b_main_audio_cvr_triplets.jsonl", [record])
+
+            typed = prepare_records(
+                run_root=dataset_run,
+                output_dir=root / "typed_records",
+                max_train_records=1,
+                max_eval_records=1,
+                eval_gallery_size=6,
+                eval_gallery_protocol="typed_hardneg",
+            )
+            typed_gallery = [json.loads(line) for line in (root / "typed_records" / "eval_gallery.jsonl").read_text(encoding="utf-8").splitlines()]
+            typed_kinds = {item["kind"] for item in typed_gallery}
+            self.assertEqual("audio_cvr_typed_hardneg_gallery", typed["eval_protocol"])
+            self.assertIn("reference_negative", typed_kinds)
+            self.assertIn("visual_hard", typed_kinds)
+            self.assertIn("audio_hard", typed_kinds)
+            self.assertNotIn("asr_hard", typed_kinds)
+
+            local = prepare_records(
+                run_root=dataset_run,
+                output_dir=root / "local_records",
+                max_train_records=1,
+                max_eval_records=1,
+                eval_gallery_size=4,
+                eval_gallery_protocol="local_same_source",
+            )
+            local_gallery = [json.loads(line) for line in (root / "local_records" / "eval_gallery.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual("audio_cvr_local_same_source_gallery", local["eval_protocol"])
+            self.assertTrue(any(item["kind"] == "local_same_source" for item in local_gallery))
+            self.assertFalse(any(item["kind"] == "audio_hard" for item in local_gallery))
+
     def test_cache_train_and_eval_adapter_smoke_with_mock_encoder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

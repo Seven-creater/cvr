@@ -1067,17 +1067,22 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 "raw_source_id": "source_show_1",
                 "reference_video": "ref.mp4",
                 "target_video": "target.mp4",
-                "edit_text": "change the speech from discussing budget planning to discussing health services",
-                "difference": {"type": "speech"},
+                "edit_text": "replace quiet room ambience with crowd cheering",
+                "difference": {"type": "audio_event"},
                 "accepted": True,
-                "b_subtype": "speech_topic_in_video_context",
-                "audio_delta_strength": 0.65,
+                "b_subtype": "sound_event",
+                "audio_delta_strength": 0.75,
                 "video_context_strength": 0.50,
                 "asr_degeneracy_risk": 0.40,
                 "visual_shortcut_risk": False,
                 "audio_only_verification": {"accept": True},
                 "video_only_shortcut": {"can_identify_target_without_audio": False},
-                "quality": {"b_subtype": "speech_topic_in_video_context"},
+                "audio_delta_hard_negatives": [
+                    {"type": "visual_hard", "video": "visual_hard.mp4", "source_id": "source_show_1", "satisfies_edit": "false"},
+                    {"type": "audio_hard", "video": "audio_hard.mp4", "source_id": "source_show_2", "satisfies_edit": "false"},
+                    {"type": "asr_hard", "video": "asr_hard.mp4", "source_id": "source_show_3", "satisfies_edit": "false"},
+                ],
+                "quality": {"b_subtype": "sound_event"},
             }
             ranked = [
                 positive,
@@ -1125,8 +1130,21 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertIn("audio_hard", negative_types)
             self.assertIn("asr_hard", negative_types)
             self.assertEqual({}, row["hard_negative_missing_reasons"])
+            self.assertTrue((run_root / "b_diagnostic_audio_cvr_triplets.jsonl").exists())
+            self.assertTrue((run_root / "audio_necessity_eval_manifest.json").exists())
+            quality_summary = json.loads((run_root / "benchmark_quality_summary.json").read_text(encoding="utf-8"))
+            self.assertGreater(quality_summary["gallery_counts"]["typed_hardneg"], 0)
+            hard_gallery = [json.loads(line) for line in (run_root / "b_main_eval_gallery_hardneg.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            hard_types = {item["negative_type"] for item in hard_gallery}
+            self.assertIn("reference_negative", hard_types)
+            self.assertIn("visual_hard", hard_types)
+            self.assertIn("audio_hard", hard_types)
+            self.assertIn("asr_hard", hard_types)
+            self.assertTrue(all(not item["satisfies_edit"] for item in hard_gallery if item["kind"] != "positive"))
 
-            ranked_without_cross_source = [positive, ranked[1]]
+            positive_without_existing_negatives = dict(positive)
+            positive_without_existing_negatives.pop("audio_delta_hard_negatives", None)
+            ranked_without_cross_source = [positive_without_existing_negatives, ranked[1]]
             self._write_jsonl(b_shards / "ranked_01.jsonl", ranked_without_cross_source)
             merge_line_results(run_root=run_root, target_a_count=0, target_b_count=1, keep_all_b=True)
             row = [json.loads(line) for line in (run_root / "b_all_audio_cvr_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()][0]
@@ -3115,7 +3133,12 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual("the mayor's remarks", accepted[0]["old_audio"])
             self.assertEqual("the bakery opening", accepted[0]["new_audio"])
             self.assertEqual(accepted[0]["pair_group_id"], accepted[0]["inverse_pair_group_id"])
-            self.assertIn({"type": "reference_negative", "video": str(root / "clips" / "tgt.mp4")}, accepted[0]["audio_delta_hard_negatives"])
+            self.assertTrue(
+                any(
+                    item.get("type") == "reference_negative" and item.get("video") == str(root / "clips" / "tgt.mp4")
+                    for item in accepted[0]["audio_delta_hard_negatives"]
+                )
+            )
             self.assertEqual("clean_audio_delta", accepted[0]["shortcut_label"])
             self.assertEqual("forward", train[0]["direction"])
             self.assertEqual("inverse", train[1]["direction"])

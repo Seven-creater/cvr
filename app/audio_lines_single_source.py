@@ -551,9 +551,18 @@ def merge_line_results(
     _write_jsonl(root / "b_main_audio_cvr_triplets.jsonl", b_main)
     _write_jsonl(root / "b_extended_audio_cvr_triplets.jsonl", b_extended)
     _write_jsonl(root / "b_diagnostic_asr_risk_triplets.jsonl", b_diagnostic)
+    _write_jsonl(root / "b_diagnostic_audio_cvr_triplets.jsonl", b_diagnostic)
     _write_jsonl(root / "b_speech_context_triplets.jsonl", b_speech)
     _write_jsonl(root / "b_music_triplets.jsonl", b_music)
     _write_jsonl(root / "b_sound_event_triplets.jsonl", b_sound)
+    benchmark_summary = _write_audio_cvr_benchmark_outputs(
+        root=root,
+        b_ranked=b_ranked,
+        b_all=b_accepted_all,
+        b_main=b_main,
+        b_extended=b_extended,
+        b_diagnostic=b_diagnostic,
+    )
     _write_jsonl(root / "a_accepted.progress.jsonl", a_accepted_progress)
     _write_jsonl(root / "a_rejected.progress.jsonl", a_rejected_progress)
     _write_jsonl(root / "b_accepted.progress.jsonl", b_accepted_progress)
@@ -581,6 +590,9 @@ def merge_line_results(
             len(b_main),
         ),
         "b_context_cvr_summary_path": str(root / "b_context_cvr_summary.json"),
+        "benchmark_quality_summary_path": str(root / "benchmark_quality_summary.json"),
+        "audio_necessity_eval_manifest_path": str(root / "audio_necessity_eval_manifest.json"),
+        "benchmark_gallery_counts": benchmark_summary.get("gallery_counts", {}),
         "target_a_count": target_a_count,
         "target_b_count": target_b_count,
         "keep_all_b": bool(keep_all_b),
@@ -594,6 +606,198 @@ def merge_line_results(
         encoding="utf-8",
     )
     return summary
+
+
+def _write_audio_cvr_benchmark_outputs(
+    *,
+    root: Path,
+    b_ranked: list[dict[str, Any]],
+    b_all: list[dict[str, Any]],
+    b_main: list[dict[str, Any]],
+    b_extended: list[dict[str, Any]],
+    b_diagnostic: list[dict[str, Any]],
+) -> dict[str, Any]:
+    global_gallery = _benchmark_gallery_rows(b_main, b_ranked, protocol="global")
+    local_gallery = _benchmark_gallery_rows(b_main, b_ranked, protocol="local_same_source")
+    hardneg_gallery = _benchmark_gallery_rows(b_main, b_ranked, protocol="typed_hardneg")
+    _write_jsonl(root / "b_main_eval_gallery_global.jsonl", global_gallery)
+    _write_jsonl(root / "b_main_eval_gallery_local_same_source.jsonl", local_gallery)
+    _write_jsonl(root / "b_main_eval_gallery_hardneg.jsonl", hardneg_gallery)
+    manifest = {
+        "protocol_version": "audio_cvr_benchmark_v1",
+        "primary_eval_split": "b_main_audio_cvr_triplets.jsonl",
+        "gallery_files": {
+            "global": "b_main_eval_gallery_global.jsonl",
+            "local_same_source": "b_main_eval_gallery_local_same_source.jsonl",
+            "typed_hardneg": "b_main_eval_gallery_hardneg.jsonl",
+        },
+        "audio_necessity_modes": ["V-only", "A-only", "V+T", "A+T", "V+A", "V+A+T"],
+        "audio_sync_rule": "audio-on/off must be applied to both query/reference and gallery/target sides",
+        "required_metrics": [
+            "R@1",
+            "R@5",
+            "R@10",
+            "target_beats_reference",
+            "reference_rank_median",
+            "target_reference_score_gap",
+            "hard_negative_recall_by_type",
+        ],
+    }
+    (root / "audio_necessity_eval_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    summary = {
+        "protocol_version": "audio_cvr_benchmark_v1",
+        "accepted_count": len(b_all),
+        "b_main_count": len(b_main),
+        "b_extended_count": len(b_extended),
+        "b_diagnostic_count": len(b_diagnostic),
+        "tier_counts": dict(Counter(str(record.get("split_tier") or "unknown") for record in b_all)),
+        "b_main_subtype_counts": dict(Counter(_b_line_record_subtype(record) for record in b_main)),
+        "hard_negative_missing_counts": _hard_negative_missing_counts(b_main),
+        "gallery_counts": {
+            "global": len(global_gallery),
+            "local_same_source": len(local_gallery),
+            "typed_hardneg": len(hardneg_gallery),
+        },
+        "gallery_kind_counts": {
+            "global": dict(Counter(str(row.get("kind") or "") for row in global_gallery)),
+            "local_same_source": dict(Counter(str(row.get("kind") or "") for row in local_gallery)),
+            "typed_hardneg": dict(Counter(str(row.get("kind") or "") for row in hardneg_gallery)),
+        },
+        "formal_eval_note": "Use reference-aware and local_same_source galleries for benchmark reporting; random gallery is smoke-only.",
+    }
+    (root / "benchmark_quality_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
+def _benchmark_gallery_rows(records: list[dict[str, Any]], candidate_pool: list[dict[str, Any]], *, protocol: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        sample_id = str(record.get("sample_id") or record.get("proposal_id") or record.get("candidate_id") or "").strip()
+        rows.append(_benchmark_gallery_row(record, sample_id=sample_id, video=str(record.get("target_video") or ""), kind="positive", negative_type="", reason="target satisfies edit_text"))
+        rows.append(_benchmark_gallery_row(record, sample_id=sample_id, video=str(record.get("reference_video") or ""), kind="reference_negative", negative_type="reference_negative", reason="reference does not satisfy edit_text"))
+        if protocol in {"local_same_source", "typed_hardneg"}:
+            rows.extend(_benchmark_existing_hard_negative_rows(record, sample_id=sample_id, protocol=protocol))
+        if protocol == "local_same_source":
+            rows.extend(_benchmark_local_candidate_rows(record, candidate_pool, sample_id=sample_id, limit=8))
+        if protocol == "global":
+            rows.extend(_benchmark_random_candidate_rows(record, candidate_pool, sample_id=sample_id, limit=20))
+    return rows
+
+
+def _benchmark_gallery_row(
+    record: dict[str, Any],
+    *,
+    sample_id: str,
+    video: str,
+    kind: str,
+    negative_type: str,
+    reason: str,
+    source_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "query_sample_id": sample_id,
+        "gallery_id": f"{kind}::{sample_id}::{_stable_hash(video)[:8]}",
+        "video": video,
+        "kind": kind,
+        "negative_type": negative_type,
+        "raw_source_id": source_id or _source_split_group_id(record),
+        "same_source": bool((source_id or _source_split_group_id(record)) == _source_split_group_id(record)),
+        "satisfies_edit": kind == "positive",
+        "verification_accept": kind == "positive",
+        "reason": reason,
+        "audio_delta_type": _b_line_record_subtype(record),
+        "split_tier": record.get("split_tier", ""),
+    }
+
+
+def _benchmark_existing_hard_negative_rows(record: dict[str, Any], *, sample_id: str, protocol: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in record.get("audio_delta_hard_negatives", []):
+        if not isinstance(item, dict) or not _negative_item_usable(item):
+            continue
+        label = str(item.get("type") or "").strip()
+        if label == "reference_negative":
+            continue
+        source_id = str(item.get("source_id") or item.get("raw_source_id") or "").strip()
+        same_source = bool(source_id and source_id == _source_split_group_id(record))
+        if protocol == "local_same_source" and not (same_source or label == "visual_hard"):
+            continue
+        video = str(item.get("video") or "").strip()
+        if not video:
+            continue
+        rows.append(
+            _benchmark_gallery_row(
+                record,
+                sample_id=sample_id,
+                video=video,
+                kind="local_same_source" if protocol == "local_same_source" else label,
+                negative_type=label,
+                reason=str(item.get("reason") or _hard_negative_reason(label)),
+                source_id=source_id or _source_split_group_id(record),
+            )
+        )
+    return rows
+
+
+def _benchmark_local_candidate_rows(record: dict[str, Any], candidate_pool: list[dict[str, Any]], *, sample_id: str, limit: int) -> list[dict[str, Any]]:
+    source = _source_split_group_id(record)
+    used = {str(record.get("reference_video") or ""), str(record.get("target_video") or "")}
+    rows: list[dict[str, Any]] = []
+    for candidate in candidate_pool:
+        video = _candidate_negative_video(candidate)
+        if len(rows) >= limit:
+            break
+        if not video or video in used or _source_split_group_id(candidate) != source or not _candidate_pool_negative_usable(candidate):
+            continue
+        rows.append(
+            _benchmark_gallery_row(
+                record,
+                sample_id=sample_id,
+                video=video,
+                kind="local_same_source",
+                negative_type="local_same_source",
+                reason="same source candidate does not satisfy edit_text",
+                source_id=source,
+            )
+        )
+        used.add(video)
+    return rows
+
+
+def _benchmark_random_candidate_rows(record: dict[str, Any], candidate_pool: list[dict[str, Any]], *, sample_id: str, limit: int) -> list[dict[str, Any]]:
+    source = _source_split_group_id(record)
+    used = {str(record.get("reference_video") or ""), str(record.get("target_video") or "")}
+    rows: list[dict[str, Any]] = []
+    for candidate in candidate_pool:
+        video = _candidate_negative_video(candidate)
+        candidate_source = _source_split_group_id(candidate)
+        if len(rows) >= limit:
+            break
+        if not video or video in used or candidate_source == source:
+            continue
+        rows.append(
+            _benchmark_gallery_row(
+                record,
+                sample_id=sample_id,
+                video=video,
+                kind="random_distractor",
+                negative_type="random_distractor",
+                reason="random cross-source distractor",
+                source_id=candidate_source,
+            )
+        )
+        used.add(video)
+    return rows
+
+
+def _hard_negative_missing_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for record in records:
+        missing = record.get("hard_negative_missing_reasons")
+        if isinstance(missing, dict):
+            for label in missing:
+                counts[str(label)] += 1
+    return dict(counts)
 
 
 def build_b_splits(
@@ -1232,7 +1436,16 @@ def _audio_delta_hard_negatives(
     negatives: list[dict[str, str]] = []
     used = {str(record.get("target_video") or "").strip(), str(reference_video or "").strip()}
     if reference_video:
-        negatives.append({"type": "reference_negative", "video": reference_video})
+        negatives.append(
+            {
+                "type": "reference_negative",
+                "video": reference_video,
+                "source_id": _source_split_group_id(record),
+                "reason": "reference does not satisfy edit_text",
+                "verification_accept": "false",
+                "satisfies_edit": "false",
+            }
+        )
     existing = record.get("audio_delta_hard_negatives")
     if isinstance(existing, list):
         for item in existing:
@@ -1240,14 +1453,14 @@ def _audio_delta_hard_negatives(
                 continue
             label = str(item.get("type") or "").strip()
             video = str(item.get("video") or "").strip()
-            if label in {"visual_hard", "audio_hard", "asr_hard"} and video and video not in used:
-                negatives.append({"type": label, "video": video})
+            if label in {"visual_hard", "audio_hard", "asr_hard"} and video and video not in used and _negative_item_usable(item):
+                negatives.append(_normalized_hard_negative_item(item, label=label, video=video, source_record=record))
                 used.add(video)
     labels = ["visual_hard", "audio_hard", "asr_hard"]
     raw_negatives = [str(item).strip() for item in record.get("hard_negatives", []) if str(item).strip()] if isinstance(record.get("hard_negatives"), list) else []
     for label, video in zip(labels, raw_negatives):
         if video and video not in used:
-            negatives.append({"type": label, "video": video})
+            negatives.append(_normalized_hard_negative_item({}, label=label, video=video, source_record=record))
             used.add(video)
     if candidate_pool:
         for label, finder in (
@@ -1261,9 +1474,47 @@ def _audio_delta_hard_negatives(
             if candidate:
                 video = str(candidate.get("target_video") or candidate.get("video") or "").strip()
                 if video and video not in used:
-                    negatives.append({"type": label, "video": video, "proposal_id": str(candidate.get("proposal_id") or candidate.get("candidate_id") or "")})
+                    negatives.append(
+                        {
+                            "type": label,
+                            "video": video,
+                            "source_id": _source_split_group_id(candidate),
+                            "reason": _hard_negative_reason(label),
+                            "proposal_id": str(candidate.get("proposal_id") or candidate.get("candidate_id") or ""),
+                            "verification_accept": "false",
+                            "satisfies_edit": "false",
+                        }
+                    )
                     used.add(video)
     return negatives
+
+
+def _normalized_hard_negative_item(item: dict[str, Any], *, label: str, video: str, source_record: dict[str, Any]) -> dict[str, str]:
+    return {
+        "type": label,
+        "video": video,
+        "source_id": str(item.get("source_id") or item.get("raw_source_id") or _source_split_group_id(source_record)),
+        "reason": str(item.get("reason") or _hard_negative_reason(label)),
+        "verification_accept": str(item.get("verification_accept", "false")).lower(),
+        "satisfies_edit": str(item.get("satisfies_edit", "false")).lower(),
+    }
+
+
+def _hard_negative_reason(label: str) -> str:
+    return {
+        "reference_negative": "reference does not satisfy edit_text",
+        "visual_hard": "visual context similar but audio edit absent",
+        "audio_hard": "audio cue similar but video context different",
+        "asr_hard": "speech keywords similar but not target",
+    }.get(label, "hard negative does not satisfy edit_text")
+
+
+def _negative_item_usable(item: dict[str, Any]) -> bool:
+    if str(item.get("satisfies_edit") or "").strip().lower() in {"1", "true", "yes", "accepted"}:
+        return False
+    if str(item.get("verification_accept") or "").strip().lower() in {"1", "true", "yes", "accepted"}:
+        return False
+    return True
 
 
 def _hard_negative_missing_reasons(record: dict[str, Any]) -> dict[str, str]:
@@ -1302,6 +1553,7 @@ def _find_visual_hard_negative(record: dict[str, Any], candidates: list[dict[str
         candidate
         for candidate in candidates
         if _candidate_negative_video(candidate) not in used
+        and _candidate_pool_negative_usable(candidate)
         and _source_split_group_id(candidate) == same_source
         and _candidate_negative_video(candidate) != str(record.get("target_video") or "").strip()
     ]
@@ -1314,6 +1566,7 @@ def _find_audio_hard_negative(record: dict[str, Any], candidates: list[dict[str,
         candidate
         for candidate in candidates
         if _candidate_negative_video(candidate) not in used
+        and _candidate_pool_negative_usable(candidate)
         and _source_split_group_id(candidate) != source
         and _audio_text_overlap(record, candidate) > 0
     ]
@@ -1327,6 +1580,7 @@ def _find_asr_hard_negative(record: dict[str, Any], candidates: list[dict[str, A
         candidate
         for candidate in candidates
         if _candidate_negative_video(candidate) not in used
+        and _candidate_pool_negative_usable(candidate)
         and _b_line_record_subtype(candidate) == "speech_topic_in_video_context"
         and _speech_keyword_overlap(record, candidate) > 0
     ]
@@ -1341,6 +1595,14 @@ def _best_candidate(candidates: list[dict[str, Any]], *, key) -> dict[str, Any] 
 
 def _candidate_negative_video(record: dict[str, Any]) -> str:
     return str(record.get("target_video") or record.get("video") or "").strip()
+
+
+def _candidate_pool_negative_usable(record: dict[str, Any]) -> bool:
+    if bool(record.get("accepted")):
+        return False
+    if _b_line_bool(record, "target_satisfies_edit") or _b_line_bool(record, "audio_only_accept"):
+        return False
+    return True
 
 
 def _visual_similarity_score(left: dict[str, Any], right: dict[str, Any]) -> float:

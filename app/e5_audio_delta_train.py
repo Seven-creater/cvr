@@ -27,6 +27,7 @@ DEFAULT_RUNS_ROOT = "/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs"
 DEFAULT_DATA_ROOT = "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval"
 QUERY_TEMPLATE = "Edit the reference video so that: {edit_text}"
 DEFAULT_NEGATIVE_TYPES = ("reference_negative", "visual_hard", "audio_hard", "asr_hard")
+EVAL_GALLERY_PROTOCOLS = ("random", "reference", "local_same_source", "typed_hardneg", "audio_necessity")
 DEFAULT_LOSS_OPTIONS = {
     "training_profile": "v1",
     "contrastive_objective": "ce",
@@ -133,6 +134,7 @@ def prepare_records(
     max_eval_records: int = 4,
     eval_gallery_size: int = 0,
     eval_gallery_include_reference_negative: bool = False,
+    eval_gallery_protocol: str = "random",
     distractor_pool_path: str | Path | None = None,
     distractor_seed: int = 13,
     progress: Callable[[str], None] | None = None,
@@ -159,12 +161,14 @@ def prepare_records(
     gallery_summary: dict[str, Any] | None = None
     gallery_path = output_root / "eval_gallery.jsonl"
     if eval_gallery_size and eval_gallery_size > 0:
+        eval_gallery_protocol = _normalize_eval_gallery_protocol(eval_gallery_protocol)
         gallery_items, positive_indices, gallery_summary = _build_eval_gallery(
             dataset_root=dataset_root,
             train_records=train_records,
             eval_records=eval_records,
             total_gallery_size=eval_gallery_size,
-            include_reference_negative=eval_gallery_include_reference_negative,
+            include_reference_negative=eval_gallery_include_reference_negative or eval_gallery_protocol != "random",
+            gallery_protocol=eval_gallery_protocol,
             distractor_pool_path=distractor_pool_path,
             seed=distractor_seed,
         )
@@ -187,13 +191,7 @@ def prepare_records(
             "eval_gallery_positive_indices": str(output_root / "eval_gallery_positive_indices.json") if gallery_summary else None,
         },
         "eval_gallery": gallery_summary,
-        "eval_protocol": (
-            "pilot_only_random_distractor_gallery_with_reference_negative"
-            if gallery_summary and eval_gallery_include_reference_negative
-            else "pilot_only_random_distractor_gallery"
-            if gallery_summary
-            else "default_aligned_eval_targets"
-        ),
+        "eval_protocol": _eval_protocol_name(gallery_summary, eval_gallery_protocol, eval_gallery_include_reference_negative),
     }
     (output_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     _emit(progress, f"[e5-audio-delta] prepared train={len(train_records)} eval={len(eval_records)} records_dir={output_root}")
@@ -943,6 +941,22 @@ def load_eval_gallery_items(path: str | Path) -> list[EvalGalleryItem]:
     return items
 
 
+def _normalize_eval_gallery_protocol(value: str) -> str:
+    protocol = str(value or "random").strip().lower()
+    if protocol not in EVAL_GALLERY_PROTOCOLS:
+        raise ValueError(f"unsupported eval gallery protocol: {value}")
+    return protocol
+
+
+def _eval_protocol_name(gallery_summary: dict[str, Any] | None, protocol: str, include_reference_negative: bool) -> str:
+    if not gallery_summary:
+        return "default_aligned_eval_targets"
+    protocol = _normalize_eval_gallery_protocol(protocol)
+    if protocol == "random":
+        return "pilot_only_random_distractor_gallery_with_reference_negative" if include_reference_negative else "pilot_only_random_distractor_gallery"
+    return f"audio_cvr_{protocol}_gallery"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a small AudioDelta adapter on e5-omni embeddings")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -964,6 +978,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--eval-gallery-include-reference-negative",
         action="store_true",
         help="Pilot-only: include each eval reference video in the expanded gallery as a directionality negative.",
+    )
+    prepare.add_argument(
+        "--eval-gallery-protocol",
+        choices=EVAL_GALLERY_PROTOCOLS,
+        default="random",
+        help="Evaluation gallery protocol: random, reference, local_same_source, typed_hardneg, or audio_necessity.",
     )
     prepare.add_argument(
         "--distractor-pool-path",
@@ -1104,6 +1124,7 @@ def main() -> None:
             max_eval_records=args.max_eval_records,
             eval_gallery_size=args.eval_gallery_size,
             eval_gallery_include_reference_negative=args.eval_gallery_include_reference_negative,
+            eval_gallery_protocol=args.eval_gallery_protocol,
             distractor_pool_path=args.distractor_pool_path,
             distractor_seed=args.distractor_seed,
             progress=progress,
@@ -2519,8 +2540,11 @@ def _topk_gallery_row(
         "gallery_id": item.gallery_id if item else f"gallery_{gallery_index:06d}",
         "video": video,
         "kind": item.kind if item else "",
+        "negative_type": _first_text(payload, "negative_type", default=item.kind if item and item.kind not in {"positive", "distractor"} else ""),
         "is_target": int(gallery_index) == int(positive_index),
         "is_reference": reference_index is not None and int(gallery_index) == int(reference_index),
+        "same_source": _truthy_text(payload.get("same_source")) if payload else False,
+        "satisfies_edit": _truthy_text(payload.get("satisfies_edit")) if payload else False,
         "source_id": item.raw_source_id if item else "",
         "audio_delta_type": _first_text(payload, "audio_delta_type", "b_subtype", default=""),
         "dataset": _dataset_from_payload_or_path(payload, video),
@@ -2667,17 +2691,33 @@ def _normalize_negative_items(items: Any) -> list[dict[str, str]]:
             neg_type = str(item.get("type") or DEFAULT_NEGATIVE_TYPES[min(index, len(DEFAULT_NEGATIVE_TYPES) - 1)]).strip()
             pair_group_id = str(item.get("pair_group_id") or "").strip()
             inverse_pair_group_id = str(item.get("inverse_pair_group_id") or "").strip()
+            source_id = str(item.get("source_id") or item.get("raw_source_id") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            satisfies_edit = str(item.get("satisfies_edit") or "").strip()
+            verification_accept = str(item.get("verification_accept") or "").strip()
         else:
             video = str(item).strip()
             neg_type = DEFAULT_NEGATIVE_TYPES[min(index, len(DEFAULT_NEGATIVE_TYPES) - 1)]
             pair_group_id = ""
             inverse_pair_group_id = ""
+            source_id = ""
+            reason = ""
+            satisfies_edit = ""
+            verification_accept = ""
         if video:
             normalized = {"type": neg_type, "video": video}
             if pair_group_id:
                 normalized["pair_group_id"] = pair_group_id
             if inverse_pair_group_id:
                 normalized["inverse_pair_group_id"] = inverse_pair_group_id
+            if source_id:
+                normalized["source_id"] = source_id
+            if reason:
+                normalized["reason"] = reason
+            if satisfies_edit:
+                normalized["satisfies_edit"] = satisfies_edit
+            if verification_accept:
+                normalized["verification_accept"] = verification_accept
             result.append(normalized)
     return result
 
@@ -2719,9 +2759,11 @@ def _build_eval_gallery(
     eval_records: list[AudioDeltaRecord],
     total_gallery_size: int,
     include_reference_negative: bool,
+    gallery_protocol: str,
     distractor_pool_path: str | Path | None,
     seed: int,
 ) -> tuple[list[EvalGalleryItem], dict[str, list[int]], dict[str, Any]]:
+    gallery_protocol = _normalize_eval_gallery_protocol(gallery_protocol)
     positives: list[EvalGalleryItem] = [
         EvalGalleryItem(
             gallery_id=f"positive::{record.sample_id}",
@@ -2733,6 +2775,9 @@ def _build_eval_gallery(
                 "pair_group_id": record.pair_group_id,
                 "audio_delta_type": record.audio_delta_type,
                 "split_tier": record.split_tier,
+                "negative_type": "",
+                "same_source": True,
+                "satisfies_edit": True,
             },
         )
         for record in eval_records
@@ -2750,11 +2795,15 @@ def _build_eval_gallery(
                     "pair_group_id": record.pair_group_id,
                     "audio_delta_type": record.audio_delta_type,
                     "split_tier": record.split_tier,
+                    "negative_type": "reference_negative",
+                    "same_source": True,
+                    "satisfies_edit": False,
                 },
             )
             for record in eval_records
         ]
-    desired_total = max(len(positives) + len(references), int(total_gallery_size))
+    hard_items = _build_protocol_hard_gallery_items(eval_records, gallery_protocol=gallery_protocol)
+    desired_total = max(len(positives) + len(references) + len(hard_items), int(total_gallery_size))
     forbidden_video_keys = {
         _media_key(record.reference_video)
         for record in (*train_records, *eval_records)
@@ -2769,7 +2818,7 @@ def _build_eval_gallery(
     pool_paths = [Path(distractor_pool_path)] if distractor_pool_path else _default_distractor_pool_paths(dataset_root)
     distractor_candidates = _load_distractor_pool(pool_paths)
     distractors: list[EvalGalleryItem] = []
-    fixed_items = positives + references
+    fixed_items = positives + references + hard_items
     seen_gallery_keys = {_media_key(item.video) for item in fixed_items}
     rng = random.Random(seed)
     rng.shuffle(distractor_candidates)
@@ -2790,7 +2839,7 @@ def _build_eval_gallery(
                 video=video,
                 raw_source_id=source_id or gallery_id,
                 kind="distractor",
-                source_payload=dict(payload),
+                source_payload={**dict(payload), "negative_type": "random_distractor", "same_source": False, "satisfies_edit": False},
             )
         )
         seen_gallery_keys.add(video_key)
@@ -2805,13 +2854,77 @@ def _build_eval_gallery(
         "gallery_count": len(gallery_items),
         "positive_count": len(positives),
         "reference_negative_count": len(references),
+        "hard_negative_count": len(hard_items),
+        "hard_negative_type_counts": _count_strings(item.kind for item in hard_items),
         "distractor_count": len(distractors),
         "requested_gallery_size": int(total_gallery_size),
         "include_reference_negative": bool(include_reference_negative),
+        "gallery_protocol": gallery_protocol,
         "pool_paths": [str(path) for path in pool_paths],
         "forbidden_source_count": len(forbidden_source_ids),
     }
     return gallery_items, {"positive_gallery_index": positive_indices, "reference_gallery_index": reference_indices}, summary
+
+
+def _count_strings(values: Any) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for value in values:
+        counts[str(value)] += 1
+    return dict(counts)
+
+
+def _build_protocol_hard_gallery_items(eval_records: list[AudioDeltaRecord], *, gallery_protocol: str) -> list[EvalGalleryItem]:
+    if gallery_protocol not in {"local_same_source", "typed_hardneg", "audio_necessity"}:
+        return []
+    items: list[EvalGalleryItem] = []
+    seen: set[str] = set()
+    for record in eval_records:
+        for negative in record.hard_negatives:
+            neg_type = str(negative.get("type") or "").strip() or "hard_negative"
+            if neg_type == "reference_negative" or not _negative_item_usable_for_gallery(negative):
+                continue
+            source_id = str(negative.get("source_id") or negative.get("raw_source_id") or "").strip()
+            same_source = bool(source_id and source_id == record.raw_source_id)
+            if gallery_protocol == "local_same_source" and not (same_source or neg_type == "visual_hard"):
+                continue
+            video = str(negative.get("video") or "").strip()
+            if not video:
+                continue
+            key = f"{record.sample_id}|{neg_type}|{_media_key(video)}"
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(
+                EvalGalleryItem(
+                    gallery_id=f"{neg_type}::{record.sample_id}::{len(items):04d}",
+                    video=video,
+                    raw_source_id=source_id or record.raw_source_id,
+                    kind="local_same_source" if gallery_protocol == "local_same_source" else neg_type,
+                    source_payload={
+                        "sample_id": record.sample_id,
+                        "pair_group_id": record.pair_group_id,
+                        "audio_delta_type": record.audio_delta_type,
+                        "split_tier": record.split_tier,
+                        "negative_type": neg_type,
+                        "same_source": same_source or neg_type == "visual_hard",
+                        "satisfies_edit": False,
+                        "reason": negative.get("reason", ""),
+                    },
+                )
+            )
+    return items
+
+
+def _negative_item_usable_for_gallery(item: dict[str, str]) -> bool:
+    if _truthy_text(item.get("satisfies_edit")):
+        return False
+    if _truthy_text(item.get("verification_accept")):
+        return False
+    return True
+
+
+def _truthy_text(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "accept", "accepted"}
 
 
 def _load_distractor_pool(paths: list[Path]) -> list[dict[str, Any]]:
