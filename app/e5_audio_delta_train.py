@@ -17,6 +17,7 @@ import numpy as np
 from app.e5_cvr_eval import (
     DEFAULT_E5_MODEL,
     DEFAULT_VIDEO_MAX_PIXELS,
+    VIDEO_AUDIO_MODES,
     VIDEO_AUDIO_MODE_ON,
     _normalize_rows,
     load_e5_encoder,
@@ -28,6 +29,7 @@ DEFAULT_DATA_ROOT = "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_r
 QUERY_TEMPLATE = "Edit the reference video so that: {edit_text}"
 DEFAULT_NEGATIVE_TYPES = ("reference_negative", "visual_hard", "audio_hard", "asr_hard")
 EVAL_GALLERY_PROTOCOLS = ("random", "reference", "local_same_source", "typed_hardneg", "audio_necessity")
+QUERY_INPUT_MODES = ("composed", "text_only", "video_only")
 DEFAULT_LOSS_OPTIONS = {
     "training_profile": "v1",
     "contrastive_objective": "ce",
@@ -212,6 +214,8 @@ def cache_embeddings(
     batch_size: int = 1,
     video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     video_fps: int = 1,
+    video_audio_mode: str = VIDEO_AUDIO_MODE_ON,
+    query_input_mode: str = "composed",
     local_segments: int = 0,
     local_segment_mode: str = "prompt",
     local_segment_cache_dir: str | Path | None = None,
@@ -231,7 +235,7 @@ def cache_embeddings(
     if encoder is None:
         if mock_encoder:
             encoder = DeterministicEncoder()
-            runtime_info: dict[str, Any] = {"model_path": "mock-deterministic", "dim": encoder.dim, "video_audio_mode": VIDEO_AUDIO_MODE_ON}
+            runtime_info: dict[str, Any] = {"model_path": "mock-deterministic", "dim": encoder.dim, "video_audio_mode": video_audio_mode}
         else:
             encoder, info = load_e5_encoder(
                 model_path=e5_model,
@@ -241,11 +245,13 @@ def cache_embeddings(
                 batch_size=batch_size,
                 video_max_pixels=video_max_pixels,
                 video_fps=video_fps,
-                video_audio_mode=VIDEO_AUDIO_MODE_ON,
+                video_audio_mode=video_audio_mode,
             )
             runtime_info = asdict(info)
     else:
-        runtime_info = {"model_path": "injected-encoder", "video_audio_mode": VIDEO_AUDIO_MODE_ON}
+        runtime_info = {"model_path": "injected-encoder", "video_audio_mode": video_audio_mode}
+    query_input_mode = _normalize_query_input_mode(query_input_mode)
+    runtime_info["query_input_mode"] = query_input_mode
     train_records = load_audio_delta_records(records_root / "train.jsonl")
     eval_records = load_audio_delta_records(records_root / "eval.jsonl")
     eval_gallery = load_eval_gallery_items(records_root / "eval_gallery.jsonl") if (records_root / "eval_gallery.jsonl").exists() else []
@@ -255,6 +261,7 @@ def cache_embeddings(
         encoder=encoder,
         output_root=output_root,
         runtime_info=runtime_info,
+        query_input_mode=query_input_mode,
         local_segments=local_segments,
         local_segment_mode=local_segment_mode,
         local_segment_cache_dir=local_segment_cache_dir,
@@ -268,6 +275,7 @@ def cache_embeddings(
         encoder=encoder,
         output_root=output_root,
         runtime_info=runtime_info,
+        query_input_mode=query_input_mode,
         local_segments=local_segments,
         local_segment_mode=local_segment_mode,
         local_segment_cache_dir=local_segment_cache_dir,
@@ -523,6 +531,7 @@ def eval_adapter(
         if reference_gallery_index is not None
         else np.diag(_score_matrix_np(data["query"], data["reference"]))
     )
+    base_negative_scores = np.einsum("bd,bnd->bn", data["query"], data["negative"])
     has_local = _has_local_segments(data) and not disable_local_segments
     gallery_segments = None
     if has_local:
@@ -592,6 +601,7 @@ def eval_adapter(
         },
         "delta_score_distribution": _delta_score_distribution(adapted_mix_scores, adapted_reference_mix_scores, positive_index=positive_gallery_index),
         "base_delta_score_distribution": _delta_score_distribution(base_mix_scores, base_reference_scores, positive_index=positive_gallery_index),
+        "base_hard_negative_recall_by_type": _hard_negative_recall_by_type(base_mix_scores, base_negative_scores, records, positive_index=positive_gallery_index),
         "hard_negative_recall_by_type": _hard_negative_recall_by_type(adapted_scores, adapted_negative_scores, records, positive_index=positive_gallery_index),
         "diagnostics_path": str(output_root / "diagnostics.json"),
         "score_diagnostics_path": str(output_root / "score_diagnostics.json"),
@@ -613,6 +623,7 @@ def eval_adapter(
         "target_beats_reference": comparison["target_beats_reference"],
         "delta_score_distribution": comparison["delta_score_distribution"],
         "base_delta_score_distribution": comparison["base_delta_score_distribution"],
+        "base_hard_negative_recall_by_type": comparison["base_hard_negative_recall_by_type"],
         "hard_negative_recall_by_type": comparison["hard_negative_recall_by_type"],
         "by_shortcut_label": comparison["by_shortcut_label"],
         "by_split_tier": comparison["by_split_tier"],
@@ -1003,6 +1014,18 @@ def build_parser() -> argparse.ArgumentParser:
     cache.add_argument("--batch-size", type=int, default=1)
     cache.add_argument("--video-max-pixels", type=int, default=DEFAULT_VIDEO_MAX_PIXELS)
     cache.add_argument("--video-fps", type=int, default=1)
+    cache.add_argument(
+        "--video-audio-mode",
+        choices=VIDEO_AUDIO_MODES,
+        default=VIDEO_AUDIO_MODE_ON,
+        help="Whether E5 should load audio from video inputs while caching embeddings. Use off for V+T/audio-off smoke checks.",
+    )
+    cache.add_argument(
+        "--query-input-mode",
+        choices=QUERY_INPUT_MODES,
+        default="composed",
+        help="Query payload mode for protocol ablations: composed=reference video+edit text, text_only=edit text only, video_only=reference video only.",
+    )
     cache.add_argument("--local-segments", type=int, default=0, help="Encode this many temporal local views per video; 0 disables local cache.")
     cache.add_argument("--local-segment-mode", choices=("prompt", "ffmpeg"), default="prompt")
     cache.add_argument("--local-segment-cache-dir")
@@ -1142,6 +1165,8 @@ def main() -> None:
             batch_size=args.batch_size,
             video_max_pixels=args.video_max_pixels,
             video_fps=args.video_fps,
+            video_audio_mode=args.video_audio_mode,
+            query_input_mode=args.query_input_mode,
             local_segments=args.local_segments,
             local_segment_mode=args.local_segment_mode,
             local_segment_cache_dir=args.local_segment_cache_dir,
@@ -1260,6 +1285,7 @@ def _cache_split_embeddings(
     encoder: Any,
     output_root: Path,
     runtime_info: dict[str, Any],
+    query_input_mode: str,
     local_segments: int,
     local_segment_mode: str,
     local_segment_cache_dir: str | Path | None,
@@ -1285,7 +1311,7 @@ def _cache_split_embeddings(
     with manifest_path.open("w", encoding="utf-8") as manifest_file:
         for index, record in enumerate(records, start=1):
             _emit(progress, f"[e5-audio-delta] cache {split} {index}/{len(records)} sample_id={record.sample_id}")
-            arrays["query"].append(_encode_one(encoder, _query_payload(record)))
+            arrays["query"].append(_encode_one(encoder, _query_payload(record, query_input_mode=query_input_mode)))
             arrays["target"].append(_encode_one(encoder, _video_payload(record.target_video)))
             arrays["reference"].append(_encode_one(encoder, _video_payload(record.reference_video)))
             arrays["edit"].append(_encode_one(encoder, record.edit_text))
@@ -3045,12 +3071,34 @@ def _split_leakage_checks(
     }
 
 
-def _query_payload(record: AudioDeltaRecord) -> dict[str, str]:
-    return {"video": _resolve_media_path(record.reference_video), "text": QUERY_TEMPLATE.format(edit_text=record.edit_text.strip().rstrip("."))}
+def _query_payload(record: AudioDeltaRecord, *, query_input_mode: str = "composed") -> str | dict[str, str]:
+    mode = _normalize_query_input_mode(query_input_mode)
+    edit_text = QUERY_TEMPLATE.format(edit_text=record.edit_text.strip().rstrip("."))
+    if mode == "text_only":
+        return edit_text
+    if mode == "video_only":
+        return {"video": _resolve_media_path(record.reference_video)}
+    return {"video": _resolve_media_path(record.reference_video), "text": edit_text}
 
 
 def _video_payload(video_path: str) -> dict[str, str]:
     return {"video": _resolve_media_path(video_path)}
+
+
+def _normalize_query_input_mode(value: str) -> str:
+    mode = str(value or "composed").strip().lower().replace("-", "_")
+    aliases = {
+        "text": "text_only",
+        "t_only": "text_only",
+        "video": "video_only",
+        "v_only": "video_only",
+        "video_text": "composed",
+        "reference_text": "composed",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in QUERY_INPUT_MODES:
+        raise ValueError(f"query_input_mode must be one of {', '.join(QUERY_INPUT_MODES)}, got {value!r}")
+    return mode
 
 
 def _resolve_media_path(raw_path: str) -> str:

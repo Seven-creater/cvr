@@ -30,8 +30,10 @@ from app.e5_audio_delta_train import (
     _scheduled_temperature,
     _training_profile_options,
     _AudioDeltaAdapter,
+    _query_payload,
     _video_payload,
 )
+from app.audio_cvr_protocol_eval import summarize_data, summarize_evals
 
 
 class E5AudioDeltaTrainTests(unittest.TestCase):
@@ -672,6 +674,110 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
         self.assertLess(_scheduled_learning_rate(base_lr=1.0, step=1, total_steps=10, warmup_steps=2, min_ratio=0.1), 1.0)
         self.assertAlmostEqual(0.07, _scheduled_temperature(step=1, total_steps=10, start=0.07, end=0.03))
         self.assertAlmostEqual(0.03, _scheduled_temperature(step=10, total_steps=10, start=0.07, end=0.03))
+
+    def test_cache_embeddings_records_video_audio_mode_for_reusable_protocol_eval(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+
+            summary = cache_embeddings(
+                records_dir=records_dir,
+                output_dir=root / "embedding_cache",
+                mock_encoder=True,
+                video_audio_mode="off",
+            )
+
+            self.assertEqual("off", summary["runtime"]["video_audio_mode"])
+
+    def test_query_input_modes_support_audio_necessity_protocol_payloads(self) -> None:
+        record = load_audio_delta_records_from_rows([self._record("sample_1", source="source_a", pair="pair_a")])[0]
+
+        composed = _query_payload(record, query_input_mode="composed")
+        text_only = _query_payload(record, query_input_mode="text_only")
+        video_only = _query_payload(record, query_input_mode="video_only")
+
+        self.assertIsInstance(composed, dict)
+        self.assertIn("video", composed)
+        self.assertIn("text", composed)
+        self.assertIsInstance(text_only, str)
+        self.assertIn("Edit the reference video", text_only)
+        self.assertEqual({"video": record.reference_video}, video_only)
+
+    def test_protocol_eval_summaries_are_reusable_beyond_pilot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_run = root / "dataset_run"
+            output_dir = root / "protocol_eval"
+            self._write_jsonl(
+                dataset_run / "b_main_audio_cvr_triplets.jsonl",
+                [
+                    self._record(
+                        "sample_1",
+                        source="source_a",
+                        pair="pair_a",
+                        negatives=[
+                            {"type": "reference_negative", "video": "/tmp/sample_1_ref.mp4", "satisfies_edit": "false"},
+                            {"type": "local_same_source", "video": "/tmp/sample_1_local.mp4", "source_id": "source_a", "satisfies_edit": "false", "verification_status": "human_verified", "temporal_relation": "adjacent_after"},
+                            {"type": "visual_hard", "video": "/tmp/sample_1_vh.mp4", "satisfies_edit": "false"},
+                        ],
+                    )
+                ],
+            )
+            self._write_jsonl(dataset_run / "b_extended_audio_cvr_triplets.jsonl", [])
+            self._write_jsonl(dataset_run / "b_diagnostic_audio_cvr_triplets.jsonl", [])
+            self._write_jsonl(dataset_run / "b_all_audio_cvr_triplets.jsonl", [])
+            (dataset_run / "audio_necessity_eval_manifest.json").write_text("{}", encoding="utf-8")
+            (dataset_run / "benchmark_quality_summary.json").write_text("{}", encoding="utf-8")
+
+            data_summary = summarize_data(run_root=dataset_run, output_dir=output_dir, run_label="Full Audio-CVR Eval")
+
+            self.assertEqual("Full Audio-CVR Eval", data_summary["run_label"])
+            self.assertEqual(1, data_summary["tier_counts"]["main"])
+            self.assertEqual(1.0, data_summary["hard_negative_coverage"]["local_same_source"]["coverage_rate"])
+            self.assertTrue((output_dir / "data_quality_summary.md").exists())
+            self.assertIn("Full Audio-CVR Eval", (output_dir / "data_quality_summary.md").read_text(encoding="utf-8"))
+
+    def test_protocol_eval_can_aggregate_eval_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            eval_dir = root / "eval_typed"
+            eval_dir.mkdir(parents=True)
+            summary = {
+                "rows": [
+                    {"method": "base_e5_global", "R@1": 0.2, "R@5": 1.0, "R@10": 1.0},
+                    {"method": "audio_delta_adapter_global", "R@1": 0.4, "R@5": 1.0, "R@10": 1.0},
+                ],
+                "target_beats_reference": {
+                    "base_e5": {"target_beats_reference_rate": 0.2, "target_minus_reference_mean": -0.1},
+                    "audio_delta_adapter": {"target_beats_reference_rate": 0.4, "target_minus_reference_mean": 0.01},
+                },
+                "base_reference_rank_summary": {"median_rank": 1},
+                "reference_rank_summary": {"median_rank": 2},
+                "base_hard_negative_recall_by_type": {"visual_hard": {"positive_beats_negative_rate": 0.8}},
+                "hard_negative_recall_by_type": {"visual_hard": {"positive_beats_negative_rate": 0.9}},
+            }
+            (eval_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            self._write_jsonl(
+                eval_dir / "per_query_scores.jsonl",
+                [
+                    {
+                        "sample_id": "sample_1",
+                        "adapter_top1": {"kind": "reference_negative", "is_target": False, "is_reference": True},
+                    }
+                ],
+            )
+
+            eval_summary = summarize_evals(output_dir=root / "out", evals=[f"typed_hardneg={eval_dir}"], run_label="Full Audio-CVR Eval")
+
+            self.assertEqual("Full Audio-CVR Eval", eval_summary["run_label"])
+            self.assertEqual(2, len(eval_summary["gallery_protocol_rows"]))
+            self.assertEqual(1, eval_summary["topk_error_count"])
+            self.assertTrue((root / "out" / "protocol_eval_summary.json").exists())
+            self.assertTrue((root / "out" / "advisor_brief.md").exists())
 
     def _record(
         self,
