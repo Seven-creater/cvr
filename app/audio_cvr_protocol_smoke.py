@@ -4,6 +4,7 @@ import argparse
 from collections import Counter, defaultdict
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 
@@ -27,6 +28,89 @@ NEGATIVE_TYPES = (
     "random_distractor",
 )
 TYPED_HARD_TYPES = ("visual_hard", "audio_hard", "asr_hard")
+
+
+def mine_local_same_source(
+    *,
+    run_root: str | Path,
+    input_path: str | Path,
+    output_path: str | Path,
+    max_per_query: int = 5,
+    manifest_paths: list[str | Path] | None = None,
+    summary_output: str | Path | None = None,
+    coverage_output: str | Path | None = None,
+) -> dict[str, Any]:
+    run_path = Path(run_root)
+    input_file = Path(input_path)
+    output_file = Path(output_path)
+    rows = _read_jsonl(input_file)
+    manifests = [Path(path) for path in manifest_paths] if manifest_paths else _default_clip_manifest_paths(run_path)
+    clip_rows = _load_clip_inventory(manifests)
+    clip_rows.extend(_sibling_clip_inventory(rows))
+    by_source = _index_clips_by_source(clip_rows)
+    mined: list[dict[str, Any]] = []
+    missing_reasons: Counter[str] = Counter()
+    for row in rows:
+        sample_id = _first_text(row, "sample_id", "proposal_id", "candidate_id")
+        reference_video = _first_text(row, "reference_video", "reference_path")
+        target_video = _first_text(row, "target_video", "target_path")
+        source_ids = _candidate_source_ids(row, reference_video, target_video)
+        ref_key = _media_key(reference_video)
+        tgt_key = _media_key(target_video)
+        ref_index = _segment_index(reference_video, _first_text(row, "reference_clip_id", "reference_id"))
+        tgt_index = _segment_index(target_video, _first_text(row, "target_clip_id", "target_id"))
+        strict_candidates: list[dict[str, Any]] = []
+        for source_id in source_ids:
+            for clip in by_source.get(source_id, []):
+                video = _first_text(clip, "video", "output_path", "video_path", "clip_path", "path")
+                if not video:
+                    continue
+                clip_key = _media_key(video)
+                if clip_key in {ref_key, tgt_key}:
+                    continue
+                relation = _temporal_relation(clip, ref_index=ref_index, tgt_index=tgt_index)
+                strict_candidates.append(
+                    {
+                        "sample_id": sample_id,
+                        "query_sample_id": sample_id,
+                        "type": "local_same_source",
+                        "negative_type": "local_same_source",
+                        "video": video,
+                        "source_id": source_id,
+                        "raw_source_id": source_id,
+                        "candidate_clip_id": _first_text(clip, "clip_id", "candidate_clip_id", default=Path(video).stem),
+                        "temporal_relation": relation,
+                        "same_source": True,
+                        "satisfies_edit": "unknown",
+                        "verification_status": "candidate_unverified",
+                        "manual_review_required": "true",
+                        "reason": "same raw source candidate; requires false-negative guard before formal benchmark use",
+                        "missing_reason": "",
+                    }
+                )
+        strict_candidates = _dedupe_candidate_rows(strict_candidates)
+        strict_candidates.sort(key=_local_candidate_sort_key)
+        selected = strict_candidates[: max(0, int(max_per_query))]
+        if not selected:
+            fallback = _fallback_visual_candidates(row, sample_id=sample_id, max_per_query=max(0, int(max_per_query)))
+            selected.extend(fallback)
+            missing_reasons["no_strict_local_same_source_candidate"] += 1
+        mined.extend(selected)
+    _write_jsonl(output_file, mined)
+    summary = _local_same_source_summary(rows, mined, missing_reasons)
+    summary_path = Path(summary_output) if summary_output else output_file.with_name("local_same_source_candidate_summary.json")
+    coverage_path = Path(coverage_output) if coverage_output else output_file.with_name("local_same_source_coverage.md")
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    coverage_path.write_text(_local_same_source_coverage_markdown(summary), encoding="utf-8")
+    return {
+        **summary,
+        "run_root": str(run_path),
+        "input_path": str(input_file),
+        "output_path": str(output_file),
+        "manifest_paths": [str(path) for path in manifests],
+        "summary_output": str(summary_path),
+        "coverage_output": str(coverage_path),
+    }
 
 
 def summarize_data(
@@ -532,6 +616,252 @@ def _negative_items(row: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)]
 
 
+def _default_clip_manifest_paths(run_path: Path) -> list[Path]:
+    candidates = [
+        run_path / "single_source_annotations.jsonl",
+        run_path / "extracted_single_source_clips.jsonl",
+        run_path / "clip_manifest.jsonl",
+        run_path / "clips_manifest.jsonl",
+    ]
+    return [path for path in candidates if path.exists()]
+
+
+def _load_clip_inventory(paths: list[Path]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        for row in _read_jsonl(path):
+            video = _first_text(row, "output_path", "video", "video_path", "clip_path", "path")
+            if not video:
+                continue
+            rows.append({**row, "video": video})
+    return rows
+
+
+def _sibling_clip_inventory(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    inventory: list[dict[str, Any]] = []
+    parents: set[Path] = set()
+    for row in rows:
+        for key in ("reference_video", "target_video", "reference_path", "target_path"):
+            value = str(row.get(key) or "").strip()
+            if not value:
+                continue
+            path = Path(value)
+            if path.parent and path.parent.exists():
+                parents.add(path.parent)
+    for parent in sorted(parents):
+        for video in sorted(parent.glob("*.mp4")):
+            source_id = _source_id_from_path(str(video))
+            inventory.append(
+                {
+                    "clip_id": video.stem,
+                    "video": str(video),
+                    "output_path": str(video),
+                    "source_clip_id": source_id,
+                    "raw_source_id": source_id,
+                }
+            )
+    return inventory
+
+
+def _index_clips_by_source(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        video = _first_text(row, "video", "output_path", "video_path", "clip_path", "path")
+        if not video:
+            continue
+        source_id = _source_id_from_row(row, video)
+        if not source_id:
+            continue
+        key = (source_id, _media_key(video))
+        if key in seen:
+            continue
+        seen.add(key)
+        by_source[source_id].append({**row, "video": video, "raw_source_id": source_id})
+    return dict(by_source)
+
+
+def _candidate_source_ids(row: dict[str, Any], reference_video: str, target_video: str) -> list[str]:
+    candidates = [
+        _source_id_from_row(row, reference_video),
+        _source_id_from_path(reference_video),
+        _source_id_from_path(target_video),
+    ]
+    result: list[str] = []
+    for value in candidates:
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def _source_id_from_row(row: dict[str, Any], video: str = "") -> str:
+    for key in ("raw_source_id", "source_clip_id", "source_disjoint_group_id", "source_id", "group_id"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return _normalize_source_id(value)
+    return _source_id_from_path(video)
+
+
+def _source_id_from_path(video: str) -> str:
+    raw = str(video or "").replace("\\", "/").strip()
+    if not raw:
+        return ""
+    name = Path(raw).stem
+    match = re.search(r"(.+?)__single_\d+", name)
+    if match:
+        return _normalize_source_id(match.group(1))
+    parent = Path(raw).parent.name
+    if parent:
+        return _normalize_source_id(parent)
+    return ""
+
+
+def _normalize_source_id(value: str) -> str:
+    text = str(value or "").strip()
+    if text.startswith("single_source_"):
+        text = text[len("single_source_") :]
+    return text
+
+
+def _segment_index(video: str, clip_id: str = "") -> int | None:
+    for value in (clip_id, video):
+        text = str(value or "").replace("\\", "/")
+        match = re.search(r"(?:__single_|single_)(\d+)", text)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _temporal_relation(clip: dict[str, Any], *, ref_index: int | None, tgt_index: int | None) -> str:
+    index = _segment_index(_first_text(clip, "video", "output_path", "path"), _first_text(clip, "clip_id", "candidate_clip_id"))
+    anchors = [value for value in (ref_index, tgt_index) if value is not None]
+    if index is None or not anchors:
+        return "same_source_non_adjacent"
+    nearest = min(anchors, key=lambda value: abs(index - value))
+    if abs(index - nearest) == 1:
+        return "adjacent_before" if index < nearest else "adjacent_after"
+    return "same_source_non_adjacent"
+
+
+def _dedupe_candidate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        key = f"{row.get('sample_id')}|{row.get('negative_type')}|{_media_key(str(row.get('video') or ''))}"
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(row)
+    return result
+
+
+def _local_candidate_sort_key(row: dict[str, Any]) -> tuple[int, str]:
+    relation = str(row.get("temporal_relation") or "")
+    priority = {
+        "adjacent_before": 0,
+        "adjacent_after": 0,
+        "same_source_non_adjacent": 1,
+        "same_group": 2,
+        "cross_source_same_context": 3,
+        "visual_hard_fallback": 4,
+    }.get(relation, 5)
+    return priority, str(row.get("video") or "")
+
+
+def _fallback_visual_candidates(row: dict[str, Any], *, sample_id: str, max_per_query: int) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for item in _negative_items(row):
+        neg_type = str(item.get("type") or item.get("negative_type") or "")
+        if neg_type != "visual_hard":
+            continue
+        video = _first_text(item, "video", "target_video", "path")
+        if not video:
+            continue
+        candidates.append(
+            {
+                "sample_id": sample_id,
+                "query_sample_id": sample_id,
+                "type": "local_fallback_visual",
+                "negative_type": "local_fallback_visual",
+                "video": video,
+                "source_id": _first_text(item, "source_id", "raw_source_id"),
+                "raw_source_id": _first_text(item, "source_id", "raw_source_id"),
+                "candidate_clip_id": _first_text(item, "candidate_clip_id", "clip_id", default=Path(video).stem),
+                "temporal_relation": "visual_hard_fallback",
+                "same_source": False,
+                "satisfies_edit": item.get("satisfies_edit", "false"),
+                "verification_status": item.get("verification_status", "auto_verified"),
+                "manual_review_required": item.get("manual_review_required", ""),
+                "reason": "fallback because no strict local_same_source candidate exists",
+                "missing_reason": "no_strict_local_same_source_candidate",
+            }
+        )
+        if len(candidates) >= max_per_query:
+            break
+    return candidates
+
+
+def _local_same_source_summary(rows: list[dict[str, Any]], candidates: list[dict[str, Any]], missing_reasons: Counter[str]) -> dict[str, Any]:
+    query_count = len(rows)
+    by_sample: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for candidate in candidates:
+        by_sample[str(candidate.get("sample_id") or "")].append(candidate)
+    strict_samples = {
+        sample_id
+        for sample_id, items in by_sample.items()
+        if any(str(item.get("negative_type")) == "local_same_source" for item in items)
+    }
+    fallback_samples = {
+        sample_id
+        for sample_id, items in by_sample.items()
+        if any(str(item.get("negative_type")) == "local_fallback_visual" for item in items)
+    }
+    relation_counts: Counter[str] = Counter(str(item.get("temporal_relation") or "unknown") for item in candidates)
+    verification_counts: Counter[str] = Counter(str(item.get("verification_status") or "unknown") for item in candidates)
+    return {
+        "query_count": query_count,
+        "candidate_count": len(candidates),
+        "strict_local_same_source_query_count": len(strict_samples),
+        "strict_local_same_source_coverage": round(len(strict_samples) / max(1, query_count), 4),
+        "local_fallback_visual_query_count": len(fallback_samples),
+        "local_fallback_visual_rate": round(len(fallback_samples) / max(1, query_count), 4),
+        "average_candidates_per_query": round(len(candidates) / max(1, query_count), 4),
+        "temporal_relation_counts": dict(sorted(relation_counts.items())),
+        "verification_status_counts": dict(sorted(verification_counts.items())),
+        "missing_reasons": dict(sorted(missing_reasons.items())),
+    }
+
+
+def _local_same_source_coverage_markdown(summary: dict[str, Any]) -> str:
+    lines = [
+        "# Local Same-Source Coverage",
+        "",
+        "| metric | value |",
+        "|---|---:|",
+    ]
+    for key in (
+        "query_count",
+        "candidate_count",
+        "strict_local_same_source_query_count",
+        "strict_local_same_source_coverage",
+        "local_fallback_visual_query_count",
+        "local_fallback_visual_rate",
+        "average_candidates_per_query",
+    ):
+        lines.append(f"| {key} | {summary.get(key)} |")
+    lines.extend(["", "## Temporal Relations", "", "| relation | count |", "|---|---:|"])
+    for key, value in (summary.get("temporal_relation_counts") or {}).items():
+        lines.append(f"| {key} | {value} |")
+    lines.extend(["", "## Verification Status", "", "| status | count |", "|---|---:|"])
+    for key, value in (summary.get("verification_status_counts") or {}).items():
+        lines.append(f"| {key} | {value} |")
+    return "\n".join(lines) + "\n"
+
+
+def _media_key(raw_path: str) -> str:
+    return str(raw_path or "").replace("\\", "/").strip().lower()
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -596,6 +926,15 @@ def build_parser() -> argparse.ArgumentParser:
     evals.add_argument("--output-dir", required=True)
     evals.add_argument("--run-label", default="Audio-CVR Protocol")
     evals.add_argument("--eval", action="append", default=[], help="Labelled eval directory, formatted as label=/path/to/eval_dir.")
+
+    mine = subparsers.add_parser("mine-local-same-source")
+    mine.add_argument("--run-root", required=True)
+    mine.add_argument("--input", required=True)
+    mine.add_argument("--output", required=True)
+    mine.add_argument("--max-per-query", type=int, default=5)
+    mine.add_argument("--manifest-path", action="append", default=[])
+    mine.add_argument("--summary-output")
+    mine.add_argument("--coverage-output")
     return parser
 
 
@@ -611,6 +950,16 @@ def main() -> None:
         )
     elif args.command == "summarize-evals":
         result = summarize_evals(output_dir=args.output_dir, evals=args.eval, run_label=args.run_label)
+    elif args.command == "mine-local-same-source":
+        result = mine_local_same_source(
+            run_root=args.run_root,
+            input_path=args.input,
+            output_path=args.output,
+            max_per_query=args.max_per_query,
+            manifest_paths=args.manifest_path or None,
+            summary_output=args.summary_output,
+            coverage_output=args.coverage_output,
+        )
     else:
         raise ValueError(f"unknown command: {args.command}")
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)

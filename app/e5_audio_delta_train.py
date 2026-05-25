@@ -28,7 +28,15 @@ DEFAULT_RUNS_ROOT = "/data02/usr/wangqihao/Demo/test/cvr_clean_main/runs"
 DEFAULT_DATA_ROOT = "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval"
 QUERY_TEMPLATE = "Edit the reference video so that: {edit_text}"
 DEFAULT_NEGATIVE_TYPES = ("reference_negative", "visual_hard", "audio_hard", "asr_hard")
-EVAL_GALLERY_PROTOCOLS = ("random", "reference", "local_same_source", "typed_hardneg", "audio_necessity")
+EVAL_GALLERY_PROTOCOLS = (
+    "random",
+    "reference",
+    "local_same_source",
+    "local_same_source_candidate",
+    "local_same_source_verified",
+    "typed_hardneg",
+    "audio_necessity",
+)
 QUERY_INPUT_MODES = ("composed", "text_only", "video_only")
 DEFAULT_LOSS_OPTIONS = {
     "training_profile": "v1",
@@ -137,6 +145,7 @@ def prepare_records(
     eval_gallery_size: int = 0,
     eval_gallery_include_reference_negative: bool = False,
     eval_gallery_protocol: str = "random",
+    local_same_source_candidates_path: str | Path | None = None,
     distractor_pool_path: str | Path | None = None,
     distractor_seed: int = 13,
     progress: Callable[[str], None] | None = None,
@@ -171,6 +180,7 @@ def prepare_records(
             total_gallery_size=eval_gallery_size,
             include_reference_negative=eval_gallery_include_reference_negative or eval_gallery_protocol != "random",
             gallery_protocol=eval_gallery_protocol,
+            local_same_source_candidates_path=local_same_source_candidates_path,
             distractor_pool_path=distractor_pool_path,
             seed=distractor_seed,
         )
@@ -994,7 +1004,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--eval-gallery-protocol",
         choices=EVAL_GALLERY_PROTOCOLS,
         default="random",
-        help="Evaluation gallery protocol: random, reference, local_same_source, typed_hardneg, or audio_necessity.",
+        help="Evaluation gallery protocol: random, reference, local_same_source, local_same_source_candidate, local_same_source_verified, typed_hardneg, or audio_necessity.",
+    )
+    prepare.add_argument(
+        "--local-same-source-candidates",
+        help="JSONL produced by audio_cvr_protocol_eval mine-local-same-source; used by local same-source gallery protocols.",
     )
     prepare.add_argument(
         "--distractor-pool-path",
@@ -1148,6 +1162,7 @@ def main() -> None:
             eval_gallery_size=args.eval_gallery_size,
             eval_gallery_include_reference_negative=args.eval_gallery_include_reference_negative,
             eval_gallery_protocol=args.eval_gallery_protocol,
+            local_same_source_candidates_path=args.local_same_source_candidates,
             distractor_pool_path=args.distractor_pool_path,
             distractor_seed=args.distractor_seed,
             progress=progress,
@@ -2718,7 +2733,7 @@ def _normalize_negative_items(items: Any) -> list[dict[str, str]]:
     for index, item in enumerate(items):
         if isinstance(item, dict):
             video = str(item.get("video") or item.get("target_video") or item.get("path") or "").strip()
-            neg_type = str(item.get("type") or DEFAULT_NEGATIVE_TYPES[min(index, len(DEFAULT_NEGATIVE_TYPES) - 1)]).strip()
+            neg_type = str(item.get("type") or item.get("negative_type") or DEFAULT_NEGATIVE_TYPES[min(index, len(DEFAULT_NEGATIVE_TYPES) - 1)]).strip()
             pair_group_id = str(item.get("pair_group_id") or "").strip()
             inverse_pair_group_id = str(item.get("inverse_pair_group_id") or "").strip()
             source_id = str(item.get("source_id") or item.get("raw_source_id") or "").strip()
@@ -2729,6 +2744,7 @@ def _normalize_negative_items(items: Any) -> list[dict[str, str]]:
             verification_status = str(item.get("verification_status") or "").strip()
             missing_reason = str(item.get("missing_reason") or "").strip()
             manual_review_required = str(item.get("manual_review_required") or "").strip()
+            candidate_clip_id = str(item.get("candidate_clip_id") or item.get("clip_id") or "").strip()
         else:
             video = str(item).strip()
             neg_type = DEFAULT_NEGATIVE_TYPES[min(index, len(DEFAULT_NEGATIVE_TYPES) - 1)]
@@ -2742,6 +2758,7 @@ def _normalize_negative_items(items: Any) -> list[dict[str, str]]:
             verification_status = ""
             missing_reason = ""
             manual_review_required = ""
+            candidate_clip_id = ""
         if video:
             normalized = {"type": neg_type, "video": video}
             if pair_group_id:
@@ -2764,6 +2781,8 @@ def _normalize_negative_items(items: Any) -> list[dict[str, str]]:
                 normalized["missing_reason"] = missing_reason
             if manual_review_required:
                 normalized["manual_review_required"] = manual_review_required
+            if candidate_clip_id:
+                normalized["candidate_clip_id"] = candidate_clip_id
             result.append(normalized)
     return result
 
@@ -2806,6 +2825,7 @@ def _build_eval_gallery(
     total_gallery_size: int,
     include_reference_negative: bool,
     gallery_protocol: str,
+    local_same_source_candidates_path: str | Path | None,
     distractor_pool_path: str | Path | None,
     seed: int,
 ) -> tuple[list[EvalGalleryItem], dict[str, list[int]], dict[str, Any]]:
@@ -2848,7 +2868,12 @@ def _build_eval_gallery(
             )
             for record in eval_records
         ]
-    hard_items = _build_protocol_hard_gallery_items(eval_records, gallery_protocol=gallery_protocol)
+    local_candidates = _load_local_same_source_candidates(local_same_source_candidates_path)
+    hard_items = _build_protocol_hard_gallery_items(
+        eval_records,
+        gallery_protocol=gallery_protocol,
+        local_candidates_by_sample=local_candidates,
+    )
     desired_total = max(len(positives) + len(references) + len(hard_items), int(total_gallery_size))
     forbidden_video_keys = {
         _media_key(record.reference_video)
@@ -2907,6 +2932,8 @@ def _build_eval_gallery(
         "include_reference_negative": bool(include_reference_negative),
         "gallery_protocol": gallery_protocol,
         "pool_paths": [str(path) for path in pool_paths],
+        "local_same_source_candidates_path": str(local_same_source_candidates_path) if local_same_source_candidates_path else None,
+        "local_same_source_candidate_sample_count": len(local_candidates),
         "forbidden_source_count": len(forbidden_source_ids),
     }
     return gallery_items, {"positive_gallery_index": positive_indices, "reference_gallery_index": reference_indices}, summary
@@ -2919,19 +2946,51 @@ def _count_strings(values: Any) -> dict[str, int]:
     return dict(counts)
 
 
-def _build_protocol_hard_gallery_items(eval_records: list[AudioDeltaRecord], *, gallery_protocol: str) -> list[EvalGalleryItem]:
-    if gallery_protocol not in {"local_same_source", "typed_hardneg", "audio_necessity"}:
+def _load_local_same_source_candidates(path: str | Path | None) -> dict[str, list[dict[str, Any]]]:
+    if not path:
+        return {}
+    root = Path(path)
+    if not root.exists():
+        return {}
+    by_sample: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in _load_distractor_pool([root]):
+        sample_id = _first_text(row, "sample_id", "query_sample_id")
+        if sample_id:
+            by_sample[sample_id].append(row)
+    return dict(by_sample)
+
+
+def _build_protocol_hard_gallery_items(
+    eval_records: list[AudioDeltaRecord],
+    *,
+    gallery_protocol: str,
+    local_candidates_by_sample: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[EvalGalleryItem]:
+    if gallery_protocol not in {
+        "local_same_source",
+        "local_same_source_candidate",
+        "local_same_source_verified",
+        "typed_hardneg",
+        "audio_necessity",
+    }:
         return []
     items: list[EvalGalleryItem] = []
     seen: set[str] = set()
+    local_candidates_by_sample = local_candidates_by_sample or {}
     for record in eval_records:
-        for negative in record.hard_negatives:
+        negatives: list[dict[str, Any]] = list(record.hard_negatives)
+        if gallery_protocol in {"local_same_source", "local_same_source_candidate", "local_same_source_verified"}:
+            negatives.extend(local_candidates_by_sample.get(record.sample_id, []))
+        for negative in negatives:
             neg_type = str(negative.get("type") or "").strip() or "hard_negative"
             if neg_type == "reference_negative" or not _negative_item_usable_for_gallery(negative):
                 continue
             source_id = str(negative.get("source_id") or negative.get("raw_source_id") or "").strip()
             same_source = bool(source_id and source_id == record.raw_source_id)
-            if gallery_protocol == "local_same_source" and not (same_source or neg_type == "visual_hard"):
+            is_local_protocol = gallery_protocol in {"local_same_source", "local_same_source_candidate", "local_same_source_verified"}
+            if is_local_protocol and not (same_source or neg_type == "visual_hard" or neg_type == "local_fallback_visual"):
+                continue
+            if gallery_protocol == "local_same_source_verified" and not _negative_item_verified_for_gallery(negative):
                 continue
             video = str(negative.get("video") or "").strip()
             if not video:
@@ -2940,26 +2999,27 @@ def _build_protocol_hard_gallery_items(eval_records: list[AudioDeltaRecord], *, 
             if key in seen:
                 continue
             seen.add(key)
-            local_kind = "local_fallback_visual" if neg_type == "visual_hard" or not same_source else "local_same_source"
+            local_kind = "local_fallback_visual" if neg_type in {"visual_hard", "local_fallback_visual"} or not same_source else "local_same_source"
             local_negative_type = "local_fallback_visual" if local_kind == "local_fallback_visual" else "local_same_source"
             items.append(
                 EvalGalleryItem(
                     gallery_id=f"{neg_type}::{record.sample_id}::{len(items):04d}",
                     video=video,
                     raw_source_id=source_id or record.raw_source_id,
-                    kind=local_kind if gallery_protocol == "local_same_source" else neg_type,
+                    kind=local_kind if is_local_protocol else neg_type,
                     source_payload={
                         "sample_id": record.sample_id,
                         "pair_group_id": record.pair_group_id,
                         "audio_delta_type": record.audio_delta_type,
                         "split_tier": record.split_tier,
-                        "negative_type": local_negative_type if gallery_protocol == "local_same_source" else neg_type,
-                        "same_source": same_source or neg_type == "visual_hard",
-                        "satisfies_edit": False,
+                        "negative_type": local_negative_type if is_local_protocol else neg_type,
+                        "same_source": same_source,
+                        "satisfies_edit": negative.get("satisfies_edit", False),
                         "reason": negative.get("reason", ""),
                         "temporal_relation": negative.get("temporal_relation", ""),
                         "verification_status": negative.get("verification_status", "auto_verified"),
-                        "missing_reason": negative.get("missing_reason", "no_strict_local_same_source_candidate" if gallery_protocol == "local_same_source" and local_kind == "local_fallback_visual" else ""),
+                        "candidate_clip_id": negative.get("candidate_clip_id", ""),
+                        "missing_reason": negative.get("missing_reason", "no_strict_local_same_source_candidate" if is_local_protocol and local_kind == "local_fallback_visual" else ""),
                         "manual_review_required": negative.get("manual_review_required", ""),
                     },
                 )
@@ -2973,6 +3033,13 @@ def _negative_item_usable_for_gallery(item: dict[str, str]) -> bool:
     if _truthy_text(item.get("verification_accept")):
         return False
     return True
+
+
+def _negative_item_verified_for_gallery(item: dict[str, Any]) -> bool:
+    status = str(item.get("verification_status") or "").strip().lower()
+    if status not in {"auto_verified", "human_verified", "verified"}:
+        return False
+    return _negative_item_usable_for_gallery(item)
 
 
 def _truthy_text(value: Any) -> bool:

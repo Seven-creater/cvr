@@ -10,6 +10,7 @@ Usage:
     --adapter-dir ADAPTER_DIR \
     [--gallery-size 1000] [--seed 13] [--max-train-records 64] [--max-eval-records 30] \
     [--protocols random,reference,local_same_source,typed_hardneg] \
+    [--mine-local-same-source] [--local-same-source-candidates PATH] \
     [--video-audio-mode on|off] [--query-input-mode composed|text_only|video_only] [--mock-encoder]
 
 This is a pilot convenience wrapper around the reusable protocol eval logic.
@@ -33,6 +34,9 @@ MOCK_ENCODER=0
 DEVICE="cuda"
 LOCAL_SEGMENTS=0
 REUSE_CACHE_FROM=""
+MINE_LOCAL_SAME_SOURCE=0
+LOCAL_SAME_SOURCE_CANDIDATES=""
+MAX_LOCAL_SAME_SOURCE_PER_QUERY=5
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -49,6 +53,9 @@ while [[ $# -gt 0 ]]; do
     --device) DEVICE="$2"; shift 2 ;;
     --local-segments) LOCAL_SEGMENTS="$2"; shift 2 ;;
     --reuse-cache-from) REUSE_CACHE_FROM="$2"; shift 2 ;;
+    --mine-local-same-source) MINE_LOCAL_SAME_SOURCE=1; shift ;;
+    --local-same-source-candidates) LOCAL_SAME_SOURCE_CANDIDATES="$2"; shift 2 ;;
+    --max-local-same-source-per-query) MAX_LOCAL_SAME_SOURCE_PER_QUERY="$2"; shift 2 ;;
     --mock-encoder) MOCK_ENCODER=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -68,6 +75,17 @@ python3 -m app.audio_cvr_protocol_eval summarize-data \
   --output-dir "$OUTPUT_DIR" \
   --run-label "1% Audio-CVR Protocol Smoke"
 
+if [[ "$MINE_LOCAL_SAME_SOURCE" -eq 1 ]]; then
+  if [[ -z "$LOCAL_SAME_SOURCE_CANDIDATES" ]]; then
+    LOCAL_SAME_SOURCE_CANDIDATES="$OUTPUT_DIR/b_main_local_same_source_candidates.jsonl"
+  fi
+  python3 -m app.audio_cvr_protocol_eval mine-local-same-source \
+    --run-root "$RUN_ROOT" \
+    --input "$RUN_ROOT/b_main_audio_cvr_triplets.jsonl" \
+    --output "$LOCAL_SAME_SOURCE_CANDIDATES" \
+    --max-per-query "$MAX_LOCAL_SAME_SOURCE_PER_QUERY"
+fi
+
 IFS=',' read -ra PROTOCOL_ARRAY <<< "$PROTOCOLS"
 EVAL_ARGS=()
 for protocol in "${PROTOCOL_ARRAY[@]}"; do
@@ -77,7 +95,8 @@ for protocol in "${PROTOCOL_ARRAY[@]}"; do
   cache_dir="$OUTPUT_DIR/cache_${protocol}"
   eval_dir="$OUTPUT_DIR/eval_${protocol}"
 
-  python3 -m app.e5_audio_delta_train prepare \
+  prepare_cmd=(
+    python3 -m app.e5_audio_delta_train prepare
     --dataset-run-root "$RUN_ROOT" \
     --output-dir "$records_dir" \
     --max-train-records "$MAX_TRAIN_RECORDS" \
@@ -85,6 +104,11 @@ for protocol in "${PROTOCOL_ARRAY[@]}"; do
     --eval-gallery-size "$GALLERY_SIZE" \
     --eval-gallery-protocol "$protocol" \
     --distractor-seed "$SEED"
+  )
+  if [[ -n "$LOCAL_SAME_SOURCE_CANDIDATES" ]]; then
+    prepare_cmd+=(--local-same-source-candidates "$LOCAL_SAME_SOURCE_CANDIDATES")
+  fi
+  "${prepare_cmd[@]}"
 
   cache_cmd=(
     python3 -m app.e5_audio_delta_train cache-embeddings

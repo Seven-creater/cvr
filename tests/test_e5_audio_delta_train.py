@@ -33,7 +33,7 @@ from app.e5_audio_delta_train import (
     _query_payload,
     _video_payload,
 )
-from app.audio_cvr_protocol_eval import summarize_data, summarize_evals
+from app.audio_cvr_protocol_eval import mine_local_same_source, summarize_data, summarize_evals
 
 
 class E5AudioDeltaTrainTests(unittest.TestCase):
@@ -153,7 +153,7 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
                     {
                         "type": "visual_hard",
                         "video": "/tmp/main_1_visual.mp4",
-                        "source_id": "source_a",
+                        "source_id": "source_b",
                         "satisfies_edit": "false",
                         "temporal_relation": "visual_hard_fallback",
                         "verification_status": "human_verified",
@@ -205,6 +205,110 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertTrue(any(payload.get("verification_status") == "human_verified" for payload in local_payloads))
             self.assertFalse(any(item["kind"] == "local_same_source" and item["source_payload"].get("negative_type") == "visual_hard" for item in local_gallery))
             self.assertTrue(any(item["kind"] == "local_fallback_visual" for item in local_gallery))
+            self.assertFalse(any(item["kind"] == "local_fallback_visual" and item["source_payload"].get("same_source") for item in local_gallery))
+
+    def test_mine_local_same_source_candidates_from_clip_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_run = root / "dataset_run"
+            dataset_run.mkdir()
+            record = self._record("main_1", source="source_a", pair="pair_a")
+            record["reference_video"] = "/clips/source_a/source_a__single_001.mp4"
+            record["target_video"] = "/clips/source_a/source_a__single_003.mp4"
+            self._write_jsonl(dataset_run / "b_main_audio_cvr_triplets.jsonl", [record])
+            self._write_jsonl(
+                dataset_run / "single_source_annotations.jsonl",
+                [
+                    {"clip_id": "source_a__single_000", "output_path": "/clips/source_a/source_a__single_000.mp4", "source_clip_id": "source_a"},
+                    {"clip_id": "source_a__single_001", "output_path": "/clips/source_a/source_a__single_001.mp4", "source_clip_id": "source_a"},
+                    {"clip_id": "source_a__single_002", "output_path": "/clips/source_a/source_a__single_002.mp4", "source_clip_id": "source_a"},
+                    {"clip_id": "source_a__single_003", "output_path": "/clips/source_a/source_a__single_003.mp4", "source_clip_id": "source_a"},
+                    {"clip_id": "source_a__single_004", "output_path": "/clips/source_a/source_a__single_004.mp4", "source_clip_id": "source_a"},
+                    {"clip_id": "source_b__single_000", "output_path": "/clips/source_b/source_b__single_000.mp4", "source_clip_id": "source_b"},
+                ],
+            )
+
+            output_path = dataset_run / "b_main_local_same_source_candidates.jsonl"
+            summary = mine_local_same_source(
+                run_root=dataset_run,
+                input_path=dataset_run / "b_main_audio_cvr_triplets.jsonl",
+                output_path=output_path,
+                max_per_query=5,
+            )
+            candidates = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+
+            self.assertGreaterEqual(summary["strict_local_same_source_coverage"], 1.0)
+            self.assertTrue(candidates)
+            self.assertFalse(any(item["video"] == record["reference_video"] for item in candidates))
+            self.assertFalse(any(item["video"] == record["target_video"] for item in candidates))
+            self.assertTrue(all(item["negative_type"] == "local_same_source" for item in candidates))
+            self.assertTrue(any(item["temporal_relation"] == "adjacent_after" for item in candidates))
+            self.assertEqual("candidate_unverified", candidates[0]["verification_status"])
+            self.assertTrue((dataset_run / "local_same_source_candidate_summary.json").exists())
+            self.assertTrue((dataset_run / "local_same_source_coverage.md").exists())
+
+    def test_prepare_can_use_mined_local_candidate_and_verified_galleries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_run = root / "dataset_run"
+            dataset_run.mkdir()
+            record = self._record("main_1", source="source_a", pair="pair_a")
+            self._write_jsonl(dataset_run / "b_main_audio_cvr_triplets.jsonl", [record])
+            candidate = {
+                "sample_id": "main_1",
+                "type": "local_same_source",
+                "negative_type": "local_same_source",
+                "video": "/tmp/main_1_local.mp4",
+                "source_id": "source_a",
+                "satisfies_edit": "unknown",
+                "verification_status": "candidate_unverified",
+                "temporal_relation": "adjacent_after",
+            }
+            candidates_path = dataset_run / "local_candidates.jsonl"
+            self._write_jsonl(candidates_path, [candidate])
+
+            candidate_summary = prepare_records(
+                run_root=dataset_run,
+                output_dir=root / "candidate_records",
+                max_train_records=1,
+                max_eval_records=1,
+                eval_gallery_size=4,
+                eval_gallery_protocol="local_same_source_candidate",
+                local_same_source_candidates_path=candidates_path,
+            )
+            candidate_gallery = [json.loads(line) for line in (root / "candidate_records" / "eval_gallery.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual("audio_cvr_local_same_source_candidate_gallery", candidate_summary["eval_protocol"])
+            self.assertTrue(any(item["kind"] == "local_same_source" for item in candidate_gallery))
+            self.assertTrue(any(item["source_payload"].get("verification_status") == "candidate_unverified" for item in candidate_gallery))
+
+            verified_summary = prepare_records(
+                run_root=dataset_run,
+                output_dir=root / "verified_empty_records",
+                max_train_records=1,
+                max_eval_records=1,
+                eval_gallery_size=4,
+                eval_gallery_protocol="local_same_source_verified",
+                local_same_source_candidates_path=candidates_path,
+            )
+            verified_empty_gallery = [json.loads(line) for line in (root / "verified_empty_records" / "eval_gallery.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual("audio_cvr_local_same_source_verified_gallery", verified_summary["eval_protocol"])
+            self.assertFalse(any(item["kind"] == "local_same_source" for item in verified_empty_gallery))
+
+            candidate["satisfies_edit"] = "false"
+            candidate["verification_status"] = "human_verified"
+            self._write_jsonl(candidates_path, [candidate])
+            verified_summary = prepare_records(
+                run_root=dataset_run,
+                output_dir=root / "verified_records",
+                max_train_records=1,
+                max_eval_records=1,
+                eval_gallery_size=4,
+                eval_gallery_protocol="local_same_source_verified",
+                local_same_source_candidates_path=candidates_path,
+            )
+            verified_gallery = [json.loads(line) for line in (root / "verified_records" / "eval_gallery.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual("audio_cvr_local_same_source_verified_gallery", verified_summary["eval_protocol"])
+            self.assertTrue(any(item["kind"] == "local_same_source" for item in verified_gallery))
 
     def test_cache_train_and_eval_adapter_smoke_with_mock_encoder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
