@@ -2914,24 +2914,26 @@ def _build_protocol_hard_gallery_items(eval_records: list[AudioDeltaRecord], *, 
             if key in seen:
                 continue
             seen.add(key)
+            local_kind = "local_fallback_visual" if neg_type == "visual_hard" or not same_source else "local_same_source"
+            local_negative_type = "local_fallback_visual" if local_kind == "local_fallback_visual" else "local_same_source"
             items.append(
                 EvalGalleryItem(
                     gallery_id=f"{neg_type}::{record.sample_id}::{len(items):04d}",
                     video=video,
                     raw_source_id=source_id or record.raw_source_id,
-                    kind="local_same_source" if gallery_protocol == "local_same_source" else neg_type,
+                    kind=local_kind if gallery_protocol == "local_same_source" else neg_type,
                     source_payload={
                         "sample_id": record.sample_id,
                         "pair_group_id": record.pair_group_id,
                         "audio_delta_type": record.audio_delta_type,
                         "split_tier": record.split_tier,
-                        "negative_type": neg_type,
+                        "negative_type": local_negative_type if gallery_protocol == "local_same_source" else neg_type,
                         "same_source": same_source or neg_type == "visual_hard",
                         "satisfies_edit": False,
                         "reason": negative.get("reason", ""),
                         "temporal_relation": negative.get("temporal_relation", ""),
                         "verification_status": negative.get("verification_status", "auto_verified"),
-                        "missing_reason": negative.get("missing_reason", ""),
+                        "missing_reason": negative.get("missing_reason", "no_strict_local_same_source_candidate" if gallery_protocol == "local_same_source" and local_kind == "local_fallback_visual" else ""),
                         "manual_review_required": negative.get("manual_review_required", ""),
                     },
                 )

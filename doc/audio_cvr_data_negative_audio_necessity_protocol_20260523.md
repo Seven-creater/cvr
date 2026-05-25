@@ -405,9 +405,12 @@ local_same_source 片段必须经过 false-negative guard。
 采样优先级：
 
 ```text
+local_same_source:
 Level 1: 与 reference/target 时间相邻的同源 clip；
 Level 2: 同源但非相邻 clip；
 Level 3: 同一 source group / 同一视频事件下的 clip；
+
+local_fallback_visual:
 Level 4: 同 visual context 的跨 source clip；
 Level 5: visual_hard 替代。
 ```
@@ -417,10 +420,22 @@ Level 5: visual_hard 替代。
 ```json
 {
   "negative_type": "local_same_source",
-  "temporal_relation": "adjacent_before | adjacent_after | same_source_non_adjacent | same_group | cross_source_same_context | visual_hard_fallback",
+  "temporal_relation": "adjacent_before | adjacent_after | same_source_non_adjacent | same_group",
   "satisfies_edit": false,
   "verification_status": "auto_verified | human_verified | uncertain",
   "missing_reason": null
+}
+```
+
+如果使用跨 source fallback，则必须显式标记为 `negative_type=local_fallback_visual`，不能混写成严格的 `local_same_source`：
+
+```json
+{
+  "negative_type": "local_fallback_visual",
+  "temporal_relation": "cross_source_same_context | visual_hard_fallback",
+  "satisfies_edit": false,
+  "verification_status": "auto_verified | human_verified | uncertain",
+  "missing_reason": "no_strict_local_same_source_candidate"
 }
 ```
 
@@ -605,6 +620,7 @@ audio_necessity_eval_manifest.json
 | 模式 | query | gallery |
 |---|---|---|
 | V-only | reference video muted + edit_text | target videos muted |
+| T-only | edit_text only | target videos/audios/full AV，按具体设置固定 |
 | A-only | reference audio + edit_text | target audios |
 | V+T | reference video + edit_text | target videos |
 | A+T | reference audio + edit_text | target audios |

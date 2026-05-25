@@ -153,6 +153,14 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
                         "video": "/tmp/main_1_visual.mp4",
                         "source_id": "source_a",
                         "satisfies_edit": "false",
+                        "temporal_relation": "visual_hard_fallback",
+                        "verification_status": "human_verified",
+                    },
+                    {
+                        "type": "local_same_source",
+                        "video": "/tmp/main_1_local.mp4",
+                        "source_id": "source_a",
+                        "satisfies_edit": "false",
                         "temporal_relation": "adjacent_after",
                         "verification_status": "human_verified",
                     },
@@ -193,6 +201,8 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             local_payloads = [item["source_payload"] for item in local_gallery if item["kind"] == "local_same_source"]
             self.assertTrue(any(payload.get("temporal_relation") == "adjacent_after" for payload in local_payloads))
             self.assertTrue(any(payload.get("verification_status") == "human_verified" for payload in local_payloads))
+            self.assertFalse(any(item["kind"] == "local_same_source" and item["source_payload"].get("negative_type") == "visual_hard" for item in local_gallery))
+            self.assertTrue(any(item["kind"] == "local_fallback_visual" for item in local_gallery))
 
     def test_cache_train_and_eval_adapter_smoke_with_mock_encoder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

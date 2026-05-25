@@ -1145,6 +1145,10 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             local_rows = [item for item in local_gallery if item["kind"] == "local_same_source"]
             self.assertTrue(any(item["temporal_relation"] in {"adjacent_before", "adjacent_after"} for item in local_rows))
             self.assertTrue(all(item["verification_status"] in {"auto_verified", "human_verified"} for item in local_rows))
+            self.assertTrue(any(item["kind"] == "local_fallback_visual" for item in local_gallery))
+            self.assertTrue(all(item["negative_type"] != "visual_hard" for item in local_rows))
+            manifest = json.loads((run_root / "audio_necessity_eval_manifest.json").read_text(encoding="utf-8"))
+            self.assertIn("T-only", manifest["audio_necessity_modes"])
             self.assertIn("audio_necessity_success_conditions", quality_summary)
 
             positive_without_existing_negatives = dict(positive)

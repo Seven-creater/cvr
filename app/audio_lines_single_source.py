@@ -631,7 +631,7 @@ def _write_audio_cvr_benchmark_outputs(
             "local_same_source": "b_main_eval_gallery_local_same_source.jsonl",
             "typed_hardneg": "b_main_eval_gallery_hardneg.jsonl",
         },
-        "audio_necessity_modes": ["V-only", "A-only", "V+T", "A+T", "V+A", "V+A+T"],
+        "audio_necessity_modes": ["V-only", "T-only", "A-only", "V+T", "A+T", "V+A", "V+A+T"],
         "audio_sync_rule": "audio-on/off must be applied to both query/reference and gallery/target sides",
         "audio_necessity_primary_comparison": "V+T vs V+A+T",
         "audio_necessity_success_conditions": [
@@ -673,6 +673,7 @@ def _write_audio_cvr_benchmark_outputs(
             "typed_hardneg": dict(Counter(str(row.get("kind") or "") for row in hardneg_gallery)),
         },
         "local_same_source_relation_counts": dict(Counter(str(row.get("temporal_relation") or "") for row in local_gallery if row.get("kind") == "local_same_source")),
+        "local_fallback_visual_count": sum(1 for row in local_gallery if row.get("kind") == "local_fallback_visual"),
         "audio_necessity_primary_comparison": "V+T vs V+A+T",
         "audio_necessity_success_conditions": manifest["audio_necessity_success_conditions"],
         "formal_eval_note": "Use reference-aware and local_same_source galleries for benchmark reporting; random gallery is smoke-only.",
@@ -749,18 +750,20 @@ def _benchmark_existing_hard_negative_rows(record: dict[str, Any], *, sample_id:
         video = str(item.get("video") or "").strip()
         if not video:
             continue
+        local_kind = "local_fallback_visual" if label == "visual_hard" or not same_source else "local_same_source"
+        local_negative_type = "local_fallback_visual" if local_kind == "local_fallback_visual" else "local_same_source"
         rows.append(
             _benchmark_gallery_row(
                 record,
                 sample_id=sample_id,
                 video=video,
-                kind="local_same_source" if protocol == "local_same_source" else label,
-                negative_type=label,
+                kind=local_kind if protocol == "local_same_source" else label,
+                negative_type=local_negative_type if protocol == "local_same_source" else label,
                 reason=str(item.get("reason") or _hard_negative_reason(label)),
                 source_id=source_id or _source_split_group_id(record),
                 temporal_relation=_hard_negative_temporal_relation(record, item, label=label, source_id=source_id),
                 verification_status=str(item.get("verification_status") or "auto_verified"),
-                missing_reason=str(item.get("missing_reason") or "") or None,
+                missing_reason=str(item.get("missing_reason") or ("no_strict_local_same_source_candidate" if protocol == "local_same_source" and local_kind == "local_fallback_visual" else "")) or None,
             )
         )
     return rows
@@ -838,7 +841,7 @@ def _hard_negative_missing_counts(records: list[dict[str, Any]]) -> dict[str, in
 
 
 def _hard_negative_temporal_relation(record: dict[str, Any], item: dict[str, Any], *, label: str, source_id: str) -> str:
-    if label == "visual_hard" and source_id != _source_split_group_id(record):
+    if label == "visual_hard":
         return "visual_hard_fallback"
     if label != "local_same_source" and source_id != _source_split_group_id(record):
         return "cross_source_same_context"
