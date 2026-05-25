@@ -2545,6 +2545,10 @@ def _topk_gallery_row(
         "is_reference": reference_index is not None and int(gallery_index) == int(reference_index),
         "same_source": _truthy_text(payload.get("same_source")) if payload else False,
         "satisfies_edit": _truthy_text(payload.get("satisfies_edit")) if payload else False,
+        "temporal_relation": _first_text(payload, "temporal_relation", default=""),
+        "verification_status": _first_text(payload, "verification_status", default=""),
+        "missing_reason": _first_text(payload, "missing_reason", default=""),
+        "manual_review_required": _truthy_text(payload.get("manual_review_required")) if payload else False,
         "source_id": item.raw_source_id if item else "",
         "audio_delta_type": _first_text(payload, "audio_delta_type", "b_subtype", default=""),
         "dataset": _dataset_from_payload_or_path(payload, video),
@@ -2695,6 +2699,10 @@ def _normalize_negative_items(items: Any) -> list[dict[str, str]]:
             reason = str(item.get("reason") or "").strip()
             satisfies_edit = str(item.get("satisfies_edit") or "").strip()
             verification_accept = str(item.get("verification_accept") or "").strip()
+            temporal_relation = str(item.get("temporal_relation") or "").strip()
+            verification_status = str(item.get("verification_status") or "").strip()
+            missing_reason = str(item.get("missing_reason") or "").strip()
+            manual_review_required = str(item.get("manual_review_required") or "").strip()
         else:
             video = str(item).strip()
             neg_type = DEFAULT_NEGATIVE_TYPES[min(index, len(DEFAULT_NEGATIVE_TYPES) - 1)]
@@ -2704,6 +2712,10 @@ def _normalize_negative_items(items: Any) -> list[dict[str, str]]:
             reason = ""
             satisfies_edit = ""
             verification_accept = ""
+            temporal_relation = ""
+            verification_status = ""
+            missing_reason = ""
+            manual_review_required = ""
         if video:
             normalized = {"type": neg_type, "video": video}
             if pair_group_id:
@@ -2718,6 +2730,14 @@ def _normalize_negative_items(items: Any) -> list[dict[str, str]]:
                 normalized["satisfies_edit"] = satisfies_edit
             if verification_accept:
                 normalized["verification_accept"] = verification_accept
+            if temporal_relation:
+                normalized["temporal_relation"] = temporal_relation
+            if verification_status:
+                normalized["verification_status"] = verification_status
+            if missing_reason:
+                normalized["missing_reason"] = missing_reason
+            if manual_review_required:
+                normalized["manual_review_required"] = manual_review_required
             result.append(normalized)
     return result
 
@@ -2909,6 +2929,10 @@ def _build_protocol_hard_gallery_items(eval_records: list[AudioDeltaRecord], *, 
                         "same_source": same_source or neg_type == "visual_hard",
                         "satisfies_edit": False,
                         "reason": negative.get("reason", ""),
+                        "temporal_relation": negative.get("temporal_relation", ""),
+                        "verification_status": negative.get("verification_status", "auto_verified"),
+                        "missing_reason": negative.get("missing_reason", ""),
+                        "manual_review_required": negative.get("manual_review_required", ""),
                     },
                 )
             )

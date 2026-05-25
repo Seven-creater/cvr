@@ -148,7 +148,14 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
                 pair="pair_a",
                 negatives=[
                     {"type": "reference_negative", "video": "/tmp/main_1_ref.mp4", "source_id": "source_a", "satisfies_edit": "false"},
-                    {"type": "visual_hard", "video": "/tmp/main_1_visual.mp4", "source_id": "source_a", "satisfies_edit": "false"},
+                    {
+                        "type": "visual_hard",
+                        "video": "/tmp/main_1_visual.mp4",
+                        "source_id": "source_a",
+                        "satisfies_edit": "false",
+                        "temporal_relation": "adjacent_after",
+                        "verification_status": "human_verified",
+                    },
                     {"type": "audio_hard", "video": "/tmp/main_1_audio.mp4", "source_id": "source_b", "satisfies_edit": "false"},
                     {"type": "asr_hard", "video": "/tmp/main_1_asr.mp4", "source_id": "source_c", "satisfies_edit": "true"},
                 ],
@@ -183,6 +190,9 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertEqual("audio_cvr_local_same_source_gallery", local["eval_protocol"])
             self.assertTrue(any(item["kind"] == "local_same_source" for item in local_gallery))
             self.assertFalse(any(item["kind"] == "audio_hard" for item in local_gallery))
+            local_payloads = [item["source_payload"] for item in local_gallery if item["kind"] == "local_same_source"]
+            self.assertTrue(any(payload.get("temporal_relation") == "adjacent_after" for payload in local_payloads))
+            self.assertTrue(any(payload.get("verification_status") == "human_verified" for payload in local_payloads))
 
     def test_cache_train_and_eval_adapter_smoke_with_mock_encoder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

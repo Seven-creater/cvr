@@ -1065,8 +1065,8 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             positive = {
                 "proposal_id": "positive",
                 "raw_source_id": "source_show_1",
-                "reference_video": "ref.mp4",
-                "target_video": "target.mp4",
+                "reference_video": "show_single_002.mp4",
+                "target_video": "show_single_004.mp4",
                 "edit_text": "replace quiet room ambience with crowd cheering",
                 "difference": {"type": "audio_event"},
                 "accepted": True,
@@ -1078,7 +1078,7 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 "audio_only_verification": {"accept": True},
                 "video_only_shortcut": {"can_identify_target_without_audio": False},
                 "audio_delta_hard_negatives": [
-                    {"type": "visual_hard", "video": "visual_hard.mp4", "source_id": "source_show_1", "satisfies_edit": "false"},
+                    {"type": "visual_hard", "video": "show_single_003.mp4", "source_id": "source_show_1", "satisfies_edit": "false"},
                     {"type": "audio_hard", "video": "audio_hard.mp4", "source_id": "source_show_2", "satisfies_edit": "false"},
                     {"type": "asr_hard", "video": "asr_hard.mp4", "source_id": "source_show_3", "satisfies_edit": "false"},
                 ],
@@ -1089,7 +1089,7 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
                 {
                     "proposal_id": "visual_hard_candidate",
                     "raw_source_id": "source_show_1",
-                    "target_video": "visual_hard.mp4",
+                    "target_video": "show_single_003.mp4",
                     "edit_text": "change the speech from discussing sports to discussing weather",
                     "difference": {"type": "speech"},
                     "accepted": False,
@@ -1141,6 +1141,11 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertIn("audio_hard", hard_types)
             self.assertIn("asr_hard", hard_types)
             self.assertTrue(all(not item["satisfies_edit"] for item in hard_gallery if item["kind"] != "positive"))
+            local_gallery = [json.loads(line) for line in (run_root / "b_main_eval_gallery_local_same_source.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            local_rows = [item for item in local_gallery if item["kind"] == "local_same_source"]
+            self.assertTrue(any(item["temporal_relation"] in {"adjacent_before", "adjacent_after"} for item in local_rows))
+            self.assertTrue(all(item["verification_status"] in {"auto_verified", "human_verified"} for item in local_rows))
+            self.assertIn("audio_necessity_success_conditions", quality_summary)
 
             positive_without_existing_negatives = dict(positive)
             positive_without_existing_negatives.pop("audio_delta_hard_negatives", None)

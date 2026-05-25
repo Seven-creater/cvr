@@ -633,6 +633,15 @@ def _write_audio_cvr_benchmark_outputs(
         },
         "audio_necessity_modes": ["V-only", "A-only", "V+T", "A+T", "V+A", "V+A+T"],
         "audio_sync_rule": "audio-on/off must be applied to both query/reference and gallery/target sides",
+        "audio_necessity_primary_comparison": "V+T vs V+A+T",
+        "audio_necessity_success_conditions": [
+            "V+A+T significantly outperforms V+T",
+            "A+T outperforms T-only or a random baseline",
+            "V-only is low on B-main/local_same_source/typed_hardneg",
+            "V+A+T has the strongest target_beats_reference",
+            "audio-off reduces the target-reference score gap",
+            "A-only approximately equal to V+A+T indicates audio-only/ASR risk and should be diagnostic",
+        ],
         "required_metrics": [
             "R@1",
             "R@5",
@@ -663,6 +672,9 @@ def _write_audio_cvr_benchmark_outputs(
             "local_same_source": dict(Counter(str(row.get("kind") or "") for row in local_gallery)),
             "typed_hardneg": dict(Counter(str(row.get("kind") or "") for row in hardneg_gallery)),
         },
+        "local_same_source_relation_counts": dict(Counter(str(row.get("temporal_relation") or "") for row in local_gallery if row.get("kind") == "local_same_source")),
+        "audio_necessity_primary_comparison": "V+T vs V+A+T",
+        "audio_necessity_success_conditions": manifest["audio_necessity_success_conditions"],
         "formal_eval_note": "Use reference-aware and local_same_source galleries for benchmark reporting; random gallery is smoke-only.",
     }
     (root / "benchmark_quality_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -693,7 +705,15 @@ def _benchmark_gallery_row(
     negative_type: str,
     reason: str,
     source_id: str | None = None,
+    temporal_relation: str = "",
+    verification_status: str = "",
+    missing_reason: str | None = None,
+    manual_review_required: bool | None = None,
 ) -> dict[str, Any]:
+    satisfies_edit = kind == "positive"
+    verification_accept = kind == "positive"
+    if kind != "positive" and not verification_status:
+        verification_status = "auto_verified"
     return {
         "query_sample_id": sample_id,
         "gallery_id": f"{kind}::{sample_id}::{_stable_hash(video)[:8]}",
@@ -702,8 +722,12 @@ def _benchmark_gallery_row(
         "negative_type": negative_type,
         "raw_source_id": source_id or _source_split_group_id(record),
         "same_source": bool((source_id or _source_split_group_id(record)) == _source_split_group_id(record)),
-        "satisfies_edit": kind == "positive",
-        "verification_accept": kind == "positive",
+        "satisfies_edit": satisfies_edit,
+        "verification_accept": verification_accept,
+        "verification_status": verification_status or ("auto_verified" if satisfies_edit else "auto_verified"),
+        "temporal_relation": temporal_relation,
+        "missing_reason": missing_reason,
+        "manual_review_required": bool(manual_review_required) if manual_review_required is not None else False,
         "reason": reason,
         "audio_delta_type": _b_line_record_subtype(record),
         "split_tier": record.get("split_tier", ""),
@@ -734,6 +758,9 @@ def _benchmark_existing_hard_negative_rows(record: dict[str, Any], *, sample_id:
                 negative_type=label,
                 reason=str(item.get("reason") or _hard_negative_reason(label)),
                 source_id=source_id or _source_split_group_id(record),
+                temporal_relation=_hard_negative_temporal_relation(record, item, label=label, source_id=source_id),
+                verification_status=str(item.get("verification_status") or "auto_verified"),
+                missing_reason=str(item.get("missing_reason") or "") or None,
             )
         )
     return rows
@@ -743,11 +770,18 @@ def _benchmark_local_candidate_rows(record: dict[str, Any], candidate_pool: list
     source = _source_split_group_id(record)
     used = {str(record.get("reference_video") or ""), str(record.get("target_video") or "")}
     rows: list[dict[str, Any]] = []
+    candidates: list[tuple[int, str, dict[str, Any], str]] = []
     for candidate in candidate_pool:
         video = _candidate_negative_video(candidate)
+        if not video or video in used or _source_split_group_id(candidate) != source or not _candidate_pool_negative_usable(candidate):
+            continue
+        relation = _local_same_source_temporal_relation(record, candidate_video=video, candidate_record=candidate)
+        priority = _local_same_source_priority(relation)
+        candidates.append((priority, video, candidate, relation))
+    for _, video, candidate, relation in sorted(candidates, key=lambda item: (item[0], _clip_numeric_index(item[1]) or 10**9, item[1])):
         if len(rows) >= limit:
             break
-        if not video or video in used or _source_split_group_id(candidate) != source or not _candidate_pool_negative_usable(candidate):
+        if video in used:
             continue
         rows.append(
             _benchmark_gallery_row(
@@ -758,6 +792,9 @@ def _benchmark_local_candidate_rows(record: dict[str, Any], candidate_pool: list
                 negative_type="local_same_source",
                 reason="same source candidate does not satisfy edit_text",
                 source_id=source,
+                temporal_relation=relation,
+                verification_status=str(candidate.get("verification_status") or "auto_verified"),
+                missing_reason=None,
             )
         )
         used.add(video)
@@ -798,6 +835,52 @@ def _hard_negative_missing_counts(records: list[dict[str, Any]]) -> dict[str, in
             for label in missing:
                 counts[str(label)] += 1
     return dict(counts)
+
+
+def _hard_negative_temporal_relation(record: dict[str, Any], item: dict[str, Any], *, label: str, source_id: str) -> str:
+    if label == "visual_hard" and source_id != _source_split_group_id(record):
+        return "visual_hard_fallback"
+    if label != "local_same_source" and source_id != _source_split_group_id(record):
+        return "cross_source_same_context"
+    return _local_same_source_temporal_relation(record, candidate_video=str(item.get("video") or ""), candidate_record=item)
+
+
+def _local_same_source_temporal_relation(record: dict[str, Any], *, candidate_video: str, candidate_record: dict[str, Any] | None = None) -> str:
+    candidate_index = _clip_numeric_index(candidate_video or str((candidate_record or {}).get("target_video") or ""))
+    reference_index = _clip_numeric_index(str(record.get("reference_video") or record.get("reference_clip_id") or ""))
+    target_index = _clip_numeric_index(str(record.get("target_video") or record.get("target_clip_id") or ""))
+    if candidate_index is None:
+        return "same_source_non_adjacent"
+    anchors = [index for index in (reference_index, target_index) if index is not None]
+    if not anchors:
+        return "same_source_non_adjacent"
+    if any(candidate_index == anchor - 1 for anchor in anchors):
+        return "adjacent_before"
+    if any(candidate_index == anchor + 1 for anchor in anchors):
+        return "adjacent_after"
+    return "same_source_non_adjacent"
+
+
+def _local_same_source_priority(relation: str) -> int:
+    return {
+        "adjacent_before": 1,
+        "adjacent_after": 1,
+        "same_source_non_adjacent": 2,
+        "same_group": 3,
+        "cross_source_same_context": 4,
+        "visual_hard_fallback": 5,
+    }.get(str(relation or ""), 9)
+
+
+def _clip_numeric_index(value: str) -> int | None:
+    text = Path(str(value or "")).stem
+    matches = re.findall(r"(?:single|clip|segment|shard|part)?[_-]?(\d{1,6})(?!.*\d)", text, flags=re.IGNORECASE)
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except ValueError:
+        return None
 
 
 def build_b_splits(
@@ -1490,7 +1573,7 @@ def _audio_delta_hard_negatives(
 
 
 def _normalized_hard_negative_item(item: dict[str, Any], *, label: str, video: str, source_record: dict[str, Any]) -> dict[str, str]:
-    return {
+    normalized = {
         "type": label,
         "video": video,
         "source_id": str(item.get("source_id") or item.get("raw_source_id") or _source_split_group_id(source_record)),
@@ -1498,6 +1581,11 @@ def _normalized_hard_negative_item(item: dict[str, Any], *, label: str, video: s
         "verification_accept": str(item.get("verification_accept", "false")).lower(),
         "satisfies_edit": str(item.get("satisfies_edit", "false")).lower(),
     }
+    for key in ("temporal_relation", "verification_status", "missing_reason", "manual_review_required"):
+        value = item.get(key)
+        if value is not None and str(value).strip():
+            normalized[key] = str(value).strip()
+    return normalized
 
 
 def _hard_negative_reason(label: str) -> str:
@@ -1749,6 +1837,9 @@ def _b_line_record_with_tier(record: dict[str, Any]) -> dict[str, Any]:
     enriched = dict(record)
     tier_metadata = _b_line_record_tier(record)
     enriched.update(tier_metadata)
+    enriched.setdefault("manual_review_required", False)
+    enriched.setdefault("manual_review_status", "not_needed")
+    enriched.setdefault("manual_review_reason", None)
     quality = dict(enriched.get("quality") if isinstance(enriched.get("quality"), dict) else {})
     for key in (
         "split_tier",
@@ -1762,6 +1853,9 @@ def _b_line_record_with_tier(record: dict[str, Any]) -> dict[str, Any]:
         "visual_shortcut_risk",
         "audio_only_solvability",
         "full_av_required",
+        "manual_review_required",
+        "manual_review_status",
+        "manual_review_reason",
     ):
         quality[key] = enriched.get(key)
     enriched["quality"] = quality
@@ -1780,6 +1874,8 @@ def _b_line_record_tier(record: dict[str, Any]) -> dict[str, Any]:
     audio_only_accept = _b_line_audio_only_accept(record)
     can_identify_without_audio = _b_line_can_identify_target_without_audio(record)
     voxceleb_record = _is_voxceleb_record(record)
+    manual_review_status = _b_line_text_value(record, "manual_review_status") or "not_needed"
+    manual_review_required = _boolish(record.get("manual_review_required")) or manual_review_status in {"pending", "uncertain"}
     reasons: list[str] = []
     if bool(record.get("fallback")):
         reasons.append("fallback_pair_proposal")
@@ -1799,6 +1895,10 @@ def _b_line_record_tier(record: dict[str, Any]) -> dict[str, Any]:
         reasons.append("visual_shortcut_risk")
     if not audio_only_accept:
         reasons.append("audio_only_verification_not_accepted")
+    if manual_review_status == "failed":
+        reasons.append("manual_review_failed")
+    elif manual_review_required:
+        reasons.append("manual_review_required")
     if voxceleb_record and not _voxceleb_main_allowed(
         video_context_strength=video_context_strength,
         asr_degeneracy_risk=asr_degeneracy_risk,
@@ -1821,6 +1921,8 @@ def _b_line_record_tier(record: dict[str, Any]) -> dict[str, Any]:
         and (audio_only_solvability < 0.85 or full_av_required)
         and not _b_line_transcript_like_edit(record)
         and not _b_line_hollow_audio_edit(record)
+        and not manual_review_required
+        and manual_review_status not in {"failed", "uncertain"}
         and (
             not voxceleb_record
             or _voxceleb_main_allowed(
@@ -1842,6 +1944,7 @@ def _b_line_record_tier(record: dict[str, Any]) -> dict[str, Any]:
         and visual_shortcut_risk <= 0.35
         and not can_identify_without_audio
         and not _b_line_hollow_audio_edit(record)
+        and manual_review_status != "failed"
     )
     main_blocking_reasons = {
         "fallback_pair_proposal",
@@ -1852,6 +1955,8 @@ def _b_line_record_tier(record: dict[str, Any]) -> dict[str, Any]:
         "visual_shortcut_risk",
         "audio_only_verification_not_accepted",
         "voxceleb_main_guard",
+        "manual_review_required",
+        "manual_review_failed",
     }
     blocks_main = any(
         reason in main_blocking_reasons or any(reason.startswith(f"{prefix}:") for prefix in main_blocking_reasons)
@@ -1877,6 +1982,8 @@ def _b_line_record_tier(record: dict[str, Any]) -> dict[str, Any]:
         "visual_shortcut_risk": round(visual_shortcut_risk, 3),
         "audio_only_solvability": round(audio_only_solvability, 3),
         "full_av_required": bool(full_av_required),
+        "manual_review_required": bool(manual_review_required),
+        "manual_review_status": manual_review_status,
     }
 
 
