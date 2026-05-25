@@ -553,6 +553,24 @@ metadata 中 satisfies_edit=true
       "satisfies_edit": false
     },
     {
+      "type": "local_same_source",
+      "video": "...",
+      "source_id": "...",
+      "temporal_relation": "adjacent_before | adjacent_after | same_source_non_adjacent | same_group",
+      "reason": "same source but does not satisfy edit_text",
+      "verification_accept": false,
+      "satisfies_edit": false
+    },
+    {
+      "type": "local_fallback_visual",
+      "video": "...",
+      "source_id": "...",
+      "temporal_relation": "cross_source_same_context | visual_hard_fallback",
+      "reason": "fallback because no strict local_same_source candidate exists",
+      "verification_accept": false,
+      "satisfies_edit": false
+    },
+    {
       "type": "visual_hard",
       "video": "...",
       "source_id": "...",
@@ -620,7 +638,7 @@ audio_necessity_eval_manifest.json
 | 模式 | query | gallery |
 |---|---|---|
 | V-only | reference video muted + edit_text | target videos muted |
-| T-only | edit_text only | target videos/audios/full AV，按具体设置固定 |
+| T-only-fullAV | edit_text only | 与主实验相同的 full AV gallery，作为文本先验 baseline |
 | A-only | reference audio + edit_text | target audios |
 | V+T | reference video + edit_text | target videos |
 | A+T | reference audio + edit_text | target audios |
@@ -675,7 +693,7 @@ V+T vs V+A+T
 Audio necessity 成立的建议条件：
 
 1. `V+A+T` 显著高于 `V+T`。
-2. `A+T` 显著高于 `T-only` 或 random baseline。
+2. `A+T` 显著高于 `T-only-fullAV` 或 random baseline。
 3. `V-only` 在 `B-main / local_same_source / typed_hardneg` 上明显低。
 4. `V+A+T` 的 `target_beats_reference` 最高。
 5. audio-off 后 `target-reference score gap` 明显下降。
@@ -777,6 +795,7 @@ ambiguous
 每次正式评估都应保存 `audio_necessity_eval_manifest.json`，明确列出：
 
 ```text
+T-only-fullAV
 V-only
 A-only
 V+T

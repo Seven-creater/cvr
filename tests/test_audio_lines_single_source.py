@@ -1148,7 +1148,7 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertTrue(any(item["kind"] == "local_fallback_visual" for item in local_gallery))
             self.assertTrue(all(item["negative_type"] != "visual_hard" for item in local_rows))
             manifest = json.loads((run_root / "audio_necessity_eval_manifest.json").read_text(encoding="utf-8"))
-            self.assertIn("T-only", manifest["audio_necessity_modes"])
+            self.assertIn("T-only-fullAV", manifest["audio_necessity_modes"])
             self.assertIn("audio_necessity_success_conditions", quality_summary)
 
             positive_without_existing_negatives = dict(positive)
