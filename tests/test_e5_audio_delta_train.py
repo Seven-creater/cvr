@@ -247,6 +247,52 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertTrue((dataset_run / "local_same_source_candidate_summary.json").exists())
             self.assertTrue((dataset_run / "local_same_source_coverage.md").exists())
 
+    def test_mine_local_same_source_recovers_source_from_manifest_when_triplet_source_is_blank(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_run = root / "dataset_run"
+            dataset_run.mkdir()
+            record = self._record("main_1", source="", pair="pair_a")
+            record["raw_source_id"] = ""
+            record["source_clip_id"] = ""
+            record["reference_video"] = "clips/audio_cvr_6_9s/source_a/source_a__single_001.mp4"
+            record["target_video"] = "clips/audio_cvr_6_9s/source_a/source_a__single_003.mp4"
+            self._write_jsonl(dataset_run / "b_main_audio_cvr_triplets.jsonl", [record])
+            self._write_jsonl(
+                dataset_run / "single_source_annotations.jsonl",
+                [
+                    {
+                        "clip_id": "source_a__single_001",
+                        "output_path": "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s/source_a/source_a__single_001.mp4",
+                        "source_clip_id": "source_a",
+                    },
+                    {
+                        "clip_id": "source_a__single_002",
+                        "output_path": "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s/source_a/source_a__single_002.mp4",
+                        "source_clip_id": "source_a",
+                    },
+                    {
+                        "clip_id": "source_a__single_003",
+                        "output_path": "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s/source_a/source_a__single_003.mp4",
+                        "source_clip_id": "source_a",
+                    },
+                ],
+            )
+
+            output_path = dataset_run / "b_main_local_same_source_candidates.jsonl"
+            summary = mine_local_same_source(
+                run_root=dataset_run,
+                input_path=dataset_run / "b_main_audio_cvr_triplets.jsonl",
+                output_path=output_path,
+                max_per_query=5,
+            )
+            candidates = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+
+            self.assertEqual(1.0, summary["strict_local_same_source_coverage"])
+            self.assertEqual(1, len(candidates))
+            self.assertEqual("source_a", candidates[0]["source_id"])
+            self.assertTrue(candidates[0]["video"].endswith("source_a__single_002.mp4"))
+
     def test_prepare_can_use_mined_local_candidate_and_verified_galleries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

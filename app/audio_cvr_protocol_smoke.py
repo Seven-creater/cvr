@@ -48,6 +48,7 @@ def mine_local_same_source(
     clip_rows = _load_clip_inventory(manifests)
     clip_rows.extend(_sibling_clip_inventory(rows))
     by_source = _index_clips_by_source(clip_rows)
+    source_lookup = _build_clip_source_lookup(clip_rows)
     mined: list[dict[str, Any]] = []
     missing_reasons: Counter[str] = Counter()
     for row in rows:
@@ -55,18 +56,29 @@ def mine_local_same_source(
         reference_video = _first_text(row, "reference_video", "reference_path")
         target_video = _first_text(row, "target_video", "target_path")
         source_ids = _candidate_source_ids(row, reference_video, target_video)
-        ref_key = _media_key(reference_video)
-        tgt_key = _media_key(target_video)
-        ref_index = _segment_index(reference_video, _first_text(row, "reference_clip_id", "reference_id"))
-        tgt_index = _segment_index(target_video, _first_text(row, "target_clip_id", "target_id"))
+        reference_clip_id = _first_text(row, "reference_clip_id", "reference_id")
+        target_clip_id = _first_text(row, "target_clip_id", "target_id")
+        for value in _source_ids_from_lookup(source_lookup, reference_video, reference_clip_id):
+            if value and value not in source_ids:
+                source_ids.append(value)
+        for value in _source_ids_from_lookup(source_lookup, target_video, target_clip_id):
+            if value and value not in source_ids:
+                source_ids.append(value)
+        excluded_keys = {
+            *_media_lookup_keys(reference_video),
+            *_clip_lookup_keys(reference_clip_id),
+            *_media_lookup_keys(target_video),
+            *_clip_lookup_keys(target_clip_id),
+        }
+        ref_index = _segment_index(reference_video, reference_clip_id)
+        tgt_index = _segment_index(target_video, target_clip_id)
         strict_candidates: list[dict[str, Any]] = []
         for source_id in source_ids:
             for clip in by_source.get(source_id, []):
                 video = _first_text(clip, "video", "output_path", "video_path", "clip_path", "path")
                 if not video:
                     continue
-                clip_key = _media_key(video)
-                if clip_key in {ref_key, tgt_key}:
+                if excluded_keys.intersection(_media_lookup_keys(video)) or excluded_keys.intersection(_clip_lookup_keys(_first_text(clip, "clip_id", "candidate_clip_id"))):
                     continue
                 relation = _temporal_relation(clip, ref_index=ref_index, tgt_index=tgt_index)
                 strict_candidates.append(
@@ -681,6 +693,33 @@ def _index_clips_by_source(rows: list[dict[str, Any]]) -> dict[str, list[dict[st
     return dict(by_source)
 
 
+def _build_clip_source_lookup(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+    lookup: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        video = _first_text(row, "video", "output_path", "video_path", "clip_path", "path")
+        source_id = _source_id_from_row(row, video)
+        if not video or not source_id:
+            continue
+        for key in _media_lookup_keys(video):
+            if source_id not in lookup[key]:
+                lookup[key].append(source_id)
+        clip_id = _first_text(row, "clip_id", "candidate_clip_id")
+        if clip_id:
+            for key in _clip_lookup_keys(clip_id):
+                if source_id not in lookup[key]:
+                    lookup[key].append(source_id)
+    return dict(lookup)
+
+
+def _source_ids_from_lookup(lookup: dict[str, list[str]], video: str, clip_id: str = "") -> list[str]:
+    result: list[str] = []
+    for key in [*_media_lookup_keys(video), *_clip_lookup_keys(clip_id)]:
+        for source_id in lookup.get(key, []):
+            if source_id and source_id not in result:
+                result.append(source_id)
+    return result
+
+
 def _candidate_source_ids(row: dict[str, Any], reference_video: str, target_video: str) -> list[str]:
     candidates = [
         _source_id_from_row(row, reference_video),
@@ -730,6 +769,48 @@ def _segment_index(video: str, clip_id: str = "") -> int | None:
         if match:
             return int(match.group(1))
     return None
+
+
+def _media_lookup_keys(video: str) -> list[str]:
+    raw = str(video or "").replace("\\", "/").strip()
+    if not raw:
+        return []
+    path = Path(raw)
+    keys = [
+        f"media:{raw.lower()}",
+        f"basename:{path.name.lower()}",
+        f"stem:{path.stem.lower()}",
+    ]
+    parts = [part for part in raw.lower().split("/") if part]
+    if len(parts) >= 2:
+        keys.append(f"tail2:{'/'.join(parts[-2:])}")
+    if len(parts) >= 3:
+        keys.append(f"tail3:{'/'.join(parts[-3:])}")
+    return _dedupe_strings(keys)
+
+
+def _clip_lookup_keys(clip_id: str) -> list[str]:
+    raw = str(clip_id or "").replace("\\", "/").strip()
+    if not raw:
+        return []
+    path = Path(raw)
+    return _dedupe_strings(
+        [
+            f"clip:{raw.lower()}",
+            f"basename:{path.name.lower()}",
+            f"stem:{path.stem.lower()}",
+        ]
+    )
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
 
 
 def _temporal_relation(clip: dict[str, Any], *, ref_index: int | None, tgt_index: int | None) -> str:
