@@ -30,7 +30,9 @@ from app.e5_audio_delta_train import (
     _scheduled_temperature,
     _training_profile_options,
     _AudioDeltaAdapter,
+    _document_payload,
     _query_payload,
+    _resolve_media_path,
     _video_payload,
 )
 from app.audio_cvr_protocol_eval import mine_local_same_source, summarize_data, summarize_evals
@@ -849,6 +851,9 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
         composed = _query_payload(record, query_input_mode="composed")
         text_only = _query_payload(record, query_input_mode="text_only")
         video_only = _query_payload(record, query_input_mode="video_only")
+        audio_only = _query_payload(record, query_input_mode="audio_only")
+        audio_text = _query_payload(record, query_input_mode="audio_text")
+        audio_document = _document_payload(record.target_video, document_input_mode="audio")
 
         self.assertIsInstance(composed, dict)
         self.assertIn("video", composed)
@@ -856,6 +861,9 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
         self.assertIsInstance(text_only, str)
         self.assertIn("Edit the reference video", text_only)
         self.assertEqual({"video": record.reference_video}, video_only)
+        self.assertEqual({"audio": str(Path(_resolve_media_path(record.reference_video)))}, audio_only)
+        self.assertEqual({"audio": str(Path(_resolve_media_path(record.reference_video))), "text": text_only}, audio_text)
+        self.assertEqual({"audio": str(Path(_resolve_media_path(record.target_video)))}, audio_document)
 
     def test_protocol_eval_summaries_are_reusable_beyond_pilot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

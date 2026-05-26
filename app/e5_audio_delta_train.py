@@ -37,7 +37,8 @@ EVAL_GALLERY_PROTOCOLS = (
     "typed_hardneg",
     "audio_necessity",
 )
-QUERY_INPUT_MODES = ("composed", "text_only", "video_only")
+QUERY_INPUT_MODES = ("composed", "text_only", "video_only", "audio_only", "audio_text")
+DOCUMENT_INPUT_MODES = ("video", "audio")
 DEFAULT_LOSS_OPTIONS = {
     "training_profile": "v1",
     "contrastive_objective": "ce",
@@ -226,6 +227,8 @@ def cache_embeddings(
     video_fps: int = 1,
     video_audio_mode: str = VIDEO_AUDIO_MODE_ON,
     query_input_mode: str = "composed",
+    document_input_mode: str = "video",
+    audio_media_cache_dir: str | Path | None = None,
     local_segments: int = 0,
     local_segment_mode: str = "prompt",
     local_segment_cache_dir: str | Path | None = None,
@@ -261,7 +264,10 @@ def cache_embeddings(
     else:
         runtime_info = {"model_path": "injected-encoder", "video_audio_mode": video_audio_mode}
     query_input_mode = _normalize_query_input_mode(query_input_mode)
+    document_input_mode = _normalize_document_input_mode(document_input_mode)
     runtime_info["query_input_mode"] = query_input_mode
+    runtime_info["document_input_mode"] = document_input_mode
+    runtime_info["audio_media_cache_dir"] = str(audio_media_cache_dir) if audio_media_cache_dir else str(output_root / "audio_media_cache")
     train_records = load_audio_delta_records(records_root / "train.jsonl")
     eval_records = load_audio_delta_records(records_root / "eval.jsonl")
     eval_gallery = load_eval_gallery_items(records_root / "eval_gallery.jsonl") if (records_root / "eval_gallery.jsonl").exists() else []
@@ -272,6 +278,8 @@ def cache_embeddings(
         output_root=output_root,
         runtime_info=runtime_info,
         query_input_mode=query_input_mode,
+        document_input_mode=document_input_mode,
+        audio_media_cache_dir=audio_media_cache_dir,
         local_segments=local_segments,
         local_segment_mode=local_segment_mode,
         local_segment_cache_dir=local_segment_cache_dir,
@@ -286,6 +294,8 @@ def cache_embeddings(
         output_root=output_root,
         runtime_info=runtime_info,
         query_input_mode=query_input_mode,
+        document_input_mode=document_input_mode,
+        audio_media_cache_dir=audio_media_cache_dir,
         local_segments=local_segments,
         local_segment_mode=local_segment_mode,
         local_segment_cache_dir=local_segment_cache_dir,
@@ -1038,8 +1048,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--query-input-mode",
         choices=QUERY_INPUT_MODES,
         default="composed",
-        help="Query payload mode for protocol ablations: composed=reference video+edit text, text_only=edit text only, video_only=reference video only.",
+        help="Query payload mode for protocol ablations: composed=reference video+edit text, text_only=edit text only, video_only=reference video only, audio_only=reference audio only, audio_text=reference audio+edit text.",
     )
+    cache.add_argument(
+        "--document-input-mode",
+        choices=DOCUMENT_INPUT_MODES,
+        default="video",
+        help="Target/reference/gallery payload mode: video=video payload, audio=extract wav and encode audio-only payload.",
+    )
+    cache.add_argument("--audio-media-cache-dir", help="Directory for extracted wav files used by audio-only protocol modes.")
     cache.add_argument("--local-segments", type=int, default=0, help="Encode this many temporal local views per video; 0 disables local cache.")
     cache.add_argument("--local-segment-mode", choices=("prompt", "ffmpeg"), default="prompt")
     cache.add_argument("--local-segment-cache-dir")
@@ -1182,6 +1199,8 @@ def main() -> None:
             video_fps=args.video_fps,
             video_audio_mode=args.video_audio_mode,
             query_input_mode=args.query_input_mode,
+            document_input_mode=args.document_input_mode,
+            audio_media_cache_dir=args.audio_media_cache_dir,
             local_segments=args.local_segments,
             local_segment_mode=args.local_segment_mode,
             local_segment_cache_dir=args.local_segment_cache_dir,
@@ -1301,6 +1320,8 @@ def _cache_split_embeddings(
     output_root: Path,
     runtime_info: dict[str, Any],
     query_input_mode: str,
+    document_input_mode: str,
+    audio_media_cache_dir: str | Path | None,
     local_segments: int,
     local_segment_mode: str,
     local_segment_cache_dir: str | Path | None,
@@ -1313,6 +1334,7 @@ def _cache_split_embeddings(
     local_segments = max(0, int(local_segments))
     local_segment_mode = _normalize_local_segment_mode(local_segment_mode)
     local_cache_root = Path(local_segment_cache_dir) if local_segment_cache_dir else output_root / "local_media_cache"
+    audio_cache_root = Path(audio_media_cache_dir) if audio_media_cache_dir else output_root / "audio_media_cache"
     target_segment_rows: list[np.ndarray] = []
     reference_segment_rows: list[np.ndarray] = []
     negative_rows: list[list[np.ndarray]] = []
@@ -1326,9 +1348,40 @@ def _cache_split_embeddings(
     with manifest_path.open("w", encoding="utf-8") as manifest_file:
         for index, record in enumerate(records, start=1):
             _emit(progress, f"[e5-audio-delta] cache {split} {index}/{len(records)} sample_id={record.sample_id}")
-            arrays["query"].append(_encode_one(encoder, _query_payload(record, query_input_mode=query_input_mode)))
-            arrays["target"].append(_encode_one(encoder, _video_payload(record.target_video)))
-            arrays["reference"].append(_encode_one(encoder, _video_payload(record.reference_video)))
+            arrays["query"].append(
+                _encode_one(
+                    encoder,
+                    _query_payload(
+                        record,
+                        query_input_mode=query_input_mode,
+                        audio_cache_root=audio_cache_root,
+                    ),
+                )
+            )
+            arrays["target"].append(
+                _encode_one(
+                    encoder,
+                    _document_payload(
+                        record.target_video,
+                        document_input_mode=document_input_mode,
+                        audio_cache_root=audio_cache_root,
+                        sample_id=record.sample_id,
+                        role="target",
+                    ),
+                )
+            )
+            arrays["reference"].append(
+                _encode_one(
+                    encoder,
+                    _document_payload(
+                        record.reference_video,
+                        document_input_mode=document_input_mode,
+                        audio_cache_root=audio_cache_root,
+                        sample_id=record.sample_id,
+                        role="reference",
+                    ),
+                )
+            )
             arrays["edit"].append(_encode_one(encoder, record.edit_text))
             arrays["old_audio"].append(_encode_one(encoder, record.old_audio or record.edit_text))
             arrays["new_audio"].append(_encode_one(encoder, record.new_audio or record.edit_text))
@@ -1370,7 +1423,18 @@ def _cache_split_embeddings(
                 video = str(negative.get("video", "")).strip()
                 if not video:
                     continue
-                neg_vectors.append(_encode_one(encoder, _video_payload(video)))
+                neg_vectors.append(
+                    _encode_one(
+                        encoder,
+                        _document_payload(
+                            video,
+                            document_input_mode=document_input_mode,
+                            audio_cache_root=audio_cache_root,
+                            sample_id=record.sample_id,
+                            role=str(negative.get("type", "negative")),
+                        ),
+                    )
+                )
                 if local_segments > 0:
                     neg_segment_vectors.append(
                         _encode_many(
@@ -1437,7 +1501,18 @@ def _cache_split_embeddings(
         gallery_lookup = {item.gallery_id: index for index, item in enumerate(gallery_items)}
         for item_index, item in enumerate(gallery_items, start=1):
             _emit(progress, f"[e5-audio-delta] cache eval gallery {item_index}/{len(gallery_items)} gallery_id={item.gallery_id}")
-            gallery_vectors.append(_encode_one(encoder, _video_payload(item.video)))
+            gallery_vectors.append(
+                _encode_one(
+                    encoder,
+                    _document_payload(
+                        item.video,
+                        document_input_mode=document_input_mode,
+                        audio_cache_root=audio_cache_root,
+                        sample_id=item.gallery_id,
+                        role=item.kind or "gallery",
+                    ),
+                )
+            )
             if local_segments > 0:
                 gallery_segment_rows.append(
                     _encode_many(
@@ -1478,6 +1553,8 @@ def _cache_split_embeddings(
         "local_segments": local_segments,
         "local_segment_mode": local_segment_mode,
         "local_segment_cache_dir": str(local_cache_root) if local_segments > 0 and local_segment_mode == "ffmpeg" else None,
+        "document_input_mode": document_input_mode,
+        "audio_media_cache_dir": str(audio_cache_root) if document_input_mode == "audio" or query_input_mode in {"audio_only", "audio_text"} else None,
         "target_segments_shape": list(stacked["target_segments"].shape) if "target_segments" in stacked else None,
         "gallery_segments_shape": list(stacked["gallery_segments"].shape) if "gallery_segments" in stacked else None,
         "runtime": runtime_info,
@@ -3138,18 +3215,44 @@ def _split_leakage_checks(
     }
 
 
-def _query_payload(record: AudioDeltaRecord, *, query_input_mode: str = "composed") -> str | dict[str, str]:
+def _query_payload(
+    record: AudioDeltaRecord,
+    *,
+    query_input_mode: str = "composed",
+    audio_cache_root: str | Path | None = None,
+) -> str | dict[str, str]:
     mode = _normalize_query_input_mode(query_input_mode)
     edit_text = QUERY_TEMPLATE.format(edit_text=record.edit_text.strip().rstrip("."))
     if mode == "text_only":
         return edit_text
     if mode == "video_only":
         return {"video": _resolve_media_path(record.reference_video)}
+    if mode == "audio_only":
+        return {"audio": _audio_media_path(record.reference_video, cache_root=audio_cache_root, sample_id=record.sample_id, role="reference")}
+    if mode == "audio_text":
+        return {
+            "audio": _audio_media_path(record.reference_video, cache_root=audio_cache_root, sample_id=record.sample_id, role="reference"),
+            "text": edit_text,
+        }
     return {"video": _resolve_media_path(record.reference_video), "text": edit_text}
 
 
 def _video_payload(video_path: str) -> dict[str, str]:
     return {"video": _resolve_media_path(video_path)}
+
+
+def _document_payload(
+    video_path: str,
+    *,
+    document_input_mode: str = "video",
+    audio_cache_root: str | Path | None = None,
+    sample_id: str = "",
+    role: str = "document",
+) -> dict[str, str]:
+    mode = _normalize_document_input_mode(document_input_mode)
+    if mode == "audio":
+        return {"audio": _audio_media_path(video_path, cache_root=audio_cache_root, sample_id=sample_id, role=role)}
+    return _video_payload(video_path)
 
 
 def _normalize_query_input_mode(value: str) -> str:
@@ -3159,6 +3262,11 @@ def _normalize_query_input_mode(value: str) -> str:
         "t_only": "text_only",
         "video": "video_only",
         "v_only": "video_only",
+        "audio": "audio_only",
+        "a_only": "audio_only",
+        "audio_text": "audio_text",
+        "a_t": "audio_text",
+        "at": "audio_text",
         "video_text": "composed",
         "reference_text": "composed",
     }
@@ -3166,6 +3274,65 @@ def _normalize_query_input_mode(value: str) -> str:
     if mode not in QUERY_INPUT_MODES:
         raise ValueError(f"query_input_mode must be one of {', '.join(QUERY_INPUT_MODES)}, got {value!r}")
     return mode
+
+
+def _normalize_document_input_mode(value: str) -> str:
+    mode = str(value or "video").strip().lower().replace("-", "_")
+    aliases = {
+        "v": "video",
+        "video_only": "video",
+        "full_av": "video",
+        "a": "audio",
+        "audio_only": "audio",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in DOCUMENT_INPUT_MODES:
+        raise ValueError(f"document_input_mode must be one of {', '.join(DOCUMENT_INPUT_MODES)}, got {value!r}")
+    return mode
+
+
+def _audio_media_path(video_path: str, *, cache_root: str | Path | None, sample_id: str = "", role: str = "audio") -> str:
+    source = Path(_resolve_media_path(video_path))
+    if source.suffix.lower() in {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}:
+        return str(source)
+    if cache_root is None:
+        return str(source)
+    root = Path(cache_root)
+    root.mkdir(parents=True, exist_ok=True)
+    safe_sample = _safe_path_token(sample_id or "sample")
+    safe_role = _safe_path_token(role or "audio")
+    digest = hashlib.sha1(str(source).encode("utf-8")).hexdigest()[:16]
+    output = root / f"{safe_sample}__{safe_role}__{digest}.wav"
+    if output.exists() and output.stat().st_size > 0:
+        return str(output)
+    temp = output.with_name(f".{output.stem}.tmp.{time.time_ns()}.wav")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(source),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(temp),
+    ]
+    try:
+        subprocess.run(command, check=True)
+        temp.replace(output)
+    except Exception:
+        temp.unlink(missing_ok=True)
+        raise
+    return str(output)
+
+
+def _safe_path_token(value: str) -> str:
+    token = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in str(value))
+    token = token.strip("._")
+    return token[:96] or "item"
 
 
 def _resolve_media_path(raw_path: str) -> str:

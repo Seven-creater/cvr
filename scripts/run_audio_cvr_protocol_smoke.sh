@@ -11,7 +11,7 @@ Usage:
     [--gallery-size 1000] [--seed 13] [--max-train-records 64] [--max-eval-records 30] \
     [--protocols random,reference,local_same_source,typed_hardneg] \
     [--mine-local-same-source] [--local-same-source-candidates PATH] \
-    [--video-audio-mode on|off] [--query-input-mode composed|text_only|video_only] [--mock-encoder]
+    [--video-audio-mode on|off] [--query-input-mode composed|text_only|video_only|audio_only|audio_text] [--document-input-mode video|audio] [--mock-encoder]
 
 This is a pilot convenience wrapper around the reusable protocol eval logic.
 It does not train a new adapter and does not claim final benchmark numbers. It
@@ -30,6 +30,7 @@ MAX_EVAL_RECORDS=30
 PROTOCOLS="random,reference,local_same_source,typed_hardneg"
 VIDEO_AUDIO_MODE="on"
 QUERY_INPUT_MODE="composed"
+DOCUMENT_INPUT_MODE="video"
 MOCK_ENCODER=0
 DEVICE="cuda"
 LOCAL_SEGMENTS=0
@@ -50,6 +51,7 @@ while [[ $# -gt 0 ]]; do
     --protocols) PROTOCOLS="$2"; shift 2 ;;
     --video-audio-mode) VIDEO_AUDIO_MODE="$2"; shift 2 ;;
     --query-input-mode) QUERY_INPUT_MODE="$2"; shift 2 ;;
+    --document-input-mode) DOCUMENT_INPUT_MODE="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --local-segments) LOCAL_SEGMENTS="$2"; shift 2 ;;
     --reuse-cache-from) REUSE_CACHE_FROM="$2"; shift 2 ;;
@@ -117,7 +119,9 @@ for protocol in "${PROTOCOL_ARRAY[@]}"; do
     --device "$DEVICE"
     --video-audio-mode "$VIDEO_AUDIO_MODE"
     --query-input-mode "$QUERY_INPUT_MODE"
+    --document-input-mode "$DOCUMENT_INPUT_MODE"
     --local-segments "$LOCAL_SEGMENTS"
+    --audio-media-cache-dir "$cache_dir/audio_media_cache"
   )
   if [[ "$MOCK_ENCODER" -eq 1 ]]; then
     cache_cmd+=(--mock-encoder)
