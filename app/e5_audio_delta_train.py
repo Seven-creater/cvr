@@ -633,6 +633,8 @@ def eval_adapter(
         "base_delta_score_distribution": _delta_score_distribution(base_mix_scores, base_reference_scores, positive_index=positive_gallery_index),
         "base_hard_negative_recall_by_type": _hard_negative_recall_by_type(base_mix_scores, base_negative_scores, records, positive_index=positive_gallery_index),
         "hard_negative_recall_by_type": _hard_negative_recall_by_type(adapted_scores, adapted_negative_scores, records, positive_index=positive_gallery_index),
+        "base_gallery_negative_recall_by_type": _gallery_negative_recall_by_type(base_mix_scores, gallery_items, records, positive_index=positive_gallery_index),
+        "gallery_negative_recall_by_type": _gallery_negative_recall_by_type(adapted_mix_scores, gallery_items, records, positive_index=positive_gallery_index),
         "diagnostics_path": str(output_root / "diagnostics.json"),
         "score_diagnostics_path": str(output_root / "score_diagnostics.json"),
         "adapter_geometry_path": str(output_root / "adapter_geometry.json"),
@@ -655,6 +657,8 @@ def eval_adapter(
         "base_delta_score_distribution": comparison["base_delta_score_distribution"],
         "base_hard_negative_recall_by_type": comparison["base_hard_negative_recall_by_type"],
         "hard_negative_recall_by_type": comparison["hard_negative_recall_by_type"],
+        "base_gallery_negative_recall_by_type": comparison["base_gallery_negative_recall_by_type"],
+        "gallery_negative_recall_by_type": comparison["gallery_negative_recall_by_type"],
         "by_shortcut_label": comparison["by_shortcut_label"],
         "by_split_tier": comparison["by_split_tier"],
         "score_diagnostics": score_diagnostics,
@@ -883,6 +887,7 @@ def run_loss_schedule(
     learning_rate: float = 3e-4,
     device: str = "cuda",
     seed: int = 13,
+    schedule_preset: str = "core",
     include_optional_losses: bool = False,
     save_topk: int = 0,
     progress: Callable[[str], None] | None = None,
@@ -892,18 +897,20 @@ def run_loss_schedule(
     output_root.mkdir(parents=True, exist_ok=True)
     eval_cache_pairs = eval_caches or [("main", cache_root)]
     rows: list[dict[str, Any]] = []
-    configs = _loss_schedule_configs(include_optional_losses=include_optional_losses)
+    configs = _loss_schedule_configs(schedule_preset=schedule_preset, include_optional_losses=include_optional_losses)
     for config in configs:
         name = str(config["name"])
         overrides = dict(config["overrides"])
+        config_steps = max(1, int(round(steps * float(config.get("steps_multiplier", 1.0)))))
+        config_learning_rate = float(config.get("learning_rate", learning_rate))
         adapter_dir = output_root / name / "adapter"
         _emit(progress, f"[e5-audio-delta] loss schedule {name} train start")
         train_summary = train_adapter(
             cache_dir=cache_root,
             output_dir=adapter_dir,
-            steps=steps,
+            steps=config_steps,
             batch_size=batch_size,
-            learning_rate=learning_rate,
+            learning_rate=config_learning_rate,
             seed=seed,
             device=device,
             training_profile="e5_omni_recipe",
@@ -938,6 +945,7 @@ def run_loss_schedule(
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "seed": seed,
+        "schedule_preset": schedule_preset,
         "include_optional_losses": include_optional_losses,
         "eval_caches": [{"label": label, "cache_dir": str(path)} for label, path in eval_cache_pairs],
         "rows": rows,
@@ -1253,6 +1261,7 @@ def build_parser() -> argparse.ArgumentParser:
     loss_schedule.add_argument("--learning-rate", type=float, default=3e-4)
     loss_schedule.add_argument("--device", default="cuda")
     loss_schedule.add_argument("--seed", type=int, default=13)
+    loss_schedule.add_argument("--schedule-preset", choices=("core", "focused", "full"), default="core")
     loss_schedule.add_argument("--include-optional-losses", action="store_true")
     loss_schedule.add_argument("--save-topk", type=int, default=0)
 
@@ -1414,6 +1423,7 @@ def main() -> None:
             learning_rate=args.learning_rate,
             device=args.device,
             seed=args.seed,
+            schedule_preset=args.schedule_preset,
             include_optional_losses=args.include_optional_losses,
             save_topk=args.save_topk,
             progress=progress,
@@ -2612,6 +2622,34 @@ def _hard_negative_recall_by_type(scores: np.ndarray, negative_scores: np.ndarra
     }
 
 
+def _gallery_negative_recall_by_type(scores: np.ndarray, gallery_items: list[EvalGalleryItem], records: list[AudioDeltaRecord], *, positive_index: np.ndarray) -> dict[str, Any]:
+    buckets: dict[str, list[bool]] = defaultdict(list)
+    if not gallery_items:
+        return {}
+    sample_to_columns: dict[str, list[tuple[int, EvalGalleryItem]]] = defaultdict(list)
+    for column, item in enumerate(gallery_items):
+        sample_id = _first_text(item.source_payload, "sample_id", "query_sample_id")
+        if sample_id:
+            sample_to_columns[sample_id].append((column, item))
+    for row_index, record in enumerate(records):
+        positive_score = float(scores[row_index, int(positive_index[row_index])])
+        for column, item in sample_to_columns.get(record.sample_id, []):
+            if column == int(positive_index[row_index]) or item.kind == "positive":
+                continue
+            neg_type = _first_text(item.source_payload, "negative_type", default=item.kind or "unknown")
+            if not neg_type or neg_type == "random_distractor":
+                continue
+            same_source = _truthy_text(item.source_payload.get("same_source")) or (str(item.raw_source_id or "").strip() and str(item.raw_source_id) == str(record.raw_source_id))
+            beats = positive_score > float(scores[row_index, column])
+            buckets[neg_type].append(beats)
+            if same_source:
+                buckets["same_source_any"].append(beats)
+    return {
+        neg_type: {"count": len(values), "positive_beats_negative_rate": round(sum(values) / max(1, len(values)), 4)}
+        for neg_type, values in sorted(buckets.items())
+    }
+
+
 def _index_scores(scores: np.ndarray, index: np.ndarray | None) -> np.ndarray:
     if index is None:
         raise ValueError("index is required")
@@ -3727,7 +3765,23 @@ def _stability_grid_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _loss_schedule_configs(*, include_optional_losses: bool = False) -> list[dict[str, Any]]:
+def _loss_schedule_configs(*, schedule_preset: str = "core", include_optional_losses: bool = False) -> list[dict[str, Any]]:
+    preset = str(schedule_preset or "core")
+    if preset not in {"core", "focused", "full"}:
+        raise ValueError(f"unknown loss schedule preset: {schedule_preset}")
+    focused = [
+        {"name": "S1_e5_omni_recipe", "stage": "baseline", "overrides": {}, "description": "E5-Omni recipe only"},
+        {"name": "C1_ref_delta", "stage": "combo", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "description": "Reference direction plus audio delta"},
+        {
+            "name": "C1_ref_delta_more_steps",
+            "stage": "combo_long",
+            "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5},
+            "steps_multiplier": 2.0,
+            "description": "C1 with twice the training steps",
+        },
+    ]
+    if preset == "focused":
+        return focused
     configs = [
         {"name": "S1_e5_omni_recipe", "stage": "baseline", "overrides": {}, "description": "E5-Omni recipe only"},
         {"name": "S2_ref", "stage": "single", "overrides": {"lambda_ref": 0.3}, "description": "Add reference-as-negative direction loss"},
@@ -3741,6 +3795,7 @@ def _loss_schedule_configs(*, include_optional_losses: bool = False) -> list[dic
             "description": "Core AudioDelta combination",
         },
     ]
+    include_optional_losses = include_optional_losses or preset == "full"
     if include_optional_losses:
         configs.extend(
             [
@@ -3780,6 +3835,7 @@ def _loss_schedule_result_row(
     base_beats = target_beats.get("base_e5") or {}
     reference_rank = eval_summary.get("reference_rank_summary") or {}
     hard_negative = eval_summary.get("hard_negative_recall_by_type") or {}
+    gallery_negative = eval_summary.get("gallery_negative_recall_by_type") or {}
     overrides = dict(config.get("overrides") or {})
     return {
         "name": name,
@@ -3789,6 +3845,7 @@ def _loss_schedule_result_row(
         "adapter_dir": str(adapter_dir),
         "eval_dir": str(eval_dir),
         "steps": train_summary.get("steps"),
+        "learning_rate": train_summary.get("learning_rate"),
         "lambda_ref": overrides.get("lambda_ref", 0.0),
         "lambda_delta": overrides.get("lambda_delta", 0.0),
         "lambda_hn": overrides.get("lambda_hn", 0.0),
@@ -3805,11 +3862,12 @@ def _loss_schedule_result_row(
         "reference_rank_median": reference_rank.get("median_rank"),
         "reference_rank_le_1": reference_rank.get("rank_le_1_rate"),
         "target_ref_gap_mean": adapted_beats.get("target_minus_reference_mean"),
-        "positive_beats_reference_negative": _negative_rate(hard_negative, "reference_negative"),
-        "positive_beats_local_same_source": _negative_rate(hard_negative, "local_same_source"),
-        "positive_beats_visual_hard": _negative_rate(hard_negative, "visual_hard"),
-        "positive_beats_audio_hard": _negative_rate(hard_negative, "audio_hard"),
-        "positive_beats_asr_hard": _negative_rate(hard_negative, "asr_hard"),
+        "positive_beats_reference_negative": _negative_rate(gallery_negative, "reference_negative", hard_negative),
+        "positive_beats_local_same_source": _negative_rate(gallery_negative, "local_same_source", hard_negative),
+        "positive_beats_same_source_any": _negative_rate(gallery_negative, "same_source_any"),
+        "positive_beats_visual_hard": _negative_rate(gallery_negative, "visual_hard", hard_negative),
+        "positive_beats_audio_hard": _negative_rate(gallery_negative, "audio_hard", hard_negative),
+        "positive_beats_asr_hard": _negative_rate(gallery_negative, "asr_hard", hard_negative),
         "by_audio_delta_type": eval_summary.get("by_audio_delta_type"),
         "by_shortcut_label": eval_summary.get("by_shortcut_label"),
         "loss_final": loss_tail.get("loss"),
@@ -3832,24 +3890,28 @@ def _preferred_eval_row(eval_summary: dict[str, Any], prefix: str) -> dict[str, 
     return {}
 
 
-def _negative_rate(summary: dict[str, Any], name: str) -> float | None:
+def _negative_rate(summary: dict[str, Any], name: str, fallback: dict[str, Any] | None = None) -> float | None:
     bucket = summary.get(name) or {}
-    return bucket.get("positive_beats_negative_rate")
+    if bucket:
+        return bucket.get("positive_beats_negative_rate")
+    if fallback:
+        return _negative_rate(fallback, name)
+    return None
 
 
 def _loss_schedule_markdown(summary: dict[str, Any]) -> str:
     lines = [
         "# AudioDelta Loss Schedule",
         "",
-        "| Run | Eval | R@1 | R@5 | R@10 | Target Beats Ref | Ref Median Rank | Ref<=1 | Gap | RefNeg | Local | Visual | Audio | ASR | Final Loss |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Run | Eval | R@1 | R@5 | R@10 | Target Beats Ref | Ref Median Rank | Ref<=1 | Gap | RefNeg | Local | SameSrc | Visual | Audio | ASR | Final Loss |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summary["rows"]:
         lines.append(
             f"| {row['name']} | {row['eval_label']} | {_fmt(row.get('R@1'))} | {_fmt(row.get('R@5'))} | {_fmt(row.get('R@10'))} | "
             f"{_fmt(row.get('target_beats_reference'))} | {_fmt(row.get('reference_rank_median'))} | {_fmt(row.get('reference_rank_le_1'))} | "
             f"{_fmt(row.get('target_ref_gap_mean'))} | {_fmt(row.get('positive_beats_reference_negative'))} | "
-            f"{_fmt(row.get('positive_beats_local_same_source'))} | {_fmt(row.get('positive_beats_visual_hard'))} | "
+            f"{_fmt(row.get('positive_beats_local_same_source'))} | {_fmt(row.get('positive_beats_same_source_any'))} | {_fmt(row.get('positive_beats_visual_hard'))} | "
             f"{_fmt(row.get('positive_beats_audio_hard'))} | {_fmt(row.get('positive_beats_asr_hard'))} | {_fmt(row.get('loss_final'))} |"
         )
     return "\n".join(lines) + "\n"

@@ -9,6 +9,7 @@ import numpy as np
 
 from app.e5_audio_delta_train import (
     DEFAULT_DATA_ROOT,
+    EvalGalleryItem,
     build_splits,
     cache_embeddings,
     eval_adapter,
@@ -22,6 +23,7 @@ from app.e5_audio_delta_train import (
     _batch_whitening_loss,
     _coral_loss,
     _false_negative_weights,
+    _gallery_negative_recall_by_type,
     _hardness_weights,
     _import_torch,
     _modality_tau,
@@ -625,6 +627,50 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertEqual(0.5, combo_rows[0]["lambda_hn"])
             self.assertTrue((root / "loss_schedule" / "loss_schedule_summary.json").exists())
             self.assertTrue((root / "loss_schedule" / "loss_schedule_comparison.md").exists())
+
+    def test_focused_loss_schedule_runs_c1_more_steps_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [
+                self._record("sample_1", source="source_a", pair="pair_a"),
+                self._record("sample_2", source="source_b", pair="pair_b"),
+            ]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+            cache_embeddings(records_dir=records_dir, output_dir=root / "embedding_cache", mock_encoder=True, local_segments=0)
+
+            summary = run_loss_schedule(
+                cache_dir=root / "embedding_cache",
+                output_dir=root / "loss_schedule_focused",
+                steps=1,
+                batch_size=2,
+                device="cpu",
+                schedule_preset="focused",
+            )
+
+            names = {row["name"] for row in summary["rows"]}
+            self.assertEqual({"S1_e5_omni_recipe", "C1_ref_delta", "C1_ref_delta_more_steps"}, names)
+            long_rows = [row for row in summary["rows"] if row["name"] == "C1_ref_delta_more_steps"]
+            self.assertEqual(2, long_rows[0]["steps"])
+
+    def test_gallery_negative_recall_reports_same_source_gallery_items(self) -> None:
+        records = load_audio_delta_records_from_rows([self._record("sample_1", source="source_a", pair="pair_a")])
+        items = [
+            EvalGalleryItem("positive::sample_1", "target.mp4", "source_a", "positive", {"sample_id": "sample_1", "negative_type": ""}),
+            EvalGalleryItem("reference::sample_1", "ref.mp4", "source_a", "reference_negative", {"sample_id": "sample_1", "negative_type": "reference_negative", "same_source": True}),
+            EvalGalleryItem("local::sample_1", "local.mp4", "source_a", "local_same_source", {"sample_id": "sample_1", "negative_type": "local_same_source", "same_source": True}),
+            EvalGalleryItem("visual::sample_1", "visual.mp4", "source_b", "visual_hard", {"sample_id": "sample_1", "negative_type": "visual_hard", "same_source": False}),
+        ]
+        scores = np.asarray([[0.9, 0.8, 0.95, 0.1]], dtype=np.float32)
+
+        summary = _gallery_negative_recall_by_type(scores, items, records, positive_index=np.asarray([0]))
+
+        self.assertEqual(1.0, summary["reference_negative"]["positive_beats_negative_rate"])
+        self.assertEqual(0.0, summary["local_same_source"]["positive_beats_negative_rate"])
+        self.assertEqual(0.5, summary["same_source_any"]["positive_beats_negative_rate"])
+        self.assertEqual(1.0, summary["visual_hard"]["positive_beats_negative_rate"])
 
     def test_stability_grid_reuses_cache_and_writes_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
