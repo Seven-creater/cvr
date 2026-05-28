@@ -1285,7 +1285,7 @@ def build_parser() -> argparse.ArgumentParser:
     loss_schedule.add_argument("--learning-rate", type=float, default=3e-4)
     loss_schedule.add_argument("--device", default="cuda")
     loss_schedule.add_argument("--seed", type=int, default=13)
-    loss_schedule.add_argument("--schedule-preset", choices=("core", "focused", "full"), default="core")
+    loss_schedule.add_argument("--schedule-preset", choices=("core", "focused", "early_stop", "full"), default="core")
     loss_schedule.add_argument("--include-optional-losses", action="store_true")
     loss_schedule.add_argument("--save-topk", type=int, default=0)
 
@@ -3791,7 +3791,7 @@ def _stability_grid_markdown(summary: dict[str, Any]) -> str:
 
 def _loss_schedule_configs(*, schedule_preset: str = "core", include_optional_losses: bool = False) -> list[dict[str, Any]]:
     preset = str(schedule_preset or "core")
-    if preset not in {"core", "focused", "full"}:
+    if preset not in {"core", "focused", "early_stop", "full"}:
         raise ValueError(f"unknown loss schedule preset: {schedule_preset}")
     focused = [
         {"name": "S1_e5_omni_recipe", "stage": "baseline", "overrides": {}, "description": "E5-Omni recipe only"},
@@ -3806,6 +3806,18 @@ def _loss_schedule_configs(*, schedule_preset: str = "core", include_optional_lo
     ]
     if preset == "focused":
         return focused
+    if preset == "early_stop":
+        return [
+            {"name": "S1_steps120", "stage": "baseline", "overrides": {}, "steps_multiplier": 1.0, "description": "S1 short baseline"},
+            {"name": "S1_steps300", "stage": "baseline", "overrides": {}, "steps_multiplier": 2.5, "description": "S1 medium baseline"},
+            {"name": "S1_steps600", "stage": "baseline", "overrides": {}, "steps_multiplier": 5.0, "description": "S1 long baseline"},
+            {"name": "C1_ref_delta_steps60", "stage": "early_stop", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 0.5, "description": "C1 very short"},
+            {"name": "C1_ref_delta_steps120", "stage": "early_stop", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 1.0, "description": "C1 short"},
+            {"name": "C1_ref_delta_steps180", "stage": "early_stop", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 1.5, "description": "C1 early stopping probe"},
+            {"name": "C1_ref_delta_steps240", "stage": "early_stop", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 2.0, "description": "C1 longer early stopping probe"},
+            {"name": "C1_ref_delta_low_lr_steps120", "stage": "low_lr", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 1.0, "learning_rate": 1e-4, "description": "C1 low learning rate short"},
+            {"name": "C1_ref_delta_low_lr_steps240", "stage": "low_lr", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 2.0, "learning_rate": 1e-4, "description": "C1 low learning rate longer"},
+        ]
     configs = [
         {"name": "S1_e5_omni_recipe", "stage": "baseline", "overrides": {}, "description": "E5-Omni recipe only"},
         {"name": "S2_ref", "stage": "single", "overrides": {"lambda_ref": 0.3}, "description": "Add reference-as-negative direction loss"},
@@ -3927,12 +3939,13 @@ def _loss_schedule_markdown(summary: dict[str, Any]) -> str:
     lines = [
         "# AudioDelta Loss Schedule",
         "",
-        "| Run | Eval | R@1 | R@5 | R@10 | Target Beats Ref | Ref Median Rank | Ref<=1 | Gap | RefNeg | Local | SameSrc | Visual | Audio | ASR | Final Loss |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Run | Eval | Steps | LR | R@1 | R@5 | R@10 | Target Beats Ref | Ref Median Rank | Ref<=1 | Gap | RefNeg | Local | SameSrc | Visual | Audio | ASR | Final Loss |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summary["rows"]:
         lines.append(
-            f"| {row['name']} | {row['eval_label']} | {_fmt(row.get('R@1'))} | {_fmt(row.get('R@5'))} | {_fmt(row.get('R@10'))} | "
+            f"| {row['name']} | {row['eval_label']} | {_fmt(row.get('steps'))} | {_fmt(row.get('learning_rate'))} | "
+            f"{_fmt(row.get('R@1'))} | {_fmt(row.get('R@5'))} | {_fmt(row.get('R@10'))} | "
             f"{_fmt(row.get('target_beats_reference'))} | {_fmt(row.get('reference_rank_median'))} | {_fmt(row.get('reference_rank_le_1'))} | "
             f"{_fmt(row.get('target_ref_gap_mean'))} | {_fmt(row.get('positive_beats_reference_negative'))} | "
             f"{_fmt(row.get('positive_beats_local_same_source'))} | {_fmt(row.get('positive_beats_same_source_any'))} | {_fmt(row.get('positive_beats_visual_hard'))} | "

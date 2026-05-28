@@ -656,6 +656,39 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             long_rows = [row for row in summary["rows"] if row["name"] == "C1_ref_delta_more_steps"]
             self.assertEqual(2, long_rows[0]["steps"])
 
+    def test_early_stop_loss_schedule_runs_step_and_lr_grid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [
+                self._record("sample_1", source="source_a", pair="pair_a"),
+                self._record("sample_2", source="source_b", pair="pair_b"),
+            ]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+            cache_embeddings(records_dir=records_dir, output_dir=root / "embedding_cache", mock_encoder=True, local_segments=0)
+
+            summary = run_loss_schedule(
+                cache_dir=root / "embedding_cache",
+                output_dir=root / "loss_schedule_early_stop",
+                steps=2,
+                batch_size=2,
+                learning_rate=3e-4,
+                device="cpu",
+                schedule_preset="early_stop",
+            )
+
+            rows_by_name = {row["name"]: row for row in summary["rows"]}
+            self.assertEqual(9, len(rows_by_name))
+            self.assertEqual(1, rows_by_name["C1_ref_delta_steps60"]["steps"])
+            self.assertEqual(2, rows_by_name["C1_ref_delta_steps120"]["steps"])
+            self.assertEqual(5, rows_by_name["S1_steps300"]["steps"])
+            self.assertEqual(10, rows_by_name["S1_steps600"]["steps"])
+            self.assertAlmostEqual(1e-4, rows_by_name["C1_ref_delta_low_lr_steps120"]["learning_rate"])
+            comparison = (root / "loss_schedule_early_stop" / "loss_schedule_comparison.md").read_text(encoding="utf-8")
+            self.assertIn("| Run | Eval | Steps | LR |", comparison)
+
     def test_gallery_negative_recall_reports_same_source_gallery_items(self) -> None:
         records = load_audio_delta_records_from_rows([self._record("sample_1", source="source_a", pair="pair_a")])
         items = [
