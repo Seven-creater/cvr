@@ -1052,8 +1052,7 @@ def load_eval_gallery_items(path: str | Path) -> list[EvalGalleryItem]:
         video = _first_text(payload, "video", "target_video", "output_path", "path")
         if not video:
             raise ValueError(f"{root} line {index}: missing gallery video path")
-        nested_payload = payload.get("source_payload")
-        source_payload = dict(nested_payload) if isinstance(nested_payload, dict) else {}
+        source_payload = _flatten_gallery_source_payload(payload)
         source_payload.update({key: value for key, value in payload.items() if key != "source_payload"})
         items.append(
             EvalGalleryItem(
@@ -1065,6 +1064,28 @@ def load_eval_gallery_items(path: str | Path) -> list[EvalGalleryItem]:
             )
         )
     return items
+
+
+def _flatten_gallery_source_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    nested = payload.get("source_payload")
+    if not isinstance(nested, dict):
+        return {}
+    result = _flatten_gallery_source_payload(nested)
+    for key, value in nested.items():
+        if key == "source_payload":
+            continue
+        if key in result and not _value_present(value):
+            continue
+        result[key] = value
+    return result
+
+
+def _value_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    return True
 
 
 def _normalize_eval_gallery_protocol(value: str) -> str:

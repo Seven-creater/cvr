@@ -685,9 +685,13 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
                         "raw_source_id": "source_a",
                         "kind": "local_same_source",
                         "source_payload": {
-                            "sample_id": "sample_1",
-                            "negative_type": "local_same_source",
-                            "same_source": True,
+                            "gallery_id": "outer_local::sample_1",
+                            "kind": "local_same_source",
+                            "source_payload": {
+                                "sample_id": "sample_1",
+                                "negative_type": "local_same_source",
+                                "same_source": True,
+                            },
                         },
                     }
                 ],
