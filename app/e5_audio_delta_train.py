@@ -356,6 +356,11 @@ def train_adapter(
     negative_curriculum_warmup_ratio: float = 0.1,
     easy_negative_weight: float = 0.1,
     enable_batch_whitening: bool | None = None,
+    lambda_delta: float | None = None,
+    lambda_hn: float | None = None,
+    lambda_ref: float | None = None,
+    lambda_edit_type: float | None = None,
+    lambda_visual: float | None = None,
     lambda_hw_hn: float | None = None,
     lambda_multi_positive: float | None = None,
     lambda_coral_align: float | None = None,
@@ -396,6 +401,11 @@ def train_adapter(
         enable_modality_temperature=enable_modality_temperature,
         enable_quantile_negative_curriculum=enable_quantile_negative_curriculum,
         enable_batch_whitening=enable_batch_whitening,
+        lambda_delta=lambda_delta,
+        lambda_hn=lambda_hn,
+        lambda_ref=lambda_ref,
+        lambda_edit_type=lambda_edit_type,
+        lambda_visual=lambda_visual,
         lambda_hw_hn=lambda_hw_hn,
         lambda_multi_positive=lambda_multi_positive,
         lambda_coral_align=lambda_coral_align,
@@ -863,6 +873,80 @@ def run_ablations(
     return summary
 
 
+def run_loss_schedule(
+    *,
+    cache_dir: str | Path,
+    output_dir: str | Path,
+    eval_caches: list[tuple[str, str | Path]] | None = None,
+    steps: int = 120,
+    batch_size: int = 8,
+    learning_rate: float = 3e-4,
+    device: str = "cuda",
+    seed: int = 13,
+    include_optional_losses: bool = False,
+    save_topk: int = 0,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    cache_root = Path(cache_dir)
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    eval_cache_pairs = eval_caches or [("main", cache_root)]
+    rows: list[dict[str, Any]] = []
+    configs = _loss_schedule_configs(include_optional_losses=include_optional_losses)
+    for config in configs:
+        name = str(config["name"])
+        overrides = dict(config["overrides"])
+        adapter_dir = output_root / name / "adapter"
+        _emit(progress, f"[e5-audio-delta] loss schedule {name} train start")
+        train_summary = train_adapter(
+            cache_dir=cache_root,
+            output_dir=adapter_dir,
+            steps=steps,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            seed=seed,
+            device=device,
+            training_profile="e5_omni_recipe",
+            enable_hardness_weighting=False,
+            enable_multi_positive=False,
+            enable_memory_bank=False,
+            lambda_hw_hn=0.0,
+            lambda_multi_positive=0.0,
+            lambda_memory_bank=0.0,
+            **overrides,
+            progress=progress,
+        )
+        loss_tail = _last_jsonl_row(adapter_dir / "loss_curve.jsonl")
+        for eval_label, eval_cache in eval_cache_pairs:
+            safe_label = _safe_label(eval_label)
+            eval_dir = output_root / name / f"eval_{safe_label}"
+            _emit(progress, f"[e5-audio-delta] loss schedule {name} eval {eval_label} start")
+            eval_summary = eval_adapter(
+                cache_dir=eval_cache,
+                adapter_dir=adapter_dir,
+                output_dir=eval_dir,
+                device=device,
+                save_topk=save_topk,
+            )
+            rows.append(_loss_schedule_result_row(name, config, eval_label, adapter_dir, eval_dir, train_summary, eval_summary, loss_tail))
+            _emit(progress, f"[e5-audio-delta] loss schedule {name} eval {eval_label} done")
+        _emit(progress, f"[e5-audio-delta] loss schedule {name} done")
+    summary = {
+        "cache_dir": str(cache_root),
+        "output_dir": str(output_root),
+        "steps": steps,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "seed": seed,
+        "include_optional_losses": include_optional_losses,
+        "eval_caches": [{"label": label, "cache_dir": str(path)} for label, path in eval_cache_pairs],
+        "rows": rows,
+    }
+    (output_root / "loss_schedule_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (output_root / "loss_schedule_comparison.md").write_text(_loss_schedule_markdown(summary), encoding="utf-8")
+    return summary
+
+
 def run_stability_grid(
     *,
     cache_dir: str | Path,
@@ -1108,6 +1192,11 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--easy-negative-weight", type=float, default=0.1)
     train.add_argument("--enable-batch-whitening", action="store_true", default=None)
     train.add_argument("--disable-batch-whitening", action="store_false", dest="enable_batch_whitening")
+    train.add_argument("--lambda-delta", type=float)
+    train.add_argument("--lambda-hn", type=float)
+    train.add_argument("--lambda-ref", type=float)
+    train.add_argument("--lambda-edit-type", type=float)
+    train.add_argument("--lambda-visual", type=float)
     train.add_argument("--lambda-hw-hn", type=float)
     train.add_argument("--lambda-multi-positive", type=float)
     train.add_argument("--lambda-coral-align", type=float)
@@ -1149,6 +1238,23 @@ def build_parser() -> argparse.ArgumentParser:
     ablate.add_argument("--device", default="cuda")
     ablate.add_argument("--seed", type=int, default=13)
     ablate.add_argument("--training-profile", choices=("v1", "v2_research", "e5_omni_recipe"), default="v2_research")
+
+    loss_schedule = subparsers.add_parser("run-loss-schedule")
+    loss_schedule.add_argument("--cache-dir", required=True, help="Training cache, usually the V+A+T cache.")
+    loss_schedule.add_argument("--output-dir", required=True)
+    loss_schedule.add_argument(
+        "--eval-cache",
+        action="append",
+        default=[],
+        help="Optional LABEL=PATH eval cache. Repeat for V_T, V_A_T, typed_hardneg, etc. Defaults to --cache-dir.",
+    )
+    loss_schedule.add_argument("--steps", type=int, default=120)
+    loss_schedule.add_argument("--batch-size", type=int, default=8)
+    loss_schedule.add_argument("--learning-rate", type=float, default=3e-4)
+    loss_schedule.add_argument("--device", default="cuda")
+    loss_schedule.add_argument("--seed", type=int, default=13)
+    loss_schedule.add_argument("--include-optional-losses", action="store_true")
+    loss_schedule.add_argument("--save-topk", type=int, default=0)
 
     stability = subparsers.add_parser("stability-grid")
     stability.add_argument("--cache-dir", required=True)
@@ -1246,6 +1352,11 @@ def main() -> None:
             negative_curriculum_warmup_ratio=args.negative_curriculum_warmup_ratio,
             easy_negative_weight=args.easy_negative_weight,
             enable_batch_whitening=args.enable_batch_whitening,
+            lambda_delta=args.lambda_delta,
+            lambda_hn=args.lambda_hn,
+            lambda_ref=args.lambda_ref,
+            lambda_edit_type=args.lambda_edit_type,
+            lambda_visual=args.lambda_visual,
             lambda_hw_hn=args.lambda_hw_hn,
             lambda_multi_positive=args.lambda_multi_positive,
             lambda_coral_align=args.lambda_coral_align,
@@ -1291,6 +1402,20 @@ def main() -> None:
             device=args.device,
             seed=args.seed,
             training_profile=args.training_profile,
+            progress=progress,
+        )
+    elif args.command == "run-loss-schedule":
+        result = run_loss_schedule(
+            cache_dir=args.cache_dir,
+            output_dir=args.output_dir,
+            eval_caches=[_parse_named_cache(raw) for raw in args.eval_cache] or None,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            device=args.device,
+            seed=args.seed,
+            include_optional_losses=args.include_optional_losses,
+            save_topk=args.save_topk,
             progress=progress,
         )
     elif args.command == "stability-grid":
@@ -2061,6 +2186,11 @@ def _training_profile_options(
     enable_modality_temperature: bool | None,
     enable_quantile_negative_curriculum: bool | None,
     enable_batch_whitening: bool | None,
+    lambda_delta: float | None,
+    lambda_hn: float | None,
+    lambda_ref: float | None,
+    lambda_edit_type: float | None,
+    lambda_visual: float | None,
     lambda_hw_hn: float | None,
     lambda_multi_positive: float | None,
     lambda_coral_align: float | None,
@@ -2102,6 +2232,16 @@ def _training_profile_options(
         result["lambda_memory_bank"] = lambda_memory_bank
     if lambda_batch_whitening is not None:
         result["lambda_batch_whitening"] = lambda_batch_whitening
+    if lambda_delta is not None:
+        result["lambda_delta"] = lambda_delta
+    if lambda_hn is not None:
+        result["lambda_hn"] = lambda_hn
+    if lambda_ref is not None:
+        result["lambda_ref"] = lambda_ref
+    if lambda_edit_type is not None:
+        result["lambda_edit_type"] = lambda_edit_type
+    if lambda_visual is not None:
+        result["lambda_visual"] = lambda_visual
     return result
 
 
@@ -3585,6 +3725,147 @@ def _stability_grid_markdown(summary: dict[str, Any]) -> str:
             f"{_fmt(row.get('adapter_target_beats_reference_rate'))} | {_fmt(row.get('loss_final'))} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def _loss_schedule_configs(*, include_optional_losses: bool = False) -> list[dict[str, Any]]:
+    configs = [
+        {"name": "S1_e5_omni_recipe", "stage": "baseline", "overrides": {}, "description": "E5-Omni recipe only"},
+        {"name": "S2_ref", "stage": "single", "overrides": {"lambda_ref": 0.3}, "description": "Add reference-as-negative direction loss"},
+        {"name": "S3_delta", "stage": "single", "overrides": {"lambda_delta": 0.5}, "description": "Add audio delta loss"},
+        {"name": "S4_hn", "stage": "single", "overrides": {"lambda_hn": 0.5}, "description": "Add typed hard negative margin loss"},
+        {"name": "C1_ref_delta", "stage": "combo", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "description": "Reference direction plus audio delta"},
+        {
+            "name": "C2_ref_delta_hn",
+            "stage": "combo",
+            "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5, "lambda_hn": 0.5},
+            "description": "Core AudioDelta combination",
+        },
+    ]
+    if include_optional_losses:
+        configs.extend(
+            [
+                {"name": "S5_edit", "stage": "single", "overrides": {"lambda_edit_type": 0.3}, "description": "Add edit-type-aware loss"},
+                {"name": "S6_visual", "stage": "single", "overrides": {"lambda_visual": 0.05}, "description": "Add weak visual context loss"},
+                {
+                    "name": "C3_ref_delta_hn_edit",
+                    "stage": "combo",
+                    "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5, "lambda_hn": 0.5, "lambda_edit_type": 0.3},
+                    "description": "Core combination plus edit type",
+                },
+                {
+                    "name": "C4_ref_delta_hn_edit_visual",
+                    "stage": "combo",
+                    "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5, "lambda_hn": 0.5, "lambda_edit_type": 0.3, "lambda_visual": 0.05},
+                    "description": "Full existing AudioDelta task loss suite",
+                },
+            ]
+        )
+    return configs
+
+
+def _loss_schedule_result_row(
+    name: str,
+    config: dict[str, Any],
+    eval_label: str,
+    adapter_dir: Path,
+    eval_dir: Path,
+    train_summary: dict[str, Any],
+    eval_summary: dict[str, Any],
+    loss_tail: dict[str, Any],
+) -> dict[str, Any]:
+    adapted = _preferred_eval_row(eval_summary, "audio_delta_adapter")
+    base = _preferred_eval_row(eval_summary, "base_e5")
+    target_beats = eval_summary.get("target_beats_reference") or {}
+    adapted_beats = target_beats.get("audio_delta_adapter") or {}
+    base_beats = target_beats.get("base_e5") or {}
+    reference_rank = eval_summary.get("reference_rank_summary") or {}
+    hard_negative = eval_summary.get("hard_negative_recall_by_type") or {}
+    overrides = dict(config.get("overrides") or {})
+    return {
+        "name": name,
+        "stage": config.get("stage"),
+        "description": config.get("description"),
+        "eval_label": eval_label,
+        "adapter_dir": str(adapter_dir),
+        "eval_dir": str(eval_dir),
+        "steps": train_summary.get("steps"),
+        "lambda_ref": overrides.get("lambda_ref", 0.0),
+        "lambda_delta": overrides.get("lambda_delta", 0.0),
+        "lambda_hn": overrides.get("lambda_hn", 0.0),
+        "lambda_edit_type": overrides.get("lambda_edit_type", 0.0),
+        "lambda_visual": overrides.get("lambda_visual", 0.0),
+        "base_R@1": base.get("R@1"),
+        "base_R@5": base.get("R@5"),
+        "base_R@10": base.get("R@10"),
+        "R@1": adapted.get("R@1"),
+        "R@5": adapted.get("R@5"),
+        "R@10": adapted.get("R@10"),
+        "base_target_beats_reference": base_beats.get("target_beats_reference_rate"),
+        "target_beats_reference": adapted_beats.get("target_beats_reference_rate"),
+        "reference_rank_median": reference_rank.get("median_rank"),
+        "reference_rank_le_1": reference_rank.get("rank_le_1_rate"),
+        "target_ref_gap_mean": adapted_beats.get("target_minus_reference_mean"),
+        "positive_beats_reference_negative": _negative_rate(hard_negative, "reference_negative"),
+        "positive_beats_local_same_source": _negative_rate(hard_negative, "local_same_source"),
+        "positive_beats_visual_hard": _negative_rate(hard_negative, "visual_hard"),
+        "positive_beats_audio_hard": _negative_rate(hard_negative, "audio_hard"),
+        "positive_beats_asr_hard": _negative_rate(hard_negative, "asr_hard"),
+        "by_audio_delta_type": eval_summary.get("by_audio_delta_type"),
+        "by_shortcut_label": eval_summary.get("by_shortcut_label"),
+        "loss_final": loss_tail.get("loss"),
+        "loss_ref": loss_tail.get("loss_ref"),
+        "loss_delta": loss_tail.get("loss_delta"),
+        "loss_hn": loss_tail.get("loss_hn"),
+        "loss_edit_type": loss_tail.get("loss_edit_type"),
+        "loss_visual": loss_tail.get("loss_visual"),
+        "effective_negative_count": loss_tail.get("effective_negative_count"),
+    }
+
+
+def _preferred_eval_row(eval_summary: dict[str, Any], prefix: str) -> dict[str, Any]:
+    rows = eval_summary.get("rows") or []
+    for suffix in ("global_local", "global"):
+        target = f"{prefix}_{suffix}"
+        found = next((row for row in rows if row.get("method") == target), None)
+        if found:
+            return found
+    return {}
+
+
+def _negative_rate(summary: dict[str, Any], name: str) -> float | None:
+    bucket = summary.get(name) or {}
+    return bucket.get("positive_beats_negative_rate")
+
+
+def _loss_schedule_markdown(summary: dict[str, Any]) -> str:
+    lines = [
+        "# AudioDelta Loss Schedule",
+        "",
+        "| Run | Eval | R@1 | R@5 | R@10 | Target Beats Ref | Ref Median Rank | Ref<=1 | Gap | RefNeg | Local | Visual | Audio | ASR | Final Loss |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in summary["rows"]:
+        lines.append(
+            f"| {row['name']} | {row['eval_label']} | {_fmt(row.get('R@1'))} | {_fmt(row.get('R@5'))} | {_fmt(row.get('R@10'))} | "
+            f"{_fmt(row.get('target_beats_reference'))} | {_fmt(row.get('reference_rank_median'))} | {_fmt(row.get('reference_rank_le_1'))} | "
+            f"{_fmt(row.get('target_ref_gap_mean'))} | {_fmt(row.get('positive_beats_reference_negative'))} | "
+            f"{_fmt(row.get('positive_beats_local_same_source'))} | {_fmt(row.get('positive_beats_visual_hard'))} | "
+            f"{_fmt(row.get('positive_beats_audio_hard'))} | {_fmt(row.get('positive_beats_asr_hard'))} | {_fmt(row.get('loss_final'))} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _safe_label(value: str) -> str:
+    label = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(value).strip())
+    return label or "eval"
+
+
+def _parse_named_cache(raw: str) -> tuple[str, Path]:
+    if "=" in raw:
+        label, path = raw.split("=", 1)
+        return _safe_label(label), Path(path)
+    path = Path(raw)
+    return _safe_label(path.name), path
 
 
 def _fmt(value: Any) -> str:

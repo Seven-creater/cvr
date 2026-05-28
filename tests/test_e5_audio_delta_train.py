@@ -15,6 +15,7 @@ from app.e5_audio_delta_train import (
     load_audio_delta_records,
     prepare_records,
     run_ablations,
+    run_loss_schedule,
     run_stability_grid,
     train_adapter,
     train_lora_plan,
@@ -587,6 +588,44 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertIn("without_batch_whitening", names)
             self.assertTrue((root / "ablations" / "comparison.md").exists())
 
+    def test_run_loss_schedule_opens_audio_delta_losses_one_by_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [
+                self._record("sample_1", source="source_a", pair="pair_a"),
+                self._record("sample_2", source="source_b", pair="pair_b", old_audio="quiet room ambience", new_audio="crowd cheering"),
+            ]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+            cache_embeddings(records_dir=records_dir, output_dir=root / "embedding_cache", mock_encoder=True, local_segments=0)
+
+            summary = run_loss_schedule(
+                cache_dir=root / "embedding_cache",
+                output_dir=root / "loss_schedule",
+                steps=1,
+                batch_size=2,
+                device="cpu",
+            )
+
+            names = {row["name"] for row in summary["rows"]}
+            self.assertIn("S1_e5_omni_recipe", names)
+            self.assertIn("S2_ref", names)
+            self.assertIn("S3_delta", names)
+            self.assertIn("S4_hn", names)
+            self.assertIn("C1_ref_delta", names)
+            self.assertIn("C2_ref_delta_hn", names)
+            ref_rows = [row for row in summary["rows"] if row["name"] == "S2_ref"]
+            self.assertEqual(0.3, ref_rows[0]["lambda_ref"])
+            self.assertEqual(0.0, ref_rows[0]["lambda_delta"])
+            combo_rows = [row for row in summary["rows"] if row["name"] == "C2_ref_delta_hn"]
+            self.assertEqual(0.3, combo_rows[0]["lambda_ref"])
+            self.assertEqual(0.5, combo_rows[0]["lambda_delta"])
+            self.assertEqual(0.5, combo_rows[0]["lambda_hn"])
+            self.assertTrue((root / "loss_schedule" / "loss_schedule_summary.json").exists())
+            self.assertTrue((root / "loss_schedule" / "loss_schedule_comparison.md").exists())
+
     def test_stability_grid_reuses_cache_and_writes_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -679,6 +718,11 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             enable_modality_temperature=None,
             enable_quantile_negative_curriculum=None,
             enable_batch_whitening=None,
+            lambda_delta=None,
+            lambda_hn=None,
+            lambda_ref=None,
+            lambda_edit_type=None,
+            lambda_visual=None,
             lambda_hw_hn=None,
             lambda_multi_positive=None,
             lambda_coral_align=None,
@@ -693,6 +737,11 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
         self.assertEqual(0.0, recipe["lambda_delta"])
         self.assertEqual(0.0, recipe["lambda_ref"])
         self.assertEqual(0.0, recipe["lambda_hn"])
+
+        ref_recipe = _training_profile_options(training_profile="e5_omni_recipe", **{**kwargs, "lambda_ref": 0.3, "lambda_delta": 0.5})
+        self.assertEqual(0.3, ref_recipe["lambda_ref"])
+        self.assertEqual(0.5, ref_recipe["lambda_delta"])
+        self.assertEqual(0.0, ref_recipe["lambda_hn"])
 
     def test_cache_ffmpeg_mode_is_scoped_to_cache_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
