@@ -26,6 +26,7 @@ from app.e5_audio_delta_train import (
     _gallery_negative_recall_by_type,
     _hardness_weights,
     _import_torch,
+    load_eval_gallery_items,
     _modality_tau,
     _multi_positive_loss,
     _quantile_negative_curriculum_weights,
@@ -671,6 +672,32 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
         self.assertEqual(0.0, summary["local_same_source"]["positive_beats_negative_rate"])
         self.assertEqual(0.5, summary["same_source_any"]["positive_beats_negative_rate"])
         self.assertEqual(1.0, summary["visual_hard"]["positive_beats_negative_rate"])
+
+    def test_load_eval_gallery_items_flattens_nested_source_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "eval_gallery.jsonl"
+            self._write_jsonl(
+                path,
+                [
+                    {
+                        "gallery_id": "local::sample_1",
+                        "video": "local.mp4",
+                        "raw_source_id": "source_a",
+                        "kind": "local_same_source",
+                        "source_payload": {
+                            "sample_id": "sample_1",
+                            "negative_type": "local_same_source",
+                            "same_source": True,
+                        },
+                    }
+                ],
+            )
+
+            items = load_eval_gallery_items(path)
+
+            self.assertEqual("sample_1", items[0].source_payload["sample_id"])
+            self.assertEqual("local_same_source", items[0].source_payload["negative_type"])
+            self.assertTrue(items[0].source_payload["same_source"])
 
     def test_stability_grid_reuses_cache_and_writes_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

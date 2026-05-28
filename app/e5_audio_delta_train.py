@@ -1052,13 +1052,16 @@ def load_eval_gallery_items(path: str | Path) -> list[EvalGalleryItem]:
         video = _first_text(payload, "video", "target_video", "output_path", "path")
         if not video:
             raise ValueError(f"{root} line {index}: missing gallery video path")
+        nested_payload = payload.get("source_payload")
+        source_payload = dict(nested_payload) if isinstance(nested_payload, dict) else {}
+        source_payload.update({key: value for key, value in payload.items() if key != "source_payload"})
         items.append(
             EvalGalleryItem(
                 gallery_id=gallery_id,
                 video=video,
                 raw_source_id=_first_text(payload, "raw_source_id", "source_clip_id", "group_id", default=gallery_id),
                 kind=_first_text(payload, "kind", default="distractor"),
-                source_payload=dict(payload),
+                source_payload=source_payload,
             )
         )
     return items
