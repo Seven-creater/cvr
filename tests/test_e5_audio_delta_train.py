@@ -589,9 +589,10 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertIn("without_modality_temperature", names)
             self.assertIn("without_quantile_negative_curriculum", names)
             self.assertIn("without_batch_whitening", names)
+            self.assertNotIn("C1_ref_delta", names)
             self.assertTrue((root / "ablations" / "comparison.md").exists())
 
-    def test_run_loss_schedule_opens_audio_delta_losses_one_by_one(self) -> None:
+    def test_run_loss_schedule_is_recipe_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             records_dir = root / "records"
@@ -613,23 +614,15 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             )
 
             names = {row["name"] for row in summary["rows"]}
-            self.assertIn("S1_e5_omni_recipe", names)
-            self.assertIn("S2_ref", names)
-            self.assertIn("S3_delta", names)
-            self.assertIn("S4_hn", names)
-            self.assertIn("C1_ref_delta", names)
-            self.assertIn("C2_ref_delta_hn", names)
-            ref_rows = [row for row in summary["rows"] if row["name"] == "S2_ref"]
-            self.assertEqual(0.3, ref_rows[0]["lambda_ref"])
-            self.assertEqual(0.0, ref_rows[0]["lambda_delta"])
-            combo_rows = [row for row in summary["rows"] if row["name"] == "C2_ref_delta_hn"]
-            self.assertEqual(0.3, combo_rows[0]["lambda_ref"])
-            self.assertEqual(0.5, combo_rows[0]["lambda_delta"])
-            self.assertEqual(0.5, combo_rows[0]["lambda_hn"])
+            self.assertEqual({"S1_e5_omni_recipe"}, names)
+            self.assertEqual(0.0, summary["rows"][0]["lambda_ref"])
+            self.assertEqual(0.0, summary["rows"][0]["lambda_delta"])
+            self.assertEqual(0.0, summary["rows"][0]["lambda_hn"])
+            self.assertFalse(summary["audio_delta_stage2_enabled"])
             self.assertTrue((root / "loss_schedule" / "loss_schedule_summary.json").exists())
             self.assertTrue((root / "loss_schedule" / "loss_schedule_comparison.md").exists())
 
-    def test_focused_loss_schedule_runs_c1_more_steps_only(self) -> None:
+    def test_focused_loss_schedule_keeps_recipe_baseline_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             records_dir = root / "records"
@@ -652,11 +645,10 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             )
 
             names = {row["name"] for row in summary["rows"]}
-            self.assertEqual({"S1_e5_omni_recipe", "C1_ref_delta", "C1_ref_delta_more_steps"}, names)
-            long_rows = [row for row in summary["rows"] if row["name"] == "C1_ref_delta_more_steps"]
-            self.assertEqual(2, long_rows[0]["steps"])
+            self.assertEqual({"S1_e5_omni_recipe"}, names)
+            self.assertEqual(1, summary["rows"][0]["steps"])
 
-    def test_early_stop_loss_schedule_runs_step_and_lr_grid(self) -> None:
+    def test_early_stop_loss_schedule_does_not_reintroduce_task_losses(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             records_dir = root / "records"
@@ -680,12 +672,10 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             )
 
             rows_by_name = {row["name"]: row for row in summary["rows"]}
-            self.assertEqual(9, len(rows_by_name))
-            self.assertEqual(1, rows_by_name["C1_ref_delta_steps60"]["steps"])
-            self.assertEqual(2, rows_by_name["C1_ref_delta_steps120"]["steps"])
-            self.assertEqual(5, rows_by_name["S1_steps300"]["steps"])
-            self.assertEqual(10, rows_by_name["S1_steps600"]["steps"])
-            self.assertAlmostEqual(1e-4, rows_by_name["C1_ref_delta_low_lr_steps120"]["learning_rate"])
+            self.assertEqual({"S1_e5_omni_recipe"}, set(rows_by_name))
+            self.assertEqual(2, rows_by_name["S1_e5_omni_recipe"]["steps"])
+            self.assertEqual(0.0, rows_by_name["S1_e5_omni_recipe"]["lambda_ref"])
+            self.assertEqual(0.0, rows_by_name["S1_e5_omni_recipe"]["lambda_delta"])
             comparison = (root / "loss_schedule_early_stop" / "loss_schedule_comparison.md").read_text(encoding="utf-8")
             self.assertIn("| Run | Eval | Steps | LR |", comparison)
 
@@ -849,8 +839,8 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
         self.assertEqual(0.0, recipe["lambda_hn"])
 
         ref_recipe = _training_profile_options(training_profile="e5_omni_recipe", **{**kwargs, "lambda_ref": 0.3, "lambda_delta": 0.5})
-        self.assertEqual(0.3, ref_recipe["lambda_ref"])
-        self.assertEqual(0.5, ref_recipe["lambda_delta"])
+        self.assertEqual(0.0, ref_recipe["lambda_ref"])
+        self.assertEqual(0.0, ref_recipe["lambda_delta"])
         self.assertEqual(0.0, ref_recipe["lambda_hn"])
 
     def test_cache_ffmpeg_mode_is_scoped_to_cache_metadata(self) -> None:
@@ -1003,6 +993,27 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             )
 
             self.assertEqual("off", summary["runtime"]["video_audio_mode"])
+
+    def test_cache_embeddings_can_skip_redundant_train_encoding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+
+            summary = cache_embeddings(
+                records_dir=records_dir,
+                output_dir=root / "embedding_cache",
+                mock_encoder=True,
+                skip_train=True,
+            )
+
+            self.assertTrue(summary["skip_train"])
+            self.assertTrue(summary["train"]["skipped"])
+            self.assertFalse((root / "embedding_cache" / "train_embeddings.npz").exists())
+            self.assertTrue((root / "embedding_cache" / "eval_embeddings.npz").exists())
 
     def test_query_input_modes_support_audio_necessity_protocol_payloads(self) -> None:
         record = load_audio_delta_records_from_rows([self._record("sample_1", source="source_a", pair="pair_a")])[0]

@@ -283,14 +283,38 @@ e5_omni_recipe / v2_research
   on:  quantile negative curriculum
   on:  false-negative debiasing
   on:  CORAL / covariance alignment
-  off: AudioDelta-specific delta/ref/edit-type/local losses by default
-  off: multi-positive, memory bank, batch whitening, LoRA by default
+  off: AudioDelta-specific delta/ref/hard-negative/edit-type/visual losses
+  off: multi-positive, memory bank, LoRA
 ```
 
-AudioDelta-specific losses are intentionally kept as later ablation knobs, not
-as the current first-stage default.
+The current training code intentionally uses the S1/e5-omni recipe only.
+Legacy AudioDelta lambda flags remain parseable for command compatibility, but
+are forced to zero and cannot create a C1 run. The former loss schedule is
+kept as a compatibility command that evaluates S1 only.
 
 ## Evaluation Metrics
+
+### Paper-grade Audio-CVR experiment
+
+Use `scripts/run_audio_cvr_aaai_final_experiment.sh` for the final adapter
+experiment. It preserves the existing source-disjoint assignment, filters the
+formal test set to forward B-main records, selects steps/LR/batch size on the
+validation split, and then runs five final seeds across all seven audio
+necessity modes. The launcher also evaluates a validation-tuned V+T/A+T late
+fusion baseline and writes paired bootstrap, randomization, and McNemar
+statistics.
+
+```bash
+setsid nohup bash scripts/run_audio_cvr_aaai_final_experiment.sh \
+  --run-root /path/to/audio_cvr_run \
+  --split-root /path/to/audio_cvr_run/b_splits \
+  --output-dir runs/aaai_audiocvr_final_$(date +%Y%m%d_%H%M%S) \
+  --gpu-ids 1,2,3,4,5,6,7 \
+  > logs/aaai_audiocvr_final.log 2>&1 < /dev/null &
+```
+
+The experiment protocol and literature rationale are documented in
+`doc/aaai_audiocvr_final_experiment_protocol_20260718.md`.
 
 Report more than `R@K`:
 

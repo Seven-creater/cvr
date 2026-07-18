@@ -71,11 +71,14 @@ DEFAULT_LOSS_OPTIONS = {
     "easy_negative_weight": 0.1,
     "enable_batch_whitening": False,
     "temperature": 0.05,
-    "lambda_delta": 0.5,
-    "lambda_hn": 0.5,
-    "lambda_ref": 0.3,
-    "lambda_edit_type": 0.3,
-    "lambda_visual": 0.05,
+    "audio_delta_stage2_enabled": False,
+    # AudioDelta task-specific objectives are intentionally disabled.  The
+    # current training recipe is the e5-omni-aligned Stage-1 baseline.
+    "lambda_delta": 0.0,
+    "lambda_hn": 0.0,
+    "lambda_ref": 0.0,
+    "lambda_edit_type": 0.0,
+    "lambda_visual": 0.0,
     "lambda_hw_hn": 0.0,
     "lambda_multi_positive": 0.0,
     "lambda_coral_align": 0.0,
@@ -233,6 +236,7 @@ def cache_embeddings(
     local_segment_mode: str = "prompt",
     local_segment_cache_dir: str | Path | None = None,
     segment_overlap: float = 0.0,
+    skip_train: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     records_root = Path(records_dir)
@@ -271,21 +275,24 @@ def cache_embeddings(
     train_records = load_audio_delta_records(records_root / "train.jsonl")
     eval_records = load_audio_delta_records(records_root / "eval.jsonl")
     eval_gallery = load_eval_gallery_items(records_root / "eval_gallery.jsonl") if (records_root / "eval_gallery.jsonl").exists() else []
-    train_summary = _cache_split_embeddings(
-        records=train_records,
-        split="train",
-        encoder=encoder,
-        output_root=output_root,
-        runtime_info=runtime_info,
-        query_input_mode=query_input_mode,
-        document_input_mode=document_input_mode,
-        audio_media_cache_dir=audio_media_cache_dir,
-        local_segments=local_segments,
-        local_segment_mode=local_segment_mode,
-        local_segment_cache_dir=local_segment_cache_dir,
-        segment_overlap=segment_overlap,
-        progress=progress,
-    )
+    if skip_train:
+        train_summary = {"split": "train", "count": 0, "skipped": True}
+    else:
+        train_summary = _cache_split_embeddings(
+            records=train_records,
+            split="train",
+            encoder=encoder,
+            output_root=output_root,
+            runtime_info=runtime_info,
+            query_input_mode=query_input_mode,
+            document_input_mode=document_input_mode,
+            audio_media_cache_dir=audio_media_cache_dir,
+            local_segments=local_segments,
+            local_segment_mode=local_segment_mode,
+            local_segment_cache_dir=local_segment_cache_dir,
+            segment_overlap=segment_overlap,
+            progress=progress,
+        )
     eval_summary = _cache_split_embeddings(
         records=eval_records,
         split="eval",
@@ -310,6 +317,7 @@ def cache_embeddings(
         "local_segment_mode": local_segment_mode,
         "local_segment_cache_dir": str(local_segment_cache_dir) if local_segment_cache_dir else None,
         "segment_overlap": segment_overlap,
+        "skip_train": bool(skip_train),
         "train": train_summary,
         "eval": eval_summary,
     }
@@ -785,44 +793,16 @@ def run_ablations(
     output_root.mkdir(parents=True, exist_ok=True)
     if training_profile in {"v2_research", "e5_omni_recipe"}:
         configs = [
-            ("full_v2", {"training_profile": "v2_research"}),
-            ("without_modality_temperature", {"training_profile": "v2_research", "enable_modality_temperature": False}),
-            ("without_quantile_negative_curriculum", {"training_profile": "v2_research", "enable_quantile_negative_curriculum": False}),
-            ("without_false_negative_debiasing", {"training_profile": "v2_research", "enable_false_negative_filtering": False}),
-            ("without_hardness_weighting", {"training_profile": "v2_research", "enable_hardness_weighting": False, "lambda_hw_hn": 0.0}),
-            ("without_multi_positive", {"training_profile": "v2_research", "enable_multi_positive": False, "lambda_multi_positive": 0.0}),
-            ("without_coral_align", {"training_profile": "v2_research", "enable_coral_align": False, "lambda_coral_align": 0.0}),
-            ("without_batch_whitening", {"training_profile": "v2_research", "enable_batch_whitening": False, "lambda_batch_whitening": 0.0}),
-            ("without_memory_bank", {"training_profile": "v2_research", "enable_memory_bank": False, "lambda_memory_bank": 0.0}),
-            ("without_false_negative_filtering", {"training_profile": "v2_research", "enable_false_negative_filtering": False}),
-            ("without_local_segments", {"training_profile": "v2_research", "disable_local_segments": True}),
-            ("without_delta", {"training_profile": "v2_research", "disable_delta_loss": True}),
-            ("without_reference_negative", {"training_profile": "v2_research", "disable_reference_negative": True}),
-            ("without_hard_negatives", {"training_profile": "v2_research", "disable_hard_negatives": True}),
-            (
-                "v1_loss_only",
-                {
-                    "training_profile": "v1",
-                    "enable_hardness_weighting": False,
-                    "enable_multi_positive": False,
-                    "enable_coral_align": False,
-                    "enable_memory_bank": False,
-                    "enable_false_negative_filtering": False,
-                    "enable_modality_temperature": False,
-                    "enable_quantile_negative_curriculum": False,
-                    "enable_batch_whitening": False,
-                },
-            ),
+            ("s1_e5_omni_recipe", {"training_profile": "e5_omni_recipe"}),
+            ("without_modality_temperature", {"training_profile": "e5_omni_recipe", "enable_modality_temperature": False}),
+            ("without_quantile_negative_curriculum", {"training_profile": "e5_omni_recipe", "enable_quantile_negative_curriculum": False}),
+            ("without_false_negative_debiasing", {"training_profile": "e5_omni_recipe", "enable_false_negative_filtering": False}),
+            ("without_coral_align", {"training_profile": "e5_omni_recipe", "enable_coral_align": False}),
+            ("without_batch_whitening", {"training_profile": "e5_omni_recipe", "enable_batch_whitening": False}),
         ]
     else:
         configs = [
-            ("full", {"training_profile": "v1"}),
-            ("without_delta", {"disable_delta_loss": True}),
-            ("without_hard_negatives", {"disable_hard_negatives": True}),
-            ("without_reference_negative", {"disable_reference_negative": True}),
-            ("without_edit_type", {"disable_edit_type_loss": True}),
-            ("without_local_segments", {"disable_local_segments": True}),
-            ("global_only", {"disable_local_segments": True, "disable_global_local_mix": True}),
+            ("s1_e5_omni_recipe", {"training_profile": "v1"}),
         ]
     rows: list[dict[str, Any]] = []
     for name, overrides in configs:
@@ -941,6 +921,8 @@ def run_loss_schedule(
     summary = {
         "cache_dir": str(cache_root),
         "output_dir": str(output_root),
+        "training_recipe": "e5_omni_recipe_only",
+        "audio_delta_stage2_enabled": False,
         "steps": steps,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
@@ -1177,6 +1159,11 @@ def build_parser() -> argparse.ArgumentParser:
     cache.add_argument("--local-segment-mode", choices=("prompt", "ffmpeg"), default="prompt")
     cache.add_argument("--local-segment-cache-dir")
     cache.add_argument("--segment-overlap", type=float, default=0.0)
+    cache.add_argument(
+        "--skip-train",
+        action="store_true",
+        help="Encode only eval queries/gallery. Useful when one shared V+A+T train cache already exists.",
+    )
 
     train = subparsers.add_parser("train-adapter")
     train.add_argument("--cache-dir", required=True)
@@ -1344,6 +1331,7 @@ def main() -> None:
             local_segment_mode=args.local_segment_mode,
             local_segment_cache_dir=args.local_segment_cache_dir,
             segment_overlap=args.segment_overlap,
+            skip_train=args.skip_train,
             progress=progress,
         )
     elif args.command == "train-adapter":
@@ -1957,18 +1945,13 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
     labels = torch.arange(retrieval_logits.shape[0], device=retrieval_logits.device)
     loss_ce = torch.nn.functional.cross_entropy(retrieval_logits, labels)
     loss_cvr = loss_ce
-    loss_multi_positive = _multi_positive_loss(torch, retrieval_logits, batch.get("positive_group_index")) if options["enable_multi_positive"] else torch.zeros((), device=retrieval_logits.device)
-    pos_global = torch.sum(query * target, dim=-1)
-    ref_global = torch.sum(query * reference, dim=-1)
-    pos_local = _paired_local_scores_torch(torch, query, target_segments) if target_segments is not None else None
-    ref_local = _paired_local_scores_torch(torch, query, reference_segments) if reference_segments is not None else None
-    pos = _mix_torch_scores(pos_global, pos_local, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"]))
-    ref = _mix_torch_scores(ref_global, ref_local, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"]))
-    pos_metric = _scale_for_modality_temperature(pos, tau_cvr, use_modality_temperature)
-    ref_metric = _scale_for_modality_temperature(ref, tau_cvr, use_modality_temperature)
-    loss_ref = torch.relu(0.2 - pos_metric + ref_metric).mean()
-    if options["disable_reference_negative"]:
-        loss_ref = torch.zeros((), device=retrieval_logits.device)
+    # Keep the implementation focused on the e5-omni Stage-1 recipe.  The
+    # old AudioDelta task losses (reference margin, delta/edit-type and
+    # visual consistency) are retained only as zero-valued compatibility
+    # fields in the logs; they are not part of the optimization objective.
+    zero = torch.zeros((), device=retrieval_logits.device)
+    loss_multi_positive = zero
+    loss_ref = zero
     neg_scores_global = torch.einsum("bd,bnd->bn", query, negative)
     neg_scores_local = _negative_local_scores_torch(torch, query, negative_segments) if negative_segments is not None else None
     neg_scores = _mix_torch_scores(neg_scores_global, neg_scores_local, float(options["local_mix_weight"]), bool(options["disable_global_local_mix"]))
@@ -2011,89 +1994,13 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
     )
     if str(options.get("contrastive_objective", "ce")) == "masked_dcl":
         loss_cvr = loss_masked_dcl
-    margins = torch.relu(0.2 - pos_metric[:, None] + neg_metric)
-    hn = margins * effective_mask
-    loss_hn = hn.sum() / effective_mask.sum().clamp_min(1.0)
-    if options["disable_hard_negatives"]:
-        loss_hn = torch.zeros((), device=retrieval_logits.device)
+    loss_hn = zero
     loss_hw_hn = torch.zeros((), device=retrieval_logits.device)
     hardness = torch.ones_like(effective_mask)
-    if options["enable_hardness_weighting"] and not options["disable_hard_negatives"]:
-        hardness = _hardness_weights(
-            torch,
-            records,
-            neg_metric,
-            effective_mask,
-            temperature=float(options["hardness_temperature"]),
-            weight_min=float(options["hardness_weight_min"]),
-            weight_max=float(options["hardness_weight_max"]),
-        )
-        loss_hw_hn = (margins * effective_mask * hardness).sum() / effective_mask.sum().clamp_min(1.0)
     final_negative_weight = effective_mask * hardness
-    delta_losses: list[Any] = []
-    edit_type_losses: list[Any] = []
-    for index, record in enumerate(records):
-        edit_type = _normalize_edit_type(record.edit_type, record.edit_text)
-        target_edit = _mix_torch_scores(
-            torch.sum(target[index] * edit[index], dim=-1),
-            _single_local_score_torch(torch, target_segments[index], edit[index]) if target_segments is not None else None,
-            float(options["local_mix_weight"]),
-            bool(options["disable_global_local_mix"]),
-        )
-        target_edit = _scale_for_modality_temperature(target_edit, tau_audio_text, use_modality_temperature)
-        reference_edit = _mix_torch_scores(
-            torch.sum(reference[index] * edit[index], dim=-1),
-            _single_local_score_torch(torch, reference_segments[index], edit[index]) if reference_segments is not None else None,
-            float(options["local_mix_weight"]),
-            bool(options["disable_global_local_mix"]),
-        )
-        reference_edit = _scale_for_modality_temperature(reference_edit, tau_audio_text, use_modality_temperature)
-        target_old = _mix_torch_scores(
-            torch.sum(target[index] * old_audio[index], dim=-1),
-            _single_local_score_torch(torch, target_segments[index], old_audio[index]) if target_segments is not None else None,
-            float(options["local_mix_weight"]),
-            bool(options["disable_global_local_mix"]),
-        )
-        target_old = _scale_for_modality_temperature(target_old, tau_audio_text, use_modality_temperature)
-        target_new = _mix_torch_scores(
-            torch.sum(target[index] * new_audio[index], dim=-1),
-            _single_local_score_torch(torch, target_segments[index], new_audio[index]) if target_segments is not None else None,
-            float(options["local_mix_weight"]),
-            bool(options["disable_global_local_mix"]),
-        )
-        target_new = _scale_for_modality_temperature(target_new, tau_audio_text, use_modality_temperature)
-        reference_old = _mix_torch_scores(
-            torch.sum(reference[index] * old_audio[index], dim=-1),
-            _single_local_score_torch(torch, reference_segments[index], old_audio[index]) if reference_segments is not None else None,
-            float(options["local_mix_weight"]),
-            bool(options["disable_global_local_mix"]),
-        )
-        reference_old = _scale_for_modality_temperature(reference_old, tau_audio_text, use_modality_temperature)
-        reference_new = _mix_torch_scores(
-            torch.sum(reference[index] * new_audio[index], dim=-1),
-            _single_local_score_torch(torch, reference_segments[index], new_audio[index]) if reference_segments is not None else None,
-            float(options["local_mix_weight"]),
-            bool(options["disable_global_local_mix"]),
-        )
-        reference_new = _scale_for_modality_temperature(reference_new, tau_audio_text, use_modality_temperature)
-        if edit_type in {"remove", "decrease"}:
-            delta = reference_edit - target_edit
-            delta_losses.append(torch.relu(0.2 - delta))
-        elif edit_type == "replace":
-            edit_type_losses.append(torch.relu(0.2 - target_new + target_old))
-            edit_type_losses.append(torch.relu(0.2 - reference_old + reference_new))
-        else:
-            delta = target_edit - reference_edit
-            delta_losses.append(torch.relu(0.2 - delta))
-    loss_delta = torch.stack(delta_losses).mean() if delta_losses else torch.zeros((), device=retrieval_logits.device)
-    loss_edit_type = torch.stack(edit_type_losses).mean() if edit_type_losses else torch.zeros((), device=retrieval_logits.device)
-    if options["disable_delta_loss"]:
-        loss_delta = torch.zeros((), device=retrieval_logits.device)
-    if options["disable_edit_type_loss"]:
-        loss_edit_type = torch.zeros((), device=retrieval_logits.device)
-    visual_sim = torch.sum(target * reference, dim=-1)
-    loss_visual = torch.relu(0.05 - visual_sim).mean()
-    zero = torch.zeros((), device=retrieval_logits.device)
+    loss_delta = zero
+    loss_edit_type = zero
+    loss_visual = zero
     doc_for_align = torch.cat([target, reference], dim=0)
     edit_for_align = torch.cat([edit, old_audio, new_audio], dim=0)
     delta_vec = target - reference
@@ -2108,14 +2015,11 @@ def _adapter_losses(torch: Any, model: Any, batch: dict[str, Any], records: list
         if options["enable_batch_whitening"]
         else zero
     )
-    loss_memory_bank = _memory_bank_loss(torch, pos, query, options.get("memory_bank"), temperature=float(tau_cvr.detach().cpu())) if options["enable_memory_bank"] else zero
+    # Memory-bank and multi-positive branches remain opt-in research hooks,
+    # but the supported baseline recipe does not train them.
+    loss_memory_bank = zero
     total = (
         loss_cvr
-        + float(options["lambda_delta"]) * loss_delta
-        + float(options["lambda_hn"]) * loss_hn
-        + float(options["lambda_ref"]) * loss_ref
-        + float(options["lambda_edit_type"]) * loss_edit_type
-        + float(options["lambda_visual"]) * loss_visual
         + float(options["lambda_hw_hn"]) * loss_hw_hn
         + float(options["lambda_multi_positive"]) * loss_multi_positive
         + float(options["lambda_coral_align"]) * loss_coral_align
@@ -2245,16 +2149,20 @@ def _training_profile_options(
         "enable_modality_temperature": enabled if enable_modality_temperature is None else enable_modality_temperature,
         "enable_quantile_negative_curriculum": enabled if enable_quantile_negative_curriculum is None else enable_quantile_negative_curriculum,
         "enable_batch_whitening": enabled if enable_batch_whitening is None else enable_batch_whitening,
-        "lambda_delta": 0.0 if enabled else DEFAULT_LOSS_OPTIONS["lambda_delta"],
-        "lambda_hn": 0.0 if enabled else DEFAULT_LOSS_OPTIONS["lambda_hn"],
-        "lambda_ref": 0.0 if enabled else DEFAULT_LOSS_OPTIONS["lambda_ref"],
-        "lambda_edit_type": 0.0 if enabled else DEFAULT_LOSS_OPTIONS["lambda_edit_type"],
-        "lambda_visual": 0.0 if enabled else DEFAULT_LOSS_OPTIONS["lambda_visual"],
+        # Stage-2 AudioDelta objectives are intentionally not part of the
+        # supported training recipe.  Keep the keys for old config readers,
+        # but force them to zero even if a legacy CLI flag passes a value.
+        "lambda_delta": 0.0,
+        "lambda_hn": 0.0,
+        "lambda_ref": 0.0,
+        "lambda_edit_type": 0.0,
+        "lambda_visual": 0.0,
         "lambda_hw_hn": 0.0,
         "lambda_multi_positive": 0.0,
         "lambda_coral_align": 0.05 if enabled else 0.0,
         "lambda_memory_bank": 0.0,
         "lambda_batch_whitening": 0.01 if enabled else 0.0,
+        "audio_delta_stage2_enabled": False,
     }
     if lambda_hw_hn is not None:
         result["lambda_hw_hn"] = lambda_hw_hn
@@ -2266,16 +2174,8 @@ def _training_profile_options(
         result["lambda_memory_bank"] = lambda_memory_bank
     if lambda_batch_whitening is not None:
         result["lambda_batch_whitening"] = lambda_batch_whitening
-    if lambda_delta is not None:
-        result["lambda_delta"] = lambda_delta
-    if lambda_hn is not None:
-        result["lambda_hn"] = lambda_hn
-    if lambda_ref is not None:
-        result["lambda_ref"] = lambda_ref
-    if lambda_edit_type is not None:
-        result["lambda_edit_type"] = lambda_edit_type
-    if lambda_visual is not None:
-        result["lambda_visual"] = lambda_visual
+    # Deliberately ignore legacy AudioDelta lambda overrides.  This prevents
+    # old C1 commands from silently changing the S1/e5-omni baseline.
     return result
 
 
@@ -3793,67 +3693,15 @@ def _loss_schedule_configs(*, schedule_preset: str = "core", include_optional_lo
     preset = str(schedule_preset or "core")
     if preset not in {"core", "focused", "early_stop", "full"}:
         raise ValueError(f"unknown loss schedule preset: {schedule_preset}")
-    focused = [
-        {"name": "S1_e5_omni_recipe", "stage": "baseline", "overrides": {}, "description": "E5-Omni recipe only"},
-        {"name": "C1_ref_delta", "stage": "combo", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "description": "Reference direction plus audio delta"},
-        {
-            "name": "C1_ref_delta_more_steps",
-            "stage": "combo_long",
-            "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5},
-            "steps_multiplier": 2.0,
-            "description": "C1 with twice the training steps",
-        },
-    ]
-    if preset == "focused":
-        return focused
-    if preset == "early_stop":
-        return [
-            {"name": "S1_steps120", "stage": "baseline", "overrides": {}, "steps_multiplier": 1.0, "description": "S1 short baseline"},
-            {"name": "S1_steps300", "stage": "baseline", "overrides": {}, "steps_multiplier": 2.5, "description": "S1 medium baseline"},
-            {"name": "S1_steps600", "stage": "baseline", "overrides": {}, "steps_multiplier": 5.0, "description": "S1 long baseline"},
-            {"name": "C1_ref_delta_steps60", "stage": "early_stop", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 0.5, "description": "C1 very short"},
-            {"name": "C1_ref_delta_steps120", "stage": "early_stop", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 1.0, "description": "C1 short"},
-            {"name": "C1_ref_delta_steps180", "stage": "early_stop", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 1.5, "description": "C1 early stopping probe"},
-            {"name": "C1_ref_delta_steps240", "stage": "early_stop", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 2.0, "description": "C1 longer early stopping probe"},
-            {"name": "C1_ref_delta_low_lr_steps120", "stage": "low_lr", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 1.0, "learning_rate": 1e-4, "description": "C1 low learning rate short"},
-            {"name": "C1_ref_delta_low_lr_steps240", "stage": "low_lr", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "steps_multiplier": 2.0, "learning_rate": 1e-4, "description": "C1 low learning rate longer"},
-        ]
-    configs = [
-        {"name": "S1_e5_omni_recipe", "stage": "baseline", "overrides": {}, "description": "E5-Omni recipe only"},
-        {"name": "S2_ref", "stage": "single", "overrides": {"lambda_ref": 0.3}, "description": "Add reference-as-negative direction loss"},
-        {"name": "S3_delta", "stage": "single", "overrides": {"lambda_delta": 0.5}, "description": "Add audio delta loss"},
-        {"name": "S4_hn", "stage": "single", "overrides": {"lambda_hn": 0.5}, "description": "Add typed hard negative margin loss"},
-        {"name": "C1_ref_delta", "stage": "combo", "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5}, "description": "Reference direction plus audio delta"},
-        {
-            "name": "C2_ref_delta_hn",
-            "stage": "combo",
-            "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5, "lambda_hn": 0.5},
-            "description": "Core AudioDelta combination",
-        },
-    ]
-    include_optional_losses = include_optional_losses or preset == "full"
-    if include_optional_losses:
-        configs.extend(
-            [
-                {"name": "S5_edit", "stage": "single", "overrides": {"lambda_edit_type": 0.3}, "description": "Add edit-type-aware loss"},
-                {"name": "S6_visual", "stage": "single", "overrides": {"lambda_visual": 0.05}, "description": "Add weak visual context loss"},
-                {
-                    "name": "C3_ref_delta_hn_edit",
-                    "stage": "combo",
-                    "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5, "lambda_hn": 0.5, "lambda_edit_type": 0.3},
-                    "description": "Core combination plus edit type",
-                },
-                {
-                    "name": "C4_ref_delta_hn_edit_visual",
-                    "stage": "combo",
-                    "overrides": {"lambda_ref": 0.3, "lambda_delta": 0.5, "lambda_hn": 0.5, "lambda_edit_type": 0.3, "lambda_visual": 0.05},
-                    "description": "Full existing AudioDelta task loss suite",
-                },
-            ]
-        )
-    return configs
-
-
+    # Kept as a compatibility helper for old automation.  The former C1/S2-
+    # S6 AudioDelta schedule is retired; every schedule now evaluates only
+    # the selected e5-omni recipe baseline.
+    return [{
+        "name": "S1_e5_omni_recipe",
+        "stage": "baseline",
+        "overrides": {},
+        "description": "e5-omni recipe only; AudioDelta task losses disabled",
+    }]
 def _loss_schedule_result_row(
     name: str,
     config: dict[str, Any],

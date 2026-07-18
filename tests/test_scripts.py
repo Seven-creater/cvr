@@ -371,6 +371,23 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("AVIGATE", smoke_script)
         self.assertNotIn("vllm.entrypoints.openai.api_server", smoke_script)
 
+    def test_aaai_audio_cvr_final_launcher_is_detached_run_safe_and_paper_scoped(self) -> None:
+        script = Path("scripts/run_audio_cvr_aaai_final_experiment.sh").read_text(encoding="utf-8")
+
+        self.assertIn("prepare-splits", script)
+        self.assertIn("summarize-validation", script)
+        self.assertIn("aggregate-final", script)
+        self.assertIn("13,23,42,71,101", script)
+        self.assertIn("T_only_fullAV", script)
+        self.assertIn("V_A_T", script)
+        self.assertIn("score-fusion", script)
+        self.assertIn("--skip-train", script)
+        self.assertIn("training-profile e5_omni_recipe", script)
+        self.assertNotIn("pkill", script)
+        self.assertNotIn("kill -", script)
+        self.assertNotIn("--lambda-ref", script)
+        self.assertNotIn("--lambda-delta", script)
+
     def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
         script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")
 
