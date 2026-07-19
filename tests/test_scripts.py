@@ -388,6 +388,19 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("--lambda-ref", script)
         self.assertNotIn("--lambda-delta", script)
 
+    def test_audio_cvr_validation_extension_is_validation_only(self) -> None:
+        script = Path("scripts/run_audio_cvr_validation_extension.sh").read_text(encoding="utf-8")
+
+        self.assertIn("700,1000,1300,1600", script)
+        self.assertIn("13,23,42", script)
+        self.assertIn("train-adapter", script)
+        self.assertIn("summarize-validation", script)
+        self.assertIn("one_se_earliest", script)
+        self.assertNotIn("test_main", script)
+        self.assertNotIn("cache-embeddings", script)
+        self.assertNotIn("pkill", script)
+        self.assertNotIn("kill -", script)
+
     def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
         script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")
 

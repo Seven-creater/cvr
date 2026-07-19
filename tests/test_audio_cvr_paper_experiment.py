@@ -7,7 +7,14 @@ import unittest
 
 import numpy as np
 
-from app.audio_cvr_paper_experiment import aggregate_final, prepare_paper_splits, score_fusion, summarize_validation
+from app.audio_cvr_paper_experiment import (
+    aggregate_final,
+    finalize_benchmark,
+    prepare_benchmark_review,
+    prepare_paper_splits,
+    score_fusion,
+    summarize_validation,
+)
 from app.e5_audio_delta_train import _AudioDeltaAdapter, _import_torch
 
 
@@ -71,6 +78,90 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             self.assertEqual("validation_only", summary["selection_split"])
             self.assertTrue((root / "selection" / "selected_config.tsv").exists())
 
+    def test_one_se_validation_rule_selects_earlier_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            grid = root / "grid"
+            for steps, seed, r1 in (
+                (700, 13, 0.45),
+                (700, 23, 0.45),
+                (1000, 13, 0.60),
+                (1000, 23, 0.40),
+            ):
+                run = grid / f"steps_{steps}" / f"seed_{seed}"
+                self._write_train_summary(run / "adapter" / "train_summary.json", steps=steps, seed=seed)
+                self._write_eval_summary(run / "eval" / "summary.json", r1=r1, beats=0.4)
+
+            summary = summarize_validation(
+                input_roots=[grid],
+                output_dir=root / "selection",
+                required_seeds=[13, 23],
+                selection_rule="one_se_earliest",
+            )
+
+            self.assertEqual(700, summary["selected_config"]["steps"])
+            self.assertEqual("one_se_earliest", summary["selection_rule_name"])
+            self.assertEqual(2, summary["one_se_candidate_count"])
+
+    def test_benchmark_review_and_freeze_are_source_disjoint_and_human_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            candidates = []
+            for index in range(18):
+                row = self._row(f"sample_{index}", f"source_{index}", f"pair_{index}")
+                row["dataset"] = "dataset_a" if index % 2 else "dataset_b"
+                row["audio_delta_type"] = "speech_topic_in_video_context" if index % 4 == 0 else "sound_event"
+                candidates.append(row)
+            candidate_path = root / "candidates.jsonl"
+            self._write_jsonl(candidate_path, candidates)
+            old_train = root / "old_train.jsonl"
+            self._write_jsonl(old_train, [self._row("old", "source_0", "pair_old")])
+
+            prepared = prepare_benchmark_review(
+                input_path=candidate_path,
+                output_dir=root / "review",
+                exclude_paths=[old_train],
+                review_count=16,
+                repeat_review_fraction=0.25,
+                random_seed=9,
+            )
+            self.assertEqual(17, prepared["eligible_count"])
+            review_rows = self._read_jsonl(root / "review" / "human_review_round1.jsonl")
+            for row in review_rows:
+                row["review"].update(
+                    {
+                        "edit_audio_only": True,
+                        "reference_does_not_satisfy_edit": True,
+                        "target_satisfies_edit": True,
+                        "video_only_cannot_identify_target": True,
+                        "hard_negatives_do_not_satisfy_edit": True,
+                        "decision": "passed",
+                    }
+                )
+            completed = root / "completed_review.jsonl"
+            self._write_jsonl(completed, review_rows)
+
+            frozen = finalize_benchmark(
+                candidate_path=root / "review" / "benchmark_review_candidates.jsonl",
+                review_paths=[completed],
+                output_dir=root / "frozen",
+                exclude_paths=[old_train],
+                target_count=10,
+                minimum_count=10,
+                max_speech_ratio=0.40,
+                max_dataset_ratio=0.60,
+                random_seed=9,
+            )
+
+            self.assertEqual(10, frozen["final_count"])
+            self.assertTrue(frozen["target_count_met"])
+            self.assertEqual(0, frozen["leakage"]["violation_count"])
+            self.assertTrue((root / "frozen" / "frozen_benchmark.sha256").exists())
+            final_rows = self._read_jsonl(root / "frozen" / "test_main.jsonl")
+            self.assertNotIn("source_0", {row["source_disjoint_group_id"] for row in final_rows})
+            speech_count = sum(row["audio_delta_type"] == "speech_topic_in_video_context" for row in final_rows)
+            self.assertLessEqual(speech_count, 4)
+
     def test_final_aggregation_reports_paired_audio_gain(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -93,6 +184,30 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             self.assertEqual(0, json.loads((root / "stats" / "audit.json").read_text())["violation_count"])
             self.assertTrue((root / "stats" / "audio_gain_summary.md").exists())
             self.assertTrue((root / "stats" / "error_breakdown.json").exists())
+
+    def test_final_aggregation_supports_prespecified_multiple_comparisons(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            final = root / "final"
+            for seed in (13, 23):
+                self._write_final_eval(final / f"seed_{seed}" / "eval_V_only", ranks=[3, 1, 3], gaps=[-0.2, 0.1, -0.2])
+                self._write_final_eval(final / f"seed_{seed}" / "eval_V_T", ranks=[2, 1, 3], gaps=[-0.1, 0.1, -0.2])
+                self._write_final_eval(final / f"seed_{seed}" / "eval_V_A_T", ranks=[1, 1, 2], gaps=[0.1, 0.2, -0.05])
+
+            summary = aggregate_final(
+                input_root=final,
+                output_dir=root / "stats",
+                required_seeds=[13, 23],
+                comparisons=[("V_A_T", "V_T"), ("V_A_T", "V_only"), ("V_T", "V_only")],
+                bootstrap_samples=200,
+                permutation_samples=200,
+                random_seed=7,
+            )
+
+            self.assertEqual(3, len(summary["paired_comparisons"]))
+            statistic = summary["paired_comparisons"]["V_A_T_minus_V_T"]["query_level_statistics"]["R@1"]
+            self.assertIn("paired_randomization_p_holm", statistic)
+            self.assertTrue((root / "stats" / "paired_comparisons.md").exists())
 
     def test_score_fusion_selects_alpha_on_paired_caches(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -289,6 +289,7 @@ python3 -m app.audio_cvr_paper_experiment summarize-validation \
   --input-root "$OUTPUT_DIR/validation/refine" \
   --output-dir "$FINAL_SELECTION" \
   --required-seeds "$REFINE_SEEDS" \
+  --selection-rule one_se_earliest \
   --top-n 1 \
   > "$OUTPUT_DIR/logs/summarize_validation_final.log" 2>&1
 
@@ -463,6 +464,11 @@ python3 -m app.audio_cvr_paper_experiment aggregate-final \
   --required-seeds "$FINAL_SEEDS" \
   --primary-mode V_A_T \
   --reference-mode V_T \
+  --comparison V_A_T:V_T \
+  --comparison V_A_T:V_A \
+  --comparison V_A_T:V_only \
+  --comparison V_T:V_only \
+  --comparison A_T:A_only \
   --bootstrap-samples "$BOOTSTRAP_SAMPLES" \
   --permutation-samples "$PERMUTATION_SAMPLES" \
   > "$OUTPUT_DIR/logs/aggregate_final.log" 2>&1

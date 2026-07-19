@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -15,6 +16,192 @@ import numpy as np
 PRIMARY_MODE = "V_A_T"
 REFERENCE_MODE = "V_T"
 DEFAULT_FINAL_SEEDS = (13, 23, 42, 71, 101)
+
+
+def prepare_benchmark_review(
+    *,
+    input_path: str | Path,
+    output_dir: str | Path,
+    exclude_paths: Iterable[str | Path] = (),
+    review_count: int = 225,
+    repeat_review_fraction: float = 0.20,
+    random_seed: int = 20260719,
+) -> dict[str, Any]:
+    """Prepare a model-blind human review pool for a future test set."""
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    candidates = _read_jsonl(Path(input_path))
+    if not candidates:
+        raise ValueError(f"no benchmark candidates found in {input_path}")
+
+    excluded = _identity_sets(_read_many_jsonl(exclude_paths))
+    reasons: Counter[str] = Counter()
+    eligible: list[dict[str, Any]] = []
+    seen_samples: set[str] = set()
+    for row in candidates:
+        reason = _benchmark_candidate_reject_reason(row, excluded=excluded)
+        sample_id = _sample_id(row)
+        if not reason and sample_id in seen_samples:
+            reason = "duplicate_sample_id"
+        if reason:
+            reasons[reason] += 1
+            continue
+        seen_samples.add(sample_id)
+        eligible.append(row)
+    if not eligible:
+        raise ValueError(f"all benchmark candidates were filtered: {dict(reasons)}")
+
+    eligible.sort(key=lambda row: _stable_row_key(row, random_seed))
+    selected = eligible[: min(len(eligible), max(1, int(review_count)))]
+    review_rows = [_formal_human_review_row(row, review_round=1) for row in selected]
+    repeat_count = min(len(review_rows), max(0, round(len(review_rows) * float(repeat_review_fraction))))
+    repeat_rows = [
+        {**_formal_human_review_row(row, review_round=2), "repeat_review": True}
+        for row in sorted(selected, key=lambda row: _stable_row_key(row, random_seed + 1))[:repeat_count]
+    ]
+
+    outputs = {
+        "candidate_pool": output_root / "benchmark_review_candidates.jsonl",
+        "review_round1": output_root / "human_review_round1.jsonl",
+        "review_round2": output_root / "human_review_round2_repeat.jsonl",
+        "summary": output_root / "review_preparation_summary.json",
+    }
+    _write_jsonl(outputs["candidate_pool"], selected)
+    _write_jsonl(outputs["review_round1"], review_rows)
+    _write_jsonl(outputs["review_round2"], repeat_rows)
+    summary = {
+        "protocol": "model_blind_test_review_preparation",
+        "input_path": str(input_path),
+        "exclude_paths": [str(path) for path in exclude_paths],
+        "input_count": len(candidates),
+        "eligible_count": len(eligible),
+        "review_count": len(selected),
+        "repeat_review_count": len(repeat_rows),
+        "repeat_review_fraction": float(repeat_review_fraction),
+        "rejected_counts": dict(sorted(reasons.items())),
+        "dataset_distribution": dict(sorted(Counter(_dataset(row) for row in selected).items())),
+        "subtype_distribution": dict(sorted(Counter(_subtype(row) for row in selected).items())),
+        "outputs": {key: str(path) for key, path in outputs.items()},
+    }
+    _write_json(outputs["summary"], summary)
+    return summary
+
+
+def finalize_benchmark(
+    *,
+    candidate_path: str | Path,
+    review_paths: Iterable[str | Path],
+    output_dir: str | Path,
+    exclude_paths: Iterable[str | Path] = (),
+    target_count: int = 150,
+    minimum_count: int = 100,
+    max_speech_ratio: float = 0.35,
+    max_dataset_ratio: float = 0.60,
+    min_strict_local_coverage: float = 0.0,
+    random_seed: int = 20260719,
+) -> dict[str, Any]:
+    """Freeze a human-passed, source-disjoint benchmark without model-score selection."""
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    candidates = _read_jsonl(Path(candidate_path))
+    if not candidates:
+        raise ValueError(f"no benchmark candidates found in {candidate_path}")
+    reviews = _read_many_jsonl(review_paths)
+    if not reviews:
+        raise ValueError("finalization requires completed human review JSONL")
+
+    review_by_sample, review_audit = _collate_reviews(reviews)
+    excluded = _identity_sets(_read_many_jsonl(exclude_paths))
+    rejection_counts: Counter[str] = Counter()
+    passed: list[dict[str, Any]] = []
+    seen_pairs: set[str] = set()
+    for row in candidates:
+        reason = _benchmark_candidate_reject_reason(row, excluded=excluded)
+        sample_id = _sample_id(row)
+        review = review_by_sample.get(sample_id)
+        if not reason and review is None:
+            reason = "not_human_reviewed"
+        if not reason and not review.get("passed", False):
+            reason = str(review.get("reason") or "human_review_not_passed")
+        pair_id = _pair_id(row)
+        if not reason and pair_id and pair_id in seen_pairs:
+            reason = "duplicate_pair_group"
+        if reason:
+            rejection_counts[reason] += 1
+            continue
+        if pair_id:
+            seen_pairs.add(pair_id)
+        passed.append(row)
+
+    selected = _select_balanced_benchmark(
+        passed,
+        target_count=max(1, int(target_count)),
+        max_speech_ratio=float(max_speech_ratio),
+        max_dataset_ratio=float(max_dataset_ratio),
+        random_seed=int(random_seed),
+    )
+    if len(selected) < max(1, int(minimum_count)):
+        raise ValueError(
+            f"only {len(selected)} reviewed candidates satisfy benchmark constraints; minimum is {minimum_count}"
+        )
+
+    strict_local_count = sum(_has_strict_local_negative(row) for row in selected)
+    strict_local_coverage = strict_local_count / len(selected)
+    leakage = _split_leakage_summary(
+        train=_read_many_jsonl(exclude_paths),
+        val=[],
+        test=selected,
+    )
+    violations: list[str] = []
+    if leakage["violation_count"]:
+        violations.append("selected benchmark overlaps excluded train/validation identities")
+    if strict_local_coverage < float(min_strict_local_coverage):
+        violations.append(
+            f"strict local coverage {strict_local_coverage:.4f} is below required {float(min_strict_local_coverage):.4f}"
+        )
+    if violations:
+        raise ValueError(f"benchmark audit failed: {violations}")
+
+    test_path = output_root / "test_main.jsonl"
+    _write_jsonl(test_path, selected)
+    test_hash = _sha256_file(test_path)
+    holdout = _identity_sets(selected)
+    holdout_path = output_root / "test_holdout_identities.json"
+    _write_json(
+        holdout_path,
+        {
+            "source_ids": sorted(holdout["source"]),
+            "pair_group_ids": sorted(holdout["pair"]),
+            "sample_ids": sorted(holdout["sample"]),
+        },
+    )
+    manifest = {
+        "protocol": "audiocvr_frozen_human_verified_test",
+        "selection_uses_model_scores": False,
+        "target_count": int(target_count),
+        "minimum_count": int(minimum_count),
+        "final_count": len(selected),
+        "target_count_met": len(selected) >= int(target_count),
+        "max_speech_ratio": float(max_speech_ratio),
+        "max_dataset_ratio": float(max_dataset_ratio),
+        "strict_local_count": strict_local_count,
+        "strict_local_coverage": strict_local_coverage,
+        "dataset_distribution": dict(sorted(Counter(_dataset(row) for row in selected).items())),
+        "subtype_distribution": dict(sorted(Counter(_subtype(row) for row in selected).items())),
+        "human_review": review_audit,
+        "rejected_counts": dict(sorted(rejection_counts.items())),
+        "leakage": leakage,
+        "test_main_sha256": test_hash,
+        "outputs": {
+            "test_main": str(test_path),
+            "manifest": str(output_root / "frozen_benchmark_manifest.json"),
+            "sha256": str(output_root / "frozen_benchmark.sha256"),
+            "holdout_identities": str(holdout_path),
+        },
+    }
+    _write_json(output_root / "frozen_benchmark_manifest.json", manifest)
+    (output_root / "frozen_benchmark.sha256").write_text(f"{test_hash}  test_main.jsonl\n", encoding="ascii")
+    return manifest
 
 
 def prepare_paper_splits(*, split_root: str | Path, output_dir: str | Path) -> dict[str, Any]:
@@ -79,6 +266,7 @@ def summarize_validation(
     output_dir: str | Path,
     required_seeds: Iterable[int],
     top_n: int = 6,
+    selection_rule: str = "lexicographic",
 ) -> dict[str, Any]:
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -121,6 +309,7 @@ def summarize_validation(
                 "seed_count": len(required),
                 "R@1_mean": _mean(r1),
                 "R@1_std": _std(r1),
+                "R@1_se": _sample_std(r1) / math.sqrt(len(r1)),
                 "R@5_mean": _mean([float(value["R@5"]) for value in selected]),
                 "R@10_mean": _mean([float(value["R@10"]) for value in selected]),
                 "target_beats_reference_mean": _mean(target_beats),
@@ -146,10 +335,40 @@ def summarize_validation(
     )
     for rank, row in enumerate(rows, start=1):
         row["validation_rank"] = rank
-    selected = rows[0]
+    best = rows[0]
+    if selection_rule == "lexicographic":
+        selected = best
+        one_se_threshold = None
+        one_se_candidates: list[dict[str, Any]] = []
+        selection_description = (
+            "max mean R@1; then max target_beats_reference; then min R@1 std; then fewer steps"
+        )
+    elif selection_rule == "one_se_earliest":
+        one_se_threshold = float(best["R@1_mean"] - best["R@1_se"])
+        one_se_candidates = [row for row in rows if float(row["R@1_mean"]) >= one_se_threshold]
+        selected = min(
+            one_se_candidates,
+            key=lambda row: (
+                row["steps"],
+                -row["target_beats_reference_mean"],
+                -row["R@1_mean"],
+                row["R@1_std"],
+                row["learning_rate"],
+                row["batch_size"],
+            ),
+        )
+        selection_description = (
+            "one-standard-error rule on mean validation R@1; among eligible configurations choose the fewest steps, "
+            "then higher target_beats_reference"
+        )
+    else:
+        raise ValueError(f"unsupported validation selection rule: {selection_rule}")
     summary = {
         "selection_split": "validation_only",
-        "selection_rule": "max mean R@1; then max target_beats_reference; then min R@1 std; then fewer steps",
+        "selection_rule": selection_description,
+        "selection_rule_name": selection_rule,
+        "one_se_threshold": one_se_threshold,
+        "one_se_candidate_count": len(one_se_candidates),
         "required_seeds": list(required),
         "configuration_count": len(rows),
         "selected_config": {
@@ -161,7 +380,7 @@ def summarize_validation(
     _write_json(output_root / "validation_model_selection.json", summary)
     (output_root / "validation_model_selection.md").write_text(_validation_markdown(summary), encoding="utf-8")
     _write_config_tsv(output_root / "top_configs.tsv", rows[: max(1, int(top_n))])
-    _write_config_tsv(output_root / "selected_config.tsv", rows[:1])
+    _write_config_tsv(output_root / "selected_config.tsv", [selected])
     return summary
 
 
@@ -175,6 +394,7 @@ def aggregate_final(
     bootstrap_samples: int = 20_000,
     permutation_samples: int = 20_000,
     random_seed: int = 20260718,
+    comparisons: Iterable[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     root = Path(input_root)
     output_root = Path(output_dir)
@@ -247,6 +467,25 @@ def aggregate_final(
         permutation_samples=max(100, int(permutation_samples)),
         random_seed=int(random_seed),
     )
+    requested_comparisons = list(comparisons or [(primary_mode, reference_mode)])
+    primary_pair = (primary_mode, reference_mode)
+    if primary_pair not in requested_comparisons:
+        requested_comparisons.insert(0, primary_pair)
+    paired_comparisons: dict[str, Any] = {}
+    for index, (mode_b, mode_a) in enumerate(requested_comparisons):
+        if mode_a not in modes or mode_b not in modes:
+            raise ValueError(f"paired comparison requires missing mode: {mode_b}:{mode_a}; found={modes}")
+        key = f"{mode_b}_minus_{mode_a}"
+        paired_comparisons[key] = _paired_mode_statistics(
+            runs=runs,
+            seeds=seeds,
+            mode_a=mode_a,
+            mode_b=mode_b,
+            bootstrap_samples=max(100, int(bootstrap_samples)),
+            permutation_samples=max(100, int(permutation_samples)),
+            random_seed=int(random_seed) + index,
+        )
+    _add_comparison_holm_corrections(paired_comparisons)
     error_breakdown = _error_breakdown([runs[(seed, primary_mode)] for seed in seeds])
     hard_negative = _hard_negative_summary([runs[(seed, primary_mode)]["summary"] for seed in seeds])
 
@@ -258,6 +497,7 @@ def aggregate_final(
         "primary_comparison": f"{primary_mode} - {reference_mode}",
         "mode_summary": mode_summary,
         "paired_statistics": paired,
+        "paired_comparisons": paired_comparisons,
         "primary_mode_subtypes": _subtype_result_summary(
             [runs[(seed, primary_mode)]["summary"] for seed in seeds]
         ),
@@ -267,9 +507,11 @@ def aggregate_final(
     _write_json(output_root / "audit.json", audit)
     _write_json(output_root / "per_seed_results.json", {"rows": per_seed})
     _write_json(output_root / "test_main_mean_std.json", summary)
+    _write_json(output_root / "paired_comparisons.json", paired_comparisons)
     _write_json(output_root / "error_breakdown.json", error_breakdown)
     (output_root / "test_main_comparison.md").write_text(_final_comparison_markdown(summary), encoding="utf-8")
     (output_root / "audio_gain_summary.md").write_text(_audio_gain_markdown(summary), encoding="utf-8")
+    (output_root / "paired_comparisons.md").write_text(_paired_comparisons_markdown(summary), encoding="utf-8")
     return summary
 
 
@@ -420,11 +662,32 @@ def build_parser() -> argparse.ArgumentParser:
     split.add_argument("--split-root", required=True)
     split.add_argument("--output-dir", required=True)
 
+    review = subparsers.add_parser("prepare-benchmark-review")
+    review.add_argument("--input-path", required=True)
+    review.add_argument("--output-dir", required=True)
+    review.add_argument("--exclude-path", action="append", default=[])
+    review.add_argument("--review-count", type=int, default=225)
+    review.add_argument("--repeat-review-fraction", type=float, default=0.20)
+    review.add_argument("--random-seed", type=int, default=20260719)
+
+    freeze = subparsers.add_parser("finalize-benchmark")
+    freeze.add_argument("--candidate-path", required=True)
+    freeze.add_argument("--review-path", action="append", required=True)
+    freeze.add_argument("--output-dir", required=True)
+    freeze.add_argument("--exclude-path", action="append", default=[])
+    freeze.add_argument("--target-count", type=int, default=150)
+    freeze.add_argument("--minimum-count", type=int, default=100)
+    freeze.add_argument("--max-speech-ratio", type=float, default=0.35)
+    freeze.add_argument("--max-dataset-ratio", type=float, default=0.60)
+    freeze.add_argument("--min-strict-local-coverage", type=float, default=0.0)
+    freeze.add_argument("--random-seed", type=int, default=20260719)
+
     validation = subparsers.add_parser("summarize-validation")
     validation.add_argument("--input-root", action="append", required=True)
     validation.add_argument("--output-dir", required=True)
     validation.add_argument("--required-seeds", default="13")
     validation.add_argument("--top-n", type=int, default=6)
+    validation.add_argument("--selection-rule", choices=("lexicographic", "one_se_earliest"), default="lexicographic")
 
     final = subparsers.add_parser("aggregate-final")
     final.add_argument("--input-root", required=True)
@@ -435,6 +698,13 @@ def build_parser() -> argparse.ArgumentParser:
     final.add_argument("--bootstrap-samples", type=int, default=20_000)
     final.add_argument("--permutation-samples", type=int, default=20_000)
     final.add_argument("--random-seed", type=int, default=20260718)
+    final.add_argument(
+        "--comparison",
+        action="append",
+        default=[],
+        metavar="MODE_B:MODE_A",
+        help="Additional paired comparison reported as MODE_B - MODE_A. Repeat as needed.",
+    )
 
     fusion = subparsers.add_parser("score-fusion")
     fusion.add_argument("--cache-a", required=True, help="First modality cache, conventionally V+T.")
@@ -452,12 +722,35 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.command == "prepare-splits":
         result = prepare_paper_splits(split_root=args.split_root, output_dir=args.output_dir)
+    elif args.command == "prepare-benchmark-review":
+        result = prepare_benchmark_review(
+            input_path=args.input_path,
+            output_dir=args.output_dir,
+            exclude_paths=args.exclude_path,
+            review_count=args.review_count,
+            repeat_review_fraction=args.repeat_review_fraction,
+            random_seed=args.random_seed,
+        )
+    elif args.command == "finalize-benchmark":
+        result = finalize_benchmark(
+            candidate_path=args.candidate_path,
+            review_paths=args.review_path,
+            output_dir=args.output_dir,
+            exclude_paths=args.exclude_path,
+            target_count=args.target_count,
+            minimum_count=args.minimum_count,
+            max_speech_ratio=args.max_speech_ratio,
+            max_dataset_ratio=args.max_dataset_ratio,
+            min_strict_local_coverage=args.min_strict_local_coverage,
+            random_seed=args.random_seed,
+        )
     elif args.command == "summarize-validation":
         result = summarize_validation(
             input_roots=args.input_root,
             output_dir=args.output_dir,
             required_seeds=_parse_ints(args.required_seeds),
             top_n=args.top_n,
+            selection_rule=args.selection_rule,
         )
     elif args.command == "aggregate-final":
         result = aggregate_final(
@@ -469,6 +762,7 @@ def main() -> None:
             bootstrap_samples=args.bootstrap_samples,
             permutation_samples=args.permutation_samples,
             random_seed=args.random_seed,
+            comparisons=[_parse_mode_comparison(value) for value in args.comparison] or None,
         )
     elif args.command == "score-fusion":
         result = score_fusion(
@@ -651,6 +945,26 @@ def _holm_bonferroni(values: list[float]) -> list[float]:
     return adjusted
 
 
+def _add_comparison_holm_corrections(comparisons: dict[str, Any]) -> None:
+    metric_names = sorted(
+        {
+            metric
+            for comparison in comparisons.values()
+            for metric in comparison.get("query_level_statistics", {})
+        }
+    )
+    for metric in metric_names:
+        keys = [key for key, value in comparisons.items() if metric in value.get("query_level_statistics", {})]
+        adjusted = _holm_bonferroni(
+            [
+                float(comparisons[key]["query_level_statistics"][metric]["paired_randomization_p"])
+                for key in keys
+            ]
+        )
+        for key, value in zip(keys, adjusted):
+            comparisons[key]["query_level_statistics"][metric]["paired_randomization_p_holm"] = value
+
+
 def _audit_final_runs(
     *, runs: dict[tuple[int, str], dict[str, Any]], seeds: tuple[int, ...], modes: list[str]
 ) -> dict[str, Any]:
@@ -765,6 +1079,226 @@ def _split_leakage_summary(*, train: list[dict[str, Any]], val: list[dict[str, A
     return {"violation_count": sum(item["count"] for item in violations), "violations": violations}
 
 
+def _benchmark_candidate_reject_reason(row: dict[str, Any], *, excluded: dict[str, set[str]]) -> str:
+    if str(row.get("split_tier") or "main").strip().lower() != "main":
+        return "not_b_main"
+    if _truthy(row.get("is_inverse")) or str(row.get("direction") or "forward").strip().lower() == "inverse":
+        return "inverse_direction"
+    if _truthy(row.get("fallback")):
+        return "fallback_record"
+    if "accepted" in row and not _truthy(row.get("accepted")):
+        return "not_accepted"
+    if "benchmark_eligible" in row and not _truthy(row.get("benchmark_eligible")):
+        return "not_benchmark_eligible"
+    if _truthy(row.get("manual_review_required")):
+        return "preexisting_manual_review_required"
+    if not _sample_id(row):
+        return "missing_sample_id"
+    source_ids = _row_identity_values(row, ("source_disjoint_group_id", "raw_source_id", "source_id"))
+    if not source_ids:
+        return "missing_source_id"
+    if source_ids & excluded["source"]:
+        return "source_seen_in_prior_split"
+    pair_ids = _row_identity_values(row, ("inverse_pair_group_id", "pair_group_id"))
+    if pair_ids & excluded["pair"]:
+        return "pair_seen_in_prior_split"
+    if _sample_id(row) in excluded["sample"]:
+        return "sample_seen_in_prior_split"
+    return ""
+
+
+def _identity_sets(rows: Iterable[dict[str, Any]]) -> dict[str, set[str]]:
+    source: set[str] = set()
+    pair: set[str] = set()
+    sample: set[str] = set()
+    for row in rows:
+        source.update(_row_identity_values(row, ("source_disjoint_group_id", "raw_source_id", "source_id")))
+        pair.update(_row_identity_values(row, ("inverse_pair_group_id", "pair_group_id")))
+        sample_id = _sample_id(row)
+        if sample_id:
+            sample.add(sample_id)
+    return {"source": source, "pair": pair, "sample": sample}
+
+
+def _row_identity_values(row: dict[str, Any], fields: Iterable[str]) -> set[str]:
+    return {str(row.get(field) or "").strip() for field in fields} - {""}
+
+
+def _read_many_jsonl(paths: Iterable[str | Path]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        rows.extend(_read_jsonl(Path(path)))
+    return rows
+
+
+def _formal_human_review_row(row: dict[str, Any], *, review_round: int) -> dict[str, Any]:
+    review = _human_review_row(row)
+    review.update(
+        {
+            "dataset": _dataset(row),
+            "source_disjoint_group_id": _first_text(
+                row, ("source_disjoint_group_id", "raw_source_id", "source_id")
+            ),
+            "pair_group_id": _pair_id(row),
+            "review_round": int(review_round),
+            "reviewer_id": "",
+        }
+    )
+    return review
+
+
+def _collate_reviews(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    rounds: dict[str, dict[int, tuple[bool, str]]] = defaultdict(dict)
+    decisions: Counter[str] = Counter()
+    for row in rows:
+        sample_id = _sample_id(row)
+        if not sample_id:
+            continue
+        review = row.get("review") if isinstance(row.get("review"), dict) else row
+        decision = str(review.get("decision") or "unreviewed").strip().lower()
+        decisions[decision] += 1
+        review_round = int(row.get("review_round") or review.get("review_round") or 1)
+        rounds[sample_id][review_round] = _review_pass_status(review)
+
+    result: dict[str, dict[str, Any]] = {}
+    repeated = 0
+    agreements = 0
+    disagreements = 0
+    for sample_id, values in rounds.items():
+        primary = values.get(1) or values[min(values)]
+        passed, reason = primary
+        if 2 in values:
+            repeated += 1
+            if values[2][0] == primary[0]:
+                agreements += 1
+            else:
+                disagreements += 1
+                passed = False
+                reason = "repeat_review_disagreement"
+        result[sample_id] = {"passed": passed, "reason": reason, "rounds": sorted(values)}
+    return result, {
+        "reviewed_sample_count": len(result),
+        "decision_counts": dict(sorted(decisions.items())),
+        "repeat_review_count": repeated,
+        "repeat_review_agreement_count": agreements,
+        "repeat_review_disagreement_count": disagreements,
+        "repeat_review_agreement_rate": agreements / repeated if repeated else None,
+    }
+
+
+def _review_pass_status(review: dict[str, Any]) -> tuple[bool, str]:
+    decision = str(review.get("decision") or "unreviewed").strip().lower()
+    if decision not in {"pass", "passed", "accept", "accepted"}:
+        return False, f"human_{decision or 'unreviewed'}"
+    checks = (
+        "edit_audio_only",
+        "reference_does_not_satisfy_edit",
+        "target_satisfies_edit",
+        "video_only_cannot_identify_target",
+        "hard_negatives_do_not_satisfy_edit",
+    )
+    missing = [key for key in checks if review.get(key) is not True]
+    if missing:
+        return False, "human_check_failed_or_missing:" + ",".join(missing)
+    return True, "passed"
+
+
+def _select_balanced_benchmark(
+    rows: list[dict[str, Any]],
+    *,
+    target_count: int,
+    max_speech_ratio: float,
+    max_dataset_ratio: float,
+    random_seed: int,
+) -> list[dict[str, Any]]:
+    speech_limit = max(0, math.floor(target_count * max_speech_ratio))
+    dataset_limit = max(1, math.floor(target_count * max_dataset_ratio))
+    remaining = sorted(rows, key=lambda row: _stable_row_key(row, random_seed))
+    selected: list[dict[str, Any]] = []
+    dataset_counts: Counter[str] = Counter()
+    subtype_counts: Counter[str] = Counter()
+    speech_count = 0
+    while remaining and len(selected) < target_count:
+        eligible = [
+            row
+            for row in remaining
+            if dataset_counts[_dataset(row)] < dataset_limit
+            and (not _is_speech(row) or speech_count < speech_limit)
+        ]
+        if not eligible:
+            break
+        row = min(
+            eligible,
+            key=lambda item: (
+                -int(_has_strict_local_negative(item)),
+                dataset_counts[_dataset(item)],
+                subtype_counts[_subtype(item)],
+                _stable_row_key(item, random_seed),
+            ),
+        )
+        selected.append(row)
+        remaining.remove(row)
+        dataset_counts[_dataset(row)] += 1
+        subtype_counts[_subtype(row)] += 1
+        speech_count += int(_is_speech(row))
+    return selected
+
+
+def _has_strict_local_negative(row: dict[str, Any]) -> bool:
+    collections = (
+        row.get("audio_delta_hard_negatives"),
+        row.get("hard_negatives"),
+        row.get("local_same_source_candidates"),
+    )
+    for values in collections:
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            negative_type = str(item.get("negative_type") or item.get("type") or "").strip().lower()
+            status = str(item.get("verification_status") or "").strip().lower()
+            if (
+                negative_type == "local_same_source"
+                and _truthy(item.get("same_source", True))
+                and item.get("satisfies_edit") is False
+                and status in {"auto_verified", "human_verified", "verified"}
+            ):
+                return True
+    return False
+
+
+def _stable_row_key(row: dict[str, Any], seed: int) -> str:
+    return hashlib.sha256(f"{seed}|{_sample_id(row)}".encode("utf-8")).hexdigest()
+
+
+def _sample_id(row: dict[str, Any]) -> str:
+    return _first_text(row, ("sample_id", "proposal_id", "clip_id"))
+
+
+def _pair_id(row: dict[str, Any]) -> str:
+    return _first_text(row, ("inverse_pair_group_id", "pair_group_id"))
+
+
+def _dataset(row: dict[str, Any]) -> str:
+    value = _first_text(row, ("dataset", "dataset_name", "source_dataset"))
+    if not value and isinstance(row.get("quality"), dict):
+        value = _first_text(row["quality"], ("dataset", "dataset_name"))
+    return value or "unknown"
+
+
+def _is_speech(row: dict[str, Any]) -> bool:
+    return _subtype(row).strip().lower() in {"speech", "speech_topic", "speech_topic_in_video_context"}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _human_review_row(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "sample_id": _first_text(row, ("sample_id", "proposal_id", "clip_id")),
@@ -786,19 +1320,27 @@ def _human_review_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validation_markdown(summary: dict[str, Any]) -> str:
+    selected = summary["selected_config"]
     lines = [
         "# Validation-only Model Selection",
         "",
         f"Selection rule: {summary['selection_rule']}",
+        f"Selected: steps={selected['steps']}, lr={selected['learning_rate']:.6g}, batch={selected['batch_size']}.",
         "",
-        "| Rank | Steps | LR | Batch | Seeds | R@1 mean | R@1 std | Beats-ref mean |",
-        "|---:|---:|---:|---:|---|---:|---:|---:|",
+        "| Rank | Selected | Steps | LR | Batch | Seeds | R@1 mean | R@1 std | R@1 SE | Beats-ref mean |",
+        "|---:|:---:|---:|---:|---:|---|---:|---:|---:|---:|",
     ]
     for row in summary["rows"]:
+        is_selected = (
+            row["steps"] == selected["steps"]
+            and row["learning_rate"] == selected["learning_rate"]
+            and row["batch_size"] == selected["batch_size"]
+        )
         lines.append(
-            f"| {row['validation_rank']} | {row['steps']} | {row['learning_rate']:.6g} | {row['batch_size']} | "
+            f"| {row['validation_rank']} | {'yes' if is_selected else ''} | {row['steps']} | "
+            f"{row['learning_rate']:.6g} | {row['batch_size']} | "
             f"{','.join(str(seed) for seed in row['seeds'])} | {row['R@1_mean']:.4f} | {row['R@1_std']:.4f} | "
-            f"{row['target_beats_reference_mean']:.4f} |"
+            f"{row['R@1_se']:.4f} | {row['target_beats_reference_mean']:.4f} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -842,6 +1384,25 @@ def _audio_gain_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _paired_comparisons_markdown(summary: dict[str, Any]) -> str:
+    lines = [
+        "# Prespecified Paired Comparisons",
+        "",
+        "All differences are query-paired and averaged across the required final seeds.",
+        "",
+        "| Comparison | Metric | Difference | 95% bootstrap CI | Randomization p | Holm p |",
+        "|---|---|---:|---:|---:|---:|",
+    ]
+    for name, comparison in summary.get("paired_comparisons", {}).items():
+        for metric, values in comparison.get("query_level_statistics", {}).items():
+            low, high = values["bootstrap_95_ci"]
+            lines.append(
+                f"| {name} | {metric} | {values['difference_mean']:.6f} | [{low:.6f}, {high:.6f}] | "
+                f"{values['paired_randomization_p']:.6g} | {values.get('paired_randomization_p_holm', 1.0):.6g} |"
+            )
+    return "\n".join(lines) + "\n"
+
+
 def _write_config_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text(
         "".join(f"{row['steps']}\t{row['learning_rate']:.12g}\t{row['batch_size']}\n" for row in rows),
@@ -859,6 +1420,10 @@ def _mean(values: list[float]) -> float:
 
 def _std(values: list[float]) -> float:
     return statistics.pstdev(values) if len(values) > 1 else 0.0
+
+
+def _sample_std(values: list[float]) -> float:
+    return statistics.stdev(values) if len(values) > 1 else 0.0
 
 
 def _percentile(sorted_values: list[float], fraction: float) -> float:
@@ -903,6 +1468,13 @@ def _contains_non_finite(value: Any) -> bool:
 
 def _parse_ints(value: str) -> tuple[int, ...]:
     return tuple(int(item.strip()) for item in str(value).split(",") if item.strip())
+
+
+def _parse_mode_comparison(value: str) -> tuple[str, str]:
+    parts = [item.strip() for item in str(value).split(":")]
+    if len(parts) != 2 or not all(parts):
+        raise ValueError(f"comparison must be MODE_B:MODE_A, got: {value}")
+    return parts[0], parts[1]
 
 
 def _read_json(path: Path) -> dict[str, Any]:
