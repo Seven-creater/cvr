@@ -16,6 +16,18 @@ import numpy as np
 PRIMARY_MODE = "V_A_T"
 REFERENCE_MODE = "V_T"
 DEFAULT_FINAL_SEEDS = (13, 23, 42, 71, 101)
+BASE_BENCHMARK_REVIEW_CHECKS = (
+    "edit_audio_only",
+    "reference_does_not_satisfy_edit",
+    "target_satisfies_edit",
+    "video_only_cannot_identify_target",
+    "hard_negatives_do_not_satisfy_edit",
+)
+EXTENDED_PROMOTION_REVIEW_CHECKS = (
+    "audio_change_clearly_audible",
+    "video_context_preserved",
+    "not_asr_or_transcript_only",
+)
 
 
 def prepare_benchmark_review(
@@ -23,23 +35,37 @@ def prepare_benchmark_review(
     input_path: str | Path,
     output_dir: str | Path,
     exclude_paths: Iterable[str | Path] = (),
+    local_candidate_paths: Iterable[str | Path] = (),
     review_count: int = 225,
     repeat_review_fraction: float = 0.20,
     random_seed: int = 20260719,
+    eligible_tiers: Iterable[str] = ("main",),
 ) -> dict[str, Any]:
     """Prepare a model-blind human review pool for a future test set."""
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+    exclude_paths = tuple(exclude_paths)
+    local_candidate_paths = tuple(local_candidate_paths)
     candidates = _read_jsonl(Path(input_path))
     if not candidates:
         raise ValueError(f"no benchmark candidates found in {input_path}")
+    local_candidates = _local_candidates_by_sample(_read_many_jsonl(local_candidate_paths))
+    if local_candidates:
+        candidates = [
+            {
+                **row,
+                "local_same_source_candidates": list(local_candidates.get(_sample_id(row), [])),
+            }
+            for row in candidates
+        ]
 
+    normalized_tiers = _normalize_eligible_tiers(eligible_tiers)
     excluded = _identity_sets(_read_many_jsonl(exclude_paths))
     reasons: Counter[str] = Counter()
     eligible: list[dict[str, Any]] = []
     seen_samples: set[str] = set()
     for row in candidates:
-        reason = _benchmark_candidate_reject_reason(row, excluded=excluded)
+        reason = _benchmark_candidate_reject_reason(row, excluded=excluded, eligible_tiers=normalized_tiers)
         sample_id = _sample_id(row)
         if not reason and sample_id in seen_samples:
             reason = "duplicate_sample_id"
@@ -51,7 +77,12 @@ def prepare_benchmark_review(
     if not eligible:
         raise ValueError(f"all benchmark candidates were filtered: {dict(reasons)}")
 
-    eligible.sort(key=lambda row: _stable_row_key(row, random_seed))
+    eligible.sort(
+        key=lambda row: (
+            0 if _automatic_split_tier(row) == "main" else 1,
+            _stable_row_key(row, random_seed),
+        )
+    )
     selected = eligible[: min(len(eligible), max(1, int(review_count)))]
     review_rows = [_formal_human_review_row(row, review_round=1) for row in selected]
     repeat_count = min(len(review_rows), max(0, round(len(review_rows) * float(repeat_review_fraction))))
@@ -73,12 +104,19 @@ def prepare_benchmark_review(
         "protocol": "model_blind_test_review_preparation",
         "input_path": str(input_path),
         "exclude_paths": [str(path) for path in exclude_paths],
+        "local_candidate_paths": [str(path) for path in local_candidate_paths],
+        "local_candidate_query_count": len(local_candidates),
+        "local_candidate_count": sum(len(rows) for rows in local_candidates.values()),
         "input_count": len(candidates),
         "eligible_count": len(eligible),
         "review_count": len(selected),
         "repeat_review_count": len(repeat_rows),
         "repeat_review_fraction": float(repeat_review_fraction),
+        "eligible_tiers": sorted(normalized_tiers),
         "rejected_counts": dict(sorted(reasons.items())),
+        "automatic_tier_distribution": dict(
+            sorted(Counter(_automatic_split_tier(row) for row in selected).items())
+        ),
         "dataset_distribution": dict(sorted(Counter(_dataset(row) for row in selected).items())),
         "subtype_distribution": dict(sorted(Counter(_subtype(row) for row in selected).items())),
         "outputs": {key: str(path) for key, path in outputs.items()},
@@ -99,10 +137,13 @@ def finalize_benchmark(
     max_dataset_ratio: float = 0.60,
     min_strict_local_coverage: float = 0.0,
     random_seed: int = 20260719,
+    eligible_tiers: Iterable[str] = ("main",),
 ) -> dict[str, Any]:
     """Freeze a human-passed, source-disjoint benchmark without model-score selection."""
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+    exclude_paths = tuple(exclude_paths)
+    review_paths = tuple(review_paths)
     candidates = _read_jsonl(Path(candidate_path))
     if not candidates:
         raise ValueError(f"no benchmark candidates found in {candidate_path}")
@@ -110,19 +151,23 @@ def finalize_benchmark(
     if not reviews:
         raise ValueError("finalization requires completed human review JSONL")
 
+    normalized_tiers = _normalize_eligible_tiers(eligible_tiers)
     review_by_sample, review_audit = _collate_reviews(reviews)
     excluded = _identity_sets(_read_many_jsonl(exclude_paths))
     rejection_counts: Counter[str] = Counter()
     passed: list[dict[str, Any]] = []
     seen_pairs: set[str] = set()
     for row in candidates:
-        reason = _benchmark_candidate_reject_reason(row, excluded=excluded)
+        reason = _benchmark_candidate_reject_reason(row, excluded=excluded, eligible_tiers=normalized_tiers)
         sample_id = _sample_id(row)
         review = review_by_sample.get(sample_id)
         if not reason and review is None:
             reason = "not_human_reviewed"
-        if not reason and not review.get("passed", False):
-            reason = str(review.get("reason") or "human_review_not_passed")
+        automatic_tier = _automatic_split_tier(row)
+        review_status_key = "promotion_passed" if automatic_tier == "extended" else "passed"
+        review_reason_key = "promotion_reason" if automatic_tier == "extended" else "reason"
+        if not reason and not review.get(review_status_key, False):
+            reason = str(review.get(review_reason_key) or "human_review_not_passed")
         pair_id = _pair_id(row)
         if not reason and pair_id and pair_id in seen_pairs:
             reason = "duplicate_pair_group"
@@ -131,7 +176,7 @@ def finalize_benchmark(
             continue
         if pair_id:
             seen_pairs.add(pair_id)
-        passed.append(row)
+        passed.append(_benchmark_output_row(row, human_verified_negatives=True))
 
     selected = _select_balanced_benchmark(
         passed,
@@ -184,10 +229,17 @@ def finalize_benchmark(
         "target_count_met": len(selected) >= int(target_count),
         "max_speech_ratio": float(max_speech_ratio),
         "max_dataset_ratio": float(max_dataset_ratio),
+        "eligible_tiers": sorted(normalized_tiers),
         "strict_local_count": strict_local_count,
         "strict_local_coverage": strict_local_coverage,
         "dataset_distribution": dict(sorted(Counter(_dataset(row) for row in selected).items())),
         "subtype_distribution": dict(sorted(Counter(_subtype(row) for row in selected).items())),
+        "automatic_tier_distribution": dict(
+            sorted(Counter(_automatic_split_tier(row) for row in selected).items())
+        ),
+        "human_promoted_extended_count": sum(
+            _truthy(row.get("human_verified_benchmark_eligible")) for row in selected
+        ),
         "human_review": review_audit,
         "rejected_counts": dict(sorted(rejection_counts.items())),
         "leakage": leakage,
@@ -666,9 +718,20 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--input-path", required=True)
     review.add_argument("--output-dir", required=True)
     review.add_argument("--exclude-path", action="append", default=[])
+    review.add_argument(
+        "--local-candidate-path",
+        action="append",
+        default=[],
+        help="Mined local_same_source candidate JSONL to attach to the model-blind review pool.",
+    )
     review.add_argument("--review-count", type=int, default=225)
     review.add_argument("--repeat-review-fraction", type=float, default=0.20)
     review.add_argument("--random-seed", type=int, default=20260719)
+    review.add_argument(
+        "--eligible-tiers",
+        default="main",
+        help="Comma-separated automatic tiers eligible for review. Extended records require promotion checks.",
+    )
 
     freeze = subparsers.add_parser("finalize-benchmark")
     freeze.add_argument("--candidate-path", required=True)
@@ -681,6 +744,11 @@ def build_parser() -> argparse.ArgumentParser:
     freeze.add_argument("--max-dataset-ratio", type=float, default=0.60)
     freeze.add_argument("--min-strict-local-coverage", type=float, default=0.0)
     freeze.add_argument("--random-seed", type=int, default=20260719)
+    freeze.add_argument(
+        "--eligible-tiers",
+        default="main",
+        help="Comma-separated automatic tiers eligible for freezing. Extended records require promotion checks.",
+    )
 
     validation = subparsers.add_parser("summarize-validation")
     validation.add_argument("--input-root", action="append", required=True)
@@ -727,9 +795,11 @@ def main() -> None:
             input_path=args.input_path,
             output_dir=args.output_dir,
             exclude_paths=args.exclude_path,
+            local_candidate_paths=args.local_candidate_path,
             review_count=args.review_count,
             repeat_review_fraction=args.repeat_review_fraction,
             random_seed=args.random_seed,
+            eligible_tiers=_parse_strings(args.eligible_tiers),
         )
     elif args.command == "finalize-benchmark":
         result = finalize_benchmark(
@@ -743,6 +813,7 @@ def main() -> None:
             max_dataset_ratio=args.max_dataset_ratio,
             min_strict_local_coverage=args.min_strict_local_coverage,
             random_seed=args.random_seed,
+            eligible_tiers=_parse_strings(args.eligible_tiers),
         )
     elif args.command == "summarize-validation":
         result = summarize_validation(
@@ -1079,17 +1150,26 @@ def _split_leakage_summary(*, train: list[dict[str, Any]], val: list[dict[str, A
     return {"violation_count": sum(item["count"] for item in violations), "violations": violations}
 
 
-def _benchmark_candidate_reject_reason(row: dict[str, Any], *, excluded: dict[str, set[str]]) -> str:
-    if str(row.get("split_tier") or "main").strip().lower() != "main":
-        return "not_b_main"
+def _benchmark_candidate_reject_reason(
+    row: dict[str, Any],
+    *,
+    excluded: dict[str, set[str]],
+    eligible_tiers: set[str] | None = None,
+) -> str:
+    eligible_tiers = eligible_tiers or {"main"}
+    automatic_tier = _automatic_split_tier(row)
+    if automatic_tier not in eligible_tiers:
+        return f"tier_not_eligible:{automatic_tier}"
     if _truthy(row.get("is_inverse")) or str(row.get("direction") or "forward").strip().lower() == "inverse":
         return "inverse_direction"
     if _truthy(row.get("fallback")):
         return "fallback_record"
     if "accepted" in row and not _truthy(row.get("accepted")):
         return "not_accepted"
-    if "benchmark_eligible" in row and not _truthy(row.get("benchmark_eligible")):
+    if automatic_tier == "main" and "benchmark_eligible" in row and not _truthy(row.get("benchmark_eligible")):
         return "not_benchmark_eligible"
+    if automatic_tier == "extended" and "training_eligible" in row and not _truthy(row.get("training_eligible")):
+        return "extended_not_training_eligible"
     if _truthy(row.get("manual_review_required")):
         return "preexisting_manual_review_required"
     if not _sample_id(row):
@@ -1131,8 +1211,22 @@ def _read_many_jsonl(paths: Iterable[str | Path]) -> list[dict[str, Any]]:
     return rows
 
 
+def _local_candidates_by_sample(rows: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    by_sample: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        sample_id = _first_text(row, ("sample_id", "query_sample_id"))
+        video = _first_text(row, ("video", "path", "video_path"))
+        if not sample_id or not video or (sample_id, video) in seen:
+            continue
+        seen.add((sample_id, video))
+        by_sample[sample_id].append(dict(row))
+    return dict(by_sample)
+
+
 def _formal_human_review_row(row: dict[str, Any], *, review_round: int) -> dict[str, Any]:
     review = _human_review_row(row)
+    automatic_tier = _automatic_split_tier(row)
     review.update(
         {
             "dataset": _dataset(row),
@@ -1140,6 +1234,9 @@ def _formal_human_review_row(row: dict[str, Any], *, review_round: int) -> dict[
                 row, ("source_disjoint_group_id", "raw_source_id", "source_id")
             ),
             "pair_group_id": _pair_id(row),
+            "automatic_split_tier": automatic_tier,
+            "promotion_review_required": automatic_tier == "extended",
+            "automatic_diagnostic_reason": row.get("diagnostic_reason"),
             "review_round": int(review_round),
             "reviewer_id": "",
         }
@@ -1148,7 +1245,8 @@ def _formal_human_review_row(row: dict[str, Any], *, review_round: int) -> dict[
 
 
 def _collate_reviews(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    rounds: dict[str, dict[int, tuple[bool, str]]] = defaultdict(dict)
+    rounds: dict[str, dict[int, dict[str, tuple[bool, str]]]] = defaultdict(dict)
+    tiers: dict[str, str] = {}
     decisions: Counter[str] = Counter()
     for row in rows:
         sample_id = _sample_id(row)
@@ -1158,7 +1256,11 @@ def _collate_reviews(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[str, An
         decision = str(review.get("decision") or "unreviewed").strip().lower()
         decisions[decision] += 1
         review_round = int(row.get("review_round") or review.get("review_round") or 1)
-        rounds[sample_id][review_round] = _review_pass_status(review)
+        tiers[sample_id] = str(row.get("automatic_split_tier") or "main").strip().lower()
+        rounds[sample_id][review_round] = {
+            "base": _review_pass_status(review),
+            "promotion": _review_pass_status(review, require_extended_promotion=True),
+        }
 
     result: dict[str, dict[str, Any]] = {}
     repeated = 0
@@ -1166,16 +1268,27 @@ def _collate_reviews(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[str, An
     disagreements = 0
     for sample_id, values in rounds.items():
         primary = values.get(1) or values[min(values)]
-        passed, reason = primary
+        passed, reason = primary["base"]
+        promotion_passed, promotion_reason = primary["promotion"]
+        effective_key = "promotion" if tiers.get(sample_id) == "extended" else "base"
         if 2 in values:
             repeated += 1
-            if values[2][0] == primary[0]:
+            if values[2][effective_key][0] == primary[effective_key][0]:
                 agreements += 1
             else:
                 disagreements += 1
                 passed = False
                 reason = "repeat_review_disagreement"
-        result[sample_id] = {"passed": passed, "reason": reason, "rounds": sorted(values)}
+                promotion_passed = False
+                promotion_reason = "repeat_review_disagreement"
+        result[sample_id] = {
+            "passed": passed,
+            "reason": reason,
+            "promotion_passed": promotion_passed,
+            "promotion_reason": promotion_reason,
+            "automatic_split_tier": tiers.get(sample_id, "main"),
+            "rounds": sorted(values),
+        }
     return result, {
         "reviewed_sample_count": len(result),
         "decision_counts": dict(sorted(decisions.items())),
@@ -1186,21 +1299,69 @@ def _collate_reviews(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[str, An
     }
 
 
-def _review_pass_status(review: dict[str, Any]) -> tuple[bool, str]:
+def _review_pass_status(
+    review: dict[str, Any], *, require_extended_promotion: bool = False
+) -> tuple[bool, str]:
     decision = str(review.get("decision") or "unreviewed").strip().lower()
     if decision not in {"pass", "passed", "accept", "accepted"}:
         return False, f"human_{decision or 'unreviewed'}"
-    checks = (
-        "edit_audio_only",
-        "reference_does_not_satisfy_edit",
-        "target_satisfies_edit",
-        "video_only_cannot_identify_target",
-        "hard_negatives_do_not_satisfy_edit",
-    )
+    checks = BASE_BENCHMARK_REVIEW_CHECKS
+    if require_extended_promotion:
+        checks += EXTENDED_PROMOTION_REVIEW_CHECKS
     missing = [key for key in checks if review.get(key) is not True]
     if missing:
         return False, "human_check_failed_or_missing:" + ",".join(missing)
     return True, "passed"
+
+
+def _normalize_eligible_tiers(values: Iterable[str]) -> set[str]:
+    if isinstance(values, str):
+        values = _parse_strings(values)
+    tiers = {str(value).strip().lower() for value in values if str(value).strip()}
+    unsupported = tiers - {"main", "extended"}
+    if unsupported:
+        raise ValueError(f"unsupported benchmark eligible tiers: {sorted(unsupported)}")
+    if not tiers:
+        raise ValueError("eligible_tiers cannot be empty")
+    return tiers
+
+
+def _automatic_split_tier(row: dict[str, Any]) -> str:
+    return str(row.get("automatic_split_tier") or row.get("split_tier") or "main").strip().lower()
+
+
+def _benchmark_output_row(
+    row: dict[str, Any], *, human_verified_negatives: bool = False
+) -> dict[str, Any]:
+    output = dict(row)
+    automatic_tier = _automatic_split_tier(row)
+    output["automatic_split_tier"] = automatic_tier
+    output["automatic_benchmark_eligible"] = (
+        _truthy(row.get("benchmark_eligible")) if "benchmark_eligible" in row else automatic_tier == "main"
+    )
+    if automatic_tier == "extended":
+        output["automatic_diagnostic_reason"] = row.get("diagnostic_reason")
+        output["split_tier"] = "main"
+        output["benchmark_eligible"] = True
+        output["human_verified_benchmark_eligible"] = True
+        output["benchmark_promotion"] = "human_verified_extended"
+    else:
+        output["human_verified_benchmark_eligible"] = False
+        output["benchmark_promotion"] = "not_required"
+    if human_verified_negatives:
+        verified_local: list[dict[str, Any]] = []
+        for item in row.get("local_same_source_candidates", []):
+            if not isinstance(item, dict):
+                continue
+            verified = dict(item)
+            verified["pre_review_verification_status"] = item.get("verification_status")
+            verified["verification_status"] = "human_verified"
+            verified["satisfies_edit"] = False
+            verified["manual_review_required"] = False
+            verified["verified_by_benchmark_review"] = True
+            verified_local.append(verified)
+        output["local_same_source_candidates"] = verified_local
+    return output
 
 
 def _select_balanced_benchmark(
@@ -1300,19 +1461,27 @@ def _sha256_file(path: Path) -> str:
 
 
 def _human_review_row(row: dict[str, Any]) -> dict[str, Any]:
+    hard_negatives: list[dict[str, Any]] = []
+    for key in ("audio_delta_hard_negatives", "hard_negatives", "local_same_source_candidates"):
+        values = row.get(key)
+        if isinstance(values, list):
+            hard_negatives.extend(item for item in values if isinstance(item, dict))
     return {
         "sample_id": _first_text(row, ("sample_id", "proposal_id", "clip_id")),
         "reference_video": row.get("reference_video"),
         "target_video": row.get("target_video"),
         "edit_text": row.get("edit_text"),
         "b_subtype": row.get("b_subtype") or row.get("audio_delta_type"),
-        "hard_negatives": row.get("audio_delta_hard_negatives") or row.get("hard_negatives") or [],
+        "hard_negatives": hard_negatives,
         "review": {
             "edit_audio_only": None,
             "reference_does_not_satisfy_edit": None,
             "target_satisfies_edit": None,
             "video_only_cannot_identify_target": None,
             "hard_negatives_do_not_satisfy_edit": None,
+            "audio_change_clearly_audible": None,
+            "video_context_preserved": None,
+            "not_asr_or_transcript_only": None,
             "decision": "unreviewed",
             "notes": "",
         },
@@ -1468,6 +1637,10 @@ def _contains_non_finite(value: Any) -> bool:
 
 def _parse_ints(value: str) -> tuple[int, ...]:
     return tuple(int(item.strip()) for item in str(value).split(",") if item.strip())
+
+
+def _parse_strings(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in str(value).split(",") if item.strip())
 
 
 def _parse_mode_comparison(value: str) -> tuple[str, str]:

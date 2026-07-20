@@ -12,6 +12,8 @@ from app.audio_lines_single_source import (
     merge_line_results,
     prepare_existing_single_source_clips,
     split_audio_line_candidates,
+    _b_asr_degeneracy_risk,
+    _b_asr_degeneracy_risk_source,
     _inverse_b_line_edit_text,
 )
 from app.composed_data import (
@@ -33,6 +35,18 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
 
     def test_json_decode_errors_are_retried_as_transient_omni_failures(self) -> None:
         self.assertTrue(_is_transient_omni_exception(ValueError("JSONDecodeError: Expecting ',' delimiter")))
+
+    def test_contextual_asr_risk_default_does_not_override_explicit_high_risk(self) -> None:
+        contextual = {"summary": "A news interview at a podium"}
+        explicit_high = {
+            "summary": "A news interview at a podium",
+            "metadata": {"asr_degeneracy_risk": 0.8},
+        }
+
+        self.assertEqual(0.45, _b_asr_degeneracy_risk(contextual, contextual))
+        self.assertEqual("heuristic_contextual_default", _b_asr_degeneracy_risk_source(contextual, contextual))
+        self.assertEqual(0.8, _b_asr_degeneracy_risk(explicit_high, contextual))
+        self.assertEqual("annotation_or_metadata", _b_asr_degeneracy_risk_source(explicit_high, contextual))
 
     def test_b_audio_review_final_issues_keep_quality_and_visual_boundaries(self) -> None:
         base = {

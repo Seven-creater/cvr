@@ -2287,6 +2287,9 @@ def propose_single_source_pairs(
                         "video_context_type": context_type,
                         "video_context_strength": video_context_strength,
                         "asr_degeneracy_risk": asr_degeneracy_risk,
+                        "asr_degeneracy_risk_source": _b_line_asr_degeneracy_risk_source(
+                            reference_annotation, target_annotation, quality
+                        ),
                     }
                 )
                 blind_local_issues: list[str] = []
@@ -2436,6 +2439,9 @@ def propose_single_source_pairs(
                         "video_context_type": context_type,
                         "video_context_strength": video_context_strength,
                         "asr_degeneracy_risk": asr_degeneracy_risk,
+                        "asr_degeneracy_risk_source": _b_line_asr_degeneracy_risk_source(
+                            reference_annotation, target_annotation, quality
+                        ),
                     }
                 )
                 if blind_v2:
@@ -2784,6 +2790,9 @@ def propose_single_source_pairs(
                         "video_context_type": context_type,
                         "video_context_strength": video_context_strength,
                         "asr_degeneracy_risk": asr_degeneracy_risk,
+                        "asr_degeneracy_risk_source": _b_line_asr_degeneracy_risk_source(
+                            reference_annotation, target_annotation, quality
+                        ),
                     }
                 )
             edit_text_quality = _edit_text_quality_payload(
@@ -9774,9 +9783,52 @@ def _b_line_asr_degeneracy_risk(
         risk = max(risk, 0.62 if context_type != "unknown" else 0.56)
     if any(term in text for term in ("black screen", "static image", "podcast", "audio only", "meeting", "webinar", "zoom")):
         risk = max(risk, 0.78)
-    if any(term in text for term in ("news", "sport", "match", "tutorial", "cook", "repair", "interview", "performance", "livestream")):
-        risk = min(risk or 0.45, 0.45)
+    if (
+        any(
+            term in text
+            for term in ("news", "sport", "match", "tutorial", "cook", "repair", "interview", "performance", "livestream")
+        )
+        and provided <= 0.0
+    ):
+        risk = 0.45
     return round(min(1.0, max(0.0, risk)), 3)
+
+
+def _b_line_asr_degeneracy_risk_source(
+    reference_annotation: dict[str, Any] | None,
+    target_annotation: dict[str, Any] | None,
+    candidate_quality: dict[str, Any] | None = None,
+) -> str:
+    candidate_quality = candidate_quality if isinstance(candidate_quality, dict) else {}
+    existing_source = str(candidate_quality.get("asr_degeneracy_risk_source") or "").strip()
+    if existing_source:
+        return existing_source
+    provided = max(
+        _score_float(candidate_quality.get("asr_degeneracy_risk")),
+        _score_float(
+            (reference_annotation or {}).get("asr_degeneracy_risk")
+            if isinstance(reference_annotation, dict)
+            else 0.0
+        ),
+        _score_float(
+            (target_annotation or {}).get("asr_degeneracy_risk")
+            if isinstance(target_annotation, dict)
+            else 0.0
+        ),
+    )
+    if provided > 0.0:
+        return "candidate_or_annotation"
+    context_type = _b_line_video_context_type(reference_annotation, target_annotation)
+    if context_type in {
+        "news/reporting",
+        "sports_commentary",
+        "tutorial_instruction",
+        "interview_context",
+        "livestream_context",
+        "performance_or_singing",
+    }:
+        return "heuristic_contextual_default"
+    return "heuristic_context_type"
 
 
 def _b_line_subtype_from_evidence(

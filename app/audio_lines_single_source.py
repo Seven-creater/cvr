@@ -2559,9 +2559,40 @@ def _b_asr_degeneracy_risk(reference: dict[str, Any], target: dict[str, Any]) ->
         risk = max(risk, 0.56)
     if any(term in text for term in ("black screen", "static image", "podcast", "meeting", "webinar", "zoom")):
         risk = max(risk, 0.80)
-    if context_type in {"news/reporting", "sports_commentary", "tutorial_instruction", "interview_context", "livestream_context", "performance_or_singing"}:
-        risk = min(risk or 0.45, 0.45)
+    if (
+        context_type
+        in {
+            "news/reporting",
+            "sports_commentary",
+            "tutorial_instruction",
+            "interview_context",
+            "livestream_context",
+            "performance_or_singing",
+        }
+        and provided <= 0.0
+    ):
+        risk = 0.45
     return round(min(1.0, max(0.0, risk)), 3)
+
+
+def _b_asr_degeneracy_risk_source(reference: dict[str, Any], target: dict[str, Any]) -> str:
+    provided = max(
+        _score_float(_metadata_value(reference, "asr_degeneracy_risk")),
+        _score_float(_metadata_value(target, "asr_degeneracy_risk")),
+    )
+    if provided > 0.0:
+        return "annotation_or_metadata"
+    context_type = _b_context_type(reference, target)
+    if context_type in {
+        "news/reporting",
+        "sports_commentary",
+        "tutorial_instruction",
+        "interview_context",
+        "livestream_context",
+        "performance_or_singing",
+    }:
+        return "heuristic_contextual_default"
+    return "heuristic_context_type"
 
 
 def _b_context_candidate_allowed(
@@ -2830,6 +2861,7 @@ def _speech_line_candidate(
             "video_context_type": video_context_type or _b_context_type(reference, target),
             "video_context_strength": video_context_strength or _b_context_strength(reference, target, visual_context_similarity),
             "asr_degeneracy_risk": asr_degeneracy_risk or _b_asr_degeneracy_risk(reference, target),
+            "asr_degeneracy_risk_source": _b_asr_degeneracy_risk_source(reference, target),
         }
     )
     record["quality"] = quality
@@ -2875,6 +2907,7 @@ def _audio_event_line_candidate(
             "video_context_type": video_context_type or _b_context_type(reference, target),
             "video_context_strength": video_context_strength or _b_context_strength(reference, target, visual_context_similarity),
             "asr_degeneracy_risk": asr_degeneracy_risk or _b_asr_degeneracy_risk(reference, target),
+            "asr_degeneracy_risk_source": _b_asr_degeneracy_risk_source(reference, target),
         }
     )
     record["quality"] = quality

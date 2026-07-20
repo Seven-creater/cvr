@@ -162,6 +162,97 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             speech_count = sum(row["audio_delta_type"] == "speech_topic_in_video_context" for row in final_rows)
             self.assertLessEqual(speech_count, 4)
 
+    def test_extended_benchmark_candidates_require_explicit_human_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            main = self._row("main_sample", "source_main", "pair_main")
+            extended = self._row("extended_sample", "source_extended", "pair_extended", tier="extended")
+            extended.update(
+                {
+                    "benchmark_eligible": False,
+                    "training_eligible": True,
+                    "diagnostic_reason": ["main_speech_cap_exceeded"],
+                    "audio_delta_type": "speech_topic_in_video_context",
+                }
+            )
+            input_path = root / "candidates.jsonl"
+            self._write_jsonl(input_path, [main, extended])
+            local_path = root / "local_candidates.jsonl"
+            self._write_jsonl(
+                local_path,
+                [
+                    {
+                        "sample_id": "extended_sample",
+                        "negative_type": "local_same_source",
+                        "video": "/extended_local.mp4",
+                        "same_source": True,
+                        "satisfies_edit": "unknown",
+                        "verification_status": "candidate_unverified",
+                    }
+                ],
+            )
+
+            default_summary = prepare_benchmark_review(
+                input_path=input_path,
+                output_dir=root / "default_review",
+                review_count=10,
+            )
+            self.assertEqual(1, default_summary["eligible_count"])
+
+            prepared = prepare_benchmark_review(
+                input_path=input_path,
+                output_dir=root / "promotion_review",
+                review_count=10,
+                eligible_tiers=("main", "extended"),
+                local_candidate_paths=(local_path,),
+            )
+            self.assertEqual(2, prepared["eligible_count"])
+            review_rows = self._read_jsonl(root / "promotion_review" / "human_review_round1.jsonl")
+            for row in review_rows:
+                row["review"].update(
+                    {
+                        "edit_audio_only": True,
+                        "reference_does_not_satisfy_edit": True,
+                        "target_satisfies_edit": True,
+                        "video_only_cannot_identify_target": True,
+                        "hard_negatives_do_not_satisfy_edit": True,
+                        "decision": "passed",
+                    }
+                )
+                if row["automatic_split_tier"] == "extended":
+                    row["review"].update(
+                        {
+                            "audio_change_clearly_audible": True,
+                            "video_context_preserved": True,
+                            "not_asr_or_transcript_only": True,
+                        }
+                    )
+            completed = root / "completed.jsonl"
+            self._write_jsonl(completed, review_rows)
+
+            frozen = finalize_benchmark(
+                candidate_path=root / "promotion_review" / "benchmark_review_candidates.jsonl",
+                review_paths=[completed],
+                output_dir=root / "frozen",
+                target_count=2,
+                minimum_count=2,
+                max_speech_ratio=1.0,
+                max_dataset_ratio=1.0,
+                eligible_tiers=("main", "extended"),
+            )
+
+            self.assertEqual(1, frozen["human_promoted_extended_count"])
+            self.assertEqual(1, frozen["strict_local_count"])
+            rows = {row["sample_id"]: row for row in self._read_jsonl(root / "frozen" / "test_main.jsonl")}
+            promoted = rows["extended_sample"]
+            self.assertEqual("extended", promoted["automatic_split_tier"])
+            self.assertEqual("main", promoted["split_tier"])
+            self.assertTrue(promoted["human_verified_benchmark_eligible"])
+            self.assertEqual("human_verified_extended", promoted["benchmark_promotion"])
+            self.assertEqual(["main_speech_cap_exceeded"], promoted["automatic_diagnostic_reason"])
+            self.assertEqual("human_verified", promoted["local_same_source_candidates"][0]["verification_status"])
+            self.assertIs(promoted["local_same_source_candidates"][0]["satisfies_edit"], False)
+
     def test_final_aggregation_reports_paired_audio_gain(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
