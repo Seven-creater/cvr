@@ -19,6 +19,7 @@ from app.audio_cvr_paper_experiment import (
     prepare_automatic_benchmark_review,
     prepare_benchmark_review,
     prepare_paper_splits,
+    prepare_training_subset,
     score_fusion,
     summarize_validation,
 )
@@ -26,6 +27,36 @@ from app.e5_audio_delta_train import _AudioDeltaAdapter, _import_torch
 
 
 class AudioCVRPaperExperimentTests(unittest.TestCase):
+    def test_prepare_training_subset_filters_non_speech_and_preserves_holdout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            train = [
+                self._automatic_row("sound", "source_sound", "pair_sound", subtype="sound_event"),
+                self._automatic_row("music", "source_music", "pair_music", subtype="music"),
+                self._automatic_row("speech", "source_speech", "pair_speech", subtype="speech_topic_in_video_context"),
+            ]
+            val = [self._automatic_row("val", "source_val", "pair_val", subtype="music")]
+            test = [self._automatic_row("test", "source_test", "pair_test", subtype="sound_event")]
+            self._write_jsonl(root / "train.jsonl", train)
+            self._write_jsonl(root / "val.jsonl", val)
+            self._write_jsonl(root / "test.jsonl", test)
+
+            summary = prepare_training_subset(
+                train_path=root / "train.jsonl",
+                val_path=root / "val.jsonl",
+                test_path=root / "test.jsonl",
+                output_dir=root / "subset",
+                expected_count=2,
+            )
+
+            self.assertEqual(2, summary["forward_count"])
+            self.assertEqual(2, summary["unique_source_count"])
+            self.assertEqual({"music": 1, "sound_event": 1}, summary["subtype_distribution"])
+            self.assertFalse(summary["selection_uses_model_scores"])
+            self.assertTrue(summary["ready_for_inverse_augmentation"])
+            selected = [json.loads(line) for line in (root / "subset" / "train_non_speech_forward.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual({"sound", "music"}, {row["sample_id"] for row in selected})
+
     def test_paper_splits_accept_frozen_test_main_150_and_audit_clean_training_pool(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -374,6 +405,33 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             self.assertEqual("one_se_earliest", summary["selection_rule_name"])
             self.assertEqual(2, summary["one_se_candidate_count"])
 
+    def test_validation_selection_keeps_adapter_ranks_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            grid = root / "grid"
+            for rank, r1 in ((16, 0.40), (32, 0.40)):
+                run = grid / f"rank_{rank}" / "seed_13"
+                self._write_train_summary(
+                    run / "adapter" / "train_summary.json",
+                    steps=100,
+                    seed=13,
+                    adapter_architecture="low_rank_residual",
+                    adapter_rank=rank,
+                )
+                self._write_eval_summary(run / "eval" / "summary.json", r1=r1, beats=0.5)
+
+            summary = summarize_validation(
+                input_roots=[grid],
+                output_dir=root / "selection",
+                required_seeds=[13],
+                selection_rule="one_se_earliest",
+            )
+
+            self.assertEqual(2, summary["configuration_count"])
+            self.assertEqual(16, summary["selected_config"]["adapter_rank"])
+            adapter_tsv = (root / "selection" / "selected_adapter_config.tsv").read_text(encoding="utf-8")
+            self.assertTrue(adapter_tsv.startswith("low_rank_residual\t16\t100\t"))
+
     def test_benchmark_review_and_freeze_are_source_disjoint_and_human_verified(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -648,7 +706,12 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             torch = _import_torch()
             adapter_dir = root / "adapter"
             adapter_dir.mkdir()
-            torch.save(_AudioDeltaAdapter(torch, 2).state_dict(), adapter_dir / "adapter.pt")
+            adapter = _AudioDeltaAdapter(torch, 2, adapter_architecture="low_rank_residual", adapter_rank=1)
+            torch.save(adapter.state_dict(), adapter_dir / "adapter.pt")
+            (adapter_dir / "adapter_config.json").write_text(
+                json.dumps({"adapter_architecture": "low_rank_residual", "adapter_rank": 1}),
+                encoding="utf-8",
+            )
 
             summary = score_fusion(
                 cache_a=cache_a,
@@ -660,6 +723,8 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             )
 
             self.assertEqual(1.0, summary["fusion"]["selected_alpha_cache_a"])
+            self.assertEqual("low_rank_residual", summary["adapter_architecture"])
+            self.assertEqual(1, summary["adapter_rank"])
             self.assertTrue((root / "fusion" / "per_query_scores.jsonl").exists())
 
     @staticmethod
@@ -780,10 +845,26 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
         }
 
     @staticmethod
-    def _write_train_summary(path: Path, *, steps: int, seed: int) -> None:
+    def _write_train_summary(
+        path: Path,
+        *,
+        steps: int,
+        seed: int,
+        adapter_architecture: str = "full_rank",
+        adapter_rank: int | None = None,
+    ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"steps": steps, "learning_rate": 0.0003, "batch_size": 8, "seed": seed}),
+            json.dumps(
+                {
+                    "steps": steps,
+                    "learning_rate": 0.0003,
+                    "batch_size": 8,
+                    "seed": seed,
+                    "adapter_architecture": adapter_architecture,
+                    "adapter_rank": adapter_rank,
+                }
+            ),
             encoding="utf-8",
         )
 

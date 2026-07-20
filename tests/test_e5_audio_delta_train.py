@@ -404,6 +404,84 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertIn("by_audio_delta_type", eval_summary)
             self.assertTrue((root / "eval" / "comparison.md").exists())
 
+    def test_low_rank_residual_adapter_starts_at_identity_and_round_trips(self) -> None:
+        torch = _import_torch()
+        model = _AudioDeltaAdapter(torch, 8, adapter_architecture="low_rank_residual", adapter_rank=2)
+        value = torch.randn(3, 8)
+
+        expected = torch.nn.functional.normalize(value, dim=-1)
+        self.assertTrue(torch.allclose(expected, model.query(value), atol=1e-7))
+        self.assertTrue(torch.allclose(expected, model.doc(value), atol=1e-7))
+        self.assertEqual(2, model.adapter_rank)
+        self.assertEqual(99, sum(parameter.numel() for parameter in model.parameters()))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+            cache_embeddings(records_dir=records_dir, output_dir=root / "cache", mock_encoder=True)
+            train_summary = train_adapter(
+                cache_dir=root / "cache",
+                output_dir=root / "adapter",
+                steps=1,
+                batch_size=1,
+                device="cpu",
+                adapter_architecture="low_rank_residual",
+                adapter_rank=4,
+            )
+            eval_summary = eval_adapter(cache_dir=root / "cache", adapter_dir=root / "adapter", output_dir=root / "eval", device="cpu")
+
+            self.assertEqual("low_rank_residual", train_summary["adapter_architecture"])
+            self.assertEqual(4, train_summary["adapter_rank"])
+            self.assertEqual(771, train_summary["trainable_parameter_count"])
+            self.assertEqual("low_rank_residual", eval_summary["adapter_architecture"])
+            self.assertEqual(4, eval_summary["adapter_rank"])
+            adapter_row = next(row for row in eval_summary["rows"] if row["method"] == "audio_delta_adapter_global")
+            self.assertIn("MRR", adapter_row)
+            self.assertIn("mean_rank", adapter_row)
+            self.assertIn("median_rank", adapter_row)
+            self.assertIn("by_dataset_group", eval_summary)
+
+    def test_eval_can_exclude_reference_from_same_cached_gallery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+            self._write_jsonl(
+                records_dir / "eval_gallery.jsonl",
+                [
+                    {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "raw_source_id": "source_a", "kind": "positive"},
+                    {"gallery_id": "reference::sample_1", "video": "/tmp/sample_1_ref.mp4", "raw_source_id": "source_a", "kind": "reference_negative"},
+                    {"gallery_id": "distractor::1", "video": "/tmp/distractor.mp4", "raw_source_id": "other", "kind": "distractor"},
+                ],
+            )
+            cache_embeddings(records_dir=records_dir, output_dir=root / "cache", mock_encoder=True)
+            train_adapter(cache_dir=root / "cache", output_dir=root / "adapter", steps=1, batch_size=1, device="cpu")
+
+            summary = eval_adapter(
+                cache_dir=root / "cache",
+                adapter_dir=root / "adapter",
+                output_dir=root / "eval_without_ref",
+                device="cpu",
+                exclude_gallery_kinds=("reference_negative",),
+                save_topk=3,
+            )
+
+            self.assertEqual(3, summary["gallery_count"])
+            self.assertEqual(2, summary["effective_gallery_count"])
+            self.assertEqual(1, summary["excluded_gallery_count"])
+            self.assertFalse(summary["reference_in_gallery"])
+            scores = json.loads((root / "eval_without_ref" / "per_query_scores.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            self.assertTrue(np.isfinite(scores["base_reference_score"]))
+            topk = json.loads((root / "eval_without_ref" / "per_query_topk.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            self.assertFalse(any(row["kind"] == "reference_negative" for row in topk["base_topk"][:2]))
+
     def test_eval_can_score_small_query_set_against_larger_gallery(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

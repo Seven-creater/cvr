@@ -287,34 +287,40 @@ e5_omni_recipe / v2_research
   off: multi-positive, memory bank, LoRA
 ```
 
-The current training code intentionally uses the S1/e5-omni recipe only.
+The current training code intentionally uses the E5-Omni-compatible recipe only.
 Legacy AudioDelta lambda flags remain parseable for command compatibility, but
-are forced to zero and cannot create a C1 run. The former loss schedule is
-kept as a compatibility command that evaluates S1 only.
+are forced to zero. The former loss schedule is kept only as a compatibility
+command and is not part of the paper method.
 
 ## Evaluation Metrics
 
 ### Paper-grade Audio-CVR experiment
 
-Use `scripts/run_audio_cvr_aaai_final_experiment.sh` for the final adapter
-experiment. It preserves the existing source-disjoint assignment, filters the
-formal test set to forward B-main records, selects steps/LR/batch size on the
-validation split, and then runs five final seeds across all seven audio
-necessity modes. The launcher also evaluates a validation-tuned V+T/A+T late
-fusion baseline and writes paired bootstrap, randomization, and McNemar
-statistics.
+For the frozen non-speech benchmark (`test=150`, `val=28`, `train=65`), use
+`scripts/run_audio_cvr_fewshot_bidir_final.sh`. It audits the frozen SHA and
+source-disjoint identities, verifies train-only inverse records with Omni,
+stops the recorded vLLM process group, and then runs the six-GPU E5 experiment.
+Adapter rank/steps/learning rate are selected on validation only. The final
+evaluation uses five seeds, all seven audio-necessity modes, forward-only versus
+verified-bidirectional training, validation-tuned late fusion, and exact
+with-reference versus without-reference retrieval from the same cached gallery.
 
 ```bash
-setsid nohup bash scripts/run_audio_cvr_aaai_final_experiment.sh \
-  --run-root /path/to/audio_cvr_run \
-  --split-root /path/to/audio_cvr_run/b_splits \
-  --output-dir runs/aaai_audiocvr_final_$(date +%Y%m%d_%H%M%S) \
-  --gpu-ids 1,2,3,4,5,6,7 \
-  > logs/aaai_audiocvr_final.log 2>&1 < /dev/null &
+setsid nohup bash scripts/run_audio_cvr_fewshot_bidir_final.sh \
+  --benchmark-root /path/to/benchmark_v1_final150_val28 \
+  --distractor-pool-path /path/to/single_source_annotations.jsonl \
+  --media-root /path/to/composed_omni_retrieval \
+  --output-dir runs/aaai_audiocvr_fewshot_$(date +%Y%m%d_%H%M%S) \
+  --expected-head <GITHUB_COMMIT> \
+  --omni-model <OMNI_MODEL_NAME> \
+  --omni-start-command '<EXACT_VLLM_START_COMMAND>' \
+  --omni-gpu-ids 0,1,2,3 \
+  --e5-gpu-ids 0,1,2,3,4,5 \
+  > logs/aaai_audiocvr_fewshot.log 2>&1 < /dev/null &
 ```
 
-The experiment protocol and literature rationale are documented in
-`doc/aaai_audiocvr_final_experiment_protocol_20260718.md`.
+The older `run_audio_cvr_aaai_final_experiment.sh` remains available for prior
+split layouts; it is not the launcher for the frozen 150-query experiment.
 
 Report more than `R@K`:
 

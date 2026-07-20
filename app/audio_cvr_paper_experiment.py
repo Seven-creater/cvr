@@ -1158,6 +1158,103 @@ def audit_training_splits(
     return summary
 
 
+def prepare_training_subset(
+    *,
+    train_path: str | Path,
+    val_path: str | Path,
+    test_path: str | Path,
+    output_dir: str | Path,
+    eligible_subtypes: Iterable[str] = ("sound_event", "music"),
+    expected_count: int | None = None,
+    expected_test_sha256: str | None = None,
+    require_existing_media: bool = False,
+) -> dict[str, Any]:
+    """Freeze a source-disjoint non-speech training subset without model-score selection."""
+    train_file, val_file, test_file = Path(train_path), Path(val_path), Path(test_path)
+    subtype_set = {_canonical_subtype_name(value) for value in eligible_subtypes}
+    subtype_set.discard("unknown")
+    if not subtype_set:
+        raise ValueError("at least one eligible subtype is required")
+    train_rows = _read_jsonl(train_file)
+    selected: list[dict[str, Any]] = []
+    rejected_reasons: Counter[str] = Counter()
+    for row in train_rows:
+        subtype = _canonical_subtype(row)
+        if subtype not in subtype_set:
+            rejected_reasons[f"subtype:{subtype}"] += 1
+            continue
+        if "accepted" in row and not _truthy(row.get("accepted")):
+            rejected_reasons["not_accepted"] += 1
+            continue
+        if _truthy(row.get("fallback")) or _truthy(row.get("fallback_used")):
+            rejected_reasons["fallback"] += 1
+            continue
+        if _truthy(row.get("is_inverse")) or str(row.get("direction") or "forward").strip().lower() == "inverse":
+            rejected_reasons["inverse"] += 1
+            continue
+        selected.append(dict(row))
+    selected.sort(key=lambda row: (_primary_source_id(row), _pair_id(row), _sample_id(row)))
+
+    if expected_count is not None and len(selected) != int(expected_count):
+        raise ValueError(f"training subset count mismatch: expected={expected_count} actual={len(selected)}")
+    missing_identity = [
+        _sample_id(row) or f"row_{index}"
+        for index, row in enumerate(selected)
+        if not _sample_id(row) or not _primary_source_id(row) or not _pair_id(row)
+    ]
+    if missing_identity:
+        raise ValueError(f"training subset has missing sample/source/pair identity: {missing_identity[:5]}")
+
+    test_sha256 = hashlib.sha256(test_file.read_bytes()).hexdigest()
+    if expected_test_sha256 and test_sha256 != str(expected_test_sha256).strip().lower():
+        raise ValueError(f"test SHA256 mismatch: expected={expected_test_sha256} actual={test_sha256}")
+    missing_media: list[dict[str, str]] = []
+    for row in selected + _read_jsonl(val_file) + _read_jsonl(test_file):
+        for role in ("reference_video", "target_video"):
+            path = str(row.get(role) or "").strip()
+            if not path or not Path(path).exists():
+                missing_media.append({"sample_id": _sample_id(row), "role": role, "path": path})
+    if require_existing_media and missing_media:
+        raise ValueError(f"training subset audit found missing media: {missing_media[:5]}")
+
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    subset_path = output_root / "train_non_speech_forward.jsonl"
+    _write_jsonl(subset_path, selected)
+    split_audit = audit_training_splits(
+        train_path=subset_path,
+        val_path=val_file,
+        test_path=test_file,
+        output_dir=output_root / "split_audit",
+    )
+    fallback_count = sum(
+        int(_truthy(row.get("fallback")) or _truthy(row.get("fallback_used"))) for row in selected
+    )
+    summary = {
+        "protocol": "audiocvr_non_speech_training_subset_v1",
+        "input_paths": {"train": str(train_file), "val": str(val_file), "test": str(test_file)},
+        "output_path": str(subset_path),
+        "eligible_subtypes": sorted(subtype_set),
+        "forward_count": len(selected),
+        "unique_source_count": len({_primary_source_id(row) for row in selected}),
+        "unique_pair_count": len({_pair_id(row) for row in selected}),
+        "subtype_distribution": dict(sorted(Counter(_canonical_subtype(row) for row in selected).items())),
+        "dataset_distribution": dict(sorted(Counter(_dataset(row) for row in selected).items())),
+        "fallback_count": fallback_count,
+        "missing_media_count": len(missing_media),
+        "missing_media_examples": missing_media[:20],
+        "rejected_reason_counts": dict(sorted(rejected_reasons.items())),
+        "test_sha256": test_sha256,
+        "selection_uses_model_scores": False,
+        "split_audit_path": str(output_root / "split_audit" / "training_split_audit.json"),
+        "ready_for_inverse_augmentation": bool(split_audit["ready_for_inverse_augmentation"] and not fallback_count and (not require_existing_media or not missing_media)),
+    }
+    _write_json(output_root / "data_audit.json", summary)
+    if not summary["ready_for_inverse_augmentation"]:
+        raise ValueError(f"training subset is not ready for inverse augmentation: {summary}")
+    return summary
+
+
 def _training_split_audit_markdown(summary: dict[str, Any]) -> str:
     lines = [
         "# Audio-CVR Training Split Audit",
@@ -1755,12 +1852,20 @@ def summarize_validation(
     if not observations:
         raise ValueError("no validation eval/summary.json files with matching adapter/train_summary.json were found")
 
-    groups: dict[tuple[int, float, int], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[str, int, int, float, int], list[dict[str, Any]]] = defaultdict(list)
     for row in observations:
-        groups[(row["steps"], row["learning_rate"], row["batch_size"])].append(row)
+        groups[
+            (
+                row["adapter_architecture"],
+                row["adapter_rank"],
+                row["steps"],
+                row["learning_rate"],
+                row["batch_size"],
+            )
+        ].append(row)
 
     rows: list[dict[str, Any]] = []
-    for (steps, learning_rate, batch_size), values in groups.items():
+    for (adapter_architecture, adapter_rank, steps, learning_rate, batch_size), values in groups.items():
         by_seed = {int(value["seed"]): value for value in values}
         if not all(seed in by_seed for seed in required):
             continue
@@ -1769,6 +1874,8 @@ def summarize_validation(
         target_beats = [float(value["target_beats_reference"]) for value in selected]
         rows.append(
             {
+                "adapter_architecture": adapter_architecture,
+                "adapter_rank": adapter_rank,
                 "steps": steps,
                 "learning_rate": learning_rate,
                 "batch_size": batch_size,
@@ -1796,6 +1903,7 @@ def summarize_validation(
             -row["target_beats_reference_mean"],
             row["R@1_std"],
             row["steps"],
+            row["adapter_rank"] if row["adapter_rank"] > 0 else 10**9,
             row["learning_rate"],
             row["batch_size"],
         )
@@ -1816,17 +1924,18 @@ def summarize_validation(
         selected = min(
             one_se_candidates,
             key=lambda row: (
+                row["adapter_rank"] if row["adapter_rank"] > 0 else 10**9,
                 row["steps"],
+                row["learning_rate"],
                 -row["target_beats_reference_mean"],
                 -row["R@1_mean"],
                 row["R@1_std"],
-                row["learning_rate"],
                 row["batch_size"],
             ),
         )
         selection_description = (
-            "one-standard-error rule on mean validation R@1; among eligible configurations choose the fewest steps, "
-            "then higher target_beats_reference"
+            "one-standard-error rule on mean validation R@1; among eligible configurations choose the lower adapter "
+            "rank, then fewer steps, then lower learning rate, then higher target_beats_reference"
         )
     else:
         raise ValueError(f"unsupported validation selection rule: {selection_rule}")
@@ -1840,7 +1949,16 @@ def summarize_validation(
         "configuration_count": len(rows),
         "selected_config": {
             key: selected[key]
-            for key in ("steps", "learning_rate", "batch_size", "R@1_mean", "R@1_std", "target_beats_reference_mean")
+            for key in (
+                "adapter_architecture",
+                "adapter_rank",
+                "steps",
+                "learning_rate",
+                "batch_size",
+                "R@1_mean",
+                "R@1_std",
+                "target_beats_reference_mean",
+            )
         },
         "rows": rows,
     }
@@ -1848,6 +1966,8 @@ def summarize_validation(
     (output_root / "validation_model_selection.md").write_text(_validation_markdown(summary), encoding="utf-8")
     _write_config_tsv(output_root / "top_configs.tsv", rows[: max(1, int(top_n))])
     _write_config_tsv(output_root / "selected_config.tsv", [selected])
+    _write_adapter_config_tsv(output_root / "top_adapter_configs.tsv", rows[: max(1, int(top_n))])
+    _write_adapter_config_tsv(output_root / "selected_adapter_config.tsv", [selected])
     return summary
 
 
@@ -1913,11 +2033,17 @@ def aggregate_final(
                 "R@1",
                 "R@5",
                 "R@10",
+                "MRR",
+                "mean_rank",
+                "median_rank",
                 "target_beats_reference",
                 "target_ref_gap",
                 "base_R@1",
                 "base_R@5",
                 "base_R@10",
+                "base_MRR",
+                "base_mean_rank",
+                "base_median_rank",
                 "base_target_beats_reference",
                 "base_target_ref_gap",
                 "reference_rank_median",
@@ -1968,6 +2094,9 @@ def aggregate_final(
         "primary_mode_subtypes": _subtype_result_summary(
             [runs[(seed, primary_mode)]["summary"] for seed in seeds]
         ),
+        "primary_mode_dataset_groups": _group_result_summary(
+            [runs[(seed, primary_mode)]["summary"] for seed in seeds], "by_dataset_group"
+        ),
         "hard_negative_summary": hard_negative,
         "audit_path": str(output_root / "audit.json"),
     }
@@ -2000,6 +2129,7 @@ def score_fusion(
         _grouped_recall_summary,
         _import_torch,
         _load_embedding_npz,
+        _load_adapter_config,
         _recall_from_scores,
         _reference_rank_summary,
         _target_beats_reference_summary,
@@ -2031,7 +2161,13 @@ def score_fusion(
     torch = _import_torch()
     device_obj = _torch_device(torch, device)
     dim = int(data_a["query"].shape[1])
-    model = _AudioDeltaAdapter(torch, dim).to(device_obj)
+    adapter_config = _load_adapter_config(adapter_root)
+    model = _AudioDeltaAdapter(
+        torch,
+        dim,
+        adapter_architecture=str(adapter_config.get("adapter_architecture", "full_rank")),
+        adapter_rank=int(adapter_config.get("adapter_rank") or 16),
+    ).to(device_obj)
     state = torch.load(adapter_root / "adapter.pt", map_location=device_obj)
     model.load_state_dict(state, strict=False)
     model.eval()
@@ -2075,6 +2211,8 @@ def score_fusion(
         "cache_a": str(cache_a_root),
         "cache_b": str(cache_b_root),
         "adapter_dir": str(adapter_root),
+        "adapter_architecture": model.adapter_architecture,
+        "adapter_rank": model.adapter_rank,
         "output_dir": str(output_root),
         "eval_count": len(records_a),
         "gallery_count": int(adapted_scores.shape[1]),
@@ -2098,6 +2236,9 @@ def score_fusion(
         "base_reference_rank_summary": _reference_rank_summary(base_scores, base_reference_scores),
         "by_audio_delta_type": _grouped_recall_summary(
             base_scores, adapted_scores, records_a, "audio_delta_type", (1, 5, 10), positive_index=positive_a
+        ),
+        "by_dataset_group": _grouped_recall_summary(
+            base_scores, adapted_scores, records_a, "dataset_group", (1, 5, 10), positive_index=positive_a
         ),
         "base_gallery_negative_recall_by_type": _gallery_negative_recall_by_type(
             base_scores, gallery_items, records_a, positive_index=positive_a
@@ -2204,6 +2345,16 @@ def build_parser() -> argparse.ArgumentParser:
     split_audit.add_argument("--val-path", required=True)
     split_audit.add_argument("--test-path", required=True)
     split_audit.add_argument("--output-dir", required=True)
+
+    training_subset = subparsers.add_parser("prepare-training-subset")
+    training_subset.add_argument("--train-path", required=True)
+    training_subset.add_argument("--val-path", required=True)
+    training_subset.add_argument("--test-path", required=True)
+    training_subset.add_argument("--output-dir", required=True)
+    training_subset.add_argument("--eligible-subtypes", default="sound_event,music")
+    training_subset.add_argument("--expected-count", type=int)
+    training_subset.add_argument("--expected-test-sha256")
+    training_subset.add_argument("--require-existing-media", action="store_true")
 
     freeze = subparsers.add_parser("finalize-benchmark")
     freeze.add_argument("--candidate-path", required=True)
@@ -2346,6 +2497,17 @@ def main() -> None:
             test_path=args.test_path,
             output_dir=args.output_dir,
         )
+    elif args.command == "prepare-training-subset":
+        result = prepare_training_subset(
+            train_path=args.train_path,
+            val_path=args.val_path,
+            test_path=args.test_path,
+            output_dir=args.output_dir,
+            eligible_subtypes=_parse_strings(args.eligible_subtypes),
+            expected_count=args.expected_count,
+            expected_test_sha256=args.expected_test_sha256,
+            require_existing_media=args.require_existing_media,
+        )
     elif args.command == "finalize-benchmark":
         if args.review_policy == "omni_consensus":
             if not args.combined_pool_path or not args.pass2_review_path:
@@ -2427,6 +2589,8 @@ def _validation_observation(
 ) -> dict[str, Any]:
     metrics = _eval_metrics(eval_summary)
     return {
+        "adapter_architecture": str(train_summary.get("adapter_architecture", "full_rank")),
+        "adapter_rank": int(train_summary.get("adapter_rank") or 0),
         "steps": int(train_summary["steps"]),
         "learning_rate": float(train_summary["learning_rate"]),
         "batch_size": int(train_summary["batch_size"]),
@@ -2450,9 +2614,15 @@ def _eval_metrics(summary: dict[str, Any]) -> dict[str, float]:
         "R@1": float(adapter.get("R@1", 0.0)),
         "R@5": float(adapter.get("R@5", 0.0)),
         "R@10": float(adapter.get("R@10", 0.0)),
+        "MRR": float(adapter.get("MRR", 0.0)),
+        "mean_rank": float(adapter.get("mean_rank", 0.0)),
+        "median_rank": float(adapter.get("median_rank", 0.0)),
         "base_R@1": float(base.get("R@1", 0.0)),
         "base_R@5": float(base.get("R@5", 0.0)),
         "base_R@10": float(base.get("R@10", 0.0)),
+        "base_MRR": float(base.get("MRR", 0.0)),
+        "base_mean_rank": float(base.get("mean_rank", 0.0)),
+        "base_median_rank": float(base.get("median_rank", 0.0)),
         "target_beats_reference": float(beats.get("target_beats_reference_rate", 0.0)),
         "target_ref_gap": float(beats.get("target_minus_reference_mean", 0.0)),
         "base_target_beats_reference": float(base_beats.get("target_beats_reference_rate", 0.0)),
@@ -2676,10 +2846,14 @@ def _hard_negative_summary(summaries: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _subtype_result_summary(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    return _group_result_summary(summaries, "by_audio_delta_type")
+
+
+def _group_result_summary(summaries: list[dict[str, Any]], field_name: str) -> dict[str, Any]:
     buckets: dict[str, dict[str, Any]] = {}
-    subtype_names = sorted({name for summary in summaries for name in summary.get("by_audio_delta_type", {})})
-    for name in subtype_names:
-        values = [summary.get("by_audio_delta_type", {}).get(name) for summary in summaries]
+    group_names = sorted({name for summary in summaries for name in summary.get(field_name, {})})
+    for name in group_names:
+        values = [summary.get(field_name, {}).get(name) for summary in summaries]
         values = [value for value in values if isinstance(value, dict)]
         if not values:
             continue
@@ -3073,19 +3247,23 @@ def _validation_markdown(summary: dict[str, Any]) -> str:
         "# Validation-only Model Selection",
         "",
         f"Selection rule: {summary['selection_rule']}",
-        f"Selected: steps={selected['steps']}, lr={selected['learning_rate']:.6g}, batch={selected['batch_size']}.",
+        f"Selected: architecture={selected['adapter_architecture']}, rank={selected['adapter_rank'] or 'full'}, "
+        f"steps={selected['steps']}, lr={selected['learning_rate']:.6g}, batch={selected['batch_size']}.",
         "",
-        "| Rank | Selected | Steps | LR | Batch | Seeds | R@1 mean | R@1 std | R@1 SE | Beats-ref mean |",
-        "|---:|:---:|---:|---:|---:|---|---:|---:|---:|---:|",
+        "| Rank | Selected | Architecture | Adapter rank | Steps | LR | Batch | Seeds | R@1 mean | R@1 std | R@1 SE | Beats-ref mean |",
+        "|---:|:---:|---|---:|---:|---:|---:|---|---:|---:|---:|---:|",
     ]
     for row in summary["rows"]:
         is_selected = (
-            row["steps"] == selected["steps"]
+            row["adapter_architecture"] == selected["adapter_architecture"]
+            and row["adapter_rank"] == selected["adapter_rank"]
+            and row["steps"] == selected["steps"]
             and row["learning_rate"] == selected["learning_rate"]
             and row["batch_size"] == selected["batch_size"]
         )
         lines.append(
-            f"| {row['validation_rank']} | {'yes' if is_selected else ''} | {row['steps']} | "
+            f"| {row['validation_rank']} | {'yes' if is_selected else ''} | {row['adapter_architecture']} | "
+            f"{row['adapter_rank'] or 'full'} | {row['steps']} | "
             f"{row['learning_rate']:.6g} | {row['batch_size']} | "
             f"{','.join(str(seed) for seed in row['seeds'])} | {row['R@1_mean']:.4f} | {row['R@1_std']:.4f} | "
             f"{row['R@1_se']:.4f} | {row['target_beats_reference_mean']:.4f} |"
@@ -3097,17 +3275,20 @@ def _final_comparison_markdown(summary: dict[str, Any]) -> str:
     lines = [
         "# Audio-CVR Final Test Results",
         "",
-        "| Mode | Model | R@1 | R@5 | R@10 | Target beats reference | Target-ref gap |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| Mode | Model | R@1 | R@5 | R@10 | MRR | Mean rank | Median rank | Target beats reference | Target-ref gap |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for mode, metrics in sorted(summary["mode_summary"].items()):
         lines.append(
             f"| {mode} | Adapter | {_mean_std(metrics['R@1'])} | {_mean_std(metrics['R@5'])} | {_mean_std(metrics['R@10'])} | "
+            f"{_mean_std(metrics['MRR'])} | {_mean_std(metrics['mean_rank'])} | {_mean_std(metrics['median_rank'])} | "
             f"{_mean_std(metrics['target_beats_reference'])} | {_mean_std(metrics['target_ref_gap'])} |"
         )
         lines.append(
             f"| {mode} | Base E5 | {_mean_std(metrics['base_R@1'])} | {_mean_std(metrics['base_R@5'])} | "
-            f"{_mean_std(metrics['base_R@10'])} | {_mean_std(metrics['base_target_beats_reference'])} | "
+            f"{_mean_std(metrics['base_R@10'])} | {_mean_std(metrics['base_MRR'])} | "
+            f"{_mean_std(metrics['base_mean_rank'])} | {_mean_std(metrics['base_median_rank'])} | "
+            f"{_mean_std(metrics['base_target_beats_reference'])} | "
             f"{_mean_std(metrics['base_target_ref_gap'])} |"
         )
     return "\n".join(lines) + "\n"
@@ -3154,6 +3335,17 @@ def _paired_comparisons_markdown(summary: dict[str, Any]) -> str:
 def _write_config_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text(
         "".join(f"{row['steps']}\t{row['learning_rate']:.12g}\t{row['batch_size']}\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _write_adapter_config_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.write_text(
+        "".join(
+            f"{row['adapter_architecture']}\t{row['adapter_rank']}\t{row['steps']}\t"
+            f"{row['learning_rate']:.12g}\t{row['batch_size']}\n"
+            for row in rows
+        ),
         encoding="utf-8",
     )
 

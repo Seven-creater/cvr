@@ -388,6 +388,27 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("--lambda-ref", script)
         self.assertNotIn("--lambda-delta", script)
 
+    def test_audio_cvr_fewshot_bidir_launcher_freezes_test_and_cleans_exact_omni_group(self) -> None:
+        script = Path("scripts/run_audio_cvr_fewshot_bidir_final.sh").read_text(encoding="utf-8")
+
+        self.assertIn("prepare-training-subset", script)
+        self.assertIn("f4b22e25e1f1262d488ff5474fdae9511301919611b42b9cc89f55c3aa633fd6", script)
+        self.assertIn("augment-b-inverse", script)
+        self.assertIn('kill -TERM -- "-$OMNI_PGID"', script)
+        self.assertIn("refusing to kill launcher process group", script)
+        self.assertIn("low_rank_residual", script)
+        self.assertIn("16,32", script)
+        self.assertIn("50,100,200,400", script)
+        self.assertIn("one_se_earliest", script)
+        self.assertIn("13,23,42,71,101", script)
+        self.assertIn("--exclude-gallery-kind reference_negative", script)
+        self.assertIn("reference_exclusion_audit.json", script)
+        self.assertIn("--bootstrap-samples", script)
+        self.assertIn("score-fusion", script)
+        self.assertNotIn("pkill", script)
+        self.assertNotIn("--lambda-ref", script)
+        self.assertNotIn("--lambda-delta", script)
+
     def test_audio_cvr_validation_extension_is_validation_only(self) -> None:
         script = Path("scripts/run_audio_cvr_validation_extension.sh").read_text(encoding="utf-8")
 

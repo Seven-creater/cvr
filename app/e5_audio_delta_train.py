@@ -39,6 +39,7 @@ EVAL_GALLERY_PROTOCOLS = (
 )
 QUERY_INPUT_MODES = ("composed", "text_only", "video_only", "audio_only", "audio_text")
 DOCUMENT_INPUT_MODES = ("video", "audio")
+ADAPTER_ARCHITECTURES = ("full_rank", "low_rank_residual")
 DEFAULT_LOSS_OPTIONS = {
     "training_profile": "v1",
     "contrastive_objective": "ce",
@@ -334,6 +335,8 @@ def train_adapter(
     learning_rate: float = 1e-3,
     seed: int = 13,
     device: str = "cuda",
+    adapter_architecture: str = "full_rank",
+    adapter_rank: int = 16,
     training_profile: str = "v1",
     contrastive_objective: str | None = None,
     dcl_debias_prob: float = 0.1,
@@ -394,7 +397,20 @@ def train_adapter(
     dim = int(data["query"].shape[1])
     device_obj = _torch_device(torch, device)
     torch.manual_seed(seed)
-    model = _AudioDeltaAdapter(torch, dim, modality_temperature_init=modality_temperature_init).to(device_obj)
+    adapter_architecture = _normalize_adapter_architecture(adapter_architecture)
+    adapter_rank = (
+        _normalize_adapter_rank(adapter_rank, dim=dim)
+        if adapter_architecture == "low_rank_residual"
+        else int(adapter_rank or 16)
+    )
+    model = _AudioDeltaAdapter(
+        torch,
+        dim,
+        modality_temperature_init=modality_temperature_init,
+        adapter_architecture=adapter_architecture,
+        adapter_rank=adapter_rank,
+    ).to(device_obj)
+    trainable_parameter_count = sum(int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     tensors = {key: torch.as_tensor(value, dtype=torch.float32, device=device_obj) for key, value in data.items()}
     count = int(tensors["query"].shape[0])
@@ -512,6 +528,9 @@ def train_adapter(
     torch.save(model.state_dict(), adapter_path)
     config = {
         "dim": dim,
+        "adapter_architecture": adapter_architecture,
+        "adapter_rank": adapter_rank if adapter_architecture == "low_rank_residual" else None,
+        "trainable_parameter_count": trainable_parameter_count,
         "steps": steps,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
@@ -544,6 +563,7 @@ def eval_adapter(
     topk: tuple[int, ...] = (1, 5, 10),
     save_topk: int = 0,
     device: str = "cuda",
+    exclude_gallery_kinds: tuple[str, ...] = (),
     disable_local_segments: bool = False,
     disable_global_local_mix: bool = False,
     local_mix_weight: float = 0.5,
@@ -562,10 +582,15 @@ def eval_adapter(
     topk = _normalize_topk(topk)
     gallery = data["gallery"] if "gallery" in data else data["target"]
     gallery_items = _eval_gallery_items_for_output(cache_root, records, gallery.shape[0])
-    base_scores = _score_matrix_np(data["query"], gallery)
+    excluded_gallery_kinds = tuple(sorted({str(kind).strip() for kind in exclude_gallery_kinds if str(kind).strip()}))
+    excluded_gallery_columns = _excluded_gallery_columns(gallery_items, excluded_gallery_kinds)
+    if any(int(index) in excluded_gallery_columns for index in positive_gallery_index):
+        raise ValueError("excluded gallery kinds would remove a positive target")
+    raw_base_scores = _score_matrix_np(data["query"], gallery)
+    base_scores = _mask_gallery_scores(raw_base_scores, excluded_gallery_columns)
     base = _recall_from_scores(base_scores, topk=topk, positive_index=positive_gallery_index)
     base_reference_scores = (
-        _index_scores(base_scores, reference_gallery_index)
+        _index_scores(raw_base_scores, reference_gallery_index)
         if reference_gallery_index is not None
         else np.diag(_score_matrix_np(data["query"], data["reference"]))
     )
@@ -574,11 +599,25 @@ def eval_adapter(
     gallery_segments = None
     if has_local:
         gallery_segments = data["gallery_segments"] if "gallery_segments" in data else data["target_segments"]
-    base_local_scores = _local_score_matrix_np(data["query"], gallery_segments) if has_local else None
+    raw_base_local_scores = _local_score_matrix_np(data["query"], gallery_segments) if has_local else None
+    base_local_scores = _mask_gallery_scores(raw_base_local_scores, excluded_gallery_columns)
     base_mix_scores = _mix_scores(base_scores, base_local_scores, local_mix_weight, disable_global_local_mix)
+    raw_base_mix_scores = _mix_scores(raw_base_scores, raw_base_local_scores, local_mix_weight, disable_global_local_mix)
     dim = int(data["query"].shape[1])
     device_obj = _torch_device(torch, device)
-    model = _AudioDeltaAdapter(torch, dim).to(device_obj)
+    adapter_config = _load_adapter_config(adapter_root)
+    adapter_architecture = _normalize_adapter_architecture(adapter_config.get("adapter_architecture", "full_rank"))
+    adapter_rank = (
+        _normalize_adapter_rank(adapter_config.get("adapter_rank", 16), dim=dim)
+        if adapter_architecture == "low_rank_residual"
+        else int(adapter_config.get("adapter_rank") or 16)
+    )
+    model = _AudioDeltaAdapter(
+        torch,
+        dim,
+        adapter_architecture=adapter_architecture,
+        adapter_rank=adapter_rank,
+    ).to(device_obj)
     state = torch.load(adapter_root / "adapter.pt", map_location=device_obj)
     model.load_state_dict(state, strict=False)
     model.eval()
@@ -593,16 +632,19 @@ def eval_adapter(
         adapted_paired_target = model.doc(paired_target)
         adapted_reference = model.doc(reference)
         adapted_negative = model.doc(negative)
-        adapted_scores = (adapted_query @ adapted_target.T).detach().cpu().numpy()
+        raw_adapted_scores = (adapted_query @ adapted_target.T).detach().cpu().numpy()
+        adapted_scores = _mask_gallery_scores(raw_adapted_scores, excluded_gallery_columns)
         adapted_reference_scores = torch.sum(adapted_query * adapted_reference, dim=-1).detach().cpu().numpy()
         adapted_negative_scores = torch.einsum("bd,bnd->bn", adapted_query, adapted_negative).detach().cpu().numpy()
-        adapted_local_scores = None
+        raw_adapted_local_scores = None
         if has_local:
             target_segments = model.doc(torch.as_tensor(gallery_segments, dtype=torch.float32, device=device_obj))
-            adapted_local_scores = _local_score_matrix_torch(torch, adapted_query, target_segments).detach().cpu().numpy()
+            raw_adapted_local_scores = _local_score_matrix_torch(torch, adapted_query, target_segments).detach().cpu().numpy()
+        adapted_local_scores = _mask_gallery_scores(raw_adapted_local_scores, excluded_gallery_columns)
         adapted_mix_scores = _mix_scores(adapted_scores, adapted_local_scores, local_mix_weight, disable_global_local_mix)
+        raw_adapted_mix_scores = _mix_scores(raw_adapted_scores, raw_adapted_local_scores, local_mix_weight, disable_global_local_mix)
         adapter_geometry = _adapter_geometry_diagnostics(torch, model, query, paired_target, reference, adapted_query, adapted_paired_target, adapted_reference)
-    adapted_reference_mix_scores = _index_scores(adapted_mix_scores, reference_gallery_index) if reference_gallery_index is not None else adapted_reference_scores
+    adapted_reference_mix_scores = _index_scores(raw_adapted_mix_scores, reference_gallery_index) if reference_gallery_index is not None else adapted_reference_scores
     adapted = _recall_from_scores(adapted_scores, topk=topk, positive_index=positive_gallery_index)
     rows = [
         {"method": "base_e5_global", **base},
@@ -623,6 +665,12 @@ def eval_adapter(
         "output_dir": str(output_root),
         "eval_count": len(records),
         "gallery_count": int(gallery.shape[0]),
+        "effective_gallery_count": int(gallery.shape[0]) - len(excluded_gallery_columns),
+        "excluded_gallery_kinds": list(excluded_gallery_kinds),
+        "excluded_gallery_count": len(excluded_gallery_columns),
+        "reference_in_gallery": bool(reference_gallery_index is not None and "reference_negative" not in excluded_gallery_kinds),
+        "adapter_architecture": adapter_architecture,
+        "adapter_rank": adapter_rank if adapter_architecture == "low_rank_residual" else None,
         "topk": list(topk),
         "has_local_segments": has_local,
         "local_mix_weight": local_mix_weight,
@@ -630,9 +678,17 @@ def eval_adapter(
         "rows": rows,
         "by_split_tier": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "split_tier", topk, positive_index=positive_gallery_index),
         "by_audio_delta_type": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "audio_delta_type", topk, positive_index=positive_gallery_index),
+        "by_dataset_group": _grouped_recall_summary(
+            base_mix_scores,
+            adapted_mix_scores,
+            records,
+            "dataset_group",
+            topk,
+            positive_index=positive_gallery_index,
+        ),
         "by_shortcut_label": _grouped_recall_summary(base_mix_scores, adapted_mix_scores, records, "shortcut_label", topk, positive_index=positive_gallery_index),
-        "reference_rank_summary": _reference_rank_summary(adapted_mix_scores, adapted_reference_mix_scores),
-        "base_reference_rank_summary": _reference_rank_summary(base_mix_scores, base_reference_scores),
+        "reference_rank_summary": _reference_rank_summary(raw_adapted_mix_scores, adapted_reference_mix_scores),
+        "base_reference_rank_summary": _reference_rank_summary(raw_base_mix_scores, base_reference_scores),
         "target_beats_reference": {
             "base_e5": _target_beats_reference_summary(base_mix_scores, base_reference_scores, positive_index=positive_gallery_index),
             "audio_delta_adapter": _target_beats_reference_summary(adapted_mix_scores, adapted_reference_mix_scores, positive_index=positive_gallery_index),
@@ -641,8 +697,8 @@ def eval_adapter(
         "base_delta_score_distribution": _delta_score_distribution(base_mix_scores, base_reference_scores, positive_index=positive_gallery_index),
         "base_hard_negative_recall_by_type": _hard_negative_recall_by_type(base_mix_scores, base_negative_scores, records, positive_index=positive_gallery_index),
         "hard_negative_recall_by_type": _hard_negative_recall_by_type(adapted_scores, adapted_negative_scores, records, positive_index=positive_gallery_index),
-        "base_gallery_negative_recall_by_type": _gallery_negative_recall_by_type(base_mix_scores, gallery_items, records, positive_index=positive_gallery_index),
-        "gallery_negative_recall_by_type": _gallery_negative_recall_by_type(adapted_mix_scores, gallery_items, records, positive_index=positive_gallery_index),
+        "base_gallery_negative_recall_by_type": _gallery_negative_recall_by_type(raw_base_mix_scores, gallery_items, records, positive_index=positive_gallery_index),
+        "gallery_negative_recall_by_type": _gallery_negative_recall_by_type(raw_adapted_mix_scores, gallery_items, records, positive_index=positive_gallery_index),
         "diagnostics_path": str(output_root / "diagnostics.json"),
         "score_diagnostics_path": str(output_root / "score_diagnostics.json"),
         "adapter_geometry_path": str(output_root / "adapter_geometry.json"),
@@ -651,8 +707,8 @@ def eval_adapter(
         comparison["per_query_topk_path"] = str(output_root / "per_query_topk.jsonl")
         comparison["per_query_scores_path"] = str(output_root / "per_query_scores.jsonl")
     score_diagnostics = _score_diagnostics(
-        base_scores=base_mix_scores,
-        adapted_scores=adapted_mix_scores,
+        base_scores=raw_base_mix_scores,
+        adapted_scores=raw_adapted_mix_scores,
         positive_index=positive_gallery_index,
         reference_index=reference_gallery_index,
     )
@@ -683,6 +739,8 @@ def eval_adapter(
             adapted_scores=adapted_mix_scores,
             positive_index=positive_gallery_index,
             reference_index=reference_gallery_index,
+            base_reference_scores=base_reference_scores,
+            adapted_reference_scores=adapted_reference_mix_scores,
             save_topk=int(save_topk),
         )
     (output_root / "comparison.md").write_text(_comparison_markdown(comparison), encoding="utf-8")
@@ -1173,6 +1231,8 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--learning-rate", type=float, default=1e-3)
     train.add_argument("--seed", type=int, default=13)
     train.add_argument("--device", default="cuda")
+    train.add_argument("--adapter-architecture", choices=ADAPTER_ARCHITECTURES, default="full_rank")
+    train.add_argument("--adapter-rank", type=int, default=16)
     train.add_argument("--training-profile", choices=("v1", "v2_research", "e5_omni_recipe"), default="v1")
     train.add_argument("--contrastive-objective", choices=("ce", "masked_dcl"))
     train.add_argument("--dcl-debias-prob", type=float, default=0.1)
@@ -1236,6 +1296,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--topk", default="1,5,10")
     evaluate.add_argument("--save-topk", type=int, default=0)
     evaluate.add_argument("--device", default="cuda")
+    evaluate.add_argument("--exclude-gallery-kind", action="append", default=[])
     evaluate.add_argument("--disable-local-segments", action="store_true")
     evaluate.add_argument("--disable-global-local-mix", action="store_true")
     evaluate.add_argument("--local-mix-weight", type=float, default=0.5)
@@ -1343,6 +1404,8 @@ def main() -> None:
             learning_rate=args.learning_rate,
             seed=args.seed,
             device=args.device,
+            adapter_architecture=args.adapter_architecture,
+            adapter_rank=args.adapter_rank,
             training_profile=args.training_profile,
             contrastive_objective=args.contrastive_objective,
             dcl_debias_prob=args.dcl_debias_prob,
@@ -1400,6 +1463,7 @@ def main() -> None:
             topk=tuple(int(part.strip()) for part in str(args.topk).split(",") if part.strip()),
             save_topk=args.save_topk,
             device=args.device,
+            exclude_gallery_kinds=tuple(args.exclude_gallery_kind),
             disable_local_segments=args.disable_local_segments,
             disable_global_local_mix=args.disable_global_local_mix,
             local_mix_weight=args.local_mix_weight,
@@ -2498,7 +2562,12 @@ def _grouped_recall_summary(
 ) -> dict[str, Any]:
     groups: dict[str, list[int]] = defaultdict(list)
     for index, record in enumerate(records):
-        groups[str(getattr(record, field_name, "unknown") or "unknown")].append(index)
+        if field_name == "dataset_group":
+            dataset = _dataset_from_payload_or_path(record.source_payload, record.target_video)
+            group = "avatar" if dataset == "avatar" else "non_avatar"
+        else:
+            group = str(getattr(record, field_name, "unknown") or "unknown")
+        groups[group].append(index)
     result: dict[str, Any] = {}
     for group, indices in sorted(groups.items()):
         idx = np.asarray(indices, dtype=np.int64)
@@ -2581,6 +2650,21 @@ def _index_scores(scores: np.ndarray, index: np.ndarray | None) -> np.ndarray:
     if index.shape[0] != scores.shape[0]:
         raise ValueError("index size must match query count")
     return np.asarray([scores[row, int(index[row])] for row in range(scores.shape[0])], dtype=np.float32)
+
+
+def _excluded_gallery_columns(gallery_items: list[EvalGalleryItem], excluded_kinds: tuple[str, ...]) -> set[int]:
+    excluded = set(excluded_kinds)
+    if not excluded:
+        return set()
+    return {index for index, item in enumerate(gallery_items) if str(item.kind or "").strip() in excluded}
+
+
+def _mask_gallery_scores(scores: np.ndarray | None, excluded_columns: set[int]) -> np.ndarray | None:
+    if scores is None or not excluded_columns:
+        return scores
+    masked = np.asarray(scores, dtype=np.float32).copy()
+    masked[:, sorted(excluded_columns)] = -np.inf
+    return masked
 
 
 def _target_beats_reference_summary(scores: np.ndarray, reference_scores: np.ndarray, *, positive_index: np.ndarray) -> dict[str, Any]:
@@ -2680,6 +2764,8 @@ def _write_eval_topk_outputs(
     adapted_scores: np.ndarray,
     positive_index: np.ndarray,
     reference_index: np.ndarray | None,
+    base_reference_scores: np.ndarray | None = None,
+    adapted_reference_scores: np.ndarray | None = None,
     save_topk: int,
 ) -> None:
     topk = max(1, int(save_topk))
@@ -2711,8 +2797,16 @@ def _write_eval_topk_outputs(
                 ],
             }
         )
-        base_reference_score = float(base_scores[row, reference]) if reference is not None else None
-        adapted_reference_score = float(adapted_scores[row, reference]) if reference is not None else None
+        base_reference_score = (
+            float(base_reference_scores[row])
+            if base_reference_scores is not None
+            else float(base_scores[row, reference]) if reference is not None else None
+        )
+        adapted_reference_score = (
+            float(adapted_reference_scores[row])
+            if adapted_reference_scores is not None
+            else float(adapted_scores[row, reference]) if reference is not None else None
+        )
         score_rows.append(
             {
                 "query_index": row,
@@ -2788,17 +2882,17 @@ def _dataset_from_payload_or_path(payload: dict[str, Any], video: str) -> str:
 
 def _adapter_geometry_diagnostics(torch: Any, model: Any, query: Any, target: Any, reference: Any, adapted_query: Any, adapted_target: Any, adapted_reference: Any) -> dict[str, Any]:
     with torch.no_grad():
-        dim = int(query.shape[-1])
-        identity = torch.eye(dim, dtype=model.query_proj.weight.dtype, device=model.query_proj.weight.device)
         query_norms = torch.linalg.norm(query, dim=-1).detach().cpu().numpy()
         target_norms = torch.linalg.norm(target, dim=-1).detach().cpu().numpy()
         adapted_query_norms = torch.linalg.norm(adapted_query, dim=-1).detach().cpu().numpy()
         adapted_target_norms = torch.linalg.norm(adapted_target, dim=-1).detach().cpu().numpy()
         adapted_reference_norms = torch.linalg.norm(adapted_reference, dim=-1).detach().cpu().numpy()
         return {
-            "query_proj_minus_identity_norm": round(float(torch.linalg.norm(model.query_proj.weight - identity).detach().cpu()), 6),
-            "doc_proj_minus_identity_norm": round(float(torch.linalg.norm(model.doc_proj.weight - identity).detach().cpu()), 6),
-            "edit_proj_minus_identity_norm": round(float(torch.linalg.norm(model.edit_proj.weight - identity).detach().cpu()), 6),
+            "adapter_architecture": str(getattr(model, "adapter_architecture", "full_rank")),
+            "adapter_rank": getattr(model, "adapter_rank", None),
+            "query_proj_minus_identity_norm": _projection_delta_norm(torch, model.query_proj),
+            "doc_proj_minus_identity_norm": _projection_delta_norm(torch, model.doc_proj),
+            "edit_proj_minus_identity_norm": _projection_delta_norm(torch, model.edit_proj),
             "base_query_norm": _score_distribution(query_norms),
             "base_target_norm": _score_distribution(target_norms),
             "adapted_query_norm": _score_distribution(adapted_query_norms),
@@ -2807,6 +2901,17 @@ def _adapter_geometry_diagnostics(torch: Any, model: Any, query: Any, target: An
             "adapted_query_target_cosine": _score_distribution((adapted_query * adapted_target[: adapted_query.shape[0]]).sum(dim=-1).detach().cpu().numpy()),
             "adapted_query_reference_cosine": _score_distribution((adapted_query * adapted_reference).sum(dim=-1).detach().cpu().numpy()),
         }
+
+
+def _projection_delta_norm(torch: Any, projection: Any) -> float:
+    if hasattr(projection, "down") and hasattr(projection, "up"):
+        left = projection.up.weight.T @ projection.up.weight
+        right = projection.down.weight @ projection.down.weight.T
+        squared = torch.trace(left @ right).clamp_min(0.0)
+        return round(float(torch.sqrt(squared).detach().cpu()), 6)
+    weight = projection.weight
+    identity = torch.eye(weight.shape[0], dtype=weight.dtype, device=weight.device)
+    return round(float(torch.linalg.norm(weight - identity).detach().cpu()), 6)
 
 
 def _rank_list_summary(ranks: list[int]) -> dict[str, Any]:
@@ -2823,7 +2928,32 @@ def _rank_list_summary(ranks: list[int]) -> dict[str, Any]:
     }
 
 
-def _AudioDeltaAdapter(torch: Any, dim: int, *, modality_temperature_init: float = 0.05) -> Any:
+def _AudioDeltaAdapter(
+    torch: Any,
+    dim: int,
+    *,
+    modality_temperature_init: float = 0.05,
+    adapter_architecture: str = "full_rank",
+    adapter_rank: int = 16,
+) -> Any:
+    adapter_architecture = _normalize_adapter_architecture(adapter_architecture)
+    adapter_rank = (
+        _normalize_adapter_rank(adapter_rank, dim=dim)
+        if adapter_architecture == "low_rank_residual"
+        else int(adapter_rank or 16)
+    )
+
+    class LowRankResidualProjection(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.down = torch.nn.Linear(dim, adapter_rank, bias=False)
+            self.up = torch.nn.Linear(adapter_rank, dim, bias=False)
+            torch.nn.init.kaiming_uniform_(self.down.weight, a=np.sqrt(5.0))
+            torch.nn.init.zeros_(self.up.weight)
+
+        def forward(self, value: Any) -> Any:
+            return value + self.up(self.down(value))
+
     class ModalityAwareTemperature(torch.nn.Module):
         def __init__(self, init_tau: float = 0.05) -> None:
             super().__init__()
@@ -2846,13 +2976,20 @@ def _AudioDeltaAdapter(torch: Any, dim: int, *, modality_temperature_init: float
     class Adapter(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.query_proj = torch.nn.Linear(dim, dim, bias=False)
-            self.doc_proj = torch.nn.Linear(dim, dim, bias=False)
-            self.edit_proj = torch.nn.Linear(dim, dim, bias=False)
+            self.adapter_architecture = adapter_architecture
+            self.adapter_rank = adapter_rank if adapter_architecture == "low_rank_residual" else None
+            if adapter_architecture == "low_rank_residual":
+                self.query_proj = LowRankResidualProjection()
+                self.doc_proj = LowRankResidualProjection()
+                self.edit_proj = LowRankResidualProjection()
+            else:
+                self.query_proj = torch.nn.Linear(dim, dim, bias=False)
+                self.doc_proj = torch.nn.Linear(dim, dim, bias=False)
+                self.edit_proj = torch.nn.Linear(dim, dim, bias=False)
+                torch.nn.init.eye_(self.query_proj.weight)
+                torch.nn.init.eye_(self.doc_proj.weight)
+                torch.nn.init.eye_(self.edit_proj.weight)
             self.modality_temperature = ModalityAwareTemperature(modality_temperature_init)
-            torch.nn.init.eye_(self.query_proj.weight)
-            torch.nn.init.eye_(self.doc_proj.weight)
-            torch.nn.init.eye_(self.edit_proj.weight)
 
         def query(self, value: Any) -> Any:
             return torch.nn.functional.normalize(self.query_proj(value), dim=-1)
@@ -2864,6 +3001,32 @@ def _AudioDeltaAdapter(torch: Any, dim: int, *, modality_temperature_init: float
             return torch.nn.functional.normalize(self.edit_proj(value), dim=-1)
 
     return Adapter()
+
+
+def _normalize_adapter_architecture(value: Any) -> str:
+    architecture = str(value or "full_rank").strip().lower()
+    if architecture not in ADAPTER_ARCHITECTURES:
+        raise ValueError(f"unsupported adapter architecture: {value}")
+    return architecture
+
+
+def _normalize_adapter_rank(value: Any, *, dim: int) -> int:
+    rank = int(value or 16)
+    if rank <= 0:
+        raise ValueError("adapter rank must be positive")
+    if rank > int(dim):
+        raise ValueError(f"adapter rank {rank} exceeds embedding dimension {dim}")
+    return rank
+
+
+def _load_adapter_config(adapter_root: Path) -> dict[str, Any]:
+    path = adapter_root / "adapter_config.json"
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"adapter config must be a JSON object: {path}")
+    return payload
 
 
 def _record_from_payload(payload: dict[str, Any], *, line_number: int) -> AudioDeltaRecord:
@@ -3633,12 +3796,12 @@ def _recall_from_scores(scores: np.ndarray, *, topk: tuple[int, ...], positive_i
         raise ValueError("positive_index size must match query count")
     order = np.argsort(-scores, axis=1, kind="stable")
     result: dict[str, float] = {}
+    ranks = np.asarray([_rank_of_index(order[index], int(positive_index[index])) for index in range(total)], dtype=np.float32)
     for k in topk:
-        hits = 0
-        for index in range(total):
-            if int(positive_index[index]) in order[index, : min(k, scores.shape[1])]:
-                hits += 1
-        result[f"R@{k}"] = round(hits / max(1, total), 4)
+        result[f"R@{k}"] = round(float((ranks <= min(k, scores.shape[1])).mean()), 4) if total else 0.0
+    result["MRR"] = round(float((1.0 / ranks).mean()), 4) if total else 0.0
+    result["mean_rank"] = round(float(ranks.mean()), 4) if total else 0.0
+    result["median_rank"] = round(float(np.median(ranks)), 4) if total else 0.0
     return result
 
 
@@ -3648,12 +3811,20 @@ def _comparison_markdown(comparison: dict[str, Any]) -> str:
         "",
         f"- eval_count: `{comparison['eval_count']}`",
         f"- gallery_count: `{comparison.get('gallery_count', comparison['eval_count'])}`",
+        f"- effective_gallery_count: `{comparison.get('effective_gallery_count', comparison.get('gallery_count', comparison['eval_count']))}`",
+        f"- excluded_gallery_kinds: `{','.join(comparison.get('excluded_gallery_kinds') or []) or 'none'}`",
+        f"- reference_in_gallery: `{str(bool(comparison.get('reference_in_gallery', comparison.get('has_reference_gallery_index', False)))).lower()}`",
+        f"- adapter_architecture: `{comparison.get('adapter_architecture', 'full_rank')}`",
+        f"- adapter_rank: `{comparison.get('adapter_rank') if comparison.get('adapter_rank') is not None else 'n/a'}`",
         "",
-        "| Method | R@1 | R@5 | R@10 |",
-        "|---|---:|---:|---:|",
+        "| Method | R@1 | R@5 | R@10 | MRR | Mean rank | Median rank |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for row in comparison["rows"]:
-        lines.append(f"| {row['method']} | {_fmt(row.get('R@1'))} | {_fmt(row.get('R@5'))} | {_fmt(row.get('R@10'))} |")
+        lines.append(
+            f"| {row['method']} | {_fmt(row.get('R@1'))} | {_fmt(row.get('R@5'))} | {_fmt(row.get('R@10'))} | "
+            f"{_fmt(row.get('MRR'))} | {_fmt(row.get('mean_rank'))} | {_fmt(row.get('median_rank'))} |"
+        )
     return "\n".join(lines) + "\n"
 
 
