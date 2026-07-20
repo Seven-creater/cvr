@@ -10,6 +10,7 @@ import numpy as np
 from app.audio_cvr_paper_experiment import (
     _automatic_consensus_reject_reason,
     _automatic_review_decision,
+    _select_disjoint_test_validation,
     _select_exact_benchmark_quota,
     aggregate_final,
     audit_training_splits,
@@ -169,6 +170,43 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             summary["selected_subtypes"],
         )
         self.assertEqual(150, len({row["raw_source_id"] for row in selected}))
+
+    def test_joint_split_selection_reserves_validation_sources_before_test(self) -> None:
+        rows = [
+            self._automatic_row(
+                "sound_shared", "source_shared", "pair_sound_shared", subtype="sound_event"
+            ),
+            self._automatic_row("sound_two", "source_two", "pair_sound_two", subtype="sound_event"),
+            self._automatic_row(
+                "sound_three", "source_three", "pair_sound_three", subtype="sound_event"
+            ),
+            self._automatic_row(
+                "music_shared", "source_shared", "pair_music_shared", subtype="music"
+            ),
+        ]
+        for row in rows:
+            row["min_stage_confidence"] = 0.8
+        rows[0]["min_stage_confidence"] = 1.0
+
+        test, _, validation, _, order = _select_disjoint_test_validation(
+            rows,
+            test_targets={"sound_event": 2, "music": 0},
+            validation_targets={"sound_event": 0, "music": 1},
+            max_dataset_ratio=1.0,
+            relaxed_dataset_ratio=1.0,
+            max_hdtf_ratio=1.0,
+            max_voxceleb_ratio=1.0,
+            max_per_source=1,
+            random_seed=13,
+        )
+
+        self.assertEqual("validation_reserved_before_test", order)
+        self.assertEqual(2, len(test))
+        self.assertEqual(1, len(validation))
+        self.assertFalse(
+            {str(row["raw_source_id"]) for row in test}
+            & {str(row["raw_source_id"]) for row in validation}
+        )
 
     def test_finalize_automatic_benchmark_rebuilds_disjoint_splits_and_asr_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -886,84 +886,35 @@ def finalize_automatic_benchmark(
     }
 
     test_targets = dict(subtype_targets or DEFAULT_BENCHMARK_SUBTYPE_TARGETS)
-    total_target = sum(max(0, int(value)) for value in test_targets.values())
-    selected, selection = _select_exact_benchmark_quota(
-        consensus_rows,
-        targets=test_targets,
-        total_target=total_target,
-        max_dataset_ratio=float(max_dataset_ratio),
-        max_hdtf_ratio=float(max_hdtf_ratio),
-        max_voxceleb_ratio=float(max_voxceleb_ratio),
-        max_per_source=max(1, int(max_per_source)),
-        random_seed=int(random_seed),
+    val_targets = dict(
+        validation_targets
+        or {"sound_event": 45, "music": 15, "speech_topic_in_video_context": 15}
     )
-    if len(selected) < total_target:
-        selected, selection = _select_exact_benchmark_quota(
+    total_target = sum(max(0, int(value)) for value in test_targets.values())
+    total_validation_target = sum(max(0, int(value)) for value in val_targets.values())
+    selected, selection, validation, validation_selection, split_allocation_order = (
+        _select_disjoint_test_validation(
             consensus_rows,
-            targets=test_targets,
-            total_target=total_target,
-            max_dataset_ratio=float(relaxed_dataset_ratio),
+            test_targets=test_targets,
+            validation_targets=val_targets,
+            max_dataset_ratio=float(max_dataset_ratio),
+            relaxed_dataset_ratio=float(relaxed_dataset_ratio),
             max_hdtf_ratio=float(max_hdtf_ratio),
             max_voxceleb_ratio=float(max_voxceleb_ratio),
             max_per_source=max(1, int(max_per_source)),
             random_seed=int(random_seed),
-            strict_dataset_ratio=float(max_dataset_ratio),
-            relaxed_dataset_non_speech_only=True,
         )
-    if len(selected) < total_target:
-        selected, selection = _select_with_non_speech_reallocation(
-            consensus_rows,
-            original_targets=test_targets,
-            total_target=total_target,
-            max_dataset_ratio=float(relaxed_dataset_ratio),
-            max_hdtf_ratio=float(max_hdtf_ratio),
-            max_voxceleb_ratio=float(max_voxceleb_ratio),
-            max_per_source=max(1, int(max_per_source)),
-            random_seed=int(random_seed),
-            strict_dataset_ratio=float(max_dataset_ratio),
-            relaxed_dataset_non_speech_only=True,
-        )
+    )
     if len(selected) < total_target:
         raise ValueError(
             f"only {len(selected)} Omni-consensus candidates satisfy benchmark constraints; target is {total_target}; "
             f"selection={selection}"
         )
-
-    selected_ids = _identity_sets(selected)
-    remaining_consensus = [row for row in consensus_rows if not _row_overlaps_identities(row, selected_ids)]
-    val_targets = dict(
-        validation_targets
-        or {"sound_event": 45, "music": 15, "speech_topic_in_video_context": 15}
-    )
-    validation, validation_selection = _select_exact_benchmark_quota(
-        remaining_consensus,
-        targets=val_targets,
-        total_target=sum(val_targets.values()),
-        max_dataset_ratio=float(relaxed_dataset_ratio),
-        max_hdtf_ratio=max(float(max_hdtf_ratio), 0.20),
-        max_voxceleb_ratio=max(float(max_voxceleb_ratio), 0.10),
-        max_per_source=max(1, int(max_per_source)),
-        random_seed=int(random_seed) + 1,
-        strict_dataset_ratio=float(max_dataset_ratio),
-        relaxed_dataset_non_speech_only=True,
-    )
-    if len(validation) < sum(val_targets.values()):
-        validation, validation_selection = _select_with_non_speech_reallocation(
-            remaining_consensus,
-            original_targets=val_targets,
-            total_target=sum(val_targets.values()),
-            max_dataset_ratio=float(relaxed_dataset_ratio),
-            max_hdtf_ratio=max(float(max_hdtf_ratio), 0.20),
-            max_voxceleb_ratio=max(float(max_voxceleb_ratio), 0.10),
-            max_per_source=max(1, int(max_per_source)),
-            random_seed=int(random_seed) + 1,
-            strict_dataset_ratio=float(max_dataset_ratio),
-            relaxed_dataset_non_speech_only=True,
-        )
-    if len(validation) < sum(val_targets.values()):
+    if len(validation) < total_validation_target:
         raise ValueError(
             f"only {len(validation)} validation candidates satisfy source-disjoint quota; "
-            f"target is {sum(val_targets.values())}"
+            f"target is {total_validation_target}; allocation={split_allocation_order}; "
+            f"selection={validation_selection}"
         )
 
     holdout_ids = _identity_sets(selected + validation)
@@ -1047,6 +998,7 @@ def finalize_automatic_benchmark(
         "review_rejection_counts": dict(sorted(rejection_counts.items())),
         "test_selection": selection,
         "validation_selection": validation_selection,
+        "split_allocation_order": split_allocation_order,
         "strict_local_count": sum(_has_strict_local_negative(row) for row in test),
         "strict_local_coverage": sum(_has_strict_local_negative(row) for row in test) / max(1, len(test)),
         "leakage": leakage,
@@ -1407,6 +1359,146 @@ def _select_with_non_speech_reallocation(
     summary["reallocated_to_sound_event"] = max(0, sound - int(original_targets.get("sound_event", 0)))
     summary["reallocation_policy"] = "music/speech shortages move only to sound_event; speech never increases"
     return selected, summary
+
+
+def _select_quota_with_fallback(
+    rows: list[dict[str, Any]],
+    *,
+    targets: dict[str, int],
+    total_target: int,
+    max_dataset_ratio: float,
+    relaxed_dataset_ratio: float,
+    max_hdtf_ratio: float,
+    max_voxceleb_ratio: float,
+    max_per_source: int,
+    random_seed: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    selected, summary = _select_exact_benchmark_quota(
+        rows,
+        targets=targets,
+        total_target=total_target,
+        max_dataset_ratio=max_dataset_ratio,
+        max_hdtf_ratio=max_hdtf_ratio,
+        max_voxceleb_ratio=max_voxceleb_ratio,
+        max_per_source=max_per_source,
+        random_seed=random_seed,
+    )
+    if len(selected) < total_target:
+        selected, summary = _select_exact_benchmark_quota(
+            rows,
+            targets=targets,
+            total_target=total_target,
+            max_dataset_ratio=relaxed_dataset_ratio,
+            max_hdtf_ratio=max_hdtf_ratio,
+            max_voxceleb_ratio=max_voxceleb_ratio,
+            max_per_source=max_per_source,
+            random_seed=random_seed,
+            strict_dataset_ratio=max_dataset_ratio,
+            relaxed_dataset_non_speech_only=True,
+        )
+    if len(selected) < total_target:
+        selected, summary = _select_with_non_speech_reallocation(
+            rows,
+            original_targets=targets,
+            total_target=total_target,
+            max_dataset_ratio=relaxed_dataset_ratio,
+            max_hdtf_ratio=max_hdtf_ratio,
+            max_voxceleb_ratio=max_voxceleb_ratio,
+            max_per_source=max_per_source,
+            random_seed=random_seed,
+            strict_dataset_ratio=max_dataset_ratio,
+            relaxed_dataset_non_speech_only=True,
+        )
+    return selected, summary
+
+
+def _select_disjoint_test_validation(
+    rows: list[dict[str, Any]],
+    *,
+    test_targets: dict[str, int],
+    validation_targets: dict[str, int],
+    max_dataset_ratio: float,
+    relaxed_dataset_ratio: float,
+    max_hdtf_ratio: float,
+    max_voxceleb_ratio: float,
+    max_per_source: int,
+    random_seed: int,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, Any],
+    list[dict[str, Any]],
+    dict[str, Any],
+    str,
+]:
+    """Select exact source-disjoint test/validation quotas without greedy starvation."""
+    test_total = sum(max(0, int(value)) for value in test_targets.values())
+    validation_total = sum(max(0, int(value)) for value in validation_targets.values())
+
+    def select_test(pool: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        return _select_quota_with_fallback(
+            pool,
+            targets=test_targets,
+            total_target=test_total,
+            max_dataset_ratio=max_dataset_ratio,
+            relaxed_dataset_ratio=relaxed_dataset_ratio,
+            max_hdtf_ratio=max_hdtf_ratio,
+            max_voxceleb_ratio=max_voxceleb_ratio,
+            max_per_source=max_per_source,
+            random_seed=random_seed,
+        )
+
+    def select_validation(pool: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        return _select_exact_benchmark_quota(
+            pool,
+            targets=validation_targets,
+            total_target=validation_total,
+            max_dataset_ratio=relaxed_dataset_ratio,
+            max_hdtf_ratio=max(max_hdtf_ratio, 0.20),
+            max_voxceleb_ratio=max(max_voxceleb_ratio, 0.10),
+            max_per_source=max_per_source,
+            random_seed=random_seed + 1,
+            strict_dataset_ratio=max_dataset_ratio,
+            relaxed_dataset_non_speech_only=True,
+        )
+
+    test, test_summary = select_test(rows)
+    test_ids = _identity_sets(test)
+    validation_pool = [row for row in rows if not _row_overlaps_identities(row, test_ids)]
+    validation, validation_summary = select_validation(validation_pool)
+    if len(test) == test_total and len(validation) == validation_total:
+        order = "test_first"
+        test_summary["split_allocation_order"] = order
+        validation_summary["split_allocation_order"] = order
+        return test, test_summary, validation, validation_summary, order
+
+    reserved_validation, reserved_validation_summary = select_validation(rows)
+    validation_ids = _identity_sets(reserved_validation)
+    reserved_test_pool = [
+        row for row in rows if not _row_overlaps_identities(row, validation_ids)
+    ]
+    reserved_test, reserved_test_summary = select_test(reserved_test_pool)
+    if len(reserved_test) == test_total and len(reserved_validation) == validation_total:
+        order = "validation_reserved_before_test"
+        reserved_test_summary["split_allocation_order"] = order
+        reserved_validation_summary["split_allocation_order"] = order
+        return (
+            reserved_test,
+            reserved_test_summary,
+            reserved_validation,
+            reserved_validation_summary,
+            order,
+        )
+
+    order = "test_first_incomplete"
+    test_summary["split_allocation_order"] = order
+    validation_summary["split_allocation_order"] = order
+    validation_summary["validation_reserved_attempt"] = {
+        "test_count": len(reserved_test),
+        "validation_count": len(reserved_validation),
+        "test_selection": reserved_test_summary,
+        "validation_selection": reserved_validation_summary,
+    }
+    return test, test_summary, validation, validation_summary, order
 
 
 def _row_with_automatic_review(
