@@ -135,6 +135,7 @@ def finalize_benchmark(
     minimum_count: int = 100,
     max_speech_ratio: float = 0.35,
     max_dataset_ratio: float = 0.60,
+    max_per_source: int = 1,
     min_strict_local_coverage: float = 0.0,
     random_seed: int = 20260719,
     eligible_tiers: Iterable[str] = ("main",),
@@ -183,6 +184,7 @@ def finalize_benchmark(
         target_count=max(1, int(target_count)),
         max_speech_ratio=float(max_speech_ratio),
         max_dataset_ratio=float(max_dataset_ratio),
+        max_per_source=max(1, int(max_per_source)),
         random_seed=int(random_seed),
     )
     if len(selected) < max(1, int(minimum_count)):
@@ -229,6 +231,7 @@ def finalize_benchmark(
         "target_count_met": len(selected) >= int(target_count),
         "max_speech_ratio": float(max_speech_ratio),
         "max_dataset_ratio": float(max_dataset_ratio),
+        "max_per_source": max(1, int(max_per_source)),
         "eligible_tiers": sorted(normalized_tiers),
         "strict_local_count": strict_local_count,
         "strict_local_coverage": strict_local_coverage,
@@ -742,6 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
     freeze.add_argument("--minimum-count", type=int, default=100)
     freeze.add_argument("--max-speech-ratio", type=float, default=0.35)
     freeze.add_argument("--max-dataset-ratio", type=float, default=0.60)
+    freeze.add_argument("--max-per-source", type=int, default=1)
     freeze.add_argument("--min-strict-local-coverage", type=float, default=0.0)
     freeze.add_argument("--random-seed", type=int, default=20260719)
     freeze.add_argument(
@@ -811,6 +815,7 @@ def main() -> None:
             minimum_count=args.minimum_count,
             max_speech_ratio=args.max_speech_ratio,
             max_dataset_ratio=args.max_dataset_ratio,
+            max_per_source=args.max_per_source,
             min_strict_local_coverage=args.min_strict_local_coverage,
             random_seed=args.random_seed,
             eligible_tiers=_parse_strings(args.eligible_tiers),
@@ -1370,6 +1375,7 @@ def _select_balanced_benchmark(
     target_count: int,
     max_speech_ratio: float,
     max_dataset_ratio: float,
+    max_per_source: int,
     random_seed: int,
 ) -> list[dict[str, Any]]:
     speech_limit = max(0, math.floor(target_count * max_speech_ratio))
@@ -1378,12 +1384,14 @@ def _select_balanced_benchmark(
     selected: list[dict[str, Any]] = []
     dataset_counts: Counter[str] = Counter()
     subtype_counts: Counter[str] = Counter()
+    source_counts: Counter[str] = Counter()
     speech_count = 0
     while remaining and len(selected) < target_count:
         eligible = [
             row
             for row in remaining
             if dataset_counts[_dataset(row)] < dataset_limit
+            and source_counts[_primary_source_id(row)] < max_per_source
             and (not _is_speech(row) or speech_count < speech_limit)
         ]
         if not eligible:
@@ -1401,6 +1409,7 @@ def _select_balanced_benchmark(
         remaining.remove(row)
         dataset_counts[_dataset(row)] += 1
         subtype_counts[_subtype(row)] += 1
+        source_counts[_primary_source_id(row)] += 1
         speech_count += int(_is_speech(row))
     return selected
 
@@ -1439,6 +1448,10 @@ def _sample_id(row: dict[str, Any]) -> str:
 
 def _pair_id(row: dict[str, Any]) -> str:
     return _first_text(row, ("inverse_pair_group_id", "pair_group_id"))
+
+
+def _primary_source_id(row: dict[str, Any]) -> str:
+    return _first_text(row, ("source_disjoint_group_id", "raw_source_id", "source_id")) or _sample_id(row)
 
 
 def _dataset(row: dict[str, Any]) -> str:

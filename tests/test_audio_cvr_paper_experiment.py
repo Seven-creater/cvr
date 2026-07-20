@@ -253,6 +253,51 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             self.assertEqual("human_verified", promoted["local_same_source_candidates"][0]["verification_status"])
             self.assertIs(promoted["local_same_source_candidates"][0]["satisfies_edit"], False)
 
+    def test_frozen_benchmark_limits_queries_per_raw_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            candidates = [
+                self._row("source_a_first", "source_a", "pair_a1"),
+                self._row("source_a_second", "source_a", "pair_a2"),
+                self._row("source_b_first", "source_b", "pair_b1"),
+            ]
+            candidate_path = root / "candidates.jsonl"
+            self._write_jsonl(candidate_path, candidates)
+            prepare_benchmark_review(
+                input_path=candidate_path,
+                output_dir=root / "review",
+                review_count=3,
+            )
+            reviews = self._read_jsonl(root / "review" / "human_review_round1.jsonl")
+            for row in reviews:
+                row["review"].update(
+                    {
+                        "edit_audio_only": True,
+                        "reference_does_not_satisfy_edit": True,
+                        "target_satisfies_edit": True,
+                        "video_only_cannot_identify_target": True,
+                        "hard_negatives_do_not_satisfy_edit": True,
+                        "decision": "passed",
+                    }
+                )
+            review_path = root / "completed.jsonl"
+            self._write_jsonl(review_path, reviews)
+
+            summary = finalize_benchmark(
+                candidate_path=root / "review" / "benchmark_review_candidates.jsonl",
+                review_paths=[review_path],
+                output_dir=root / "frozen",
+                target_count=3,
+                minimum_count=2,
+                max_speech_ratio=1.0,
+                max_dataset_ratio=1.0,
+                max_per_source=1,
+            )
+
+            self.assertEqual(2, summary["final_count"])
+            rows = self._read_jsonl(root / "frozen" / "test_main.jsonl")
+            self.assertEqual(2, len({row["source_disjoint_group_id"] for row in rows}))
+
     def test_final_aggregation_reports_paired_audio_gain(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
