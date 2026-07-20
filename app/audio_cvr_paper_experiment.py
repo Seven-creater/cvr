@@ -7,7 +7,9 @@ import json
 import math
 from pathlib import Path
 import random
+import re
 import statistics
+import sys
 from typing import Any, Iterable
 
 import numpy as np
@@ -27,6 +29,24 @@ EXTENDED_PROMOTION_REVIEW_CHECKS = (
     "audio_change_clearly_audible",
     "video_context_preserved",
     "not_asr_or_transcript_only",
+)
+DEFAULT_BENCHMARK_SUBTYPE_TARGETS = {
+    "sound_event": 90,
+    "music": 30,
+    "speech_topic_in_video_context": 30,
+}
+DEFAULT_REVIEW_POOL_TARGETS = {
+    "sound_event": 180,
+    "music": 70,
+    "speech_topic_in_video_context": 180,
+}
+AUTOMATIC_REVIEW_PROFILE = "audiocvr_benchmark_review_v1"
+AUTOMATIC_REVIEW_CRITICAL_FIELDS = (
+    "audio_only_pass",
+    "video_only_pass",
+    "full_av_pass",
+    "transcript_like",
+    "full_av_required",
 )
 
 
@@ -257,6 +277,1171 @@ def finalize_benchmark(
     _write_json(output_root / "frozen_benchmark_manifest.json", manifest)
     (output_root / "frozen_benchmark.sha256").write_text(f"{test_hash}  test_main.jsonl\n", encoding="ascii")
     return manifest
+
+
+def prepare_automatic_benchmark_review(
+    *,
+    input_paths: Iterable[str | Path],
+    output_dir: str | Path,
+    review_pool_targets: dict[str, int] | None = None,
+    random_seed: int = 20260720,
+    max_per_source: int = 2,
+) -> dict[str, Any]:
+    """Merge accepted runs, deduplicate them, and freeze a model-blind Omni review pool."""
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    paths = tuple(Path(path) for path in input_paths)
+    if not paths:
+        raise ValueError("at least one --input-path is required")
+    raw_rows: list[dict[str, Any]] = []
+    for path in paths:
+        rows = _read_jsonl(path)
+        for row in rows:
+            normalized = _normalize_automatic_pool_row(row, input_path=path)
+            raw_rows.append(normalized)
+    if not raw_rows:
+        raise ValueError("automatic benchmark inputs contain no records")
+
+    filtered: list[dict[str, Any]] = []
+    rejected_counts: Counter[str] = Counter()
+    for row in raw_rows:
+        reason = _automatic_pool_filter_reason(row)
+        if reason:
+            rejected_counts[reason] += 1
+        else:
+            filtered.append(row)
+    deduplicated, duplicate_counts = _deduplicate_automatic_pool(filtered, random_seed=random_seed)
+    targets = dict(review_pool_targets or DEFAULT_REVIEW_POOL_TARGETS)
+    candidates = _select_automatic_review_pool(
+        deduplicated,
+        targets=targets,
+        max_per_source=max(1, int(max_per_source)),
+        random_seed=int(random_seed),
+    )
+    if not candidates:
+        raise ValueError("automatic benchmark review pool became empty")
+
+    combined_path = output_root / "combined_accepted_pool.jsonl"
+    dedup_path = output_root / "combined_pool_deduplicated.jsonl"
+    candidate_path = output_root / "automatic_review_candidates.jsonl"
+    summary_path = output_root / "combined_pool_summary.json"
+    _write_jsonl(combined_path, raw_rows)
+    _write_jsonl(dedup_path, deduplicated)
+    _write_jsonl(candidate_path, candidates)
+    summary = {
+        "protocol": "audiocvr_automatic_benchmark_pool_v1",
+        "selection_uses_model_scores": False,
+        "input_paths": [str(path) for path in paths],
+        "input_count": len(raw_rows),
+        "post_filter_count": len(filtered),
+        "deduplicated_count": len(deduplicated),
+        "review_candidate_count": len(candidates),
+        "filter_rejection_counts": dict(sorted(rejected_counts.items())),
+        "duplicate_drop_counts": dict(sorted(duplicate_counts.items())),
+        "review_pool_targets": targets,
+        "review_pool_subtypes": dict(sorted(Counter(_canonical_subtype(row) for row in candidates).items())),
+        "review_pool_datasets": dict(sorted(Counter(_dataset(row) for row in candidates).items())),
+        "legacy_asr_risk_is_advisory_only": True,
+        "random_seed": int(random_seed),
+        "max_per_source_in_review_pool": max(1, int(max_per_source)),
+        "outputs": {
+            "combined_pool": str(combined_path),
+            "deduplicated_pool": str(dedup_path),
+            "review_candidates": str(candidate_path),
+            "summary": str(summary_path),
+        },
+    }
+    _write_json(summary_path, summary)
+    return summary
+
+
+def _normalize_automatic_pool_row(row: dict[str, Any], *, input_path: Path) -> dict[str, Any]:
+    normalized = dict(row)
+    subtype = _canonical_subtype(normalized)
+    normalized["b_subtype"] = subtype
+    normalized["automatic_split_tier"] = _automatic_split_tier(normalized)
+    normalized["dataset"] = _normalized_dataset(normalized)
+    normalized["raw_source_id"] = _stable_source_id(normalized)
+    normalized["source_disjoint_group_id"] = normalized["raw_source_id"]
+    normalized["sample_id"] = _stable_sample_id(normalized)
+    normalized["pair_group_id"] = _stable_pair_group_id(normalized)
+    normalized["legacy_asr_risk"] = _numeric_field(normalized, "asr_degeneracy_risk")
+    normalized["legacy_asr_risk_advisory_only"] = True
+    normalized["automatic_review_input_path"] = str(input_path)
+    normalized["existing_verifier_complete"] = _existing_verifier_complete(normalized)
+    normalized["existing_min_stage_confidence"] = _existing_min_stage_confidence(normalized)
+    return normalized
+
+
+def _automatic_pool_filter_reason(row: dict[str, Any]) -> str:
+    if "accepted" in row and not _truthy(row.get("accepted")):
+        return "not_accepted"
+    if _truthy(row.get("fallback")):
+        return "fallback_record"
+    if _truthy(row.get("is_inverse")) or str(row.get("direction") or "forward").strip().lower() == "inverse":
+        return "inverse_record"
+    if _canonical_subtype(row) not in DEFAULT_BENCHMARK_SUBTYPE_TARGETS:
+        return "unsupported_subtype"
+    if not _first_text(row, ("reference_video", "reference_clip_path")):
+        return "missing_reference_video"
+    if not _first_text(row, ("target_video", "target_clip_path")):
+        return "missing_target_video"
+    if not str(row.get("edit_text") or row.get("audio_only_edit_text") or "").strip():
+        return "missing_edit_text"
+    explicit_failure = _existing_verifier_explicit_failure(row)
+    if explicit_failure:
+        return explicit_failure
+    return ""
+
+
+def _deduplicate_automatic_pool(
+    rows: list[dict[str, Any]], *, random_seed: int
+) -> tuple[list[dict[str, Any]], Counter[str]]:
+    current = list(rows)
+    drops: Counter[str] = Counter()
+    for reason, key_fn in (
+        ("duplicate_sample_id", lambda row: _sample_id(row)),
+        ("duplicate_reference_target", _normalized_reference_target_key),
+        ("duplicate_pair_group", _pair_id),
+    ):
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        passthrough: list[dict[str, Any]] = []
+        for row in current:
+            key = str(key_fn(row) or "").strip()
+            if key:
+                grouped[key].append(row)
+            else:
+                passthrough.append(row)
+        selected = passthrough
+        for values in grouped.values():
+            values.sort(key=lambda row: _automatic_pool_priority(row, random_seed))
+            selected.append(values[0])
+            drops[reason] += max(0, len(values) - 1)
+        current = selected
+    current.sort(key=lambda row: _stable_row_key(row, random_seed))
+    return current, drops
+
+
+def _automatic_pool_priority(row: dict[str, Any], seed: int) -> tuple[Any, ...]:
+    tier_rank = {"main": 0, "extended": 1, "diagnostic": 2}.get(_automatic_split_tier(row), 3)
+    speech_cap_only = _diagnostic_reasons(row) == {"main_speech_cap_exceeded"}
+    return (
+        tier_rank,
+        -int(speech_cap_only),
+        -int(_truthy(row.get("existing_verifier_complete"))),
+        -_numeric_field(row, "audio_delta_strength"),
+        -_numeric_field(row, "video_context_strength"),
+        -float(row.get("existing_min_stage_confidence") or 0.0),
+        _stable_row_key(row, seed),
+    )
+
+
+def _select_automatic_review_pool(
+    rows: list[dict[str, Any]],
+    *,
+    targets: dict[str, int],
+    max_per_source: int,
+    random_seed: int,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    source_counts: Counter[str] = Counter()
+    dataset_counts: Counter[str] = Counter()
+    for subtype in ("music", "sound_event", "speech_topic_in_video_context"):
+        target = max(0, int(targets.get(subtype, 0)))
+        candidates = [row for row in rows if _canonical_subtype(row) == subtype]
+        while candidates and sum(_canonical_subtype(row) == subtype for row in selected) < target:
+            eligible = [row for row in candidates if source_counts[_primary_source_id(row)] < max_per_source]
+            if not eligible:
+                break
+            row = min(
+                eligible,
+                key=lambda item: (
+                    dataset_counts[_dataset(item)],
+                    *_automatic_pool_priority(item, random_seed),
+                ),
+            )
+            selected.append(row)
+            source_counts[_primary_source_id(row)] += 1
+            dataset_counts[_dataset(row)] += 1
+            candidates.remove(row)
+    selected.sort(key=lambda row: (_canonical_subtype(row), _stable_row_key(row, random_seed)))
+    return selected
+
+
+def review_benchmark_omni(
+    *,
+    candidate_path: str | Path,
+    output_path: str | Path,
+    media_root: str | Path,
+    cache_dir: str | Path,
+    base_url: str,
+    api_key: str,
+    model: str,
+    review_pass_id: int = 1,
+    pass1_review_paths: Iterable[str | Path] = (),
+    repeat_review_fraction: float = 0.20,
+    random_seed: int = 20260720,
+    shard_index: int = 0,
+    shard_count: int = 1,
+    timeout_seconds: float = 180.0,
+    omni_retries: int = 2,
+    resume: bool = False,
+    fail_on_error: bool = False,
+) -> dict[str, Any]:
+    """Run the independent three-stage Omni audit for one deterministic shard."""
+    from app.audio_lines_single_source import (
+        _call_omni_with_retries,
+        _extract_audio_only_cache,
+        _extract_video_only_cache,
+    )
+    from app.composed_omni import OpenAIComposedDataClient
+
+    candidate_file = Path(candidate_path)
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    candidates = _read_jsonl(candidate_file)
+    if not candidates:
+        raise ValueError(f"no automatic review candidates found in {candidate_file}")
+    if int(review_pass_id) not in {1, 2}:
+        raise ValueError("review_pass_id must be 1 or 2")
+    if int(shard_count) <= 0 or not 0 <= int(shard_index) < int(shard_count):
+        raise ValueError("shard_index must be in [0, shard_count)")
+
+    if int(review_pass_id) == 2:
+        pass1 = _automatic_reviews_by_sample(_read_many_jsonl(pass1_review_paths))
+        if not pass1:
+            raise ValueError("review pass 2 requires at least one non-empty --pass1-review-path")
+        passing = [row for row in candidates if pass1.get(_sample_id(row), {}).get("decision") == "pass"]
+        repeat_ids = _deterministic_repeat_ids(
+            passing,
+            fraction=float(repeat_review_fraction),
+            random_seed=int(random_seed),
+        )
+        candidates = [row for row in candidates if _sample_id(row) in repeat_ids]
+    candidates = sorted(candidates, key=lambda row: _sample_id(row))
+    candidates = [row for index, row in enumerate(candidates) if index % int(shard_count) == int(shard_index)]
+
+    completed_ids: set[str] = set()
+    if resume and output_file.exists():
+        existing_rows = _read_jsonl(output_file)
+        retained_rows = [row for row in existing_rows if str(row.get("decision") or "") != "error"]
+        completed_ids = {_sample_id(row) for row in retained_rows}
+        if len(retained_rows) != len(existing_rows):
+            _write_jsonl(output_file, retained_rows)
+    elif output_file.exists():
+        output_file.write_text("", encoding="utf-8")
+    else:
+        output_file.touch()
+
+    client = OpenAIComposedDataClient(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        timeout_seconds=float(timeout_seconds),
+    )
+    cache_root = Path(cache_dir)
+    media_root_path = Path(media_root)
+    decision_counts: Counter[str] = Counter()
+    processed = 0
+    for index, row in enumerate(candidates, start=1):
+        sample_id = _sample_id(row)
+        if sample_id in completed_ids:
+            continue
+        try:
+            reference_path = _resolve_media_path(media_root_path, _first_text(row, ("reference_video", "reference_clip_path")))
+            target_path = _resolve_media_path(media_root_path, _first_text(row, ("target_video", "target_clip_path")))
+            reference_audio = _extract_audio_only_cache(
+                video_path=reference_path,
+                cache_dir=cache_root / "audio_only",
+                clip_id=f"{sample_id}_reference",
+            )
+            target_audio = _extract_audio_only_cache(
+                video_path=target_path,
+                cache_dir=cache_root / "audio_only",
+                clip_id=f"{sample_id}_target",
+            )
+            reference_silent = _extract_video_only_cache(
+                video_path=reference_path,
+                cache_dir=cache_root / "video_only",
+                clip_id=f"{sample_id}_reference",
+            )
+            target_silent = _extract_video_only_cache(
+                video_path=target_path,
+                cache_dir=cache_root / "video_only",
+                clip_id=f"{sample_id}_target",
+            )
+            edit_text = str(row.get("edit_text") or row.get("audio_only_edit_text") or "").strip()
+            proposal = _automatic_audio_proposal(row)
+            local_gate = row.get("local_gate_report") if isinstance(row.get("local_gate_report"), dict) else {}
+            audio_verify, raw_audio = _call_omni_with_retries(
+                label=f"benchmark_audio_only:{sample_id}:pass{review_pass_id}",
+                retries=int(omni_retries),
+                fail_on_transient=bool(fail_on_error),
+                func=lambda: client.verify_b_line_audio_only_edit(
+                    reference_audio_path=str(reference_audio),
+                    target_audio_path=str(target_audio),
+                    edit_text=edit_text,
+                    audio_only_proposal=proposal,
+                ),
+            )
+            video_verify, raw_video = _call_omni_with_retries(
+                label=f"benchmark_video_only:{sample_id}:pass{review_pass_id}",
+                retries=int(omni_retries),
+                fail_on_transient=bool(fail_on_error),
+                func=lambda: client.verify_b_line_video_only_shortcut(
+                    reference_clip_path=str(reference_silent),
+                    target_clip_path=str(target_silent),
+                    edit_text=edit_text,
+                    audio_only_evidence={"proposal": proposal, "verification": audio_verify},
+                    local_gate_report=local_gate,
+                ),
+            )
+            full_av, raw_full_av = _call_omni_with_retries(
+                label=f"benchmark_full_av:{sample_id}:pass{review_pass_id}",
+                retries=int(omni_retries),
+                fail_on_transient=bool(fail_on_error),
+                func=lambda: client.verify_b_line_full_av_consistency(
+                    reference_clip_path=str(reference_path),
+                    target_clip_path=str(target_path),
+                    edit_text=edit_text,
+                    audio_only_evidence={"proposal": proposal, "verification": audio_verify},
+                    local_gate_report=local_gate,
+                ),
+            )
+            context, raw_context = _call_omni_with_retries(
+                label=f"benchmark_context:{sample_id}:pass{review_pass_id}",
+                retries=int(omni_retries),
+                fail_on_transient=bool(fail_on_error),
+                func=lambda: client.audit_audiocvr_benchmark_context(
+                    reference_clip_path=str(reference_path),
+                    target_clip_path=str(target_path),
+                    edit_text=edit_text,
+                    audio_only_evidence={"proposal": proposal, "verification": audio_verify},
+                    review_pass_id=int(review_pass_id),
+                ),
+            )
+            review = _automatic_review_decision(
+                row,
+                audio_verify=audio_verify,
+                video_verify=video_verify,
+                full_av=full_av,
+                context=context,
+                review_pass_id=int(review_pass_id),
+                model=model,
+            )
+            review.update(
+                {
+                    "raw_audio_only_verification": raw_audio,
+                    "raw_video_only_verification": raw_video,
+                    "raw_full_av_verification": raw_full_av,
+                    "raw_context_verification": raw_context,
+                }
+            )
+        except Exception as exc:
+            if fail_on_error:
+                raise
+            review = {
+                "sample_id": sample_id,
+                "reviewer_type": "omni",
+                "review_profile": AUTOMATIC_REVIEW_PROFILE,
+                "review_pass_id": int(review_pass_id),
+                "model": model,
+                "decision": "error",
+                "reject_reasons": [f"review_error:{type(exc).__name__}:{exc}"],
+            }
+        _append_jsonl(output_file, review)
+        decision_counts[str(review.get("decision") or "unknown")] += 1
+        processed += 1
+        print(
+            f"[review-benchmark-omni] pass={review_pass_id} shard={shard_index}/{shard_count} "
+            f"{index}/{len(candidates)} sample={sample_id} decision={review.get('decision')}",
+            file=sys.stderr,
+            flush=True,
+        )
+    summary = {
+        "protocol": AUTOMATIC_REVIEW_PROFILE,
+        "candidate_path": str(candidate_file),
+        "output_path": str(output_file),
+        "review_pass_id": int(review_pass_id),
+        "shard_index": int(shard_index),
+        "shard_count": int(shard_count),
+        "candidate_count_for_shard": len(candidates),
+        "preexisting_completed_count": len(completed_ids),
+        "processed_count": processed,
+        "decision_counts": dict(sorted(decision_counts.items())),
+    }
+    _write_json(output_file.with_suffix(".summary.json"), summary)
+    return summary
+
+
+def _automatic_review_decision(
+    row: dict[str, Any],
+    *,
+    audio_verify: dict[str, Any],
+    video_verify: dict[str, Any],
+    full_av: dict[str, Any],
+    context: dict[str, Any],
+    review_pass_id: int,
+    model: str,
+) -> dict[str, Any]:
+    subtype = _canonical_subtype(row)
+    transcript_like = bool(context.get("transcript_like")) or _transcript_like_text(str(row.get("edit_text") or ""))
+    speech_role = str(context.get("speech_role") or ("not_speech" if subtype != "speech_topic_in_video_context" else "asr_only"))
+    min_confidence = min(
+        float(audio_verify.get("confidence") or 0.0),
+        float(video_verify.get("confidence") or 0.0),
+        float(full_av.get("confidence") or 0.0),
+        float(context.get("confidence") or 0.0),
+    )
+    audio_pass = (
+        bool(audio_verify.get("accept"))
+        and not bool(audio_verify.get("reference_satisfies_edit"))
+        and bool(audio_verify.get("target_satisfies_edit"))
+        and bool(audio_verify.get("audio_difference_specific"))
+        and bool(audio_verify.get("edit_text_audio_only"))
+    )
+    video_pass = (
+        bool(video_verify.get("accept"))
+        and bool(video_verify.get("visual_context_preserved"))
+        and not bool(video_verify.get("visual_shortcut_risk"))
+        and not bool(video_verify.get("can_identify_target_without_audio"))
+    )
+    full_av_pass = (
+        bool(full_av.get("accept"))
+        and bool(full_av.get("visual_context_preserved"))
+        and not bool(full_av.get("visual_shortcut_risk"))
+        and bool(full_av.get("audio_edit_still_valid"))
+        and bool(context.get("accept"))
+        and bool(context.get("visual_context_preserved"))
+        and bool(context.get("audio_edit_still_valid"))
+    )
+    recomputed_asr_risk = float(context.get("recomputed_asr_risk") or 0.0)
+    video_context_strength = float(context.get("video_context_strength") or 0.0)
+    audio_only_solvability = float(context.get("audio_only_solvability") or 0.0)
+    full_av_required = bool(context.get("full_av_required"))
+    reject_reasons: list[str] = []
+    if not audio_pass:
+        reject_reasons.append("audio_only_gate_failed")
+    if not video_pass:
+        reject_reasons.append("video_only_gate_failed")
+    if not full_av_pass:
+        reject_reasons.append("full_av_gate_failed")
+    if subtype == "speech_topic_in_video_context":
+        if speech_role not in {"contextual_speech", "speech_with_event"}:
+            reject_reasons.append(f"speech_role:{speech_role}")
+        if transcript_like:
+            reject_reasons.append("transcript_like")
+        if not full_av_required:
+            reject_reasons.append("full_av_not_required")
+        if recomputed_asr_risk > 0.35:
+            reject_reasons.append("asr_risk_above_0.35")
+        if video_context_strength < 0.60:
+            reject_reasons.append("video_context_below_0.60")
+        if _numeric_field(row, "audio_delta_strength") < 0.70:
+            reject_reasons.append("audio_delta_below_0.70")
+        if audio_only_solvability >= 0.85:
+            reject_reasons.append("audio_only_solvability_high")
+    if reject_reasons:
+        decision = "reject"
+    elif min_confidence < 0.65:
+        decision = "uncertain"
+        reject_reasons.append("minimum_stage_confidence_below_0.65")
+    else:
+        decision = "pass"
+    return {
+        "sample_id": _sample_id(row),
+        "pair_group_id": _pair_id(row),
+        "raw_source_id": _primary_source_id(row),
+        "dataset": _dataset(row),
+        "b_subtype": subtype,
+        "reviewer_type": "omni",
+        "review_profile": AUTOMATIC_REVIEW_PROFILE,
+        "review_pass_id": int(review_pass_id),
+        "model": model,
+        "audio_only_pass": audio_pass,
+        "video_only_pass": video_pass,
+        "full_av_pass": full_av_pass,
+        "speech_role": speech_role,
+        "transcript_like": transcript_like,
+        "full_av_required": full_av_required,
+        "recomputed_asr_risk": recomputed_asr_risk,
+        "video_context_strength": video_context_strength,
+        "audio_only_solvability": audio_only_solvability,
+        "min_stage_confidence": min_confidence,
+        "decision": decision,
+        "reject_reasons": reject_reasons,
+        "audio_only_verification": audio_verify,
+        "video_only_verification": video_verify,
+        "full_av_verification": full_av,
+        "context_verification": context,
+    }
+
+
+def finalize_automatic_benchmark(
+    *,
+    combined_pool_path: str | Path,
+    candidate_path: str | Path,
+    pass1_review_paths: Iterable[str | Path],
+    pass2_review_paths: Iterable[str | Path],
+    output_dir: str | Path,
+    subtype_targets: dict[str, int] | None = None,
+    validation_targets: dict[str, int] | None = None,
+    repeat_review_fraction: float = 0.20,
+    max_dataset_ratio: float = 0.50,
+    relaxed_dataset_ratio: float = 0.55,
+    max_hdtf_ratio: float = 0.15,
+    max_voxceleb_ratio: float = 0.05,
+    max_per_source: int = 1,
+    random_seed: int = 20260720,
+) -> dict[str, Any]:
+    """Freeze an Omni-consensus benchmark, then rebuild source-disjoint train and validation splits."""
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    combined_pool = _read_jsonl(Path(combined_pool_path))
+    candidates = _read_jsonl(Path(candidate_path))
+    if not combined_pool or not candidates:
+        raise ValueError("automatic finalization requires non-empty combined pool and candidate JSONL")
+    combined_pool = [row for row in combined_pool if not _automatic_pool_filter_reason(row)]
+    combined_pool, final_pool_duplicate_drops = _deduplicate_automatic_pool(
+        combined_pool, random_seed=int(random_seed)
+    )
+    if not combined_pool:
+        raise ValueError("combined pool became empty after final safety filtering and deduplication")
+    candidate_ids = [_sample_id(row) for row in candidates]
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise ValueError("automatic review candidate pool contains duplicate sample_id values")
+    pass1 = _automatic_reviews_by_sample(_read_many_jsonl(pass1_review_paths))
+    pass2 = _automatic_reviews_by_sample(_read_many_jsonl(pass2_review_paths))
+    if not pass1:
+        raise ValueError("automatic finalization requires pass-1 Omni reviews")
+    pool_summary_path = Path(combined_pool_path).parent / "combined_pool_summary.json"
+    pool_summary = _read_optional_json(pool_summary_path)
+
+    candidate_by_id = {_sample_id(row): row for row in candidates}
+    repeat_ids = _deterministic_repeat_ids(
+        [candidate_by_id[sample_id] for sample_id, review in pass1.items() if review.get("decision") == "pass" and sample_id in candidate_by_id],
+        fraction=float(repeat_review_fraction),
+        random_seed=int(random_seed),
+    )
+    consensus_rows: list[dict[str, Any]] = []
+    diagnostic_rows: list[dict[str, Any]] = []
+    rejection_counts: Counter[str] = Counter()
+    agreement = _automatic_review_agreement(pass1, pass2, repeat_ids)
+    for sample_id, row in candidate_by_id.items():
+        first = pass1.get(sample_id)
+        if first is None:
+            rejection_counts["missing_pass1_review"] += 1
+            continue
+        consensus_reason = _automatic_consensus_reject_reason(
+            first,
+            pass2.get(sample_id),
+            repeated=sample_id in repeat_ids,
+        )
+        enriched = _row_with_automatic_review(row, first, pass2.get(sample_id), consensus_reason=consensus_reason)
+        if consensus_reason:
+            rejection_counts[consensus_reason] += 1
+            if _automatic_review_is_diagnostic(first, pass2.get(sample_id)):
+                diagnostic_rows.append(enriched)
+            continue
+        consensus_rows.append(enriched)
+
+    pass1_decisions = Counter(str(row.get("decision") or "missing") for row in pass1.values())
+    pass2_decisions = Counter(str(row.get("decision") or "missing") for row in pass2.values())
+    pass1_reject_reasons = Counter(
+        str(reason)
+        for row in pass1.values()
+        if row.get("decision") != "pass"
+        for reason in row.get("reject_reasons", [])
+    )
+    pass2_reject_reasons = Counter(
+        str(reason)
+        for row in pass2.values()
+        if row.get("decision") != "pass"
+        for reason in row.get("reject_reasons", [])
+    )
+    automatic_review_summary = {
+        "protocol": AUTOMATIC_REVIEW_PROFILE,
+        "combined_input_count": int(pool_summary.get("input_count", len(combined_pool))),
+        "post_filter_count": int(pool_summary.get("post_filter_count", len(combined_pool))),
+        "deduplicated_pool_count": len(combined_pool),
+        "final_pool_duplicate_drop_counts": dict(sorted(final_pool_duplicate_drops.items())),
+        "review_candidate_count": len(candidates),
+        "pass1_review_count": len(pass1),
+        "pass1_decisions": dict(sorted(pass1_decisions.items())),
+        "pass2_review_count": len(pass2),
+        "pass2_decisions": dict(sorted(pass2_decisions.items())),
+        "repeat_review": agreement,
+        "consensus_eligible_count": len(consensus_rows),
+        "diagnostic_count_before_freeze": len(diagnostic_rows),
+        "consensus_rejection_counts": dict(sorted(rejection_counts.items())),
+        "pass1_reject_reasons": dict(sorted(pass1_reject_reasons.items())),
+        "pass2_reject_reasons": dict(sorted(pass2_reject_reasons.items())),
+        "legacy_asr_risk_distribution": _numeric_distribution(
+            [_numeric_field(row, "legacy_asr_risk") for row in candidates]
+        ),
+        "recomputed_asr_risk_distribution": _numeric_distribution(
+            [float(row.get("recomputed_asr_risk") or 0.0) for row in pass1.values()]
+        ),
+        "selection_uses_retrieval_model_scores": False,
+    }
+
+    test_targets = dict(subtype_targets or DEFAULT_BENCHMARK_SUBTYPE_TARGETS)
+    total_target = sum(max(0, int(value)) for value in test_targets.values())
+    selected, selection = _select_exact_benchmark_quota(
+        consensus_rows,
+        targets=test_targets,
+        total_target=total_target,
+        max_dataset_ratio=float(max_dataset_ratio),
+        max_hdtf_ratio=float(max_hdtf_ratio),
+        max_voxceleb_ratio=float(max_voxceleb_ratio),
+        max_per_source=max(1, int(max_per_source)),
+        random_seed=int(random_seed),
+    )
+    if len(selected) < total_target:
+        selected, selection = _select_exact_benchmark_quota(
+            consensus_rows,
+            targets=test_targets,
+            total_target=total_target,
+            max_dataset_ratio=float(relaxed_dataset_ratio),
+            max_hdtf_ratio=float(max_hdtf_ratio),
+            max_voxceleb_ratio=float(max_voxceleb_ratio),
+            max_per_source=max(1, int(max_per_source)),
+            random_seed=int(random_seed),
+            strict_dataset_ratio=float(max_dataset_ratio),
+            relaxed_dataset_non_speech_only=True,
+        )
+    if len(selected) < total_target:
+        selected, selection = _select_with_non_speech_reallocation(
+            consensus_rows,
+            original_targets=test_targets,
+            total_target=total_target,
+            max_dataset_ratio=float(relaxed_dataset_ratio),
+            max_hdtf_ratio=float(max_hdtf_ratio),
+            max_voxceleb_ratio=float(max_voxceleb_ratio),
+            max_per_source=max(1, int(max_per_source)),
+            random_seed=int(random_seed),
+            strict_dataset_ratio=float(max_dataset_ratio),
+            relaxed_dataset_non_speech_only=True,
+        )
+    if len(selected) < total_target:
+        raise ValueError(
+            f"only {len(selected)} Omni-consensus candidates satisfy benchmark constraints; target is {total_target}; "
+            f"selection={selection}"
+        )
+
+    selected_ids = _identity_sets(selected)
+    remaining_consensus = [row for row in consensus_rows if not _row_overlaps_identities(row, selected_ids)]
+    val_targets = dict(
+        validation_targets
+        or {"sound_event": 45, "music": 15, "speech_topic_in_video_context": 15}
+    )
+    validation, validation_selection = _select_exact_benchmark_quota(
+        remaining_consensus,
+        targets=val_targets,
+        total_target=sum(val_targets.values()),
+        max_dataset_ratio=float(relaxed_dataset_ratio),
+        max_hdtf_ratio=max(float(max_hdtf_ratio), 0.20),
+        max_voxceleb_ratio=max(float(max_voxceleb_ratio), 0.10),
+        max_per_source=max(1, int(max_per_source)),
+        random_seed=int(random_seed) + 1,
+        strict_dataset_ratio=float(max_dataset_ratio),
+        relaxed_dataset_non_speech_only=True,
+    )
+    if len(validation) < sum(val_targets.values()):
+        validation, validation_selection = _select_with_non_speech_reallocation(
+            remaining_consensus,
+            original_targets=val_targets,
+            total_target=sum(val_targets.values()),
+            max_dataset_ratio=float(relaxed_dataset_ratio),
+            max_hdtf_ratio=max(float(max_hdtf_ratio), 0.20),
+            max_voxceleb_ratio=max(float(max_voxceleb_ratio), 0.10),
+            max_per_source=max(1, int(max_per_source)),
+            random_seed=int(random_seed) + 1,
+            strict_dataset_ratio=float(max_dataset_ratio),
+            relaxed_dataset_non_speech_only=True,
+        )
+    if len(validation) < sum(val_targets.values()):
+        raise ValueError(
+            f"only {len(validation)} validation candidates satisfy source-disjoint quota; "
+            f"target is {sum(val_targets.values())}"
+        )
+
+    holdout_ids = _identity_sets(selected + validation)
+    diagnostic_sample_ids = {_sample_id(row) for row in diagnostic_rows}
+    train: list[dict[str, Any]] = []
+    for row in combined_pool:
+        if _row_overlaps_identities(row, holdout_ids) or _sample_id(row) in diagnostic_sample_ids:
+            continue
+        item = dict(row)
+        item["dataset_split"] = "train"
+        item["recommended_sampling_weight"] = _recommended_training_sampling_weight(item)
+        train.append(item)
+    test = [{**row, "dataset_split": "test_main"} for row in selected]
+    validation = [{**row, "dataset_split": "val"} for row in validation]
+    diagnostic = [{**row, "dataset_split": "diagnostic_asr"} for row in diagnostic_rows]
+
+    leakage = _split_leakage_summary(train=train, val=validation, test=test)
+    if leakage["violation_count"]:
+        raise ValueError(f"automatic benchmark split leakage detected: {leakage}")
+    if len({_pair_id(row) for row in test}) != len(test):
+        raise ValueError("duplicate pair_group_id remains in automatic test benchmark")
+
+    test_path = output_root / "test_main_150.jsonl"
+    val_path = output_root / "val.jsonl"
+    train_path = output_root / "train.jsonl"
+    diagnostic_path = output_root / "test_asr_diagnostic.jsonl"
+    _write_jsonl(test_path, test)
+    _write_jsonl(val_path, validation)
+    _write_jsonl(train_path, train)
+    _write_jsonl(diagnostic_path, diagnostic)
+    test_hash = _sha256_file(test_path)
+    holdout = _identity_sets(test)
+    _write_json(
+        output_root / "test_holdout_identities.json",
+        {
+            "source_ids": sorted(holdout["source"]),
+            "pair_group_ids": sorted(holdout["pair"]),
+            "sample_ids": sorted(holdout["sample"]),
+        },
+    )
+    agreement_path = output_root / "review_agreement_summary.json"
+    _write_json(agreement_path, agreement)
+    _write_json(output_root / "automatic_review_summary.json", automatic_review_summary)
+    asr_summary = {
+        "count": len(diagnostic),
+        "speech_roles": dict(sorted(Counter(_review_field(row, "speech_role") or "unknown" for row in diagnostic).items())),
+        "rejection_reasons": dict(sorted(Counter(reason for row in diagnostic for reason in row.get("automatic_consensus_reasons", [])).items())),
+    }
+    _write_json(output_root / "asr_diagnostic_summary.json", asr_summary)
+    crosstab = _subtype_dataset_crosstab(test)
+    _write_json(output_root / "subtype_dataset_crosstab.json", crosstab)
+    audit = {
+        "selection_uses_model_scores": False,
+        "leakage": leakage,
+        "duplicate_pair_count": len(test) - len({_pair_id(row) for row in test}),
+        "missing_media_count": sum(
+            not _first_text(row, ("reference_video",)) or not _first_text(row, ("target_video",)) for row in test
+        ),
+        "test_count": len(test),
+        "validation_count": len(validation),
+        "train_count": len(train),
+    }
+    _write_json(output_root / "leakage_audit.json", audit)
+    manifest = {
+        "protocol": "audiocvr_automatic_model_verified_benchmark_v1",
+        "human_validated": False,
+        "automatically_curated": True,
+        "model_verified": True,
+        "selection_uses_model_scores": False,
+        "combined_pool_path": str(combined_pool_path),
+        "candidate_path": str(candidate_path),
+        "test_target_count": total_target,
+        "test_final_count": len(test),
+        "test_subtype_targets": test_targets,
+        "test_subtype_distribution": dict(sorted(Counter(_canonical_subtype(row) for row in test).items())),
+        "test_dataset_distribution": dict(sorted(Counter(_dataset(row) for row in test).items())),
+        "validation_targets": val_targets,
+        "validation_distribution": dict(sorted(Counter(_canonical_subtype(row) for row in validation).items())),
+        "train_distribution": dict(sorted(Counter(_canonical_subtype(row) for row in train).items())),
+        "automatic_review": agreement,
+        "review_rejection_counts": dict(sorted(rejection_counts.items())),
+        "test_selection": selection,
+        "validation_selection": validation_selection,
+        "strict_local_count": sum(_has_strict_local_negative(row) for row in test),
+        "strict_local_coverage": sum(_has_strict_local_negative(row) for row in test) / max(1, len(test)),
+        "leakage": leakage,
+        "test_main_sha256": test_hash,
+        "random_seed": int(random_seed),
+        "outputs": {
+            "test_main": str(test_path),
+            "test_asr_diagnostic": str(diagnostic_path),
+            "train": str(train_path),
+            "val": str(val_path),
+            "agreement": str(agreement_path),
+            "manifest": str(output_root / "frozen_benchmark_manifest.json"),
+        },
+        "limitation": "Automatically curated and model-verified; not human-validated.",
+    }
+    _write_json(output_root / "frozen_benchmark_manifest.json", manifest)
+    (output_root / "frozen_benchmark.sha256").write_text(
+        f"{test_hash}  test_main_150.jsonl\n", encoding="ascii"
+    )
+    _write_json(
+        output_root / "rejection_breakdown.json",
+        {
+            "consensus_rejections": dict(sorted(rejection_counts.items())),
+            "pass1_reject_reasons": dict(sorted(pass1_reject_reasons.items())),
+            "pass2_reject_reasons": dict(sorted(pass2_reject_reasons.items())),
+        },
+    )
+    _write_json(
+        output_root / "split_summary.json",
+        {
+            "train_count": len(train),
+            "val_count": len(validation),
+            "test_main_count": len(test),
+            "diagnostic_count": len(diagnostic),
+            "train_subtypes": dict(sorted(Counter(_canonical_subtype(row) for row in train).items())),
+            "val_subtypes": dict(sorted(Counter(_canonical_subtype(row) for row in validation).items())),
+            "test_subtypes": dict(sorted(Counter(_canonical_subtype(row) for row in test).items())),
+            "source_group_counts": {
+                "train": len({_primary_source_id(row) for row in train}),
+                "val": len({_primary_source_id(row) for row in validation}),
+                "test": len({_primary_source_id(row) for row in test}),
+            },
+            "leakage": leakage,
+        },
+    )
+    (output_root / "benchmark_quality_report.md").write_text(
+        _automatic_benchmark_markdown(manifest, asr_summary, automatic_review_summary), encoding="utf-8"
+    )
+    return manifest
+
+
+def _automatic_consensus_reject_reason(
+    pass1: dict[str, Any], pass2: dict[str, Any] | None, *, repeated: bool
+) -> str:
+    if pass1.get("decision") != "pass":
+        return f"pass1_{pass1.get('decision') or 'missing'}"
+    if not repeated:
+        return ""
+    if pass2 is None:
+        return "missing_repeat_review"
+    if pass2.get("decision") != "pass":
+        return f"pass2_{pass2.get('decision') or 'missing'}"
+    if any(pass1.get(field) != pass2.get(field) for field in AUTOMATIC_REVIEW_CRITICAL_FIELDS):
+        return "rejected_review_disagreement"
+    if str(pass1.get("speech_role") or "") != str(pass2.get("speech_role") or ""):
+        return "speech_role_disagreement"
+    return ""
+
+
+def _automatic_review_agreement(
+    pass1: dict[str, dict[str, Any]],
+    pass2: dict[str, dict[str, Any]],
+    repeat_ids: set[str],
+) -> dict[str, Any]:
+    compared = [sample_id for sample_id in sorted(repeat_ids) if sample_id in pass1 and sample_id in pass2]
+    exact = sum(pass1[sample_id].get("decision") == pass2[sample_id].get("decision") for sample_id in compared)
+    field_matches = 0
+    field_total = 0
+    speech_matches = 0
+    disagreements = 0
+    for sample_id in compared:
+        first, second = pass1[sample_id], pass2[sample_id]
+        for field in AUTOMATIC_REVIEW_CRITICAL_FIELDS:
+            field_matches += int(first.get(field) == second.get(field))
+            field_total += 1
+        speech_matches += int(first.get("speech_role") == second.get("speech_role"))
+        disagreements += int(bool(_automatic_consensus_reject_reason(first, second, repeated=True)))
+    return {
+        "repeat_review_count": len(repeat_ids),
+        "repeat_review_requested_count": len(repeat_ids),
+        "repeat_review_completed_count": len(compared),
+        "exact_decision_agreement": exact / len(compared) if compared else None,
+        "field_level_agreement": field_matches / field_total if field_total else None,
+        "speech_role_agreement": speech_matches / len(compared) if compared else None,
+        "disagreement_count": disagreements,
+        "missing_repeat_count": len(repeat_ids) - len(compared),
+    }
+
+
+def _select_exact_benchmark_quota(
+    rows: list[dict[str, Any]],
+    *,
+    targets: dict[str, int],
+    total_target: int,
+    max_dataset_ratio: float,
+    max_hdtf_ratio: float,
+    max_voxceleb_ratio: float,
+    max_per_source: int,
+    random_seed: int,
+    strict_dataset_ratio: float | None = None,
+    relaxed_dataset_non_speech_only: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    normalized_targets = {
+        _canonical_subtype_name(key): max(0, int(value)) for key, value in targets.items()
+    }
+    selected: list[dict[str, Any]] = []
+    dataset_counts: Counter[str] = Counter()
+    source_counts: Counter[str] = Counter()
+    subtype_counts: Counter[str] = Counter()
+    dataset_limit = max(1, math.floor(total_target * max_dataset_ratio))
+    strict_dataset_limit = (
+        max(1, math.floor(total_target * float(strict_dataset_ratio)))
+        if strict_dataset_ratio is not None
+        else dataset_limit
+    )
+    hdtf_limit = max(0, math.floor(total_target * max_hdtf_ratio))
+    voxceleb_limit = max(0, math.floor(total_target * max_voxceleb_ratio))
+    remaining = list(rows)
+    subtype_order = sorted(
+        normalized_targets,
+        key=lambda subtype: (
+            len([row for row in rows if _canonical_subtype(row) == subtype]) / max(1, normalized_targets[subtype]),
+            subtype,
+        ),
+    )
+    for subtype in subtype_order:
+        while subtype_counts[subtype] < normalized_targets[subtype]:
+            eligible = [
+                row
+                for row in remaining
+                if _canonical_subtype(row) == subtype
+                and source_counts[_primary_source_id(row)] < max_per_source
+                and dataset_counts[_dataset(row)] < dataset_limit
+                and not (
+                    relaxed_dataset_non_speech_only
+                    and subtype == "speech_topic_in_video_context"
+                    and dataset_counts[_dataset(row)] >= strict_dataset_limit
+                )
+                and (_dataset(row) != "hdtf" or dataset_counts["hdtf"] < hdtf_limit)
+                and (_dataset(row) != "voxceleb" or dataset_counts["voxceleb"] < voxceleb_limit)
+                and _voxceleb_automatic_review_allowed(row)
+            ]
+            if not eligible:
+                break
+            row = min(
+                eligible,
+                key=lambda item: (
+                    -int(_has_strict_local_negative(item)),
+                    dataset_counts[_dataset(item)],
+                    -float(_review_field(item, "min_stage_confidence") or 0.0),
+                    -float(_review_field(item, "video_context_strength") or 0.0),
+                    -_numeric_field(item, "audio_delta_strength"),
+                    float(_review_field(item, "recomputed_asr_risk") or 0.0),
+                    _stable_row_key(item, random_seed),
+                ),
+            )
+            selected.append(row)
+            remaining.remove(row)
+            subtype_counts[subtype] += 1
+            dataset_counts[_dataset(row)] += 1
+            source_counts[_primary_source_id(row)] += 1
+    selection = {
+        "requested_targets": normalized_targets,
+        "selected_count": len(selected),
+        "selected_subtypes": dict(sorted(subtype_counts.items())),
+        "selected_datasets": dict(sorted(dataset_counts.items())),
+        "max_dataset_ratio": max_dataset_ratio,
+        "dataset_limit": dataset_limit,
+        "strict_dataset_limit": strict_dataset_limit,
+        "hdtf_limit": hdtf_limit,
+        "voxceleb_limit": voxceleb_limit,
+        "dataset_ratio_relaxed": dataset_limit > strict_dataset_limit,
+        "relaxed_dataset_non_speech_only": bool(relaxed_dataset_non_speech_only),
+        "reallocated_to_sound_event": 0,
+    }
+    return selected, selection
+
+
+def _select_with_non_speech_reallocation(
+    rows: list[dict[str, Any]],
+    *,
+    original_targets: dict[str, int],
+    total_target: int,
+    max_dataset_ratio: float,
+    max_hdtf_ratio: float,
+    max_voxceleb_ratio: float,
+    max_per_source: int,
+    random_seed: int,
+    strict_dataset_ratio: float | None = None,
+    relaxed_dataset_non_speech_only: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    availability = Counter(_canonical_subtype(row) for row in rows)
+    targets = {_canonical_subtype_name(key): int(value) for key, value in original_targets.items()}
+    music = min(targets.get("music", 0), availability["music"])
+    speech = min(targets.get("speech_topic_in_video_context", 0), availability["speech_topic_in_video_context"])
+    sound = total_target - music - speech
+    effective = {
+        "sound_event": sound,
+        "music": music,
+        "speech_topic_in_video_context": speech,
+    }
+    selected, summary = _select_exact_benchmark_quota(
+        rows,
+        targets=effective,
+        total_target=total_target,
+        max_dataset_ratio=max_dataset_ratio,
+        max_hdtf_ratio=max_hdtf_ratio,
+        max_voxceleb_ratio=max_voxceleb_ratio,
+        max_per_source=max_per_source,
+        random_seed=random_seed,
+        strict_dataset_ratio=strict_dataset_ratio,
+        relaxed_dataset_non_speech_only=relaxed_dataset_non_speech_only,
+    )
+    summary["original_targets"] = {
+        _canonical_subtype_name(key): int(value) for key, value in original_targets.items()
+    }
+    summary["reallocated_to_sound_event"] = max(0, sound - int(original_targets.get("sound_event", 0)))
+    summary["reallocation_policy"] = "music/speech shortages move only to sound_event; speech never increases"
+    return selected, summary
+
+
+def _row_with_automatic_review(
+    row: dict[str, Any],
+    pass1: dict[str, Any],
+    pass2: dict[str, Any] | None,
+    *,
+    consensus_reason: str,
+) -> dict[str, Any]:
+    output = dict(row)
+    output["automatic_review_pass1"] = pass1
+    if pass2 is not None:
+        output["automatic_review_pass2"] = pass2
+    output["automatic_review_consensus"] = not bool(consensus_reason)
+    output["automatic_consensus_reasons"] = [consensus_reason] if consensus_reason else []
+    output["reviewer_type"] = "omni"
+    output["review_profile"] = AUTOMATIC_REVIEW_PROFILE
+    output["human_validated"] = False
+    output["model_verified"] = not bool(consensus_reason)
+    output["recomputed_asr_risk"] = float(pass1.get("recomputed_asr_risk") or 0.0)
+    output["speech_role"] = str(pass1.get("speech_role") or "")
+    output["transcript_like"] = bool(pass1.get("transcript_like"))
+    output["full_av_required"] = bool(pass1.get("full_av_required"))
+    output["video_context_strength"] = float(pass1.get("video_context_strength") or 0.0)
+    output["audio_only_solvability"] = float(pass1.get("audio_only_solvability") or 0.0)
+    output["min_stage_confidence"] = min(
+        [float(pass1.get("min_stage_confidence") or 0.0)]
+        + ([float(pass2.get("min_stage_confidence") or 0.0)] if pass2 is not None else [])
+    )
+    if not consensus_reason:
+        output["split_tier"] = "main"
+        output["benchmark_eligible"] = True
+    else:
+        output["split_tier"] = "diagnostic"
+        output["benchmark_eligible"] = False
+    return output
+
+
+def _automatic_review_is_diagnostic(pass1: dict[str, Any], pass2: dict[str, Any] | None) -> bool:
+    values = [pass1] + ([pass2] if pass2 else [])
+    return any(
+        str(value.get("speech_role") or "") in {"asr_only", "generic_talking_head"}
+        or bool(value.get("transcript_like"))
+        or float(value.get("recomputed_asr_risk") or 0.0) > 0.35
+        or float(value.get("audio_only_solvability") or 0.0) >= 0.85
+        for value in values
+    )
+
+
+def _automatic_reviews_by_sample(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        sample_id = _sample_id(row)
+        if not sample_id:
+            continue
+        if sample_id in output:
+            raise ValueError(f"duplicate automatic review for sample_id={sample_id}")
+        output[sample_id] = row
+    return output
+
+
+def _deterministic_repeat_ids(
+    rows: list[dict[str, Any]], *, fraction: float, random_seed: int
+) -> set[str]:
+    if not rows or fraction <= 0:
+        return set()
+    count = min(len(rows), max(1, round(len(rows) * min(1.0, fraction))))
+    ranked = sorted(rows, key=lambda row: _stable_row_key(row, random_seed + 7919))
+    return {_sample_id(row) for row in ranked[:count]}
+
+
+def _row_overlaps_identities(row: dict[str, Any], identities: dict[str, set[str]]) -> bool:
+    source = _row_identity_values(row, ("source_disjoint_group_id", "raw_source_id", "source_id"))
+    pair = _row_identity_values(row, ("inverse_pair_group_id", "pair_group_id"))
+    sample = {_sample_id(row)} - {""}
+    return bool(source & identities["source"] or pair & identities["pair"] or sample & identities["sample"])
+
+
+def _voxceleb_automatic_review_allowed(row: dict[str, Any]) -> bool:
+    if _dataset(row) != "voxceleb":
+        return True
+    return (
+        float(_review_field(row, "recomputed_asr_risk") or 0.0) <= 0.30
+        and float(_review_field(row, "video_context_strength") or 0.0) >= 0.70
+    )
+
+
+def _review_field(row: dict[str, Any], key: str) -> Any:
+    if key in row:
+        return row.get(key)
+    review = row.get("automatic_review_pass1") if isinstance(row.get("automatic_review_pass1"), dict) else {}
+    return review.get(key)
+
+
+def _recommended_training_sampling_weight(row: dict[str, Any]) -> float:
+    subtype = _canonical_subtype(row)
+    if subtype == "sound_event":
+        return 0.50
+    if subtype == "music":
+        return 0.20
+    speech_role = str(row.get("speech_role") or "")
+    if speech_role in {"asr_only", "generic_talking_head"} or _truthy(row.get("transcript_like")):
+        return 0.05
+    if subtype == "speech_topic_in_video_context":
+        return 0.25 if speech_role in {"contextual_speech", "speech_with_event"} else 0.05
+    return 0.0
+
+
+def _subtype_dataset_crosstab(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    result: dict[str, Counter[str]] = defaultdict(Counter)
+    for row in rows:
+        result[_canonical_subtype(row)][_dataset(row)] += 1
+    return {key: dict(sorted(value.items())) for key, value in sorted(result.items())}
+
+
+def _automatic_benchmark_markdown(
+    manifest: dict[str, Any],
+    asr_summary: dict[str, Any],
+    automatic_review_summary: dict[str, Any],
+) -> str:
+    lines = [
+        "# Audio-CVR Automatic Benchmark Quality Report",
+        "",
+        "> Automatically curated and model-verified; not human-validated.",
+        "",
+        f"- Test count: {manifest['test_final_count']}",
+        f"- Test SHA256: `{manifest['test_main_sha256']}`",
+        f"- Strict local coverage: {manifest['strict_local_coverage']:.2%}",
+        f"- ASR diagnostic count: {asr_summary['count']}",
+        f"- Review candidates: {automatic_review_summary['review_candidate_count']}",
+        f"- Omni consensus eligible: {automatic_review_summary['consensus_eligible_count']}",
+        f"- Repeat decision agreement: {automatic_review_summary['repeat_review']['exact_decision_agreement']}",
+        f"- Leakage violations: {manifest['leakage']['violation_count']}",
+        "",
+        "## Test Subtypes",
+        "",
+        "| Subtype | Count |",
+        "|---|---:|",
+    ]
+    lines.extend(f"| {key} | {value} |" for key, value in manifest["test_subtype_distribution"].items())
+    lines.extend(["", "## Dataset Distribution", "", "| Dataset | Count |", "|---|---:|"])
+    lines.extend(f"| {key} | {value} |" for key, value in manifest["test_dataset_distribution"].items())
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _numeric_distribution(values: Iterable[float]) -> dict[str, Any]:
+    finite: list[float] = []
+    for value in values:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(numeric):
+            finite.append(numeric)
+    if not finite:
+        return {"count": 0, "min": None, "max": None, "mean": None, "unique_values": []}
+    unique = sorted(set(finite))
+    return {
+        "count": len(finite),
+        "min": min(finite),
+        "max": max(finite),
+        "mean": statistics.fmean(finite),
+        "unique_values": unique[:50],
+        "unique_value_count": len(unique),
+    }
 
 
 def prepare_paper_splits(*, split_root: str | Path, output_dir: str | Path) -> dict[str, Any]:
@@ -736,6 +1921,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated automatic tiers eligible for review. Extended records require promotion checks.",
     )
 
+    automatic_prepare = subparsers.add_parser("prepare-automatic-benchmark-review")
+    automatic_prepare.add_argument("--input-path", action="append", required=True)
+    automatic_prepare.add_argument("--output-dir", required=True)
+    automatic_prepare.add_argument(
+        "--review-pool-targets",
+        default="sound_event=180,music=70,speech_topic_in_video_context=180",
+    )
+    automatic_prepare.add_argument("--max-per-source", type=int, default=2)
+    automatic_prepare.add_argument("--random-seed", type=int, default=20260720)
+
+    automatic_review = subparsers.add_parser("review-benchmark-omni")
+    automatic_review.add_argument("--candidate-path", required=True)
+    automatic_review.add_argument("--output-path", required=True)
+    automatic_review.add_argument("--media-root", required=True)
+    automatic_review.add_argument("--cache-dir", required=True)
+    automatic_review.add_argument("--base-url", required=True)
+    automatic_review.add_argument("--api-key", default="EMPTY")
+    automatic_review.add_argument("--model", required=True)
+    automatic_review.add_argument("--review-pass-id", type=int, choices=(1, 2), default=1)
+    automatic_review.add_argument("--pass1-review-path", action="append", default=[])
+    automatic_review.add_argument("--repeat-review-fraction", type=float, default=0.20)
+    automatic_review.add_argument("--random-seed", type=int, default=20260720)
+    automatic_review.add_argument("--shard-index", type=int, default=0)
+    automatic_review.add_argument("--shard-count", type=int, default=1)
+    automatic_review.add_argument("--timeout-seconds", type=float, default=180.0)
+    automatic_review.add_argument("--omni-retries", type=int, default=2)
+    automatic_review.add_argument("--resume", action="store_true")
+    automatic_review.add_argument("--fail-on-error", action="store_true")
+
+    automatic_finalize = subparsers.add_parser("finalize-automatic-benchmark")
+    automatic_finalize.add_argument("--combined-pool-path", required=True)
+    automatic_finalize.add_argument("--candidate-path", required=True)
+    automatic_finalize.add_argument("--pass1-review-path", action="append", required=True)
+    automatic_finalize.add_argument("--pass2-review-path", action="append", required=True)
+    automatic_finalize.add_argument("--output-dir", required=True)
+    automatic_finalize.add_argument(
+        "--subtype-targets",
+        default="sound_event=90,music=30,speech_topic_in_video_context=30",
+    )
+    automatic_finalize.add_argument(
+        "--validation-targets",
+        default="sound_event=45,music=15,speech_topic_in_video_context=15",
+    )
+    automatic_finalize.add_argument("--repeat-review-fraction", type=float, default=0.20)
+    automatic_finalize.add_argument("--max-dataset-ratio", type=float, default=0.50)
+    automatic_finalize.add_argument("--relaxed-dataset-ratio", type=float, default=0.55)
+    automatic_finalize.add_argument("--max-hdtf-ratio", type=float, default=0.15)
+    automatic_finalize.add_argument("--max-voxceleb-ratio", type=float, default=0.05)
+    automatic_finalize.add_argument("--max-per-source", type=int, default=1)
+    automatic_finalize.add_argument("--random-seed", type=int, default=20260720)
+
     freeze = subparsers.add_parser("finalize-benchmark")
     freeze.add_argument("--candidate-path", required=True)
     freeze.add_argument("--review-path", action="append", required=True)
@@ -744,10 +1980,30 @@ def build_parser() -> argparse.ArgumentParser:
     freeze.add_argument("--target-count", type=int, default=150)
     freeze.add_argument("--minimum-count", type=int, default=100)
     freeze.add_argument("--max-speech-ratio", type=float, default=0.35)
-    freeze.add_argument("--max-dataset-ratio", type=float, default=0.60)
+    freeze.add_argument(
+        "--max-dataset-ratio",
+        type=float,
+        default=None,
+        help="Defaults to 0.60 for human review and 0.50 for omni_consensus.",
+    )
     freeze.add_argument("--max-per-source", type=int, default=1)
     freeze.add_argument("--min-strict-local-coverage", type=float, default=0.0)
     freeze.add_argument("--random-seed", type=int, default=20260719)
+    freeze.add_argument("--review-policy", choices=("human", "omni_consensus"), default="human")
+    freeze.add_argument("--combined-pool-path")
+    freeze.add_argument("--pass2-review-path", action="append", default=[])
+    freeze.add_argument(
+        "--subtype-targets",
+        default="sound_event=90,music=30,speech_topic_in_video_context=30",
+    )
+    freeze.add_argument(
+        "--validation-targets",
+        default="sound_event=45,music=15,speech_topic_in_video_context=15",
+    )
+    freeze.add_argument("--repeat-review-fraction", type=float, default=0.20)
+    freeze.add_argument("--relaxed-dataset-ratio", type=float, default=0.55)
+    freeze.add_argument("--max-hdtf-ratio", type=float, default=0.15)
+    freeze.add_argument("--max-voxceleb-ratio", type=float, default=0.05)
     freeze.add_argument(
         "--eligible-tiers",
         default="main",
@@ -805,21 +2061,91 @@ def main() -> None:
             random_seed=args.random_seed,
             eligible_tiers=_parse_strings(args.eligible_tiers),
         )
-    elif args.command == "finalize-benchmark":
-        result = finalize_benchmark(
-            candidate_path=args.candidate_path,
-            review_paths=args.review_path,
+    elif args.command == "prepare-automatic-benchmark-review":
+        result = prepare_automatic_benchmark_review(
+            input_paths=args.input_path,
             output_dir=args.output_dir,
-            exclude_paths=args.exclude_path,
-            target_count=args.target_count,
-            minimum_count=args.minimum_count,
-            max_speech_ratio=args.max_speech_ratio,
-            max_dataset_ratio=args.max_dataset_ratio,
+            review_pool_targets=_parse_named_ints(args.review_pool_targets),
             max_per_source=args.max_per_source,
-            min_strict_local_coverage=args.min_strict_local_coverage,
             random_seed=args.random_seed,
-            eligible_tiers=_parse_strings(args.eligible_tiers),
         )
+    elif args.command == "review-benchmark-omni":
+        result = review_benchmark_omni(
+            candidate_path=args.candidate_path,
+            output_path=args.output_path,
+            media_root=args.media_root,
+            cache_dir=args.cache_dir,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=args.model,
+            review_pass_id=args.review_pass_id,
+            pass1_review_paths=args.pass1_review_path,
+            repeat_review_fraction=args.repeat_review_fraction,
+            random_seed=args.random_seed,
+            shard_index=args.shard_index,
+            shard_count=args.shard_count,
+            timeout_seconds=args.timeout_seconds,
+            omni_retries=args.omni_retries,
+            resume=args.resume,
+            fail_on_error=args.fail_on_error,
+        )
+    elif args.command == "finalize-automatic-benchmark":
+        result = finalize_automatic_benchmark(
+            combined_pool_path=args.combined_pool_path,
+            candidate_path=args.candidate_path,
+            pass1_review_paths=args.pass1_review_path,
+            pass2_review_paths=args.pass2_review_path,
+            output_dir=args.output_dir,
+            subtype_targets=_parse_named_ints(args.subtype_targets),
+            validation_targets=_parse_named_ints(args.validation_targets),
+            repeat_review_fraction=args.repeat_review_fraction,
+            max_dataset_ratio=args.max_dataset_ratio,
+            relaxed_dataset_ratio=args.relaxed_dataset_ratio,
+            max_hdtf_ratio=args.max_hdtf_ratio,
+            max_voxceleb_ratio=args.max_voxceleb_ratio,
+            max_per_source=args.max_per_source,
+            random_seed=args.random_seed,
+        )
+    elif args.command == "finalize-benchmark":
+        if args.review_policy == "omni_consensus":
+            if not args.combined_pool_path or not args.pass2_review_path:
+                raise ValueError(
+                    "omni_consensus requires --combined-pool-path and at least one --pass2-review-path"
+                )
+            subtype_targets = _parse_named_ints(args.subtype_targets)
+            if sum(subtype_targets.values()) != int(args.target_count):
+                raise ValueError("--target-count must equal the sum of --subtype-targets")
+            result = finalize_automatic_benchmark(
+                combined_pool_path=args.combined_pool_path,
+                candidate_path=args.candidate_path,
+                pass1_review_paths=args.review_path,
+                pass2_review_paths=args.pass2_review_path,
+                output_dir=args.output_dir,
+                subtype_targets=subtype_targets,
+                validation_targets=_parse_named_ints(args.validation_targets),
+                repeat_review_fraction=args.repeat_review_fraction,
+                max_dataset_ratio=0.50 if args.max_dataset_ratio is None else args.max_dataset_ratio,
+                relaxed_dataset_ratio=args.relaxed_dataset_ratio,
+                max_hdtf_ratio=args.max_hdtf_ratio,
+                max_voxceleb_ratio=args.max_voxceleb_ratio,
+                max_per_source=args.max_per_source,
+                random_seed=args.random_seed,
+            )
+        else:
+            result = finalize_benchmark(
+                candidate_path=args.candidate_path,
+                review_paths=args.review_path,
+                output_dir=args.output_dir,
+                exclude_paths=args.exclude_path,
+                target_count=args.target_count,
+                minimum_count=args.minimum_count,
+                max_speech_ratio=args.max_speech_ratio,
+                max_dataset_ratio=0.60 if args.max_dataset_ratio is None else args.max_dataset_ratio,
+                max_per_source=args.max_per_source,
+                min_strict_local_coverage=args.min_strict_local_coverage,
+                random_seed=args.random_seed,
+                eligible_tiers=_parse_strings(args.eligible_tiers),
+            )
     elif args.command == "summarize-validation":
         result = summarize_validation(
             input_roots=args.input_root,
@@ -1624,6 +2950,212 @@ def _subtype(row: dict[str, Any]) -> str:
     return str(row.get("b_subtype") or row.get("audio_delta_type") or "unknown")
 
 
+def _canonical_subtype(row: dict[str, Any]) -> str:
+    return _canonical_subtype_name(_subtype(row))
+
+
+def _canonical_subtype_name(value: Any) -> str:
+    subtype = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if subtype in {"speech", "speech_topic", "speech_audio_content", "speech_topic_in_video_context"}:
+        return "speech_topic_in_video_context"
+    if subtype in {"music", "musical_event"}:
+        return "music"
+    if subtype in {"sound", "sound_event", "audio_event", "audio"}:
+        return "sound_event"
+    return "unknown"
+
+
+def _normalized_dataset(row: dict[str, Any]) -> str:
+    explicit = _dataset(row).strip().lower().replace("-", "_")
+    text = " ".join(
+        str(value or "").lower()
+        for value in (
+            explicit,
+            row.get("reference_video"),
+            row.get("target_video"),
+            row.get("source_id"),
+        )
+    )
+    aliases = (
+        ("vgg_monoaudio", "vgg_monoaudio"),
+        ("vggsound", "vggsound"),
+        ("voxceleb", "voxceleb"),
+        ("worldsense", "worldsense"),
+        ("daily_omni", "daily_omni"),
+        ("hdtf", "hdtf"),
+        ("avatar", "avatar"),
+    )
+    for token, name in aliases:
+        if token in text:
+            return name
+    return explicit or "unknown"
+
+
+def _stable_source_id(row: dict[str, Any]) -> str:
+    explicit = _first_text(row, ("source_disjoint_group_id", "raw_source_id", "source_id", "source_group_id"))
+    if explicit:
+        return explicit
+    path = _first_text(row, ("reference_video", "target_video"))
+    stem = Path(path).stem
+    stem = re.sub(r"(?:__|[_-])(?:single|clip|segment|part)[_-]?\d+$", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"(?:__|[_-])\d{1,6}$", "", stem)
+    dataset = _normalized_dataset(row)
+    if stem:
+        return f"{dataset}:{stem}"
+    digest = hashlib.sha256(
+        f"{dataset}|{row.get('reference_video')}|{row.get('target_video')}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"derived_source:{digest}"
+
+
+def _stable_sample_id(row: dict[str, Any]) -> str:
+    explicit = _first_text(row, ("sample_id", "proposal_id", "clip_id"))
+    if explicit:
+        return explicit
+    digest = hashlib.sha256(
+        "|".join(
+            (
+                _first_text(row, ("reference_video",)),
+                _first_text(row, ("target_video",)),
+                str(row.get("edit_text") or row.get("audio_only_edit_text") or "").strip(),
+            )
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"audiocvr_{digest}"
+
+
+def _stable_pair_group_id(row: dict[str, Any]) -> str:
+    explicit = _first_text(row, ("inverse_pair_group_id", "pair_group_id"))
+    if explicit:
+        return explicit
+    pair = sorted(
+        (
+            _normalize_media_identity(_first_text(row, ("reference_video",))),
+            _normalize_media_identity(_first_text(row, ("target_video",))),
+        )
+    )
+    digest = hashlib.sha256(f"{_stable_source_id(row)}|{pair[0]}|{pair[1]}".encode("utf-8")).hexdigest()[:24]
+    return f"pair_{digest}"
+
+
+def _normalized_reference_target_key(row: dict[str, Any]) -> str:
+    reference = _normalize_media_identity(_first_text(row, ("reference_video", "reference_clip_path")))
+    target = _normalize_media_identity(_first_text(row, ("target_video", "target_clip_path")))
+    return f"{reference}|{target}" if reference and target else ""
+
+
+def _normalize_media_identity(value: str) -> str:
+    return str(value or "").strip().replace("\\", "/").lower()
+
+
+def _numeric_field(row: dict[str, Any], key: str) -> float:
+    sources = (
+        row,
+        row.get("quality") if isinstance(row.get("quality"), dict) else {},
+        row.get("final_omni_verification") if isinstance(row.get("final_omni_verification"), dict) else {},
+        row.get("audio_delta_analysis") if isinstance(row.get("audio_delta_analysis"), dict) else {},
+    )
+    for source in sources:
+        if key not in source:
+            continue
+        try:
+            return min(1.0, max(0.0, float(source.get(key) or 0.0)))
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _diagnostic_reasons(row: dict[str, Any]) -> set[str]:
+    value = row.get("diagnostic_reason")
+    if isinstance(value, list):
+        return {str(item).strip() for item in value if str(item).strip()}
+    if str(value or "").strip():
+        return {str(value).strip()}
+    return set()
+
+
+def _existing_verifier_complete(row: dict[str, Any]) -> bool:
+    return all(
+        isinstance(row.get(key), dict) and bool(row.get(key))
+        for key in ("audio_only_verification", "video_only_shortcut", "full_av_consistency")
+    )
+
+
+def _existing_verifier_explicit_failure(row: dict[str, Any]) -> str:
+    audio = row.get("audio_only_verification") if isinstance(row.get("audio_only_verification"), dict) else None
+    video = row.get("video_only_shortcut") if isinstance(row.get("video_only_shortcut"), dict) else None
+    full_av = row.get("full_av_consistency") if isinstance(row.get("full_av_consistency"), dict) else None
+    if audio is not None and "accept" in audio and not _truthy(audio.get("accept")):
+        return "legacy_audio_only_reject"
+    if audio is not None and "reference_satisfies_edit" in audio and _truthy(audio.get("reference_satisfies_edit")):
+        return "legacy_reference_satisfies_edit"
+    if audio is not None and "target_satisfies_edit" in audio and not _truthy(audio.get("target_satisfies_edit")):
+        return "legacy_target_does_not_satisfy_edit"
+    if video is not None and (
+        _truthy(video.get("can_identify_target_without_audio")) or _truthy(video.get("visual_shortcut_risk"))
+    ):
+        return "legacy_video_only_shortcut"
+    if full_av is not None and "accept" in full_av and not _truthy(full_av.get("accept")):
+        return "legacy_full_av_reject"
+    if full_av is not None and "audio_edit_still_valid" in full_av and not _truthy(full_av.get("audio_edit_still_valid")):
+        return "legacy_audio_edit_invalid_full_av"
+    return ""
+
+
+def _existing_min_stage_confidence(row: dict[str, Any]) -> float:
+    values: list[float] = []
+    for key in ("audio_only_verification", "video_only_shortcut", "full_av_consistency"):
+        payload = row.get(key) if isinstance(row.get(key), dict) else {}
+        if "confidence" in payload:
+            try:
+                values.append(float(payload.get("confidence") or 0.0))
+            except (TypeError, ValueError):
+                pass
+    return min(values) if values else 0.0
+
+
+def _resolve_media_path(media_root: Path, value: str) -> Path:
+    path = Path(value)
+    resolved = path if path.is_absolute() else media_root / path
+    resolved = resolved.resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"media file does not exist: {resolved}")
+    return resolved
+
+
+def _automatic_audio_proposal(row: dict[str, Any]) -> dict[str, Any]:
+    for key in ("audio_only_proposal", "audio_delta_analysis", "audio_delta"):
+        value = row.get(key)
+        if isinstance(value, dict) and value:
+            return dict(value)
+    return {
+        "difference_type": "speech" if _canonical_subtype(row) == "speech_topic_in_video_context" else "audio_event",
+        "b_subtype": _canonical_subtype(row),
+        "reference_audio_content": str(row.get("old_audio") or "").strip(),
+        "target_audio_content": str(row.get("new_audio") or "").strip(),
+        "edit_text": str(row.get("edit_text") or "").strip(),
+    }
+
+
+def _transcript_like_text(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return True
+    patterns = (
+        r"\bfrom saying\s+['\"]?.+?['\"]?\s+to saying\s+['\"]?.+?['\"]?(?:\b|$)",
+        r"\bchange (?:the )?(?:voice|speech) from saying\b",
+        r"\breplace (?:the )?(?:sentence|phrase|words)\b",
+        r"\bverbatim\b|\btranscript\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def _first_text(row: dict[str, Any], keys: Iterable[str]) -> str:
     for key in keys:
         value = row.get(key)
@@ -1656,6 +3188,27 @@ def _parse_strings(value: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in str(value).split(",") if item.strip())
 
 
+def _parse_named_ints(value: str) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"expected NAME=COUNT, got: {item}")
+        name, raw_count = item.split("=", 1)
+        canonical = _canonical_subtype_name(name)
+        if canonical == "unknown":
+            raise ValueError(f"unsupported subtype target: {name}")
+        count = int(raw_count)
+        if count < 0:
+            raise ValueError(f"subtype target must be non-negative: {item}")
+        result[canonical] = count
+    if not result:
+        raise ValueError("subtype target mapping must not be empty")
+    return result
+
+
 def _parse_mode_comparison(value: str) -> tuple[str, str]:
     parts = [item.strip() for item in str(value).split(":")]
     if len(parts) != 2 or not all(parts):
@@ -1665,6 +3218,13 @@ def _parse_mode_comparison(value: str) -> tuple[str, str]:
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_optional_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    payload = _read_json(path)
+    return payload if isinstance(payload, dict) else {}
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

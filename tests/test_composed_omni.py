@@ -27,6 +27,70 @@ class _FakeHTTPResponse:
 
 
 class ComposedOmniClientTests(unittest.TestCase):
+    def test_audiocvr_repeat_context_audit_changes_order_but_preserves_roles(self) -> None:
+        request_holder: dict[str, object] = {}
+        response_payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "accept": True,
+                                "reject_reason": "",
+                                "visual_context_preserved": True,
+                                "audio_edit_still_valid": True,
+                                "full_av_required": True,
+                                "speech_role": "contextual_speech",
+                                "transcript_like": False,
+                                "recomputed_asr_risk": 0.2,
+                                "video_context_strength": 0.8,
+                                "audio_only_solvability": 0.5,
+                                "confidence": 0.9,
+                                "evidence": ["the visible event contextualizes the speech"],
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        def fake_urlopen(request, timeout):
+            request_holder["request"] = request
+            return _FakeHTTPResponse(response_payload)
+
+        temp_parent = Path.cwd() / "runs"
+        temp_parent.mkdir(exist_ok=True)
+        tmp_dir = temp_parent / f"tmp-audiocvr-audit-{uuid.uuid4().hex}"
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        try:
+            reference = tmp_dir / "reference.mp4"
+            target = tmp_dir / "target.mp4"
+            reference.write_bytes(b"reference-video")
+            target.write_bytes(b"target-video")
+            client = OpenAIComposedDataClient(
+                base_url="http://127.0.0.1:8092/v1",
+                api_key="EMPTY",
+                model="omni-model",
+            )
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                normalized, _ = client.audit_audiocvr_benchmark_context(
+                    reference_clip_path=str(reference),
+                    target_clip_path=str(target),
+                    edit_text="change the discussion from weather to a visible sports play",
+                    audio_only_evidence={"verification": {"accept": True}},
+                    review_pass_id=2,
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        self.assertEqual("contextual_speech", normalized["speech_role"])
+        request_body = json.loads(request_holder["request"].data.decode("utf-8"))
+        self.assertIn("reverse checklist order", request_body["messages"][0]["content"])
+        user_content = request_body["messages"][1]["content"]
+        text_labels = [item["text"] for item in user_content if item.get("type") == "text"]
+        self.assertTrue(text_labels[0].startswith("Target"))
+        self.assertTrue(text_labels[1].startswith("Reference"))
+
     def test_annotate_clip_materializes_local_video_path_as_data_url(self) -> None:
         request_holder: dict[str, object] = {}
         response_payload = {

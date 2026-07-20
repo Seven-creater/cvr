@@ -8,8 +8,13 @@ import unittest
 import numpy as np
 
 from app.audio_cvr_paper_experiment import (
+    _automatic_consensus_reject_reason,
+    _automatic_review_decision,
+    _select_exact_benchmark_quota,
     aggregate_final,
+    finalize_automatic_benchmark,
     finalize_benchmark,
+    prepare_automatic_benchmark_review,
     prepare_benchmark_review,
     prepare_paper_splits,
     score_fusion,
@@ -19,6 +24,200 @@ from app.e5_audio_delta_train import _AudioDeltaAdapter, _import_torch
 
 
 class AudioCVRPaperExperimentTests(unittest.TestCase):
+    def test_automatic_review_pool_merges_and_deduplicates_without_using_legacy_asr_risk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            main = self._automatic_row("main", "source_a", "pair_a", subtype="sound_event")
+            duplicate = self._automatic_row(
+                "duplicate",
+                "source_a",
+                "pair_a",
+                subtype="sound_event",
+                tier="extended",
+            )
+            duplicate["reference_video"] = main["reference_video"]
+            duplicate["target_video"] = main["target_video"]
+            duplicate["asr_degeneracy_risk"] = 0.45
+            rejected = self._automatic_row("rejected", "source_b", "pair_b", subtype="music")
+            rejected["audio_only_verification"]["accept"] = False
+            first = root / "old.jsonl"
+            second = root / "fresh.jsonl"
+            self._write_jsonl(first, [main])
+            self._write_jsonl(second, [duplicate, rejected])
+
+            summary = prepare_automatic_benchmark_review(
+                input_paths=[first, second],
+                output_dir=root / "review",
+                review_pool_targets={"sound_event": 10, "music": 10, "speech_topic_in_video_context": 10},
+            )
+
+            self.assertEqual(3, summary["input_count"])
+            self.assertEqual(1, summary["deduplicated_count"])
+            self.assertEqual(1, summary["duplicate_drop_counts"]["duplicate_reference_target"])
+            self.assertEqual(1, summary["filter_rejection_counts"]["legacy_audio_only_reject"])
+            rows = self._read_jsonl(root / "review" / "combined_pool_deduplicated.jsonl")
+            self.assertEqual("main", rows[0]["sample_id"])
+            self.assertTrue(rows[0]["legacy_asr_risk_advisory_only"])
+
+    def test_automatic_speech_review_rejects_transcript_like_asr(self) -> None:
+        row = self._automatic_row(
+            "speech",
+            "source_speech",
+            "pair_speech",
+            subtype="speech_topic_in_video_context",
+        )
+        row["edit_text"] = "change the spoken phrase from hello there to good morning"
+        review = _automatic_review_decision(
+            row,
+            audio_verify=self._audio_review_payload(),
+            video_verify=self._video_review_payload(),
+            full_av=self._full_av_review_payload(),
+            context=self._context_review_payload(
+                speech_role="asr_only",
+                transcript_like=True,
+                asr_risk=0.90,
+            ),
+            review_pass_id=1,
+            model="mock-omni",
+        )
+
+        self.assertEqual("reject", review["decision"])
+        self.assertIn("speech_role:asr_only", review["reject_reasons"])
+        self.assertIn("transcript_like", review["reject_reasons"])
+        self.assertIn("asr_risk_above_0.35", review["reject_reasons"])
+
+    def test_automatic_repeat_disagreement_never_enters_consensus(self) -> None:
+        first = self._model_review("sample", subtype="sound_event")
+        second = dict(first)
+        second["review_pass_id"] = 2
+        second["full_av_pass"] = False
+
+        reason = _automatic_consensus_reject_reason(first, second, repeated=True)
+
+        self.assertEqual("rejected_review_disagreement", reason)
+
+    def test_automatic_selector_enforces_90_30_30_quota_and_source_uniqueness(self) -> None:
+        rows: list[dict[str, object]] = []
+        specs = (("sound_event", 90), ("music", 30), ("speech_topic_in_video_context", 30))
+        datasets = ("avatar", "vggsound", "worldsense", "daily_omni")
+        index = 0
+        for subtype, count in specs:
+            for _ in range(count):
+                dataset = datasets[index % len(datasets)]
+                row = self._automatic_row(
+                    f"sample_{index}",
+                    f"source_{index}",
+                    f"pair_{index}",
+                    subtype=subtype,
+                    dataset=dataset,
+                )
+                row["automatic_review_pass1"] = self._model_review(
+                    str(row["sample_id"]), subtype=subtype
+                )
+                row["min_stage_confidence"] = 0.9
+                rows.append(row)
+                index += 1
+
+        selected, summary = _select_exact_benchmark_quota(
+            rows,
+            targets={"sound_event": 90, "music": 30, "speech_topic_in_video_context": 30},
+            total_target=150,
+            max_dataset_ratio=0.50,
+            max_hdtf_ratio=0.15,
+            max_voxceleb_ratio=0.05,
+            max_per_source=1,
+            random_seed=20260720,
+        )
+
+        self.assertEqual(150, len(selected))
+        self.assertEqual(
+            {"music": 30, "sound_event": 90, "speech_topic_in_video_context": 30},
+            summary["selected_subtypes"],
+        )
+        self.assertEqual(150, len({row["raw_source_id"] for row in selected}))
+
+    def test_finalize_automatic_benchmark_rebuilds_disjoint_splits_and_asr_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            rows: list[dict[str, object]] = []
+            subtypes = [
+                "sound_event",
+                "sound_event",
+                "sound_event",
+                "sound_event",
+                "sound_event",
+                "music",
+                "music",
+                "speech_topic_in_video_context",
+                "speech_topic_in_video_context",
+            ]
+            for index, subtype in enumerate(subtypes):
+                rows.append(
+                    self._automatic_row(
+                        f"sample_{index}",
+                        f"source_{index}",
+                        f"pair_{index}",
+                        subtype=subtype,
+                        dataset=("avatar", "vggsound", "worldsense", "daily_omni")[index % 4],
+                    )
+                )
+            asr_row = self._automatic_row(
+                "sample_asr",
+                "source_asr",
+                "pair_asr",
+                subtype="speech_topic_in_video_context",
+                dataset="hdtf",
+            )
+            rows.append(asr_row)
+            combined = root / "combined.jsonl"
+            candidates = root / "candidates.jsonl"
+            pass1_path = root / "pass1.jsonl"
+            pass2_path = root / "pass2.jsonl"
+            self._write_jsonl(combined, rows)
+            self._write_jsonl(candidates, rows)
+            reviews = [
+                self._model_review(str(row["sample_id"]), subtype=str(row["b_subtype"]))
+                for row in rows[:-1]
+            ]
+            asr_review = self._model_review("sample_asr", subtype="speech_topic_in_video_context")
+            asr_review.update(
+                {
+                    "decision": "reject",
+                    "speech_role": "asr_only",
+                    "transcript_like": True,
+                    "recomputed_asr_risk": 0.9,
+                    "reject_reasons": ["speech_role:asr_only", "transcript_like"],
+                }
+            )
+            reviews.append(asr_review)
+            self._write_jsonl(pass1_path, reviews)
+            self._write_jsonl(pass2_path, [])
+
+            manifest = finalize_automatic_benchmark(
+                combined_pool_path=combined,
+                candidate_path=candidates,
+                pass1_review_paths=[pass1_path],
+                pass2_review_paths=[pass2_path],
+                output_dir=root / "benchmark",
+                subtype_targets={"sound_event": 3, "music": 1, "speech_topic_in_video_context": 1},
+                validation_targets={"sound_event": 1, "music": 1, "speech_topic_in_video_context": 1},
+                repeat_review_fraction=0.0,
+                max_dataset_ratio=0.80,
+                relaxed_dataset_ratio=0.80,
+                max_hdtf_ratio=0.20,
+                max_voxceleb_ratio=0.20,
+            )
+
+            self.assertEqual(5, manifest["test_final_count"])
+            self.assertEqual(0, manifest["leakage"]["violation_count"])
+            self.assertEqual(1, len(self._read_jsonl(root / "benchmark" / "test_asr_diagnostic.jsonl")))
+            self.assertTrue((root / "benchmark" / "frozen_benchmark.sha256").exists())
+            self.assertTrue((root / "benchmark" / "automatic_review_summary.json").exists())
+            self.assertTrue((root / "benchmark" / "benchmark_quality_report.md").exists())
+            audit = json.loads((root / "benchmark" / "leakage_audit.json").read_text(encoding="utf-8"))
+            self.assertFalse(audit["selection_uses_model_scores"])
+            self.assertEqual(0, audit["duplicate_pair_count"])
+
     def test_prepare_paper_splits_preserves_assignment_and_filters_test_main(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -405,6 +604,107 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             "split_tier": tier,
             "direction": "forward",
             "audio_delta_type": "sound_event",
+        }
+
+    @staticmethod
+    def _automatic_row(
+        sample_id: str,
+        source: str,
+        pair: str,
+        *,
+        subtype: str,
+        tier: str = "main",
+        dataset: str = "avatar",
+    ) -> dict[str, object]:
+        row = AudioCVRPaperExperimentTests._row(sample_id, source, pair, tier=tier)
+        row.update(
+            {
+                "accepted": True,
+                "fallback": False,
+                "dataset": dataset,
+                "b_subtype": subtype,
+                "audio_delta_type": subtype,
+                "audio_delta_strength": 0.9,
+                "video_context_strength": 0.8,
+                "asr_degeneracy_risk": 0.45,
+                "audio_only_verification": AudioCVRPaperExperimentTests._audio_review_payload(),
+                "video_only_shortcut": AudioCVRPaperExperimentTests._video_review_payload(),
+                "full_av_consistency": AudioCVRPaperExperimentTests._full_av_review_payload(),
+            }
+        )
+        return row
+
+    @staticmethod
+    def _audio_review_payload() -> dict[str, object]:
+        return {
+            "accept": True,
+            "reference_satisfies_edit": False,
+            "target_satisfies_edit": True,
+            "audio_difference_specific": True,
+            "edit_text_audio_only": True,
+            "confidence": 0.9,
+        }
+
+    @staticmethod
+    def _video_review_payload() -> dict[str, object]:
+        return {
+            "accept": True,
+            "visual_context_preserved": True,
+            "visual_shortcut_risk": False,
+            "can_identify_target_without_audio": False,
+            "confidence": 0.9,
+        }
+
+    @staticmethod
+    def _full_av_review_payload() -> dict[str, object]:
+        return {
+            "accept": True,
+            "visual_context_preserved": True,
+            "visual_shortcut_risk": False,
+            "audio_edit_still_valid": True,
+            "confidence": 0.9,
+        }
+
+    @staticmethod
+    def _context_review_payload(
+        *,
+        speech_role: str,
+        transcript_like: bool = False,
+        asr_risk: float = 0.1,
+    ) -> dict[str, object]:
+        return {
+            "accept": True,
+            "visual_context_preserved": True,
+            "audio_edit_still_valid": True,
+            "full_av_required": True,
+            "speech_role": speech_role,
+            "transcript_like": transcript_like,
+            "recomputed_asr_risk": asr_risk,
+            "video_context_strength": 0.8,
+            "audio_only_solvability": 0.5,
+            "confidence": 0.9,
+        }
+
+    @staticmethod
+    def _model_review(sample_id: str, *, subtype: str) -> dict[str, object]:
+        speech = subtype == "speech_topic_in_video_context"
+        return {
+            "sample_id": sample_id,
+            "reviewer_type": "omni",
+            "review_profile": "audiocvr_benchmark_review_v1",
+            "review_pass_id": 1,
+            "audio_only_pass": True,
+            "video_only_pass": True,
+            "full_av_pass": True,
+            "speech_role": "contextual_speech" if speech else "not_speech",
+            "transcript_like": False,
+            "full_av_required": True,
+            "recomputed_asr_risk": 0.1,
+            "video_context_strength": 0.8,
+            "audio_only_solvability": 0.5,
+            "min_stage_confidence": 0.9,
+            "decision": "pass",
+            "reject_reasons": [],
         }
 
     @staticmethod

@@ -224,6 +224,21 @@ REQUIRED_B_LINE_FULL_AV_CONSISTENCY_FIELDS = (
     "evidence",
 )
 
+REQUIRED_AUDIOCVR_BENCHMARK_CONTEXT_FIELDS = (
+    "accept",
+    "reject_reason",
+    "visual_context_preserved",
+    "audio_edit_still_valid",
+    "full_av_required",
+    "speech_role",
+    "transcript_like",
+    "recomputed_asr_risk",
+    "video_context_strength",
+    "audio_only_solvability",
+    "confidence",
+    "evidence",
+)
+
 REQUIRED_VIDEO_EDIT_PLAN_FIELDS = (
     "should_generate",
     "source_prompt",
@@ -921,6 +936,33 @@ def _b_line_full_av_consistency_system_prompt() -> str:
     )
 
 
+def _audiocvr_benchmark_context_system_prompt(review_pass_id: int = 1) -> str:
+    repeat_instruction = (
+        "This is an independent repeat audit. Ignore any possible prior decision and evaluate in reverse checklist order: "
+        "first whether full AV is required, then visual context/shortcuts, then directional audio evidence. "
+        if int(review_pass_id) == 2
+        else "Evaluate in checklist order: directional audio evidence, visual context/shortcuts, then whether full AV is required. "
+    )
+    return "".join((
+        "You are an independent model-blind auditor for an Audio-CVR benchmark. ",
+        repeat_instruction,
+        "The task is directional retrieval: the reference must not satisfy the audio edit, the target must satisfy it, "
+        "and the surrounding visual context must be preserved. Inspect both full videos and the edit text. "
+        "Return exactly one JSON object with schema: "
+        '{"accept": boolean, "reject_reason": string, "visual_context_preserved": boolean, '
+        '"audio_edit_still_valid": boolean, "full_av_required": boolean, '
+        '"speech_role": "not_speech"|"contextual_speech"|"speech_with_event"|"asr_only"|"generic_talking_head", '
+        '"transcript_like": boolean, "recomputed_asr_risk": number, "video_context_strength": number, '
+        '"audio_only_solvability": number, "confidence": number, "evidence": [string]}. '
+        "Use contextual_speech only when visible activities, setting, participants, or events provide useful context beyond a transcript. "
+        "Use speech_with_event when speech is tied to an audible/visible event, performance, tutorial, sport, or broadcast. "
+        "Use asr_only for word/topic matching that can be solved from a transcript without useful video context. "
+        "Use generic_talking_head for static meetings, podcasts, webinars, or generic face-to-camera clips. "
+        "Set transcript_like=true for verbatim phrase replacement or near-literal transcript matching. "
+        "Scores must be in [0,1]. Reject unsupported, ambiguous, visually revealing, or context-mismatched pairs.",
+    ))
+
+
 def _pair_judge_system_prompt() -> str:
     return (
         "You are a strict judge for composed video retrieval dataset construction. "
@@ -1469,6 +1511,33 @@ def _build_b_line_full_av_consistency_user_content(
         {"type": "video_url", "video_url": {"url": target_clip_path}},
         {"type": "text", "text": prompt},
     ]
+
+
+def _build_audiocvr_benchmark_context_user_content(
+    *,
+    reference_clip_path: str,
+    target_clip_path: str,
+    edit_text: str,
+    audio_only_evidence: dict[str, Any],
+    review_pass_id: int,
+) -> list[dict[str, Any]]:
+    prompt = (
+        f"Independent benchmark review pass: {int(review_pass_id)}.\n"
+        f"Proposed directional audio edit: {edit_text}\n"
+        f"Blind audio evidence JSON:\n{_prompt_json(audio_only_evidence, max_chars=1000)}\n"
+        "Do not rewrite the edit. Judge whether this is a reliable benchmark query, then classify its speech/ASR role. "
+        "Do not infer quality from dataset names, prior tier labels, or model retrieval scores."
+    )
+    reference_items = [
+        {"type": "text", "text": "Reference full audio-visual video (before the proposed edit):"},
+        {"type": "video_url", "video_url": {"url": reference_clip_path}},
+    ]
+    target_items = [
+        {"type": "text", "text": "Target full audio-visual video (after the proposed edit):"},
+        {"type": "video_url", "video_url": {"url": target_clip_path}},
+    ]
+    media_items = target_items + reference_items if int(review_pass_id) == 2 else reference_items + target_items
+    return media_items + [{"type": "text", "text": prompt}]
 
 
 def _prompt_json(payload: dict[str, Any], *, max_chars: int) -> str:
@@ -2054,6 +2123,28 @@ class OpenAIComposedDataClient:
             max_tokens=600,
         )
         return _normalize_b_line_full_av_consistency_payload(raw_payload), raw_payload
+
+    def audit_audiocvr_benchmark_context(
+        self,
+        *,
+        reference_clip_path: str,
+        target_clip_path: str,
+        edit_text: str,
+        audio_only_evidence: dict[str, Any],
+        review_pass_id: int = 1,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        raw_payload = self._request_json(
+            user_content=_build_audiocvr_benchmark_context_user_content(
+                reference_clip_path=reference_clip_path,
+                target_clip_path=target_clip_path,
+                edit_text=edit_text,
+                audio_only_evidence=audio_only_evidence,
+                review_pass_id=review_pass_id,
+            ),
+            system_prompt=_audiocvr_benchmark_context_system_prompt(review_pass_id),
+            max_tokens=750,
+        )
+        return _normalize_audiocvr_benchmark_context_payload(raw_payload), raw_payload
 
     def judge_pair(
         self,
@@ -2968,6 +3059,36 @@ def _normalize_b_line_full_av_consistency_payload(payload: dict[str, Any]) -> di
         "visual_context_preserved": _bool_value(payload.get("visual_context_preserved")),
         "visual_shortcut_risk": _bool_value(payload.get("visual_shortcut_risk")),
         "audio_edit_still_valid": _bool_value(payload.get("audio_edit_still_valid")),
+        "confidence": _score_value(payload.get("confidence")),
+        "evidence": _detail_list(payload.get("evidence")),
+    }
+
+
+def _normalize_audiocvr_benchmark_context_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    missing_fields = _missing_fields(payload, REQUIRED_AUDIOCVR_BENCHMARK_CONTEXT_FIELDS)
+    if missing_fields:
+        raise ValueError(f"Audio-CVR benchmark context audit missing fields: {missing_fields}")
+    speech_role = str(payload.get("speech_role", "")).strip().lower().replace("-", "_").replace(" ", "_")
+    allowed_roles = {
+        "not_speech",
+        "contextual_speech",
+        "speech_with_event",
+        "asr_only",
+        "generic_talking_head",
+    }
+    if speech_role not in allowed_roles:
+        raise ValueError(f"unsupported Audio-CVR speech_role: {speech_role or '<empty>'}")
+    return {
+        "accept": _bool_value(payload.get("accept")),
+        "reject_reason": str(payload.get("reject_reason", "")).strip(),
+        "visual_context_preserved": _bool_value(payload.get("visual_context_preserved")),
+        "audio_edit_still_valid": _bool_value(payload.get("audio_edit_still_valid")),
+        "full_av_required": _bool_value(payload.get("full_av_required")),
+        "speech_role": speech_role,
+        "transcript_like": _bool_value(payload.get("transcript_like")),
+        "recomputed_asr_risk": _score_value(payload.get("recomputed_asr_risk")),
+        "video_context_strength": _score_value(payload.get("video_context_strength")),
+        "audio_only_solvability": _score_value(payload.get("audio_only_solvability")),
         "confidence": _score_value(payload.get("confidence")),
         "evidence": _detail_list(payload.get("evidence")),
     }
