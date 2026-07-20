@@ -1098,6 +1098,137 @@ def finalize_automatic_benchmark(
     return manifest
 
 
+def audit_training_splits(
+    *,
+    train_path: str | Path,
+    val_path: str | Path,
+    test_path: str | Path,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    """Audit the frozen benchmark splits before inverse augmentation or E5 training."""
+    paths = {
+        "train": Path(train_path),
+        "val": Path(val_path),
+        "test": Path(test_path),
+    }
+    rows = {name: _read_jsonl(path) for name, path in paths.items()}
+    empty = [name for name, values in rows.items() if not values]
+    if empty:
+        raise ValueError(f"training split audit requires non-empty files: {empty}")
+
+    leakage = _split_leakage_summary(
+        train=rows["train"],
+        val=rows["val"],
+        test=rows["test"],
+    )
+    violations: list[dict[str, Any]] = list(leakage["violations"])
+    for split_name, values in rows.items():
+        sample_counts = Counter(_sample_id(row) for row in values if _sample_id(row))
+        duplicate_samples = sorted(key for key, count in sample_counts.items() if count > 1)
+        if duplicate_samples:
+            violations.append(
+                {
+                    "type": "duplicate_sample",
+                    "split": split_name,
+                    "count": len(duplicate_samples),
+                    "examples": duplicate_samples[:5],
+                }
+            )
+    test_inverse = [
+        row
+        for row in rows["test"]
+        if _truthy(row.get("is_inverse"))
+        or str(row.get("direction") or "forward").strip().lower() == "inverse"
+    ]
+    if test_inverse:
+        violations.append(
+            {
+                "type": "inverse_in_test_main",
+                "split": "test",
+                "count": len(test_inverse),
+                "examples": [_sample_id(row) for row in test_inverse[:5]],
+            }
+        )
+    test_pairs = [_pair_id(row) for row in rows["test"] if _pair_id(row)]
+    duplicate_test_pairs = sorted(
+        pair for pair, count in Counter(test_pairs).items() if count > 1
+    )
+    if duplicate_test_pairs:
+        violations.append(
+            {
+                "type": "duplicate_pair_in_test_main",
+                "split": "test",
+                "count": len(duplicate_test_pairs),
+                "examples": duplicate_test_pairs[:5],
+            }
+        )
+
+    split_summaries: dict[str, Any] = {}
+    for split_name, values in rows.items():
+        directions = Counter(
+            "inverse"
+            if _truthy(row.get("is_inverse"))
+            or str(row.get("direction") or "forward").strip().lower() == "inverse"
+            else "forward"
+            for row in values
+        )
+        split_summaries[split_name] = {
+            "count": len(values),
+            "unique_source_count": len({_primary_source_id(row) for row in values}),
+            "unique_pair_count": len({_pair_id(row) for row in values}),
+            "subtype_distribution": dict(
+                sorted(Counter(_canonical_subtype(row) for row in values).items())
+            ),
+            "dataset_distribution": dict(sorted(Counter(_dataset(row) for row in values).items())),
+            "direction_distribution": dict(sorted(directions.items())),
+        }
+
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "protocol": "audiocvr_training_split_audit_v1",
+        "input_paths": {name: str(path) for name, path in paths.items()},
+        "splits": split_summaries,
+        "train_forward_count": int(split_summaries["train"]["direction_distribution"].get("forward", 0)),
+        "train_inverse_count": int(split_summaries["train"]["direction_distribution"].get("inverse", 0)),
+        "leakage": leakage,
+        "violation_count": sum(int(item.get("count") or 0) for item in violations),
+        "violations": violations,
+        "ready_for_inverse_augmentation": not violations,
+        "ready_for_training": not violations,
+    }
+    _write_json(output_root / "training_split_audit.json", summary)
+    (output_root / "training_split_audit.md").write_text(
+        _training_split_audit_markdown(summary), encoding="utf-8"
+    )
+    if violations:
+        raise ValueError(f"training split audit failed: {violations}")
+    return summary
+
+
+def _training_split_audit_markdown(summary: dict[str, Any]) -> str:
+    lines = [
+        "# Audio-CVR Training Split Audit",
+        "",
+        f"- Ready for training: `{str(summary['ready_for_training']).lower()}`",
+        f"- Leakage violations: {summary['leakage']['violation_count']}",
+        f"- Total violations: {summary['violation_count']}",
+        "",
+        "| Split | Records | Sources | Pairs | Forward | Inverse |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for split_name in ("train", "val", "test"):
+        split = summary["splits"][split_name]
+        directions = split["direction_distribution"]
+        lines.append(
+            f"| {split_name} | {split['count']} | {split['unique_source_count']} | "
+            f"{split['unique_pair_count']} | {directions.get('forward', 0)} | "
+            f"{directions.get('inverse', 0)} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _automatic_consensus_reject_reason(
     pass1: dict[str, Any], pass2: dict[str, Any] | None, *, repeated: bool
 ) -> str:
@@ -1451,7 +1582,10 @@ def prepare_paper_splits(*, split_root: str | Path, output_dir: str | Path) -> d
 
     train = _read_jsonl(source_root / "train.jsonl")
     val = _read_jsonl(source_root / "val.jsonl")
-    test_all = _read_jsonl(source_root / "test_main.jsonl")
+    test_source = source_root / "test_main.jsonl"
+    if not test_source.exists():
+        test_source = source_root / "test_main_150.jsonl"
+    test_all = _read_jsonl(test_source)
     if not train or not val or not test_all:
         raise ValueError("paper split preparation requires non-empty train, val, and test_main JSONL files")
 
@@ -1485,6 +1619,7 @@ def prepare_paper_splits(*, split_root: str | Path, output_dir: str | Path) -> d
     summary = {
         "split_root": str(source_root),
         "output_dir": str(output_root),
+        "test_source_path": str(test_source),
         "counts": {
             "train": len(train),
             "val": len(val),
@@ -1972,6 +2107,12 @@ def build_parser() -> argparse.ArgumentParser:
     automatic_finalize.add_argument("--max-per-source", type=int, default=1)
     automatic_finalize.add_argument("--random-seed", type=int, default=20260720)
 
+    split_audit = subparsers.add_parser("audit-training-splits")
+    split_audit.add_argument("--train-path", required=True)
+    split_audit.add_argument("--val-path", required=True)
+    split_audit.add_argument("--test-path", required=True)
+    split_audit.add_argument("--output-dir", required=True)
+
     freeze = subparsers.add_parser("finalize-benchmark")
     freeze.add_argument("--candidate-path", required=True)
     freeze.add_argument("--review-path", action="append", required=True)
@@ -2105,6 +2246,13 @@ def main() -> None:
             max_voxceleb_ratio=args.max_voxceleb_ratio,
             max_per_source=args.max_per_source,
             random_seed=args.random_seed,
+        )
+    elif args.command == "audit-training-splits":
+        result = audit_training_splits(
+            train_path=args.train_path,
+            val_path=args.val_path,
+            test_path=args.test_path,
+            output_dir=args.output_dir,
         )
     elif args.command == "finalize-benchmark":
         if args.review_policy == "omni_consensus":

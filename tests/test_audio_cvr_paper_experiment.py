@@ -12,6 +12,7 @@ from app.audio_cvr_paper_experiment import (
     _automatic_review_decision,
     _select_exact_benchmark_quota,
     aggregate_final,
+    audit_training_splits,
     finalize_automatic_benchmark,
     finalize_benchmark,
     prepare_automatic_benchmark_review,
@@ -24,6 +25,39 @@ from app.e5_audio_delta_train import _AudioDeltaAdapter, _import_torch
 
 
 class AudioCVRPaperExperimentTests(unittest.TestCase):
+    def test_paper_splits_accept_frozen_test_main_150_and_audit_clean_training_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            split_root = root / "benchmark_v1"
+            train = [self._automatic_row("train", "source_train", "pair_train", subtype="sound_event")]
+            val = [self._automatic_row("val", "source_val", "pair_val", subtype="music")]
+            test = [self._automatic_row("test", "source_test", "pair_test", subtype="sound_event")]
+            for row, split in ((train[0], "train"), (val[0], "val"), (test[0], "test_main")):
+                row["dataset_split"] = split
+                row["split_tier"] = "main"
+                row["direction"] = "forward"
+                row["is_inverse"] = False
+            self._write_jsonl(split_root / "train.jsonl", train)
+            self._write_jsonl(split_root / "val.jsonl", val)
+            self._write_jsonl(split_root / "test_main_150.jsonl", test)
+
+            prepared = prepare_paper_splits(
+                split_root=split_root,
+                output_dir=root / "paper_splits",
+            )
+            audit = audit_training_splits(
+                train_path=split_root / "train.jsonl",
+                val_path=split_root / "val.jsonl",
+                test_path=split_root / "test_main_150.jsonl",
+                output_dir=root / "audit",
+            )
+
+            self.assertTrue(prepared["test_source_path"].endswith("test_main_150.jsonl"))
+            self.assertEqual(0, audit["violation_count"])
+            self.assertEqual(1, audit["train_forward_count"])
+            self.assertTrue(audit["ready_for_training"])
+            self.assertTrue((root / "audit" / "training_split_audit.md").exists())
+
     def test_automatic_review_pool_merges_and_deduplicates_without_using_legacy_asr_risk(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -1105,6 +1105,7 @@ def augment_b_inverse(
     timeout_seconds: float = 180.0,
     omni_retries: int = 2,
     fail_on_transient_omni_errors: bool = False,
+    resume: bool = False,
 ) -> dict[str, Any]:
     run_root_path = Path(run_root)
     root_path = _infer_cvr_root(run_root_path, root)
@@ -1119,7 +1120,10 @@ def augment_b_inverse(
     train_path = run_root_path / "b_train_bidirectional_triplets.jsonl"
     for path in (candidates_path, accepted_path, rejected_path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
+        if not resume:
+            path.write_text("", encoding="utf-8")
+        elif not path.exists():
+            path.touch()
 
     client = OpenAIComposedDataClient(
         base_url=base_url,
@@ -1127,15 +1131,41 @@ def augment_b_inverse(
         model=model,
         timeout_seconds=timeout_seconds,
     )
-    accepted: list[dict[str, Any]] = []
-    rejected: list[dict[str, Any]] = []
-    candidates: list[dict[str, Any]] = []
+    accepted = _deduplicate_inverse_outputs(_load_jsonl(accepted_path) if resume else [])
+    rejected = _deduplicate_inverse_outputs(_load_jsonl(rejected_path) if resume else [])
+    if resume:
+        retained_rejected = [
+            record
+            for record in rejected
+            if not str(record.get("inverse_reject_reason") or "").startswith(
+                "inverse_verification_error:"
+            )
+        ]
+        if len(retained_rejected) != len(rejected):
+            rejected = retained_rejected
+            _write_jsonl(rejected_path, rejected)
+    candidates = _deduplicate_inverse_outputs(_load_jsonl(candidates_path) if resume else [])
+    completed_ids = {
+        str(record.get("proposal_id") or "").strip()
+        for record in accepted + rejected
+        if str(record.get("proposal_id") or "").strip()
+    }
+    candidate_ids = {
+        str(record.get("proposal_id") or "").strip()
+        for record in candidates
+        if str(record.get("proposal_id") or "").strip()
+    }
 
     for index, record in enumerate(records, start=1):
         inverse_edit = _inverse_b_line_edit_text(str(record.get("edit_text") or record.get("audio_only_edit_text") or ""))
         candidate = _build_inverse_candidate_record(record, inverse_edit=inverse_edit, index=index)
-        candidates.append(candidate)
-        _append_jsonl_record(candidates_path, candidate)
+        proposal_id = str(candidate.get("proposal_id") or "").strip()
+        if proposal_id in completed_ids:
+            continue
+        if proposal_id not in candidate_ids:
+            candidates.append(candidate)
+            candidate_ids.add(proposal_id)
+            _append_jsonl_record(candidates_path, candidate)
         if not inverse_edit.get("ok"):
             candidate["inverse_accept"] = False
             candidate["accepted"] = False
@@ -1180,6 +1210,9 @@ def augment_b_inverse(
             flush=True,
         )
 
+    accepted = _deduplicate_inverse_outputs(accepted)
+    rejected = _deduplicate_inverse_outputs(rejected)
+    candidates = _deduplicate_inverse_outputs(candidates)
     forward_train = [_forward_train_record(record) for record in records]
     _write_jsonl(train_path, forward_train + accepted)
     summary = {
@@ -1190,6 +1223,7 @@ def augment_b_inverse(
         "candidate_count": len(candidates),
         "accepted_count": len(accepted),
         "rejected_count": len(rejected),
+        "resume": bool(resume),
         "outputs": {
             "candidates": str(candidates_path),
             "accepted": str(accepted_path),
@@ -1200,6 +1234,19 @@ def augment_b_inverse(
     }
     (run_root_path / "b_inverse_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return summary
+
+
+def _deduplicate_inverse_outputs(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in records:
+        key = str(record.get("proposal_id") or record.get("candidate_id") or "").strip()
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        output.append(record)
+    return output
 
 
 def _infer_cvr_root(run_root: Path, explicit_root: str | Path | None) -> Path:
@@ -3024,6 +3071,7 @@ def build_parser() -> argparse.ArgumentParser:
     inverse.add_argument("--timeout-seconds", type=float, default=180.0)
     inverse.add_argument("--omni-retries", type=int, default=2)
     inverse.add_argument("--fail-on-transient-omni-errors", action="store_true")
+    inverse.add_argument("--resume", action="store_true")
 
     splits = subparsers.add_parser("build-b-splits")
     splits.add_argument("--run-root", required=True)
@@ -3089,6 +3137,7 @@ def main() -> None:
             timeout_seconds=args.timeout_seconds,
             omni_retries=args.omni_retries,
             fail_on_transient_omni_errors=args.fail_on_transient_omni_errors,
+            resume=args.resume,
         )
     elif args.command == "build-b-splits":
         result = build_b_splits(

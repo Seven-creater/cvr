@@ -401,6 +401,21 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("pkill", script)
         self.assertNotIn("kill -", script)
 
+    def test_audio_cvr_post_review_finalizer_uses_full_pool_and_audits_leakage(self) -> None:
+        script = Path("scripts/finalize_audio_cvr_review_and_prepare_training.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("combined_pool_deduplicated.jsonl", script)
+        self.assertIn("sound_event=120,music=30,speech_topic_in_video_context=0", script)
+        self.assertIn("sound_event=30,music=10,speech_topic_in_video_context=0", script)
+        self.assertIn("finalize-automatic-benchmark", script)
+        self.assertIn("audit-training-splits", script)
+        self.assertIn("test_main_150.jsonl", script)
+        self.assertNotIn("review-benchmark-omni", script)
+        self.assertNotIn("pkill", script)
+        self.assertNotIn("kill -", script)
+
     def test_video_edit_env_script_is_read_only_and_checks_wan_layout(self) -> None:
         script = Path("scripts/check_video_edit_env.sh").read_text(encoding="utf-8")
 

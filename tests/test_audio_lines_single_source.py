@@ -3243,6 +3243,33 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual("the bakery opening", train[0]["old_audio"])
             self.assertEqual("the mayor's remarks", train[0]["new_audio"])
 
+            client.reset_mock()
+            with mock.patch("app.audio_lines_single_source.OpenAIComposedDataClient", return_value=client), mock.patch(
+                "app.audio_lines_single_source._extract_audio_only_cache",
+                side_effect=lambda video_path, cache_dir, clip_id: cache_dir / f"{clip_id}.wav",
+            ), mock.patch(
+                "app.audio_lines_single_source._extract_video_only_cache",
+                side_effect=lambda video_path, cache_dir, clip_id: cache_dir / f"{clip_id}.mp4",
+            ):
+                resumed = augment_b_inverse(
+                    run_root=run_root,
+                    input_path=input_path,
+                    root=root,
+                    max_records=1,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="qwen3-omni",
+                    resume=True,
+                )
+
+            resumed_accepted = [json.loads(line) for line in (run_root / "b_inverse_accepted.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            resumed_train = [json.loads(line) for line in (run_root / "b_train_bidirectional_triplets.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertTrue(resumed["resume"])
+            self.assertEqual(1, resumed["accepted_count"])
+            self.assertEqual(1, len(resumed_accepted))
+            self.assertEqual(2, len(resumed_train))
+            client.verify_b_line_audio_only_edit.assert_not_called()
+
     def test_augment_b_inverse_rejects_video_only_shortcut(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
