@@ -8,7 +8,9 @@ Usage:
     --work-root WORK_ROOT \
     [--output-dir WORK_ROOT/benchmark_v1] \
     [--test-targets sound_event=120,music=30,speech_topic_in_video_context=0] \
-    [--validation-targets sound_event=30,music=10,speech_topic_in_video_context=0]
+    [--validation-targets sound_event=22,music=8,speech_topic_in_video_context=0] \
+    [--max-dataset-ratio 0.50] \
+    [--relaxed-dataset-ratio 0.55]
 
 WORK_ROOT must contain:
   review_pool/combined_pool_deduplicated.jsonl
@@ -26,8 +28,10 @@ EOF
 WORK_ROOT=""
 OUTPUT_DIR=""
 TEST_TARGETS="sound_event=120,music=30,speech_topic_in_video_context=0"
-VALIDATION_TARGETS="sound_event=30,music=10,speech_topic_in_video_context=0"
+VALIDATION_TARGETS="sound_event=22,music=8,speech_topic_in_video_context=0"
 RANDOM_SEED=20260720
+MAX_DATASET_RATIO=0.50
+RELAXED_DATASET_RATIO=0.55
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,6 +40,8 @@ while [[ $# -gt 0 ]]; do
     --test-targets) TEST_TARGETS="$2"; shift 2 ;;
     --validation-targets) VALIDATION_TARGETS="$2"; shift 2 ;;
     --random-seed) RANDOM_SEED="$2"; shift 2 ;;
+    --max-dataset-ratio) MAX_DATASET_RATIO="$2"; shift 2 ;;
+    --relaxed-dataset-ratio) RELAXED_DATASET_RATIO="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -75,8 +81,8 @@ python3 -m app.audio_cvr_paper_experiment finalize-automatic-benchmark \
   --subtype-targets "$TEST_TARGETS" \
   --validation-targets "$VALIDATION_TARGETS" \
   --repeat-review-fraction 0.20 \
-  --max-dataset-ratio 0.50 \
-  --relaxed-dataset-ratio 0.55 \
+  --max-dataset-ratio "$MAX_DATASET_RATIO" \
+  --relaxed-dataset-ratio "$RELAXED_DATASET_RATIO" \
   --max-hdtf-ratio 0.15 \
   --max-voxceleb-ratio 0.05 \
   --max-per-source 1 \

@@ -24,13 +24,15 @@ test_main:
   total = 150
 
 validation:
-  sound_event = 30
-  music = 10
+  sound_event = 22
+  music = 8
   speech = 0
-  total = 40
+  total = 30
 ```
 
 所有被判为 ASR-only、transcript-like、generic talking-head 或 audio-only-solvable 的 speech 记录保留到 diagnostic，不进入主测试集。
+
+数据集来源比例是覆盖度诊断，不应覆盖三阶段内容质量判断。若严格 dataset cap 导致只能冻结一个仍由单一数据集主导的小集合，本轮允许显式设置 `--max-dataset-ratio 1.0 --relaxed-dataset-ratio 1.0`，冻结 150 条 source-unique 高质量样本。论文必须报告完整 dataset 分布、按 dataset 的结果和来源偏斜限制；不得把该设置描述为跨数据集均衡。另从主测试集构造 dominant-source 与 non-dominant-source 数量匹配的诊断子集，仅作 robustness 分析，不替代 150 条主测试集。
 
 ## 3. 训练集来源
 
@@ -100,7 +102,7 @@ train_unique_source_count
 
 inverse 增加方向监督，但不增加独立 source 数量。
 
-训练继续使用冻结的 E5-Omni-7B 和轻量 adapter。超参数只在 40 条 validation 上选择；配置冻结后，使用 5 个 seed 对 150 条 test-main 做一次正式评估。主实验至少包含：
+训练继续使用冻结的 E5-Omni-7B 和轻量 adapter。超参数只在 30 条 validation 上选择；配置冻结后，使用 5 个 seed 对 150 条 test-main 做一次正式评估。主实验至少包含：
 
 ```text
 with-reference vs without-reference

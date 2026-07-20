@@ -408,7 +408,9 @@ class ScriptTests(unittest.TestCase):
 
         self.assertIn("combined_pool_deduplicated.jsonl", script)
         self.assertIn("sound_event=120,music=30,speech_topic_in_video_context=0", script)
-        self.assertIn("sound_event=30,music=10,speech_topic_in_video_context=0", script)
+        self.assertIn("sound_event=22,music=8,speech_topic_in_video_context=0", script)
+        self.assertIn('--max-dataset-ratio "$MAX_DATASET_RATIO"', script)
+        self.assertIn('--relaxed-dataset-ratio "$RELAXED_DATASET_RATIO"', script)
         self.assertIn("finalize-automatic-benchmark", script)
         self.assertIn("audit-training-splits", script)
         self.assertIn("test_main_150.jsonl", script)
