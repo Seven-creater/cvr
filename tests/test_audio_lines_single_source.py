@@ -1199,6 +1199,36 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             inverse_diag = [json.loads(line) for line in (run_root / "b_splits" / "test_inverse_diagnostic.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
             self.assertEqual(1, sum(1 for record in train + inverse_diag if record.get("is_inverse")))
 
+    def test_build_b_splits_treats_missing_optional_inverse_output_as_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir) / "run"
+            rows = [
+                {
+                    "proposal_id": f"main_{index}",
+                    "accepted": True,
+                    "split_tier": "main",
+                    "raw_source_id": f"source_{index}",
+                    "pair_group_id": f"pair_{index}",
+                    "inverse_pair_group_id": f"pair_{index}",
+                    "reference_video": f"ref{index}.mp4",
+                    "target_video": f"tgt{index}.mp4",
+                    "edit_text": "replace quiet room ambience with crowd cheering",
+                }
+                for index in range(1, 7)
+            ]
+            self._write_jsonl(run_root / "b_main_audio_cvr_triplets.jsonl", rows)
+            self._write_jsonl(run_root / "b_extended_audio_cvr_triplets.jsonl", [])
+            self._write_jsonl(run_root / "b_diagnostic_asr_risk_triplets.jsonl", [])
+            self.assertFalse((run_root / "b_inverse_accepted.jsonl").exists())
+
+            summary = build_b_splits(run_root=run_root, train_ratio=0.5, val_ratio=0.25, test_ratio=0.25)
+
+            self.assertFalse(summary["inverse_input_exists"])
+            self.assertEqual(0, summary["inverse_input_count"])
+            self.assertEqual([], summary["leakage_violations"])
+            self.assertTrue((run_root / "b_splits" / "test_inverse_diagnostic.jsonl").exists())
+            self.assertEqual("", (run_root / "b_splits" / "test_inverse_diagnostic.jsonl").read_text(encoding="utf-8"))
+
     def test_a_omni_first_keeps_audio_anchor_pairs_for_omni_visual_judging(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -900,7 +900,12 @@ def build_b_splits(
     main = [_forward_train_record(record) for record in _load_jsonl(root / "b_main_audio_cvr_triplets.jsonl")]
     extended = [_forward_train_record(record) for record in _load_jsonl(root / "b_extended_audio_cvr_triplets.jsonl")]
     diagnostic = [_forward_train_record(record) for record in _load_jsonl(root / "b_diagnostic_asr_risk_triplets.jsonl")]
-    inverse = [record for record in _load_jsonl(root / "b_inverse_accepted.jsonl") if bool(record.get("is_inverse"))]
+    inverse_path = root / "b_inverse_accepted.jsonl"
+    inverse = (
+        [record for record in _load_jsonl(inverse_path) if bool(record.get("is_inverse"))]
+        if inverse_path.exists()
+        else []
+    )
 
     split_records = [record for record in main + extended if not bool(record.get("is_inverse"))]
     group_to_split = _source_disjoint_split_map(
@@ -975,6 +980,8 @@ def build_b_splits(
         "test_main_count": len(test_main),
         "test_inverse_diagnostic_count": len(test_inverse_diagnostic),
         "diagnostic_count": len(diagnostic),
+        "inverse_input_exists": inverse_path.exists(),
+        "inverse_input_count": len(inverse),
         "leakage_violations": violations,
         "outputs": {
             "train": str(output_root / "train.jsonl"),
