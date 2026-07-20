@@ -929,14 +929,9 @@ def build_b_splits(
         else:
             test_candidates.append(record)
 
-    test_main = _one_direction_per_pair_group(
-        [record for record in test_candidates if record.get("split_tier") == "main" and not bool(record.get("is_inverse"))]
-    )
-
-    test_pair_groups = {str(record.get("pair_group_id") or "").strip() for record in test_main}
-    test_main.extend(
-        record for record in test_candidates if record.get("split_tier") != "main" and str(record.get("pair_group_id") or "").strip() not in test_pair_groups
-    )
+    test_forward_candidates = [record for record in test_candidates if not bool(record.get("is_inverse"))]
+    test_main = _one_direction_per_pair_group(test_forward_candidates)
+    test_pair_duplicate_dropped_count = len(test_forward_candidates) - len(test_main)
 
     test_inverse_diagnostic: list[dict[str, Any]] = []
     for record in inverse:
@@ -978,6 +973,8 @@ def build_b_splits(
         "train_count": len(train),
         "val_count": len(val),
         "test_main_count": len(test_main),
+        "test_forward_candidate_count_before_pair_dedupe": len(test_forward_candidates),
+        "test_pair_duplicate_dropped_count": test_pair_duplicate_dropped_count,
         "test_inverse_diagnostic_count": len(test_inverse_diagnostic),
         "diagnostic_count": len(diagnostic),
         "inverse_input_exists": inverse_path.exists(),
@@ -1043,13 +1040,28 @@ def _source_disjoint_split_map(
 def _one_direction_per_pair_group(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for record in sorted(records, key=lambda item: str(item.get("proposal_id") or item.get("candidate_id") or item.get("pair_group_id") or "")):
+    for record in sorted(records, key=_test_pair_representative_priority):
         pair_group = str(record.get("pair_group_id") or _inverse_pair_group_id(record)).strip()
         if pair_group in seen:
             continue
         seen.add(pair_group)
         selected.append(record)
     return selected
+
+
+def _test_pair_representative_priority(record: dict[str, Any]) -> tuple[Any, ...]:
+    tier_rank = {"main": 0, "extended": 1, "diagnostic": 2}.get(
+        str(record.get("split_tier") or "").strip().lower(),
+        3,
+    )
+    return (
+        tier_rank,
+        -_b_line_metric(record, "final_omni_quality_score"),
+        -_b_line_metric(record, "audio_delta_strength"),
+        -_b_line_metric(record, "video_context_strength"),
+        _b_line_metric(record, "asr_degeneracy_risk"),
+        str(record.get("proposal_id") or record.get("candidate_id") or record.get("pair_group_id") or ""),
+    )
 
 
 def _split_leakage_violations(splits: dict[str, list[dict[str, Any]]]) -> list[str]:

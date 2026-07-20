@@ -1229,6 +1229,51 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertTrue((run_root / "b_splits" / "test_inverse_diagnostic.jsonl").exists())
             self.assertEqual("", (run_root / "b_splits" / "test_inverse_diagnostic.jsonl").read_text(encoding="utf-8"))
 
+    def test_build_b_splits_deduplicates_test_pairs_with_main_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir) / "run"
+            main_rows = []
+            extended_rows = []
+            for index in range(1, 7):
+                shared = {
+                    "accepted": True,
+                    "raw_source_id": f"source_{index}",
+                    "pair_group_id": f"pair_{index}",
+                    "inverse_pair_group_id": f"pair_{index}",
+                    "reference_video": f"ref{index}.mp4",
+                    "target_video": f"tgt{index}.mp4",
+                    "edit_text": "replace quiet room ambience with crowd cheering",
+                }
+                main_rows.append({**shared, "proposal_id": f"main_{index}", "split_tier": "main"})
+                extended_rows.append(
+                    {
+                        **shared,
+                        "proposal_id": f"extended_{index}",
+                        "split_tier": "extended",
+                        "final_omni_quality_score": 0.99,
+                    }
+                )
+            self._write_jsonl(run_root / "b_main_audio_cvr_triplets.jsonl", main_rows)
+            self._write_jsonl(run_root / "b_extended_audio_cvr_triplets.jsonl", extended_rows)
+            self._write_jsonl(run_root / "b_diagnostic_asr_risk_triplets.jsonl", [])
+
+            summary = build_b_splits(run_root=run_root, train_ratio=0.5, val_ratio=0.25, test_ratio=0.25)
+
+            test_rows = [
+                json.loads(line)
+                for line in (run_root / "b_splits" / "test_main.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            pair_groups = [row["pair_group_id"] for row in test_rows]
+            self.assertEqual(len(pair_groups), len(set(pair_groups)))
+            self.assertGreater(summary["test_pair_duplicate_dropped_count"], 0)
+            self.assertEqual(
+                summary["test_forward_candidate_count_before_pair_dedupe"],
+                summary["test_main_count"] + summary["test_pair_duplicate_dropped_count"],
+            )
+            self.assertTrue(all(row["split_tier"] == "main" for row in test_rows))
+            self.assertEqual([], summary["leakage_violations"])
+
     def test_a_omni_first_keeps_audio_anchor_pairs_for_omni_visual_judging(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
