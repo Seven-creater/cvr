@@ -405,6 +405,8 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('for index in "${!MODE_NAMES[@]}"', script)
         self.assertIn("--exclude-gallery-kind reference_negative", script)
         self.assertIn("reference_exclusion_audit.json", script)
+        self.assertIn('ln -sfn "$(realpath', script)
+        self.assertIn('stats = root / "statistics_forward_only"', script)
         self.assertIn("--bootstrap-samples", script)
         self.assertIn("score-fusion", script)
         self.assertNotIn("pkill", script)

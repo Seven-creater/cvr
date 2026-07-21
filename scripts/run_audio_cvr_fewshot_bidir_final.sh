@@ -559,8 +559,10 @@ done
 VARIANT_ROOT="$OUTPUT_DIR/variant_comparison_matrix"
 for seed in "${FINAL_SEED_ARRAY[@]}"; do
   mkdir -p "$VARIANT_ROOT/seed_${seed}"
-  ln -sfn "$OUTPUT_DIR/final_forward_only/seed_${seed}/eval_V_A_T" "$VARIANT_ROOT/seed_${seed}/eval_Forward_only"
-  ln -sfn "$OUTPUT_DIR/final_forward_bidir/seed_${seed}/eval_V_A_T" "$VARIANT_ROOT/seed_${seed}/eval_Forward_Bidir"
+  ln -sfn "$(realpath "$OUTPUT_DIR/final_forward_only/seed_${seed}/eval_V_A_T")" \
+    "$VARIANT_ROOT/seed_${seed}/eval_Forward_only"
+  ln -sfn "$(realpath "$OUTPUT_DIR/final_forward_bidir/seed_${seed}/eval_V_A_T")" \
+    "$VARIANT_ROOT/seed_${seed}/eval_Forward_Bidir"
 done
 python3 -m app.audio_cvr_paper_experiment aggregate-final \
   --input-root "$VARIANT_ROOT" --output-dir "$OUTPUT_DIR/statistics_variant_comparison" \
@@ -587,7 +589,7 @@ audit = {"loss_curve_count": curve_count, "non_finite_count": len(bad), "violati
 if bad:
     raise SystemExit(f"non-finite loss values found: {bad[:5]}")
 
-stats = root / "statistics_forward_bidir"
+stats = root / "statistics_forward_only"
 for source, target in (
     (stats / "per_seed_results.json", root / "per_seed_results.json"),
     (stats / "test_main_mean_std.json", root / "final_mean_std.json"),
@@ -599,7 +601,7 @@ for source, target in (
 selection = json.loads((root / "validation_selection.json").read_text(encoding="utf-8"))["selected_config"]
 inverse = json.loads((root / "inverse_summary.json").read_text(encoding="utf-8"))
 lines = [
-    "# Audio-CVR Few-Shot Bidirectional Final Results",
+    "# Audio-CVR Few-Shot Adapter Final Results",
     "",
     f"- Adapter: `{selection['adapter_architecture']}`, rank `{selection['adapter_rank']}`.",
     f"- Validation-selected steps/LR/batch: `{selection['steps']}` / `{selection['learning_rate']}` / `{selection['batch_size']}`.",
@@ -609,10 +611,10 @@ lines = [
     "",
     "## Result Files",
     "",
-    "- `statistics_forward_bidir/test_main_comparison.md`: main seven-mode table.",
-    "- `statistics_forward_bidir/paired_comparisons.md`: audio and reference counterfactual tests.",
-    "- `statistics_variant_comparison/paired_comparisons.md`: bidirectional versus forward-only.",
-    "- `statistics_forward_only/test_main_comparison.md`: forward-only ablation.",
+    "- `statistics_forward_only/test_main_comparison.md`: primary seven-mode table.",
+    "- `statistics_forward_only/paired_comparisons.md`: primary audio and reference counterfactual tests.",
+    "- `statistics_variant_comparison/paired_comparisons.md`: verified-bidirectional augmentation versus forward-only.",
+    "- `statistics_forward_bidir/test_main_comparison.md`: verified-bidirectional augmentation ablation.",
 ]
 (root / "paper_results.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
