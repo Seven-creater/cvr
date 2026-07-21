@@ -265,6 +265,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("b_audio_blind_review_v2_volume", script)
         self.assertIn("PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-24}", script)
         self.assertIn("CONCURRENCY=${CONCURRENCY:-24}", script)
+        self.assertIn("--allow-partial-downloads", script)
         self.assertIn("--sound-event-target 800", script)
         self.assertIn("--music-target 200", script)
         self.assertIn('"service_owned": False', script)

@@ -204,6 +204,7 @@ ingest_args=(
   --hf-endpoint "$HF_ENDPOINT"
   --min-duration-seconds "$MIN_CLIP_SECONDS"
   --probe-workers "$PROBE_WORKERS"
+  --allow-partial-downloads
 )
 for path in "${EXCLUDE_OVERLAP_PATHS[@]}"; do
   ingest_args+=(--exclude-overlap-with "$path")

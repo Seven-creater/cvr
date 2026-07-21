@@ -1,15 +1,47 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from app.audio_cvr_source_ingest import _load_jsonl, extend_frozen_test, parse_avqa_video_identity, prepare_mirror_sources
+from app.audio_cvr_source_ingest import (
+    DatasetSpec,
+    _download_dataset,
+    _load_jsonl,
+    extend_frozen_test,
+    parse_avqa_video_identity,
+    prepare_mirror_sources,
+)
 
 
 class AudioCvrSourceIngestTests(unittest.TestCase):
+    def test_partial_mirror_download_keeps_materialized_media_and_records_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "avqa_videos"
+            destination.mkdir()
+            (destination / "usable.mp4").write_bytes(b"v" * 8192)
+            spec = DatasetSpec("avqa_videos", "example/avqa", "test", "avqa")
+
+            with mock.patch("app.audio_cvr_source_ingest.shutil.which", return_value="hf"), mock.patch(
+                "app.audio_cvr_source_ingest.subprocess.run",
+                side_effect=subprocess.CalledProcessError(1, ["hf", "download"]),
+            ):
+                summary = _download_dataset(
+                    spec,
+                    destination,
+                    hf_endpoint="https://hf-mirror.com",
+                    resume=True,
+                    allow_partial=True,
+                )
+
+            self.assertEqual("partial_after_download_error", summary["status"])
+            self.assertEqual(1, summary["materialized_media_count"])
+            self.assertTrue((destination / ".audio_cvr_download_partial.json").exists())
+            self.assertFalse((destination / ".audio_cvr_download_complete").exists())
+
     def test_jsonl_resume_preserves_and_truncates_only_incomplete_tail(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "progress.jsonl"

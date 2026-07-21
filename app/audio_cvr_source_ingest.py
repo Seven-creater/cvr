@@ -115,6 +115,7 @@ def prepare_mirror_sources(
     probe_workers: int = 16,
     materialize_mode: str = "symlink",
     skip_download: bool = False,
+    allow_partial_downloads: bool = False,
     resume: bool = False,
 ) -> dict[str, Any]:
     root_path = Path(root).resolve()
@@ -156,16 +157,32 @@ def prepare_mirror_sources(
         _write_json(ingest_config_path, ingest_config)
 
     source_roots: dict[str, Path] = {}
+    download_summaries: dict[str, dict[str, Any]] = {}
     for dataset in datasets:
         spec = DATASET_SPECS[dataset]
         if dataset == "existing_vggsound":
             source_root = root_path / "raw" / "vggsound"
             if not source_root.exists():
                 raise FileNotFoundError(f"existing VGGSound root is missing: {source_root}")
+            download_summaries[dataset] = {
+                "status": "existing_local_source",
+                "source_root": str(source_root),
+            }
         else:
             source_root = download_root / dataset
             if not skip_download:
-                _download_dataset(spec, source_root, hf_endpoint=hf_endpoint, resume=resume)
+                download_summaries[dataset] = _download_dataset(
+                    spec,
+                    source_root,
+                    hf_endpoint=hf_endpoint,
+                    resume=resume,
+                    allow_partial=allow_partial_downloads,
+                )
+            else:
+                download_summaries[dataset] = {
+                    "status": "download_skipped",
+                    "source_root": str(source_root),
+                }
             if not source_root.exists():
                 raise FileNotFoundError(f"downloaded dataset root is missing: {source_root}")
         source_roots[dataset] = source_root
@@ -367,6 +384,7 @@ def prepare_mirror_sources(
         "seed": seed,
         "datasets": datasets,
         "source_targets": source_targets,
+        "download_summaries": download_summaries,
         "selected_source_count": len(provenance),
         "selected_dataset_counts": dict(selected_dataset_counts),
         "dataset_summaries": dataset_summaries,
@@ -567,21 +585,57 @@ def extend_frozen_test(
     return manifest
 
 
-def _download_dataset(spec: DatasetSpec, destination: Path, *, hf_endpoint: str, resume: bool) -> None:
+def _download_dataset(
+    spec: DatasetSpec,
+    destination: Path,
+    *,
+    hf_endpoint: str,
+    resume: bool,
+    allow_partial: bool = False,
+) -> dict[str, Any]:
     if spec.repo_id is None:
-        return
+        return {"status": "not_required", "source_root": str(destination)}
     destination.mkdir(parents=True, exist_ok=True)
     marker = destination / ".audio_cvr_download_complete"
+    partial_marker = destination / ".audio_cvr_download_partial.json"
     if resume and marker.exists():
-        return
+        return {
+            "status": "complete_cached",
+            "repo_id": spec.repo_id,
+            "source_root": str(destination),
+        }
     executable = shutil.which("hf") or shutil.which("huggingface-cli")
     if not executable:
         raise RuntimeError("neither `hf` nor `huggingface-cli` is available")
     command = [executable, "download", spec.repo_id, "--repo-type", "dataset", "--local-dir", str(destination)]
     environment = os.environ.copy()
     environment["HF_ENDPOINT"] = hf_endpoint
-    subprocess.run(command, check=True, env=environment)
+    try:
+        subprocess.run(command, check=True, env=environment)
+    except subprocess.CalledProcessError as exc:
+        media_files = _iter_videos(destination)
+        materialized_media = [path for path in media_files if path.stat().st_size > 4096]
+        partial_summary = {
+            "status": "partial_after_download_error",
+            "repo_id": spec.repo_id,
+            "source_root": str(destination),
+            "returncode": int(exc.returncode),
+            "discovered_media_count": len(media_files),
+            "materialized_media_count": len(materialized_media),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        _write_json(partial_marker, partial_summary)
+        if not allow_partial or not materialized_media:
+            raise
+        return partial_summary
     _write_text_atomic(marker, spec.repo_id + "\n")
+    partial_marker.unlink(missing_ok=True)
+    return {
+        "status": "complete",
+        "repo_id": spec.repo_id,
+        "source_root": str(destination),
+        "discovered_media_count": len(_iter_videos(destination)),
+    }
 
 
 def _eligible_dataset_videos(spec: DatasetSpec, source_root: Path) -> list[Path]:
@@ -1013,6 +1067,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--probe-workers", type=int, default=16)
     prepare.add_argument("--materialize-mode", choices=("symlink", "hardlink", "copy"), default="symlink")
     prepare.add_argument("--skip-download", action="store_true")
+    prepare.add_argument("--allow-partial-downloads", action="store_true")
     prepare.add_argument("--resume", action="store_true")
 
     summarize = subparsers.add_parser("summarize-run")
@@ -1045,6 +1100,7 @@ def main() -> None:
             probe_workers=args.probe_workers,
             materialize_mode=args.materialize_mode,
             skip_download=args.skip_download,
+            allow_partial_downloads=args.allow_partial_downloads,
             resume=args.resume,
         )
     elif args.command == "summarize-run":
