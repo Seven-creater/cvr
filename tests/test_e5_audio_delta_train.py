@@ -14,6 +14,7 @@ from app.e5_audio_delta_train import (
     cache_embeddings,
     eval_adapter,
     load_audio_delta_records,
+    prepare_omnicvr_records,
     prepare_records,
     run_ablations,
     run_loss_schedule,
@@ -43,6 +44,93 @@ from app.audio_cvr_protocol_eval import mine_local_same_source, summarize_data, 
 
 
 class E5AudioDeltaTrainTests(unittest.TestCase):
+    def test_prepare_omnicvr_and_per_query_reference_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            videos = root / "videos"
+            videos.mkdir()
+            for video_id in ("a.mp4", "b.mp4", "c.mp4", "d.mp4"):
+                (videos / video_id).write_bytes(b"")
+            annotations = root / "omnicvr.jsonl"
+            self._write_jsonl(
+                annotations,
+                [
+                    {
+                        "source_id": "a.mp4",
+                        "target_id": "b.mp4",
+                        "instruction": "replace the bell with a drum",
+                        "candidates": ["a.mp4", "b.mp4", "c.mp4"],
+                    },
+                    {
+                        "source_id": "b.mp4",
+                        "target_id": "c.mp4",
+                        "instruction": "replace the drum with a whistle",
+                        "candidates": ["b.mp4", "c.mp4", "d.mp4"],
+                    },
+                ],
+            )
+
+            summary = prepare_omnicvr_records(
+                annotation_path=annotations,
+                videos_dir=videos,
+                output_dir=root / "records",
+                query_count=2,
+                expected_gallery_size=3,
+            )
+            self.assertEqual(2, summary["query_count"])
+            self.assertEqual(4, summary["gallery_union_count"])
+            self.assertFalse(summary["shared_candidate_pool"])
+            eval_rows = [json.loads(line) for line in (root / "records" / "eval.jsonl").read_text(encoding="utf-8").splitlines()]
+            self._write_jsonl(root / "records" / "train.jsonl", eval_rows)
+
+            cache_embeddings(records_dir=root / "records", output_dir=root / "cache", mock_encoder=True)
+            with np.load(root / "cache" / "eval_embeddings.npz") as data:
+                candidate_mask = np.asarray(data["candidate_gallery_mask"], dtype=bool)
+                positive = np.asarray(data["positive_gallery_index"], dtype=np.int64)
+                reference = np.asarray(data["reference_gallery_index"], dtype=np.int64)
+            self.assertEqual((2, 4), candidate_mask.shape)
+            self.assertTrue(np.all(candidate_mask.sum(axis=1) == 3))
+            self.assertTrue(np.all(candidate_mask[np.arange(2), positive]))
+            self.assertTrue(np.all(candidate_mask[np.arange(2), reference]))
+
+            train_adapter(cache_dir=root / "cache", output_dir=root / "adapter", steps=1, batch_size=2, device="cpu")
+            eval_summary = eval_adapter(
+                cache_dir=root / "cache",
+                adapter_dir=root / "adapter",
+                output_dir=root / "eval_without_source",
+                device="cpu",
+                exclude_query_reference=True,
+                save_topk=2,
+            )
+            self.assertEqual(4, eval_summary["gallery_count"])
+            self.assertEqual(2, eval_summary["effective_gallery_count"])
+            self.assertEqual(2, eval_summary["excluded_query_reference_count"])
+            self.assertFalse(eval_summary["reference_in_gallery"])
+            topk_rows = [
+                json.loads(line)
+                for line in (root / "eval_without_source" / "per_query_topk.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(all(not any(item["is_reference"] for item in row["base_topk"]) for row in topk_rows))
+            self.assertTrue(all(not any(item["is_reference"] for item in row["adapter_topk"]) for row in topk_rows))
+
+    def test_prepare_omnicvr_rejects_missing_source_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            annotations = root / "omnicvr.jsonl"
+            self._write_jsonl(
+                annotations,
+                [{"source_id": "a.mp4", "target_id": "b.mp4", "instruction": "add a bell", "candidates": ["b.mp4"]}],
+            )
+            with self.assertRaisesRegex(ValueError, "source_id is absent"):
+                prepare_omnicvr_records(
+                    annotation_path=annotations,
+                    videos_dir=root,
+                    output_dir=root / "records",
+                    query_count=1,
+                    expected_gallery_size=1,
+                    require_existing_media=False,
+                )
+
     def test_prepare_loads_b_line_tier_outputs_and_preserves_training_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

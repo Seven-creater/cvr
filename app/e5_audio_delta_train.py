@@ -215,6 +215,180 @@ def prepare_records(
     return summary
 
 
+def prepare_omnicvr_records(
+    *,
+    annotation_path: str | Path,
+    videos_dir: str | Path,
+    output_dir: str | Path,
+    start_index: int = 0,
+    query_count: int = 1000,
+    expected_gallery_size: int = 2000,
+    require_existing_media: bool = True,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Convert the public OmniCVR annotations into the existing E5 eval format."""
+    annotation_root = Path(annotation_path)
+    media_root = Path(videos_dir)
+    output_root = Path(output_dir)
+    if not annotation_root.exists():
+        raise FileNotFoundError(f"OmniCVR annotations not found: {annotation_root}")
+    if start_index < 0 or query_count <= 0:
+        raise ValueError("start_index must be non-negative and query_count must be positive")
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict[str, Any]] = []
+    stop_index = start_index + query_count
+    with annotation_root.open("r", encoding="utf-8-sig") as handle:
+        for zero_index, line in enumerate(handle):
+            if zero_index < start_index:
+                continue
+            if zero_index >= stop_index:
+                break
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError(f"{annotation_root} line {zero_index + 1}: expected a JSON object")
+            payload = dict(payload)
+            payload["_omnicvr_line_number"] = zero_index + 1
+            rows.append(payload)
+    if len(rows) != query_count:
+        raise ValueError(f"requested {query_count} OmniCVR rows from index {start_index}, found {len(rows)}")
+
+    requested_video_ids: set[str] = set()
+    normalized_rows: list[dict[str, Any]] = []
+    for payload in rows:
+        line_number = int(payload["_omnicvr_line_number"])
+        source_id = _omnicvr_video_id(payload.get("source_id"), line_number=line_number, field="source_id")
+        target_id = _omnicvr_video_id(payload.get("target_id"), line_number=line_number, field="target_id")
+        instruction = str(payload.get("instruction") or "").strip()
+        candidates_raw = payload.get("candidates")
+        if not instruction:
+            raise ValueError(f"OmniCVR line {line_number}: missing instruction")
+        if not isinstance(candidates_raw, list):
+            raise ValueError(f"OmniCVR line {line_number}: candidates must be a list")
+        candidates = [_omnicvr_video_id(value, line_number=line_number, field="candidates") for value in candidates_raw]
+        if len(candidates) != len(set(candidates)):
+            raise ValueError(f"OmniCVR line {line_number}: duplicate candidate ids")
+        if expected_gallery_size > 0 and len(candidates) != expected_gallery_size:
+            raise ValueError(
+                f"OmniCVR line {line_number}: expected {expected_gallery_size} candidates, found {len(candidates)}"
+            )
+        if source_id not in candidates:
+            raise ValueError(f"OmniCVR line {line_number}: source_id is absent from candidates")
+        if target_id not in candidates:
+            raise ValueError(f"OmniCVR line {line_number}: target_id is absent from candidates")
+        if source_id == target_id:
+            raise ValueError(f"OmniCVR line {line_number}: source_id and target_id must differ")
+        requested_video_ids.update(candidates)
+        requested_video_ids.update((source_id, target_id))
+        normalized_rows.append(
+            {
+                "line_number": line_number,
+                "source_id": source_id,
+                "target_id": target_id,
+                "instruction": instruction,
+                "candidates": candidates,
+            }
+        )
+
+    media_lookup = _omnicvr_media_lookup(media_root, requested_video_ids, require_existing=require_existing_media)
+    gallery_video_ids: list[str] = []
+    seen_gallery_ids: set[str] = set()
+    for payload in normalized_rows:
+        for video_id in payload["candidates"]:
+            if video_id not in seen_gallery_ids:
+                seen_gallery_ids.add(video_id)
+                gallery_video_ids.append(video_id)
+    gallery_lookup = {_omnicvr_gallery_id(video_id): index for index, video_id in enumerate(gallery_video_ids)}
+
+    record_rows: list[dict[str, Any]] = []
+    positive_indices: list[int] = []
+    reference_indices: list[int] = []
+    for offset, payload in enumerate(normalized_rows):
+        sample_id = f"omnicvr_audio_{start_index + offset + 1:04d}"
+        source_id = payload["source_id"]
+        target_id = payload["target_id"]
+        candidate_gallery_ids = [_omnicvr_gallery_id(video_id) for video_id in payload["candidates"]]
+        positive_gallery_id = _omnicvr_gallery_id(target_id)
+        reference_gallery_id = _omnicvr_gallery_id(source_id)
+        positive_indices.append(int(gallery_lookup[positive_gallery_id]))
+        reference_indices.append(int(gallery_lookup[reference_gallery_id]))
+        record_rows.append(
+            {
+                "sample_id": sample_id,
+                "reference_video": media_lookup[source_id],
+                "target_video": media_lookup[target_id],
+                "edit_text": payload["instruction"],
+                "edit_type": "replace",
+                "audio_delta_type": "audio_center",
+                "direction": "forward",
+                "split_tier": "test",
+                "raw_source_id": source_id,
+                "pair_group_id": f"omnicvr::{source_id}::{target_id}",
+                "inverse_pair_group_id": f"omnicvr::{source_id}::{target_id}",
+                "shortcut_label": "official_omnicvr_audio_center",
+                "dataset": "omnicvr",
+                "dataset_group": "omnicvr",
+                "full_av_required": True,
+                "source_id": source_id,
+                "target_id": target_id,
+                "omnicvr_line_number": payload["line_number"],
+                "positive_gallery_id": positive_gallery_id,
+                "reference_gallery_id": reference_gallery_id,
+                "candidate_gallery_ids": candidate_gallery_ids,
+                "audio_delta_hard_negatives": [],
+            }
+        )
+    gallery_rows = [
+        {
+            "gallery_id": _omnicvr_gallery_id(video_id),
+            "video": media_lookup[video_id],
+            "raw_source_id": video_id,
+            "kind": "candidate",
+            "source_payload": {"official_video_id": video_id, "dataset": "omnicvr"},
+        }
+        for video_id in gallery_video_ids
+    ]
+
+    _write_jsonl(output_root / "train.jsonl", [])
+    _write_jsonl(output_root / "eval.jsonl", record_rows)
+    _write_jsonl(output_root / "eval_gallery.jsonl", gallery_rows)
+    index_payload = {
+        "positive_gallery_index": positive_indices,
+        "reference_gallery_index": reference_indices,
+    }
+    (output_root / "eval_gallery_positive_indices.json").write_text(
+        json.dumps(index_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    candidate_counts = [len(row["candidate_gallery_ids"]) for row in record_rows]
+    shared_candidate_pool = len({tuple(row["candidate_gallery_ids"]) for row in record_rows}) == 1
+    summary = {
+        "dataset": "OmniCVR",
+        "category": "audio-center",
+        "annotation_path": str(annotation_root),
+        "videos_dir": str(media_root),
+        "output_dir": str(output_root),
+        "start_index": start_index,
+        "query_count": len(record_rows),
+        "gallery_union_count": len(gallery_rows),
+        "candidate_count_min": min(candidate_counts),
+        "candidate_count_max": max(candidate_counts),
+        "expected_gallery_size": expected_gallery_size,
+        "shared_candidate_pool": shared_candidate_pool,
+        "source_in_candidates_count": len(record_rows),
+        "target_in_candidates_count": len(record_rows),
+        "missing_media_count": 0,
+        "eval_protocol": "official_omnicvr_audio_center",
+    }
+    (output_root / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _emit(
+        progress,
+        f"[e5-audio-delta] prepared OmniCVR queries={len(record_rows)} gallery_union={len(gallery_rows)} records_dir={output_root}",
+    )
+    return summary
+
+
 def cache_embeddings(
     *,
     records_dir: str | Path,
@@ -564,6 +738,7 @@ def eval_adapter(
     save_topk: int = 0,
     device: str = "cuda",
     exclude_gallery_kinds: tuple[str, ...] = (),
+    exclude_query_reference: bool = False,
     disable_local_segments: bool = False,
     disable_global_local_mix: bool = False,
     local_mix_weight: float = 0.5,
@@ -582,12 +757,29 @@ def eval_adapter(
     topk = _normalize_topk(topk)
     gallery = data["gallery"] if "gallery" in data else data["target"]
     gallery_items = _eval_gallery_items_for_output(cache_root, records, gallery.shape[0])
+    candidate_gallery_mask = _candidate_gallery_mask(data, query_count=len(records), gallery_count=gallery.shape[0])
+    if not np.all(candidate_gallery_mask[np.arange(len(records)), positive_gallery_index]):
+        raise ValueError("candidate gallery mask excludes a positive target")
     excluded_gallery_kinds = tuple(sorted({str(kind).strip() for kind in exclude_gallery_kinds if str(kind).strip()}))
     excluded_gallery_columns = _excluded_gallery_columns(gallery_items, excluded_gallery_kinds)
     if any(int(index) in excluded_gallery_columns for index in positive_gallery_index):
         raise ValueError("excluded gallery kinds would remove a positive target")
+    if exclude_query_reference and reference_gallery_index is None:
+        raise ValueError("--exclude-query-reference requires a reference gallery index for every query")
+    if exclude_query_reference and np.any(reference_gallery_index == positive_gallery_index):
+        raise ValueError("per-query reference removal would remove a positive target")
     raw_base_scores = _score_matrix_np(data["query"], gallery)
-    base_scores = _mask_gallery_scores(raw_base_scores, excluded_gallery_columns)
+    source_inclusive_base_scores = _mask_gallery_scores_by_query(
+        raw_base_scores,
+        candidate_gallery_mask=candidate_gallery_mask,
+        excluded_columns=set(),
+    )
+    base_scores = _mask_gallery_scores_by_query(
+        raw_base_scores,
+        candidate_gallery_mask=candidate_gallery_mask,
+        excluded_columns=excluded_gallery_columns,
+        excluded_query_index=reference_gallery_index if exclude_query_reference else None,
+    )
     base = _recall_from_scores(base_scores, topk=topk, positive_index=positive_gallery_index)
     base_reference_scores = (
         _index_scores(raw_base_scores, reference_gallery_index)
@@ -600,9 +792,24 @@ def eval_adapter(
     if has_local:
         gallery_segments = data["gallery_segments"] if "gallery_segments" in data else data["target_segments"]
     raw_base_local_scores = _local_score_matrix_np(data["query"], gallery_segments) if has_local else None
-    base_local_scores = _mask_gallery_scores(raw_base_local_scores, excluded_gallery_columns)
+    source_inclusive_base_local_scores = _mask_gallery_scores_by_query(
+        raw_base_local_scores,
+        candidate_gallery_mask=candidate_gallery_mask,
+        excluded_columns=set(),
+    )
+    base_local_scores = _mask_gallery_scores_by_query(
+        raw_base_local_scores,
+        candidate_gallery_mask=candidate_gallery_mask,
+        excluded_columns=excluded_gallery_columns,
+        excluded_query_index=reference_gallery_index if exclude_query_reference else None,
+    )
     base_mix_scores = _mix_scores(base_scores, base_local_scores, local_mix_weight, disable_global_local_mix)
-    raw_base_mix_scores = _mix_scores(raw_base_scores, raw_base_local_scores, local_mix_weight, disable_global_local_mix)
+    raw_base_mix_scores = _mix_scores(
+        source_inclusive_base_scores,
+        source_inclusive_base_local_scores,
+        local_mix_weight,
+        disable_global_local_mix,
+    )
     dim = int(data["query"].shape[1])
     device_obj = _torch_device(torch, device)
     adapter_config = _load_adapter_config(adapter_root)
@@ -633,16 +840,41 @@ def eval_adapter(
         adapted_reference = model.doc(reference)
         adapted_negative = model.doc(negative)
         raw_adapted_scores = (adapted_query @ adapted_target.T).detach().cpu().numpy()
-        adapted_scores = _mask_gallery_scores(raw_adapted_scores, excluded_gallery_columns)
+        source_inclusive_adapted_scores = _mask_gallery_scores_by_query(
+            raw_adapted_scores,
+            candidate_gallery_mask=candidate_gallery_mask,
+            excluded_columns=set(),
+        )
+        adapted_scores = _mask_gallery_scores_by_query(
+            raw_adapted_scores,
+            candidate_gallery_mask=candidate_gallery_mask,
+            excluded_columns=excluded_gallery_columns,
+            excluded_query_index=reference_gallery_index if exclude_query_reference else None,
+        )
         adapted_reference_scores = torch.sum(adapted_query * adapted_reference, dim=-1).detach().cpu().numpy()
         adapted_negative_scores = torch.einsum("bd,bnd->bn", adapted_query, adapted_negative).detach().cpu().numpy()
         raw_adapted_local_scores = None
         if has_local:
             target_segments = model.doc(torch.as_tensor(gallery_segments, dtype=torch.float32, device=device_obj))
             raw_adapted_local_scores = _local_score_matrix_torch(torch, adapted_query, target_segments).detach().cpu().numpy()
-        adapted_local_scores = _mask_gallery_scores(raw_adapted_local_scores, excluded_gallery_columns)
+        source_inclusive_adapted_local_scores = _mask_gallery_scores_by_query(
+            raw_adapted_local_scores,
+            candidate_gallery_mask=candidate_gallery_mask,
+            excluded_columns=set(),
+        )
+        adapted_local_scores = _mask_gallery_scores_by_query(
+            raw_adapted_local_scores,
+            candidate_gallery_mask=candidate_gallery_mask,
+            excluded_columns=excluded_gallery_columns,
+            excluded_query_index=reference_gallery_index if exclude_query_reference else None,
+        )
         adapted_mix_scores = _mix_scores(adapted_scores, adapted_local_scores, local_mix_weight, disable_global_local_mix)
-        raw_adapted_mix_scores = _mix_scores(raw_adapted_scores, raw_adapted_local_scores, local_mix_weight, disable_global_local_mix)
+        raw_adapted_mix_scores = _mix_scores(
+            source_inclusive_adapted_scores,
+            source_inclusive_adapted_local_scores,
+            local_mix_weight,
+            disable_global_local_mix,
+        )
         adapter_geometry = _adapter_geometry_diagnostics(torch, model, query, paired_target, reference, adapted_query, adapted_paired_target, adapted_reference)
     adapted_reference_mix_scores = _index_scores(raw_adapted_mix_scores, reference_gallery_index) if reference_gallery_index is not None else adapted_reference_scores
     adapted = _recall_from_scores(adapted_scores, topk=topk, positive_index=positive_gallery_index)
@@ -659,16 +891,35 @@ def eval_adapter(
                 {"method": "audio_delta_adapter_global_local", **_recall_from_scores(adapted_mix_scores, topk=topk, positive_index=positive_gallery_index)},
             ]
         )
+    candidate_counts = candidate_gallery_mask.sum(axis=1).astype(np.int64)
+    effective_mask = candidate_gallery_mask.copy()
+    if excluded_gallery_columns:
+        excluded_array = np.asarray(sorted(excluded_gallery_columns), dtype=np.int64)
+        effective_mask[:, excluded_array] = False
+    if exclude_query_reference and reference_gallery_index is not None:
+        effective_mask[np.arange(len(records)), reference_gallery_index] = False
+    effective_counts = effective_mask.sum(axis=1).astype(np.int64)
     comparison = {
         "cache_dir": str(cache_root),
         "adapter_dir": str(adapter_root),
         "output_dir": str(output_root),
         "eval_count": len(records),
         "gallery_count": int(gallery.shape[0]),
-        "effective_gallery_count": int(gallery.shape[0]) - len(excluded_gallery_columns),
+        "effective_gallery_count": int(effective_counts[0]) if np.all(effective_counts == effective_counts[0]) else None,
+        "effective_gallery_count_min": int(effective_counts.min()),
+        "effective_gallery_count_max": int(effective_counts.max()),
+        "candidate_gallery_count_min": int(candidate_counts.min()),
+        "candidate_gallery_count_max": int(candidate_counts.max()),
+        "has_per_query_candidate_mask": "candidate_gallery_mask" in data,
         "excluded_gallery_kinds": list(excluded_gallery_kinds),
         "excluded_gallery_count": len(excluded_gallery_columns),
-        "reference_in_gallery": bool(reference_gallery_index is not None and "reference_negative" not in excluded_gallery_kinds),
+        "exclude_query_reference": bool(exclude_query_reference),
+        "excluded_query_reference_count": len(records) if exclude_query_reference and reference_gallery_index is not None else 0,
+        "reference_in_gallery": bool(
+            reference_gallery_index is not None
+            and not exclude_query_reference
+            and "reference_negative" not in excluded_gallery_kinds
+        ),
         "adapter_architecture": adapter_architecture,
         "adapter_rank": adapter_rank if adapter_architecture == "low_rank_residual" else None,
         "topk": list(topk),
@@ -1182,6 +1433,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prepare.add_argument("--distractor-seed", type=int, default=13)
 
+    prepare_omnicvr = subparsers.add_parser("prepare-omnicvr")
+    prepare_omnicvr.add_argument("--annotation-path", required=True)
+    prepare_omnicvr.add_argument("--videos-dir", required=True)
+    prepare_omnicvr.add_argument("--output-dir", required=True)
+    prepare_omnicvr.add_argument("--start-index", type=int, default=0)
+    prepare_omnicvr.add_argument("--query-count", type=int, default=1000)
+    prepare_omnicvr.add_argument("--expected-gallery-size", type=int, default=2000)
+    prepare_omnicvr.add_argument("--allow-missing-media", action="store_true")
+
     cache = subparsers.add_parser("cache-embeddings")
     cache.add_argument("--records-dir", required=True)
     cache.add_argument("--output-dir", required=True)
@@ -1297,6 +1557,11 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--save-topk", type=int, default=0)
     evaluate.add_argument("--device", default="cuda")
     evaluate.add_argument("--exclude-gallery-kind", action="append", default=[])
+    evaluate.add_argument(
+        "--exclude-query-reference",
+        action="store_true",
+        help="Mask each query's own reference/source candidate while retaining that video for other queries.",
+    )
     evaluate.add_argument("--disable-local-segments", action="store_true")
     evaluate.add_argument("--disable-global-local-mix", action="store_true")
     evaluate.add_argument("--local-mix-weight", type=float, default=0.5)
@@ -1369,6 +1634,17 @@ def main() -> None:
             local_same_source_candidates_path=args.local_same_source_candidates,
             distractor_pool_path=args.distractor_pool_path,
             distractor_seed=args.distractor_seed,
+            progress=progress,
+        )
+    elif args.command == "prepare-omnicvr":
+        result = prepare_omnicvr_records(
+            annotation_path=args.annotation_path,
+            videos_dir=args.videos_dir,
+            output_dir=args.output_dir,
+            start_index=args.start_index,
+            query_count=args.query_count,
+            expected_gallery_size=args.expected_gallery_size,
+            require_existing_media=not args.allow_missing_media,
             progress=progress,
         )
     elif args.command == "cache-embeddings":
@@ -1464,6 +1740,7 @@ def main() -> None:
             save_topk=args.save_topk,
             device=args.device,
             exclude_gallery_kinds=tuple(args.exclude_gallery_kind),
+            exclude_query_reference=args.exclude_query_reference,
             disable_local_segments=args.disable_local_segments,
             disable_global_local_mix=args.disable_global_local_mix,
             local_mix_weight=args.local_mix_weight,
@@ -1707,6 +1984,7 @@ def _cache_split_embeddings(
         gallery_segment_rows: list[np.ndarray] = []
         positive_gallery_index: list[int] = []
         reference_gallery_index: list[int] = []
+        candidate_gallery_mask: list[np.ndarray] = []
         gallery_records_path = output_root / "eval_gallery.jsonl"
         _write_jsonl(gallery_records_path, [asdict(item) for item in gallery_items])
         gallery_lookup = {item.gallery_id: index for index, item in enumerate(gallery_items)}
@@ -1740,13 +2018,28 @@ def _cache_split_embeddings(
                     )
                 )
         for record in records:
-            gallery_id = f"positive::{record.sample_id}"
+            gallery_id = _first_text(record.source_payload, "positive_gallery_id", default=f"positive::{record.sample_id}")
+            if gallery_id not in gallery_lookup:
+                raise ValueError(f"positive gallery id not found for {record.sample_id}: {gallery_id}")
             positive_gallery_index.append(int(gallery_lookup[gallery_id]))
-            reference_id = f"reference::{record.sample_id}"
+            reference_id = _first_text(record.source_payload, "reference_gallery_id", default=f"reference::{record.sample_id}")
             if reference_id in gallery_lookup:
                 reference_gallery_index.append(int(gallery_lookup[reference_id]))
+            candidate_ids = record.source_payload.get("candidate_gallery_ids")
+            if isinstance(candidate_ids, list) and candidate_ids:
+                missing = [str(item) for item in candidate_ids if str(item) not in gallery_lookup]
+                if missing:
+                    raise ValueError(f"candidate gallery ids missing for {record.sample_id}: {missing[:3]}")
+                row_mask = np.zeros(len(gallery_items), dtype=np.float32)
+                row_mask[[gallery_lookup[str(item)] for item in candidate_ids]] = 1.0
+            else:
+                row_mask = np.ones(len(gallery_items), dtype=np.float32)
+            if row_mask[int(gallery_lookup[gallery_id])] <= 0:
+                raise ValueError(f"positive target is outside candidate gallery for {record.sample_id}")
+            candidate_gallery_mask.append(row_mask)
         stacked["gallery"] = np.vstack(gallery_vectors).astype(np.float32)
         stacked["positive_gallery_index"] = np.asarray(positive_gallery_index, dtype=np.int64)
+        stacked["candidate_gallery_mask"] = np.asarray(candidate_gallery_mask, dtype=np.float32)
         if len(reference_gallery_index) == len(records):
             stacked["reference_gallery_index"] = np.asarray(reference_gallery_index, dtype=np.int64)
         if local_segments > 0:
@@ -1761,6 +2054,7 @@ def _cache_split_embeddings(
         "embedding_shape": list(stacked["query"].shape),
         "negative_shape": list(stacked["negative"].shape),
         "gallery_shape": list(stacked["gallery"].shape) if "gallery" in stacked else None,
+        "candidate_gallery_mask_shape": list(stacked["candidate_gallery_mask"].shape) if "candidate_gallery_mask" in stacked else None,
         "local_segments": local_segments,
         "local_segment_mode": local_segment_mode,
         "local_segment_cache_dir": str(local_cache_root) if local_segments > 0 and local_segment_mode == "ffmpeg" else None,
@@ -2667,6 +2961,46 @@ def _mask_gallery_scores(scores: np.ndarray | None, excluded_columns: set[int]) 
     return masked
 
 
+def _candidate_gallery_mask(data: dict[str, np.ndarray], *, query_count: int, gallery_count: int) -> np.ndarray:
+    if "candidate_gallery_mask" not in data:
+        return np.ones((query_count, gallery_count), dtype=bool)
+    mask = np.asarray(data["candidate_gallery_mask"], dtype=bool)
+    if mask.shape != (query_count, gallery_count):
+        raise ValueError(
+            f"candidate gallery mask shape {mask.shape} does not match queries/gallery {(query_count, gallery_count)}"
+        )
+    if np.any(mask.sum(axis=1) <= 0):
+        raise ValueError("every query must retain at least one candidate")
+    return mask
+
+
+def _mask_gallery_scores_by_query(
+    scores: np.ndarray | None,
+    *,
+    candidate_gallery_mask: np.ndarray,
+    excluded_columns: set[int],
+    excluded_query_index: np.ndarray | None = None,
+) -> np.ndarray | None:
+    if scores is None:
+        return None
+    masked = np.asarray(scores, dtype=np.float32).copy()
+    if candidate_gallery_mask.shape != masked.shape:
+        raise ValueError(
+            f"candidate gallery mask shape {candidate_gallery_mask.shape} does not match scores {masked.shape}"
+        )
+    masked[~candidate_gallery_mask] = -np.inf
+    if excluded_columns:
+        masked[:, sorted(excluded_columns)] = -np.inf
+    if excluded_query_index is not None:
+        query_index = np.asarray(excluded_query_index, dtype=np.int64)
+        if query_index.shape != (masked.shape[0],):
+            raise ValueError("per-query excluded gallery index must match query count")
+        if np.any(query_index < 0) or np.any(query_index >= masked.shape[1]):
+            raise ValueError("per-query excluded gallery index is out of range")
+        masked[np.arange(masked.shape[0]), query_index] = -np.inf
+    return masked
+
+
 def _target_beats_reference_summary(scores: np.ndarray, reference_scores: np.ndarray, *, positive_index: np.ndarray) -> dict[str, Any]:
     positive_scores = _index_scores(scores, positive_index)
     deltas = positive_scores - reference_scores
@@ -2717,7 +3051,11 @@ def _non_positive_scores(scores: np.ndarray, positive_index: np.ndarray, referen
         blocked = {int(positive_index[row])}
         if reference_lookup is not None:
             blocked.add(int(reference_lookup[row]))
-        values.extend(float(scores[row, col]) for col in range(scores.shape[1]) if col not in blocked)
+        values.extend(
+            float(scores[row, col])
+            for col in range(scores.shape[1])
+            if col not in blocked and np.isfinite(scores[row, col])
+        )
     return np.asarray(values, dtype=np.float32)
 
 
@@ -4028,6 +4366,44 @@ def _first_text(payload: dict[str, Any], *keys: str, default: str = "") -> str:
         if value is not None and str(value).strip():
             return str(value).strip()
     return default
+
+
+def _omnicvr_video_id(value: Any, *, line_number: int, field: str) -> str:
+    video_id = str(value or "").strip()
+    if not video_id:
+        raise ValueError(f"OmniCVR line {line_number}: missing {field}")
+    if Path(video_id).name != video_id or not video_id.lower().endswith(".mp4"):
+        raise ValueError(f"OmniCVR line {line_number}: invalid {field} video id: {video_id}")
+    return video_id
+
+
+def _omnicvr_gallery_id(video_id: str) -> str:
+    return f"omnicvr::{video_id}"
+
+
+def _omnicvr_media_lookup(media_root: Path, video_ids: set[str], *, require_existing: bool) -> dict[str, str]:
+    direct = {video_id: media_root / video_id for video_id in video_ids}
+    missing = [video_id for video_id, path in direct.items() if not path.is_file()]
+    if missing and media_root.exists():
+        basename_lookup: dict[str, Path] = {}
+        duplicate_basenames: set[str] = set()
+        for path in media_root.rglob("*.mp4"):
+            if path.name in basename_lookup and basename_lookup[path.name] != path:
+                duplicate_basenames.add(path.name)
+            else:
+                basename_lookup[path.name] = path
+        if duplicate_basenames:
+            sample = sorted(duplicate_basenames)[:3]
+            raise ValueError(f"duplicate OmniCVR media basenames under {media_root}: {sample}")
+        for video_id in missing:
+            if video_id in basename_lookup:
+                direct[video_id] = basename_lookup[video_id]
+    unresolved = sorted(video_id for video_id, path in direct.items() if not path.is_file())
+    if unresolved and require_existing:
+        raise FileNotFoundError(
+            f"missing {len(unresolved)} OmniCVR videos under {media_root}; examples: {unresolved[:3]}"
+        )
+    return {video_id: str(path) for video_id, path in direct.items()}
 
 
 def _float_value(value: Any) -> float:
