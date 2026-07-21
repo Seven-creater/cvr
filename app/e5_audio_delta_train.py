@@ -435,6 +435,7 @@ def cache_embeddings(
             reuse_cache_root=Path(reuse_cache_from),
             progress=progress,
         )
+    pyav_error_compat = _ensure_pyav_error_compat()
     if encoder is None:
         if mock_encoder:
             encoder = DeterministicEncoder()
@@ -459,6 +460,7 @@ def cache_embeddings(
     runtime_info["document_input_mode"] = document_input_mode
     runtime_info["video_fps"] = int(video_fps)
     runtime_info["video_max_pixels"] = int(video_max_pixels)
+    runtime_info["pyav_error_compat"] = pyav_error_compat
     runtime_info["audio_media_cache_dir"] = str(audio_media_cache_dir) if audio_media_cache_dir else str(output_root / "audio_media_cache")
     train_records = load_audio_delta_records(records_root / "train.jsonl")
     eval_records = load_audio_delta_records(records_root / "eval.jsonl")
@@ -4316,6 +4318,22 @@ def _retryable_encoding_error(exc: Exception) -> bool:
         return True
     text = str(exc).lower()
     return "resource temporarily unavailable" in text or "failed initializing scaling graph" in text
+
+
+def _ensure_pyav_error_compat(av_module: Any | None = None) -> str | None:
+    if av_module is None:
+        try:
+            import av as av_module
+        except ImportError:
+            return None
+    if hasattr(av_module, "AVError"):
+        return f"{av_module.AVError.__module__}.{av_module.AVError.__name__}"
+    error_module = getattr(av_module, "error", None)
+    fallback = getattr(error_module, "FFmpegError", None) or OSError
+    if not isinstance(fallback, type) or not issubclass(fallback, BaseException):
+        fallback = OSError
+    setattr(av_module, "AVError", fallback)
+    return f"{fallback.__module__}.{fallback.__name__}"
 
 
 def _encode_payload_batch_resilient(

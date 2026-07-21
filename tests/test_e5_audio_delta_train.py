@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 
@@ -37,6 +38,7 @@ from app.e5_audio_delta_train import (
     _training_profile_options,
     _AudioDeltaAdapter,
     _document_payload,
+    _ensure_pyav_error_compat,
     _query_payload,
     _resolve_media_path,
     _video_payload,
@@ -45,6 +47,16 @@ from app.audio_cvr_protocol_eval import mine_local_same_source, summarize_data, 
 
 
 class E5AudioDeltaTrainTests(unittest.TestCase):
+    def test_pyav_error_compat_maps_legacy_name_to_ffmpeg_error(self) -> None:
+        class FakeFFmpegError(OSError):
+            pass
+
+        fake_av = SimpleNamespace(error=SimpleNamespace(FFmpegError=FakeFFmpegError))
+        selected = _ensure_pyav_error_compat(fake_av)
+
+        self.assertIs(FakeFFmpegError, fake_av.AVError)
+        self.assertTrue(str(selected).endswith("FakeFFmpegError"))
+
     def test_checkpoint_prefill_shards_resume_and_retry_transient_decode_failure(self) -> None:
         class CountingEncoder:
             def __init__(self, *, fail_once: bool = False, forbid_calls: bool = False) -> None:
