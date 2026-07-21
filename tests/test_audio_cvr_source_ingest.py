@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from app.audio_cvr_source_ingest import _load_jsonl, extend_frozen_test, parse_avqa_video_identity, prepare_mirror_sources
+
+
+class AudioCvrSourceIngestTests(unittest.TestCase):
+    def test_jsonl_resume_preserves_and_truncates_only_incomplete_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "progress.jsonl"
+            path.write_bytes(b'{"sample_id":"ok"}\n{"sample_id":"partial')
+
+            self.assertEqual([{"sample_id": "ok"}], _load_jsonl(path))
+            self.assertEqual(b'{"sample_id":"ok"}\n', path.read_bytes())
+            backups = list(path.parent.glob("progress.jsonl.incomplete_tail.*"))
+            self.assertEqual(1, len(backups))
+            self.assertEqual(b'{"sample_id":"partial', backups[0].read_bytes())
+
+    @staticmethod
+    def _write_jsonl(path: Path, rows: list[dict]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+
+    @staticmethod
+    def _row(sample_id: str, subtype: str, source_id: str, *, dataset: str = "avqa_videos") -> dict:
+        return {
+            "sample_id": sample_id,
+            "proposal_id": sample_id,
+            "source_disjoint_group_id": source_id,
+            "pair_group_id": f"pair_{sample_id}",
+            "reference_video": f"clips/{sample_id}_ref.mp4",
+            "target_video": f"clips/{sample_id}_tgt.mp4",
+            "edit_text": "replace quiet ambience with applause" if subtype == "sound_event" else "replace piano music with guitar music",
+            "b_subtype": subtype,
+            "dataset": dataset,
+            "accepted": True,
+            "fallback": False,
+            "manual_review_required": False,
+            "split_tier": "main",
+            "audio_delta_strength": 0.8,
+            "video_context_strength": 0.7,
+        }
+
+    def test_avqa_identity_removes_only_final_time_suffix(self) -> None:
+        self.assertEqual("youtube_id_with_under-score", parse_avqa_video_identity("youtube_id_with_under-score_000123"))
+        self.assertEqual("youtube_id_with_under-score", parse_avqa_video_identity("youtube_id_with_under-score_-12.5"))
+        self.assertEqual("youtube_id_with_under-score", parse_avqa_video_identity("youtube_id_with_under-score"))
+
+    def test_extend_frozen_test_preserves_existing_rows_and_exact_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            existing_path = root / "test150.jsonl"
+            candidate_path = root / "candidates.jsonl"
+            output_dir = root / "output"
+            existing = [
+                self._row("old_sound", "sound_event", "old_source_sound", dataset="avatar"),
+                self._row("old_music", "music", "old_source_music", dataset="avatar"),
+            ]
+            candidates = [
+                self._row("new_sound", "sound_event", "new_source_sound"),
+                self._row("new_music", "music", "new_source_music"),
+                self._row("reserve_sound", "sound_event", "reserve_source_sound"),
+            ]
+            self._write_jsonl(existing_path, existing)
+            self._write_jsonl(candidate_path, candidates)
+
+            summary = extend_frozen_test(
+                existing_test_path=existing_path,
+                candidate_path=candidate_path,
+                output_dir=output_dir,
+                target_count=4,
+                sound_event_target=2,
+                music_target=2,
+            )
+
+            frozen = [json.loads(line) for line in (output_dir / "test_main_4.jsonl").read_text(encoding="utf-8").splitlines()]
+            reserve = [json.loads(line) for line in (output_dir / "test1000_reserve_candidates.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(["old_sound", "old_music"], [row["sample_id"] for row in frozen[:2]])
+            self.assertEqual({"sound_event": 2, "music": 2}, summary["subtype_counts"])
+            self.assertEqual(0, summary["audit"]["violation_count"])
+            self.assertEqual(["reserve_sound"], [row["sample_id"] for row in reserve])
+
+    def test_extend_frozen_test_rejects_source_overlap_and_shortage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            existing_path = root / "test150.jsonl"
+            candidate_path = root / "candidates.jsonl"
+            existing = [
+                self._row("old_sound", "sound_event", "shared_source", dataset="avatar"),
+                self._row("old_music", "music", "old_music_source", dataset="avatar"),
+            ]
+            candidates = [self._row("overlap_sound", "sound_event", "shared_source")]
+            self._write_jsonl(existing_path, existing)
+            self._write_jsonl(candidate_path, candidates)
+
+            with self.assertRaisesRegex(ValueError, "not enough eligible"):
+                extend_frozen_test(
+                    existing_test_path=existing_path,
+                    candidate_path=candidate_path,
+                    output_dir=root / "output",
+                    target_count=4,
+                    sound_event_target=2,
+                    music_target=2,
+                )
+
+    def test_source_ingest_journals_each_decision_and_resumes_without_duplication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "data"
+            run_root = Path(temp_dir) / "run"
+            source = root / "raw" / "vggsound" / "scratch" / "event.mp4"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"video-with-audio")
+            media = {"has_video": True, "has_audio": True, "duration_seconds": 10.0}
+
+            with mock.patch("app.audio_cvr_source_ingest.probe_media", return_value=media):
+                first = prepare_mirror_sources(
+                    root=root,
+                    run_root=run_root,
+                    datasets=["existing_vggsound"],
+                    source_targets={"existing_vggsound": 1},
+                    skip_download=True,
+                    materialize_mode="copy",
+                )
+                resumed = prepare_mirror_sources(
+                    root=root,
+                    run_root=run_root,
+                    datasets=["existing_vggsound"],
+                    source_targets={"existing_vggsound": 1},
+                    skip_download=True,
+                    materialize_mode="copy",
+                    resume=True,
+                )
+
+            progress_rows = [
+                json.loads(line)
+                for line in (run_root / "source_ingest.progress.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, first["selected_source_count"])
+            self.assertEqual(1, resumed["selected_source_count"])
+            self.assertEqual(1, len(progress_rows))
+            self.assertEqual("selected", progress_rows[0]["decision"])
+
+            with self.assertRaisesRegex(ValueError, "pass --resume"):
+                prepare_mirror_sources(
+                    root=root,
+                    run_root=run_root,
+                    datasets=["existing_vggsound"],
+                    source_targets={"existing_vggsound": 1},
+                    skip_download=True,
+                    materialize_mode="copy",
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

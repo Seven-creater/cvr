@@ -872,6 +872,7 @@ B_AUDIO_REVIEW_ACCEPTANCE_PROFILE = "b_audio_review"
 B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE = "b_audio_context_cvr"
 B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE = "b_audio_blind_review"
 B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE = "b_audio_blind_review_v2"
+B_AUDIO_BLIND_REVIEW_V2_VOLUME_ACCEPTANCE_PROFILE = "b_audio_blind_review_v2_volume"
 STANDARD_AUDIO_DATASET_LINE = "standard"
 VISUAL_AUDIO_ANCHOR_LINE = "visual_audio_anchor"
 SPEECH_AUDIO_CONTENT_LINE = "speech_audio_content"
@@ -1018,6 +1019,7 @@ ACCEPTANCE_PROFILE_NAMES = {
     B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
     B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE,
     B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE,
+    B_AUDIO_BLIND_REVIEW_V2_VOLUME_ACCEPTANCE_PROFILE,
 }
 ACCEPTANCE_PROFILE_CONFIGS = {
     DEFAULT_ACCEPTANCE_PROFILE: {
@@ -1150,6 +1152,37 @@ ACCEPTANCE_PROFILE_CONFIGS = {
         "asr_degeneracy_risk": 0.55,
         "visual_delta_strength": 0.55,
         "audio_delta_strength": 0.60,
+        "audio_edit_specificity_score": 0.70,
+        "audio_edit_generation_confidence": 0.70,
+        "audio_only_verification_confidence": 0.70,
+        "video_only_shortcut_confidence": 0.60,
+        "full_av_consistency_confidence": 0.60,
+    },
+    B_AUDIO_BLIND_REVIEW_V2_VOLUME_ACCEPTANCE_PROFILE: {
+        "template_semantic_context_score": 0.15,
+        "template_compatibility_score": 0.30,
+        "template_clean_stability_score": 0.30,
+        "template_single_delta_bundle_score": 0.25,
+        "template_target_uniqueness_score": 0.20,
+        "template_difference_strength_score": 0.25,
+        "same_context_score": 0.20,
+        "edit_match_score": 0.25,
+        "target_uniqueness_score": 0.20,
+        "difference_strength_score": 0.25,
+        "edit_necessity_score": 0.30,
+        "edit_target_alignment_score": 0.30,
+        "action_evidence_score": 0.20,
+        "non_speech_audio_event_score": 0.20,
+        "edit_text_quality_score": 0.30,
+        "video_context_strength": 0.25,
+        "asr_degeneracy_risk": 0.75,
+        "visual_delta_strength": 0.70,
+        "audio_delta_strength": 0.35,
+        "audio_edit_specificity_score": 0.35,
+        "audio_edit_generation_confidence": 0.35,
+        "audio_only_verification_confidence": 0.35,
+        "video_only_shortcut_confidence": 0.30,
+        "full_av_consistency_confidence": 0.30,
     },
 }
 SAME_TEMPLATE_CLUSTER_RELATION = "same_template_cluster"
@@ -1184,6 +1217,8 @@ def _normalize_acceptance_profile(value: str | None) -> str:
         profile = B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE
     if profile in {"b_audio_blind_v2", "b_blind_review_v2", "blind_audio_review_v2"}:
         profile = B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE
+    if profile in {"b_audio_blind_v2_volume", "b_blind_review_v2_volume", "blind_audio_review_v2_volume"}:
+        profile = B_AUDIO_BLIND_REVIEW_V2_VOLUME_ACCEPTANCE_PROFILE
     if profile not in ACCEPTANCE_PROFILE_NAMES:
         allowed = ", ".join(sorted(ACCEPTANCE_PROFILE_NAMES))
         raise ValueError(f"unsupported acceptance_profile={value!r}; expected one of: {allowed}")
@@ -1222,6 +1257,7 @@ def _is_b_audio_review_profile(acceptance_profile: str | None) -> bool:
         B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
         B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE,
         B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE,
+        B_AUDIO_BLIND_REVIEW_V2_VOLUME_ACCEPTANCE_PROFILE,
     }
 
 
@@ -1234,13 +1270,21 @@ def _is_b_audio_blind_review_profile(acceptance_profile: str | None) -> bool:
 
 
 def _is_b_audio_blind_review_v2_profile(acceptance_profile: str | None) -> bool:
-    return _normalize_acceptance_profile(acceptance_profile) == B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE
+    return _normalize_acceptance_profile(acceptance_profile) in {
+        B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE,
+        B_AUDIO_BLIND_REVIEW_V2_VOLUME_ACCEPTANCE_PROFILE,
+    }
+
+
+def _is_b_audio_blind_review_v2_volume_profile(acceptance_profile: str | None) -> bool:
+    return _normalize_acceptance_profile(acceptance_profile) == B_AUDIO_BLIND_REVIEW_V2_VOLUME_ACCEPTANCE_PROFILE
 
 
 def _is_b_audio_blind_review_family_profile(acceptance_profile: str | None) -> bool:
     return _normalize_acceptance_profile(acceptance_profile) in {
         B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE,
         B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE,
+        B_AUDIO_BLIND_REVIEW_V2_VOLUME_ACCEPTANCE_PROFILE,
     }
 
 
@@ -1253,6 +1297,7 @@ def _uses_soft_local_gate_profile(acceptance_profile: str | None) -> bool:
         B_AUDIO_CONTEXT_CVR_ACCEPTANCE_PROFILE,
         B_AUDIO_BLIND_REVIEW_ACCEPTANCE_PROFILE,
         B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE,
+        B_AUDIO_BLIND_REVIEW_V2_VOLUME_ACCEPTANCE_PROFILE,
     }
 SUBJECT_SIGNATURE_MARKER_TOKENS = {
     "bald",
@@ -2453,6 +2498,7 @@ def propose_single_source_pairs(
                         video_only_shortcut=video_only_shortcut,
                         full_av_consistency=full_av_consistency,
                         quality=quality,
+                        acceptance_profile=acceptance_profile,
                     )
                 else:
                     blind_review_issues = _b_audio_blind_review_issues(
@@ -2558,6 +2604,7 @@ def propose_single_source_pairs(
                     "target_caption": str(audio_only_proposal.get("target_audio_content", "")).strip(),
                     "difference": difference,
                     "audio_dataset_line": audio_dataset_line,
+                    "acceptance_profile": acceptance_profile,
                     "audio_line_quality_profile": str(quality.get("audio_line_quality_profile", "")).strip(),
                     "audio_delta_strength": _score_float(audio_delta_analysis.get("audio_delta_strength")),
                     "audio_delta_type": str(audio_delta_analysis.get("audio_delta_type", "")).strip(),
@@ -2589,7 +2636,7 @@ def propose_single_source_pairs(
                     "discarded_deltas": list(model_fields.get("discarded_deltas", [])),
                     "pair_video_evidence": list(model_fields.get("evidence", [])),
                     "confidence": confidence,
-                    "model_accepted": _boolish(audio_only_proposal.get("accept")),
+                    "model_accepted": accepted,
                     "local_gate_passed": not blind_local_issues,
                     "final_omni_accept": final_omni_accept,
                     "final_accept_source": "audio_only_blind_review",
@@ -3298,6 +3345,8 @@ def annotate_clips(
     overwrite: bool = False,
     timeout_seconds: float = 180.0,
     concurrency: int = 1,
+    omni_retries: int = 0,
+    fail_on_transient_omni_errors: bool = False,
 ) -> dict[str, Any]:
     return _annotate_clips_impl(
         root=root,
@@ -3310,6 +3359,8 @@ def annotate_clips(
         overwrite=overwrite,
         detective=False,
         concurrency=concurrency,
+        omni_retries=omni_retries,
+        fail_on_transient_omni_errors=fail_on_transient_omni_errors,
     )
 
 
@@ -3325,6 +3376,8 @@ def detective_annotate_clips(
     timeout_seconds: float = 180.0,
     concurrency: int = 1,
     audio_focused: bool = False,
+    omni_retries: int = 0,
+    fail_on_transient_omni_errors: bool = False,
 ) -> dict[str, Any]:
     return _annotate_clips_impl(
         root=root,
@@ -3338,6 +3391,8 @@ def detective_annotate_clips(
         detective=True,
         concurrency=concurrency,
         audio_focused=audio_focused,
+        omni_retries=omni_retries,
+        fail_on_transient_omni_errors=fail_on_transient_omni_errors,
     )
 
 
@@ -3354,6 +3409,8 @@ def _annotate_clips_impl(
     detective: bool,
     concurrency: int,
     audio_focused: bool = False,
+    omni_retries: int = 0,
+    fail_on_transient_omni_errors: bool = False,
 ) -> dict[str, Any]:
     layout = ensure_layout(root)
     manifest_path = Path(clips_manifest_path)
@@ -3390,17 +3447,29 @@ def _annotate_clips_impl(
         if detective:
             tool_observations = _build_toolbox_observations(clip_path)
             try:
-                normalized, raw_model_output = local_client.annotate_clip_detective(
-                    clip_path=str(clip_path),
-                    tool_observations=tool_observations,
-                    audio_focused=audio_focused,
+                normalized, raw_model_output = _call_omni_with_retries(
+                    label=f"detective_annotation:{clip_id}",
+                    retries=omni_retries,
+                    fail_on_transient=fail_on_transient_omni_errors,
+                    func=lambda: local_client.annotate_clip_detective(
+                        clip_path=str(clip_path),
+                        tool_observations=tool_observations,
+                        audio_focused=audio_focused,
+                    ),
                 )
                 fallback_used = False
             except Exception as detective_exc:
+                if fail_on_transient_omni_errors and _is_transient_omni_exception(detective_exc):
+                    raise
                 detective_fallback_used = True
                 detective_fallback_reason = "detective_to_single_pass"
                 try:
-                    normalized, single_pass_output = local_client.annotate_clip(clip_path=str(clip_path))
+                    normalized, single_pass_output = _call_omni_with_retries(
+                        label=f"single_pass_annotation:{clip_id}",
+                        retries=omni_retries,
+                        fail_on_transient=fail_on_transient_omni_errors,
+                        func=lambda: local_client.annotate_clip(clip_path=str(clip_path)),
+                    )
                     raw_model_output = {
                         "detective_error": f"{type(detective_exc).__name__}: {detective_exc}",
                         "single_pass_fallback": single_pass_output,
@@ -3418,6 +3487,8 @@ def _annotate_clips_impl(
                     fallback_used = False
                     detective_to_single_pass = True
                 except Exception as single_pass_exc:
+                    if fail_on_transient_omni_errors and _is_transient_omni_exception(single_pass_exc):
+                        raise
                     normalized = _fallback_clip_annotation()
                     raw_model_output = {
                         "detective_error": f"{type(detective_exc).__name__}: {detective_exc}",
@@ -3428,9 +3499,16 @@ def _annotate_clips_impl(
                     detective_fallback_reason = "detective_and_single_pass_failed"
         else:
             try:
-                normalized, raw_model_output = local_client.annotate_clip(clip_path=str(clip_path))
+                normalized, raw_model_output = _call_omni_with_retries(
+                    label=f"clip_annotation:{clip_id}",
+                    retries=omni_retries,
+                    fail_on_transient=fail_on_transient_omni_errors,
+                    func=lambda: local_client.annotate_clip(clip_path=str(clip_path)),
+                )
                 fallback_used = False
             except Exception as exc:
+                if fail_on_transient_omni_errors and _is_transient_omni_exception(exc):
+                    raise
                 normalized = _fallback_clip_annotation()
                 raw_model_output = {"error": f"{type(exc).__name__}: {exc}"}
                 fallback_used = True
@@ -3531,6 +3609,8 @@ def _annotate_clips_impl(
         "audio_focused_annotation": bool(audio_focused),
         "detective_to_single_pass_count": detective_to_single_pass_count if detective else 0,
         "concurrency": concurrency,
+        "omni_retries": int(omni_retries),
+        "fail_on_transient_omni_errors": bool(fail_on_transient_omni_errors),
     }
 
 
@@ -4789,10 +4869,10 @@ def propose_group_pairs(
         _write_jsonl(output, [])
     if not accepted_output.exists():
         _write_jsonl(accepted_output, [])
-    if accepted_progress_output is not None:
+    if accepted_progress_output is not None and not accepted_progress_output.exists():
         accepted_progress_output.parent.mkdir(parents=True, exist_ok=True)
         accepted_progress_output.write_text("", encoding="utf-8")
-    if rejected_progress_output is not None:
+    if rejected_progress_output is not None and not rejected_progress_output.exists():
         rejected_progress_output.parent.mkdir(parents=True, exist_ok=True)
         rejected_progress_output.write_text("", encoding="utf-8")
     print("[propose-group-pairs] load raw asset index", file=sys.stderr, flush=True)
@@ -9367,8 +9447,11 @@ def _b_audio_blind_review_v2_issues(
     video_only_shortcut: dict[str, Any],
     full_av_consistency: dict[str, Any],
     quality: dict[str, Any],
+    acceptance_profile: str = B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE,
 ) -> list[str]:
     issues: list[str] = []
+    profile = _normalize_acceptance_profile(acceptance_profile)
+    volume_profile = _is_b_audio_blind_review_v2_volume_profile(profile)
     difference_type = str(audio_delta_analysis.get("audio_delta_type", audio_only_proposal.get("difference_type", ""))).strip()
     if difference_type == "speech_topic":
         difference_type = "speech"
@@ -9380,16 +9463,21 @@ def _b_audio_blind_review_v2_issues(
     edit_text = str(audio_edit_generation.get("edit_text", audio_only_proposal.get("edit_text", ""))).strip()
     issues.extend(_b_line_edit_text_audio_only_issues(edit_text, difference_type))
 
-    if not _boolish(audio_delta_analysis.get("accept")):
+    if not _boolish(audio_delta_analysis.get("accept")) and not (
+        volume_profile
+        and _boolish(audio_delta_analysis.get("audio_difference_specific"))
+        and not _b_line_audio_phrase_is_hollow(str(audio_delta_analysis.get("reference_audio_content", "")))
+        and not _b_line_audio_phrase_is_hollow(str(audio_delta_analysis.get("target_audio_content", "")))
+    ):
         reason = str(audio_delta_analysis.get("reject_reason", "")).strip()
         issues.append("audio_delta_reject" + (f": {reason}" if reason else ""))
     if _score_float(audio_delta_analysis.get("audio_delta_strength")) < _profile_threshold(
-        B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE, "audio_delta_strength"
+        profile, "audio_delta_strength"
     ):
         issues.append(
             "audio_delta_strength_below_threshold: "
             f"{_score_float(audio_delta_analysis.get('audio_delta_strength')):.2f} < "
-            f"{_profile_threshold(B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE, 'audio_delta_strength'):.2f}"
+            f"{_profile_threshold(profile, 'audio_delta_strength'):.2f}"
         )
     if not _boolish(audio_delta_analysis.get("audio_difference_specific")):
         issues.append("audio_delta_not_specific")
@@ -9398,20 +9486,33 @@ def _b_audio_blind_review_v2_issues(
     ):
         issues.append("audio_delta_hollow_content")
 
-    if not _boolish(audio_edit_generation.get("accept")):
+    if not _boolish(audio_edit_generation.get("accept")) and not (
+        volume_profile and _boolish(audio_edit_generation.get("edit_text_audio_only"))
+    ):
         reason = str(audio_edit_generation.get("reject_reason", "")).strip()
         issues.append("audio_edit_generation_reject" + (f": {reason}" if reason else ""))
     if not _boolish(audio_edit_generation.get("edit_text_audio_only")):
         issues.append("audio_edit_generation_not_audio_only")
-    if _score_float(audio_edit_generation.get("edit_text_specificity_score")) < 0.70:
+    edit_specificity_threshold = _profile_threshold(profile, "audio_edit_specificity_score")
+    if _score_float(audio_edit_generation.get("edit_text_specificity_score")) < edit_specificity_threshold:
         issues.append(
             "audio_edit_specificity_below_threshold: "
-            f"{_score_float(audio_edit_generation.get('edit_text_specificity_score')):.2f} < 0.70"
+            f"{_score_float(audio_edit_generation.get('edit_text_specificity_score')):.2f} < {edit_specificity_threshold:.2f}"
         )
-    if _score_float(audio_edit_generation.get("confidence")) < 0.70:
-        issues.append(f"audio_edit_generation_confidence_below_threshold: {_score_float(audio_edit_generation.get('confidence')):.2f} < 0.70")
+    edit_confidence_threshold = _profile_threshold(profile, "audio_edit_generation_confidence")
+    if _score_float(audio_edit_generation.get("confidence")) < edit_confidence_threshold:
+        issues.append(
+            "audio_edit_generation_confidence_below_threshold: "
+            f"{_score_float(audio_edit_generation.get('confidence')):.2f} < {edit_confidence_threshold:.2f}"
+        )
 
-    if not _boolish(audio_only_verification.get("accept")):
+    directional_audio_pass = (
+        not _boolish(audio_only_verification.get("reference_satisfies_edit"))
+        and _boolish(audio_only_verification.get("target_satisfies_edit"))
+        and _boolish(audio_only_verification.get("audio_difference_specific"))
+        and _boolish(audio_only_verification.get("edit_text_audio_only"))
+    )
+    if not _boolish(audio_only_verification.get("accept")) and not (volume_profile and directional_audio_pass):
         reason = str(audio_only_verification.get("reject_reason", "")).strip()
         issues.append("audio_only_verification_reject" + (f": {reason}" if reason else ""))
     if _boolish(audio_only_verification.get("reference_satisfies_edit")):
@@ -9422,10 +9523,19 @@ def _b_audio_blind_review_v2_issues(
         issues.append("audio_only_verification_not_specific")
     if not _boolish(audio_only_verification.get("edit_text_audio_only")):
         issues.append("audio_only_verification_edit_text_not_audio_only")
-    if _score_float(audio_only_verification.get("confidence")) < 0.70:
-        issues.append(f"audio_only_verification_confidence_below_threshold: {_score_float(audio_only_verification.get('confidence')):.2f} < 0.70")
+    audio_verification_threshold = _profile_threshold(profile, "audio_only_verification_confidence")
+    if _score_float(audio_only_verification.get("confidence")) < audio_verification_threshold:
+        issues.append(
+            "audio_only_verification_confidence_below_threshold: "
+            f"{_score_float(audio_only_verification.get('confidence')):.2f} < {audio_verification_threshold:.2f}"
+        )
 
-    if not _boolish(video_only_shortcut.get("accept")):
+    video_only_pass = (
+        _boolish(video_only_shortcut.get("visual_context_preserved"))
+        and not _boolish(video_only_shortcut.get("visual_shortcut_risk"))
+        and not _boolish(video_only_shortcut.get("can_identify_target_without_audio"))
+    )
+    if not _boolish(video_only_shortcut.get("accept")) and not (volume_profile and video_only_pass):
         reason = str(video_only_shortcut.get("reject_reason", "")).strip()
         issues.append("video_only_shortcut_reject" + (f": {reason}" if reason else ""))
     if _boolish(video_only_shortcut.get("visual_shortcut_risk")):
@@ -9434,10 +9544,19 @@ def _b_audio_blind_review_v2_issues(
         issues.append("video_only_can_identify_target_without_audio")
     if not _boolish(video_only_shortcut.get("visual_context_preserved")):
         issues.append("video_only_visual_context_not_preserved")
-    if _score_float(video_only_shortcut.get("confidence")) < 0.60:
-        issues.append(f"video_only_shortcut_confidence_below_threshold: {_score_float(video_only_shortcut.get('confidence')):.2f} < 0.60")
+    video_confidence_threshold = _profile_threshold(profile, "video_only_shortcut_confidence")
+    if _score_float(video_only_shortcut.get("confidence")) < video_confidence_threshold:
+        issues.append(
+            "video_only_shortcut_confidence_below_threshold: "
+            f"{_score_float(video_only_shortcut.get('confidence')):.2f} < {video_confidence_threshold:.2f}"
+        )
 
-    if not _boolish(full_av_consistency.get("accept")):
+    full_av_pass = (
+        _boolish(full_av_consistency.get("visual_context_preserved"))
+        and not _boolish(full_av_consistency.get("visual_shortcut_risk"))
+        and _boolish(full_av_consistency.get("audio_edit_still_valid"))
+    )
+    if not _boolish(full_av_consistency.get("accept")) and not (volume_profile and full_av_pass):
         reason = str(full_av_consistency.get("reject_reason", "")).strip()
         issues.append("full_av_consistency_reject" + (f": {reason}" if reason else ""))
     if not _boolish(full_av_consistency.get("visual_context_preserved")):
@@ -9446,14 +9565,18 @@ def _b_audio_blind_review_v2_issues(
         issues.append("visual_shortcut_risk")
     if not _boolish(full_av_consistency.get("audio_edit_still_valid")):
         issues.append("full_av_audio_edit_not_valid")
-    if _score_float(full_av_consistency.get("confidence")) < 0.60:
-        issues.append(f"full_av_consistency_confidence_below_threshold: {_score_float(full_av_consistency.get('confidence')):.2f} < 0.60")
+    full_av_confidence_threshold = _profile_threshold(profile, "full_av_consistency_confidence")
+    if _score_float(full_av_consistency.get("confidence")) < full_av_confidence_threshold:
+        issues.append(
+            "full_av_consistency_confidence_below_threshold: "
+            f"{_score_float(full_av_consistency.get('confidence')):.2f} < {full_av_confidence_threshold:.2f}"
+        )
 
-    if _score_float(quality.get("video_context_strength")) < _profile_threshold(B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE, "video_context_strength"):
+    if _score_float(quality.get("video_context_strength")) < _profile_threshold(profile, "video_context_strength"):
         issues.append("blind_review_video_context_too_weak")
-    if _score_float(quality.get("asr_degeneracy_risk")) > _profile_threshold(B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE, "asr_degeneracy_risk"):
+    if _score_float(quality.get("asr_degeneracy_risk")) > _profile_threshold(profile, "asr_degeneracy_risk"):
         issues.append("blind_review_asr_degeneracy_risk_too_high")
-    if _score_float(quality.get("visual_delta_strength")) > _profile_threshold(B_AUDIO_BLIND_REVIEW_V2_ACCEPTANCE_PROFILE, "visual_delta_strength"):
+    if _score_float(quality.get("visual_delta_strength")) > _profile_threshold(profile, "visual_delta_strength"):
         issues.append("visual_shortcut_risk: local visual_delta_strength too high")
     return _dedupe_strings(issues)
 
@@ -19461,29 +19584,67 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         raise FileNotFoundError(f"jsonl file not found: {path}")
     records: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
+    data = path.read_bytes()
+    raw_lines = data.split(b"\n")
+    for line_number, raw_line in enumerate(raw_lines, start=1):
+        if not raw_line.strip():
             continue
-        payload = json.loads(line)
+        try:
+            payload = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if line_number == len(raw_lines) and not data.endswith(b"\n"):
+                _truncate_incomplete_jsonl_tail(path, data)
+                print(f"[jsonl-resume] preserved and removed incomplete final line path={path}", file=sys.stderr, flush=True)
+                break
+            raise ValueError(f"{path} line {line_number}: invalid JSON: {exc}") from exc
         if not isinstance(payload, dict):
             raise ValueError(f"{path} line {line_number}: expected a JSON object")
         records.append(payload)
     return records
 
 
+def _truncate_incomplete_jsonl_tail(path: Path, data: bytes) -> None:
+    prefix_length = data.rfind(b"\n") + 1
+    tail = data[prefix_length:]
+    if not tail:
+        return
+    backup = path.with_name(f"{path.name}.incomplete_tail.{os.getpid()}")
+    backup.write_bytes(tail)
+    with path.open("r+b") as handle:
+        handle.truncate(prefix_length)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    temp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _append_jsonl_record(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    payload = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError(f"failed to append JSONL record to {path}")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _resolve_under_root(root: Path, raw_path: str | Path) -> Path:
@@ -19683,6 +19844,8 @@ def build_parser() -> argparse.ArgumentParser:
     annotate_clips_parser.add_argument("--model", required=True)
     annotate_clips_parser.add_argument("--timeout-seconds", type=float, default=180.0)
     annotate_clips_parser.add_argument("--concurrency", type=int, default=1)
+    annotate_clips_parser.add_argument("--omni-retries", type=int, default=0)
+    annotate_clips_parser.add_argument("--fail-on-transient-omni-errors", action="store_true")
     annotate_clips_parser.add_argument("--overwrite", action="store_true")
 
     detective_annotate_parser = subparsers.add_parser("detective-annotate-clips")
@@ -19694,6 +19857,8 @@ def build_parser() -> argparse.ArgumentParser:
     detective_annotate_parser.add_argument("--model", required=True)
     detective_annotate_parser.add_argument("--timeout-seconds", type=float, default=180.0)
     detective_annotate_parser.add_argument("--concurrency", type=int, default=1)
+    detective_annotate_parser.add_argument("--omni-retries", type=int, default=0)
+    detective_annotate_parser.add_argument("--fail-on-transient-omni-errors", action="store_true")
     detective_annotate_parser.add_argument("--overwrite", action="store_true")
     detective_annotate_parser.add_argument("--audio-focused", action="store_true")
 
@@ -19898,6 +20063,8 @@ def main() -> None:
             model=args.model,
             timeout_seconds=args.timeout_seconds,
             concurrency=args.concurrency,
+            omni_retries=args.omni_retries,
+            fail_on_transient_omni_errors=args.fail_on_transient_omni_errors,
             overwrite=args.overwrite,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -19991,6 +20158,8 @@ def main() -> None:
             concurrency=args.concurrency,
             overwrite=args.overwrite,
             audio_focused=args.audio_focused,
+            omni_retries=args.omni_retries,
+            fail_on_transient_omni_errors=args.fail_on_transient_omni_errors,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

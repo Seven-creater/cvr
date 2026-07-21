@@ -175,7 +175,12 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("MODEL=${MODEL:-qwen3-omni-30b-a3b-instruct}", script)
         self.assertIn("resolved_model_alias=", script)
         self.assertIn("SHARD_TIMEOUT_SECONDS=${SHARD_TIMEOUT_SECONDS:-3600}", script)
-        self.assertIn("timeout \"$SHARD_TIMEOUT_SECONDS\" python3 -m app.composed_data propose-single-source-pairs", script)
+        self.assertIn("proposal_args=(", script)
+        self.assertIn("python3 -m app.composed_data propose-single-source-pairs", script)
+        self.assertIn('timeout "$SHARD_TIMEOUT_SECONDS" "${proposal_args[@]}"', script)
+        self.assertIn("run_line_shards_with_retries", script)
+        self.assertIn("ANNOTATION_RETRY_ATTEMPTS=${ANNOTATION_RETRY_ATTEMPTS:-4}", script)
+        self.assertIn("SHARD_RETRY_ATTEMPTS=${SHARD_RETRY_ATTEMPTS:-4}", script)
         self.assertIn("failed_or_timed_out_shards", script)
         self.assertIn("AUDIO_LINE_QUALITY_PROFILE=${AUDIO_LINE_QUALITY_PROFILE:-default}", script)
         self.assertIn("--audio-line-quality-profile \"$AUDIO_LINE_QUALITY_PROFILE\"", script)
@@ -242,8 +247,9 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("vllm.entrypoints.openai.api_server", clip_script)
 
         self.assertIn("AUDIO_DATASET_LINE=speech_audio_content", run_script)
-        self.assertIn("AUDIO_LINE_QUALITY_PROFILE=b_audio_blind_review_v2", run_script)
-        self.assertIn("B_ACCEPTANCE_PROFILE=b_audio_blind_review_v2", run_script)
+        self.assertIn("QUALITY_PROFILE=${QUALITY_PROFILE:-b_audio_blind_review_v2}", run_script)
+        self.assertIn('AUDIO_LINE_QUALITY_PROFILE="$QUALITY_PROFILE"', run_script)
+        self.assertIn('B_ACCEPTANCE_PROFILE="$QUALITY_PROFILE"', run_script)
         self.assertIn("B_CANDIDATE_MODE=audio_first", run_script)
         self.assertIn("MIN_CLIPS_PER_FOLDER=2", run_script)
         self.assertIn("MIN_GROUP_CLIPS=2", run_script)
@@ -251,6 +257,22 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("--keep-all-b", run_script)
         self.assertNotIn("modelscope download", run_script)
         self.assertNotIn("vllm.entrypoints.openai.api_server", run_script)
+
+    def test_avatar_like_test1000_launcher_reuses_existing_four_gpu_service(self) -> None:
+        script = Path("scripts/run_audio_cvr_avatar_like_test1000_4gpu.sh").read_text(encoding="utf-8")
+
+        self.assertIn("existing_vggsound,avqa_videos", script)
+        self.assertIn("b_audio_blind_review_v2_volume", script)
+        self.assertIn("PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-24}", script)
+        self.assertIn("CONCURRENCY=${CONCURRENCY:-24}", script)
+        self.assertIn("--sound-event-target 800", script)
+        self.assertIn("--music-target 200", script)
+        self.assertIn('"service_owned": False', script)
+        self.assertIn('history_path = path.with_name("status_history.jsonl")', script)
+        self.assertIn('tee -a "$RUN_ROOT/logs/bline.log"', script)
+        self.assertNotIn("vllm.entrypoints.openai.api_server", script)
+        self.assertNotIn("pkill", script)
+        self.assertNotIn("kill -", script)
 
     def test_audio_cvr_v1_b_first_4gpu_fast_starts_omni_and_uses_b_first_pipeline(self) -> None:
         script = Path("scripts/run_audio_cvr_v1_b_first_4gpu_fast.sh").read_text(encoding="utf-8")

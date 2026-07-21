@@ -16,6 +16,7 @@ SINGLE_SOURCE_ROOT=${SINGLE_SOURCE_ROOT:-$ROOT/clips/single_source}
 RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/audio_lines_single_source_reuse_$(date +%Y%m%d_%H%M%S)}
 MODEL=${MODEL:-qwen3-omni-30b-a3b-instruct}
 BASE_URL=${BASE_URL:-http://127.0.0.1:8093/v1}
+BASE_URL_POOL=${BASE_URL_POOL:-}
 AUDIO_DATASET_LINE=${AUDIO_DATASET_LINE:-both}
 TARGET_A_COUNT=${TARGET_A_COUNT:-8}
 TARGET_B_COUNT=${TARGET_B_COUNT:-8}
@@ -44,6 +45,9 @@ MIN_GROUP_CLIPS=${MIN_GROUP_CLIPS:-4}
 KEEP_ALL_B=${KEEP_ALL_B:-0}
 OMNI_TRANSIENT_RETRIES=${OMNI_TRANSIENT_RETRIES:-2}
 FAIL_ON_TRANSIENT_OMNI_ERRORS=${FAIL_ON_TRANSIENT_OMNI_ERRORS:-1}
+ANNOTATION_RETRY_ATTEMPTS=${ANNOTATION_RETRY_ATTEMPTS:-4}
+SHARD_RETRY_ATTEMPTS=${SHARD_RETRY_ATTEMPTS:-4}
+RESUME=${RESUME:-0}
 
 usage() {
   cat <<'EOF'
@@ -54,6 +58,7 @@ Options:
   --single-source-root PATH
   --run-root PATH
   --base-url URL
+  --base-url-pool URL[,URL] weighted endpoint pool used by proposal shards
   --model NAME
   --audio-dataset-line visual_audio_anchor|speech_audio_content|both
   --target-a-count N
@@ -64,8 +69,8 @@ Options:
   --propose-parallel-jobs N
   --request-timeout-seconds N
   --shard-timeout-seconds N
-  --audio-line-quality-profile default|v4_strict|v5_audio_primary|b_audio_context_cvr|b_audio_blind_review|b_audio_blind_review_v2
-  --acceptance-profile exploration|b_audio_review|b_audio_context_cvr|b_audio_blind_review|b_audio_blind_review_v2
+  --audio-line-quality-profile default|v4_strict|v5_audio_primary|b_audio_context_cvr|b_audio_blind_review|b_audio_blind_review_v2|b_audio_blind_review_v2_volume
+  --acceptance-profile exploration|b_audio_review|b_audio_context_cvr|b_audio_blind_review|b_audio_blind_review_v2|b_audio_blind_review_v2_volume
   --a-candidate-mode hybrid|omni_first
   --b-candidate-mode hybrid|audio_first
   --min-clips-per-folder N
@@ -78,7 +83,10 @@ Options:
   --force-audio-focused-refresh
   --annotation-search-root PATH
   --omni-transient-retries N
+  --annotation-retry-attempts N
+  --shard-retry-attempts N
   --allow-transient-omni-fallback
+  --resume
   --concurrency N
   -h, --help
 EOF
@@ -90,6 +98,7 @@ while [[ $# -gt 0 ]]; do
     --single-source-root) SINGLE_SOURCE_ROOT="$2"; shift 2 ;;
     --run-root) RUN_ROOT="$2"; shift 2 ;;
     --base-url) BASE_URL="$2"; shift 2 ;;
+    --base-url-pool) BASE_URL_POOL="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
     --audio-dataset-line) AUDIO_DATASET_LINE="$2"; shift 2 ;;
     --target-a-count) TARGET_A_COUNT="$2"; shift 2 ;;
@@ -117,7 +126,10 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --omni-transient-retries) OMNI_TRANSIENT_RETRIES="$2"; shift 2 ;;
+    --annotation-retry-attempts) ANNOTATION_RETRY_ATTEMPTS="$2"; shift 2 ;;
+    --shard-retry-attempts) SHARD_RETRY_ATTEMPTS="$2"; shift 2 ;;
     --allow-transient-omni-fallback) FAIL_ON_TRANSIENT_OMNI_ERRORS=0; shift ;;
+    --resume) RESUME=1; shift ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[audio-lines] unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -176,6 +188,56 @@ PY
   echo "[audio-lines] model=$MODEL"
 }
 
+is_audio_focused_profile() {
+  case "$AUDIO_LINE_QUALITY_PROFILE" in
+    v4_strict|v5_audio_primary|b_audio_context_cvr|b_audio_blind_review|b_audio_blind_review_v2|b_audio_blind_review_v2_volume)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+run_command_with_retries() {
+  local label="$1"
+  local attempts="$2"
+  shift 2
+  local attempt
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    echo "[audio-lines] $label attempt=$attempt/$attempts start $(date)"
+    if "$@"; then
+      echo "[audio-lines] $label attempt=$attempt/$attempts done $(date)"
+      return 0
+    fi
+    if [ "$attempt" -lt "$attempts" ]; then
+      echo "[audio-lines] WARN $label attempt=$attempt/$attempts failed; completed JSONL rows are preserved, retrying" >&2
+      sleep $((attempt * 5))
+    fi
+  done
+  echo "[audio-lines] ERROR $label failed after $attempts attempts" >&2
+  return 1
+}
+
+resolve_base_url_pool() {
+  if [ -z "$BASE_URL_POOL" ]; then
+    BASE_URL_POOL="$BASE_URL"
+  fi
+  IFS=',' read -r -a BASE_URL_POOL_ITEMS <<< "$BASE_URL_POOL"
+  if [ "${#BASE_URL_POOL_ITEMS[@]}" -eq 0 ]; then
+    echo "[audio-lines] empty base URL pool" >&2
+    exit 2
+  fi
+  local endpoint
+  for endpoint in "${BASE_URL_POOL_ITEMS[@]}"; do
+    curl -fsS -m 30 "$endpoint/models" >/dev/null || {
+      echo "[audio-lines] unhealthy endpoint in base URL pool: $endpoint" >&2
+      exit 2
+    }
+  done
+  echo "[audio-lines] base_url=$BASE_URL base_url_pool=$BASE_URL_POOL"
+}
+
 run_line_shards() {
   local line_name="$1"
   local shard_dir="$2"
@@ -187,6 +249,7 @@ run_line_shards() {
   mkdir -p "$shard_dir/logs"
   local active=0
   local failed=0
+  local assignment_index=0
   shopt -s nullglob
   for shard in "$shard_dir"/"${ranked_prefix}"_shard_*.jsonl; do
     local rows
@@ -196,28 +259,36 @@ run_line_shards() {
     fi
     local shard_id
     shard_id=$(basename "$shard" .jsonl | sed "s/${ranked_prefix}_shard_//")
+    local shard_base_url
+    shard_base_url="${BASE_URL_POOL_ITEMS[$((assignment_index % ${#BASE_URL_POOL_ITEMS[@]}))]}"
+    assignment_index=$((assignment_index + 1))
     (
-      echo "[audio-lines] $line_name shard=$shard_id rows=$rows start $(date)"
+      echo "[audio-lines] $line_name shard=$shard_id rows=$rows base_url=$shard_base_url start $(date)"
+      proposal_args=(
+        python3 -m app.composed_data propose-single-source-pairs
+        --root "$ROOT"
+        --clip-annotations-path "$SEGMENT_ANNOTATIONS"
+        --pair-candidates-path "$shard"
+        --whole-annotation-path "$WHOLE_ANNOTATION"
+        --output-path "$shard_dir/ranked_${shard_id}.jsonl"
+        --accepted-output-path "$shard_dir/accepted_${shard_id}.jsonl"
+        --accepted-progress-path "$shard_dir/accepted_progress_${shard_id}.jsonl"
+        --rejected-progress-path "$shard_dir/rejected_progress_${shard_id}.jsonl"
+        --base-url "$shard_base_url"
+        --api-key EMPTY
+        --model "$MODEL"
+        --timeout-seconds "$REQUEST_TIMEOUT_SECONDS"
+        --max-accepted-pairs "$max_accepted"
+        --zero-accepted-stop-after 0
+        --acceptance-profile "$acceptance_profile"
+        --audio-dataset-line "$line_mode"
+        --omni-retries "$OMNI_TRANSIENT_RETRIES"
+      )
+      if [ "$FAIL_ON_TRANSIENT_OMNI_ERRORS" = "1" ]; then
+        proposal_args+=(--fail-on-transient-omni-errors)
+      fi
       set +e
-      timeout "$SHARD_TIMEOUT_SECONDS" python3 -m app.composed_data propose-single-source-pairs \
-        --root "$ROOT" \
-        --clip-annotations-path "$SEGMENT_ANNOTATIONS" \
-        --pair-candidates-path "$shard" \
-        --whole-annotation-path "$WHOLE_ANNOTATION" \
-        --output-path "$shard_dir/ranked_${shard_id}.jsonl" \
-        --accepted-output-path "$shard_dir/accepted_${shard_id}.jsonl" \
-        --accepted-progress-path "$shard_dir/accepted_progress_${shard_id}.jsonl" \
-        --rejected-progress-path "$shard_dir/rejected_progress_${shard_id}.jsonl" \
-        --base-url "$BASE_URL" \
-        --api-key EMPTY \
-        --model "$MODEL" \
-        --timeout-seconds "$REQUEST_TIMEOUT_SECONDS" \
-        --max-accepted-pairs "$max_accepted" \
-        --zero-accepted-stop-after 0 \
-        --acceptance-profile "$acceptance_profile" \
-        --audio-dataset-line "$line_mode" \
-        --omni-retries "$OMNI_TRANSIENT_RETRIES" \
-        $(if [ "$FAIL_ON_TRANSIENT_OMNI_ERRORS" = "1" ]; then printf '%s' '--fail-on-transient-omni-errors'; fi)
+      timeout "$SHARD_TIMEOUT_SECONDS" "${proposal_args[@]}"
       status=$?
       set -e
       if [ "$status" -eq 0 ]; then
@@ -228,7 +299,7 @@ run_line_shards() {
         echo "[audio-lines] WARN $line_name shard=$shard_id failed status=$status $(date)" >&2
       fi
       exit "$status"
-    ) > "$shard_dir/logs/${line_name}_${shard_id}.log" 2>&1 &
+    ) >> "$shard_dir/logs/${line_name}_${shard_id}.log" 2>&1 &
     active=$((active + 1))
     if [ "$active" -ge "$PROPOSE_PARALLEL_JOBS" ]; then
       if ! wait -n; then
@@ -246,7 +317,30 @@ run_line_shards() {
   done
   if [ "$failed" -gt 0 ]; then
     echo "[audio-lines] WARN $line_name completed with failed_or_timed_out_shards=$failed; continuing with progress files" >&2
+    return 1
   fi
+  return 0
+}
+
+run_line_shards_with_retries() {
+  local original_jobs="$PROPOSE_PARALLEL_JOBS"
+  local attempt
+  for ((attempt = 1; attempt <= SHARD_RETRY_ATTEMPTS; attempt++)); do
+    echo "[audio-lines] shard_round=$attempt/$SHARD_RETRY_ATTEMPTS parallel_jobs=$PROPOSE_PARALLEL_JOBS"
+    if run_line_shards "$@"; then
+      PROPOSE_PARALLEL_JOBS="$original_jobs"
+      return 0
+    fi
+    if [ "$attempt" -lt "$SHARD_RETRY_ATTEMPTS" ]; then
+      PROPOSE_PARALLEL_JOBS=$((PROPOSE_PARALLEL_JOBS * 2 / 3))
+      if [ "$PROPOSE_PARALLEL_JOBS" -lt 6 ]; then
+        PROPOSE_PARALLEL_JOBS=6
+      fi
+      sleep $((attempt * 10))
+    fi
+  done
+  PROPOSE_PARALLEL_JOBS="$original_jobs"
+  return 1
 }
 
 mkdir -p "$RUN_ROOT" "$REPO_ROOT/logs"
@@ -254,6 +348,7 @@ echo "[audio-lines] start $(date)"
 echo "[audio-lines] run_root=$RUN_ROOT root=$ROOT single_source_root=$SINGLE_SOURCE_ROOT line=$AUDIO_DATASET_LINE"
 echo "[audio-lines] max_source_folders=$MAX_SOURCE_FOLDERS max_clips=$MAX_CLIPS propose_shards=$PROPOSE_SHARDS propose_parallel_jobs=$PROPOSE_PARALLEL_JOBS shard_timeout_seconds=$SHARD_TIMEOUT_SECONDS annotation_search_roots=$ANNOTATION_SEARCH_ROOTS audio_line_quality_profile=$AUDIO_LINE_QUALITY_PROFILE b_acceptance_profile=$B_ACCEPTANCE_PROFILE a_candidate_mode=$A_CANDIDATE_MODE b_candidate_mode=$B_CANDIDATE_MODE min_clips_per_folder=$MIN_CLIPS_PER_FOLDER min_group_clips=$MIN_GROUP_CLIPS keep_all_b=$KEEP_ALL_B fresh_annotations=$FRESH_ANNOTATIONS force_audio_focused_refresh=$FORCE_AUDIO_FOCUSED_REFRESH reuse_run_root=$REUSE_RUN_ROOT skip_annotation_refresh=$SKIP_ANNOTATION_REFRESH omni_transient_retries=$OMNI_TRANSIENT_RETRIES fail_on_transient_omni_errors=$FAIL_ON_TRANSIENT_OMNI_ERRORS"
 resolve_omni_model
+resolve_base_url_pool
 
 SEGMENTS_MANIFEST="$RUN_ROOT/extracted_single_source_clips.jsonl"
 CLIP_GROUPS="$RUN_ROOT/single_source_clip_groups.jsonl"
@@ -313,30 +408,44 @@ else
   "${prepare_existing_args[@]}"
 
   require_file "$CLIPS_TO_ANNOTATE" "clips manifest"
-  python3 -m app.composed_data detective-annotate-clips \
-    --root "$ROOT" \
-    --clips-manifest-path "$CLIPS_TO_ANNOTATE" \
-    --output-path "$SEGMENT_ANNOTATIONS" \
-    --base-url "$BASE_URL" \
-    --api-key EMPTY \
-    --model "$MODEL" \
-    --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS" \
-    --concurrency "$CONCURRENCY" \
-    $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "v5_audio_primary" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_context_cvr" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_blind_review" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_blind_review_v2" ]; then printf '%s' '--audio-focused'; fi)
+  annotation_args=(
+    python3 -m app.composed_data detective-annotate-clips
+    --root "$ROOT"
+    --clips-manifest-path "$CLIPS_TO_ANNOTATE"
+    --output-path "$SEGMENT_ANNOTATIONS"
+    --base-url "$BASE_URL"
+    --api-key EMPTY
+    --model "$MODEL"
+    --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS"
+    --concurrency "$CONCURRENCY"
+    --omni-retries "$OMNI_TRANSIENT_RETRIES"
+    --fail-on-transient-omni-errors
+  )
+  if is_audio_focused_profile; then
+    annotation_args+=(--audio-focused)
+  fi
+  run_command_with_retries "segment annotation" "$ANNOTATION_RETRY_ATTEMPTS" "${annotation_args[@]}"
 fi
 
 if [ "$SKIP_ANNOTATION_REFRESH" != "1" ] && [ "$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")" -gt 0 ]; then
   echo "[audio-lines] audio refresh annotation start rows=$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")"
-  python3 -m app.composed_data detective-annotate-clips \
-    --root "$ROOT" \
-    --clips-manifest-path "$AUDIO_REFRESH_MANIFEST" \
-    --output-path "$AUDIO_REFRESH_ANNOTATIONS" \
-    --base-url "$BASE_URL" \
-    --api-key EMPTY \
-    --model "$MODEL" \
-    --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS" \
-    --concurrency "$CONCURRENCY" \
-    $(if [ "$AUDIO_LINE_QUALITY_PROFILE" = "v4_strict" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "v5_audio_primary" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_context_cvr" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_blind_review" ] || [ "$AUDIO_LINE_QUALITY_PROFILE" = "b_audio_blind_review_v2" ]; then printf '%s' '--audio-focused'; fi)
+  refresh_annotation_args=(
+    python3 -m app.composed_data detective-annotate-clips
+    --root "$ROOT"
+    --clips-manifest-path "$AUDIO_REFRESH_MANIFEST"
+    --output-path "$AUDIO_REFRESH_ANNOTATIONS"
+    --base-url "$BASE_URL"
+    --api-key EMPTY
+    --model "$MODEL"
+    --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS"
+    --concurrency "$CONCURRENCY"
+    --omni-retries "$OMNI_TRANSIENT_RETRIES"
+    --fail-on-transient-omni-errors
+  )
+  if is_audio_focused_profile; then
+    refresh_annotation_args+=(--audio-focused)
+  fi
+  run_command_with_retries "audio refresh annotation" "$ANNOTATION_RETRY_ATTEMPTS" "${refresh_annotation_args[@]}"
   python3 -m app.audio_lines_single_source merge-annotations \
     --base-annotations-path "$SEGMENT_ANNOTATIONS" \
     --refresh-annotations-path "$AUDIO_REFRESH_ANNOTATIONS" \
@@ -371,30 +480,39 @@ python3 -m app.audio_lines_single_source split-candidates \
   --b-candidate-mode "$B_CANDIDATE_MODE"
 
 if [ "$AUDIO_DATASET_LINE" = "both" ] || [ "$AUDIO_DATASET_LINE" = "visual_audio_anchor" ]; then
-  test -d "$RUN_ROOT/a_shards" && mv "$RUN_ROOT/a_shards" "$RUN_ROOT/a_shards_before_$(date +%Y%m%d_%H%M%S)"
+  if [ "$RESUME" != "1" ]; then
+    test -d "$RUN_ROOT/a_shards" && mv "$RUN_ROOT/a_shards" "$RUN_ROOT/a_shards_before_$(date +%Y%m%d_%H%M%S)"
+  fi
   python3 -m app.audio_lines_single_source shard-jsonl \
     --input-path "$A_CANDIDATES" \
     --output-dir "$RUN_ROOT/a_shards" \
     --shards "$PROPOSE_SHARDS" \
     --prefix a
-  run_line_shards "a_visual_audio_anchor" "$RUN_ROOT/a_shards" "a" "a" "audio_matters" "visual_audio_anchor" "$TARGET_A_COUNT"
+  run_line_shards_with_retries "a_visual_audio_anchor" "$RUN_ROOT/a_shards" "a" "a" "audio_matters" "visual_audio_anchor" "$TARGET_A_COUNT"
 fi
 
 if [ "$AUDIO_DATASET_LINE" = "both" ] || [ "$AUDIO_DATASET_LINE" = "speech_audio_content" ]; then
-  test -d "$RUN_ROOT/b_shards" && mv "$RUN_ROOT/b_shards" "$RUN_ROOT/b_shards_before_$(date +%Y%m%d_%H%M%S)"
+  if [ "$RESUME" != "1" ]; then
+    test -d "$RUN_ROOT/b_shards" && mv "$RUN_ROOT/b_shards" "$RUN_ROOT/b_shards_before_$(date +%Y%m%d_%H%M%S)"
+  fi
   python3 -m app.audio_lines_single_source shard-jsonl \
     --input-path "$B_CANDIDATES" \
     --output-dir "$RUN_ROOT/b_shards" \
     --shards "$PROPOSE_SHARDS" \
     --prefix b
-  run_line_shards "b_speech_audio_content" "$RUN_ROOT/b_shards" "b" "b" "$B_ACCEPTANCE_PROFILE" "speech_audio_content" "$TARGET_B_COUNT"
+  run_line_shards_with_retries "b_speech_audio_content" "$RUN_ROOT/b_shards" "b" "b" "$B_ACCEPTANCE_PROFILE" "speech_audio_content" "$TARGET_B_COUNT"
 fi
 
-python3 -m app.audio_lines_single_source merge-line-results \
-  --run-root "$RUN_ROOT" \
-  --target-a-count "$TARGET_A_COUNT" \
-  --target-b-count "$TARGET_B_COUNT" \
-  $(if [ "$KEEP_ALL_B" = "1" ]; then printf '%s' '--keep-all-b'; fi)
+merge_args=(
+  python3 -m app.audio_lines_single_source merge-line-results
+  --run-root "$RUN_ROOT"
+  --target-a-count "$TARGET_A_COUNT"
+  --target-b-count "$TARGET_B_COUNT"
+)
+if [ "$KEEP_ALL_B" = "1" ]; then
+  merge_args+=(--keep-all-b)
+fi
+"${merge_args[@]}"
 
 mkdir -p "$RUN_ROOT/manual_review"
 python3 -m app.composed_data build-review-bundle \

@@ -19,6 +19,7 @@ from app.audio_lines_single_source import (
 from app.composed_data import (
     ensure_layout,
     propose_single_source_pairs,
+    _b_audio_blind_review_v2_issues,
     _b_line_edit_text_audio_only_issues,
     _is_transient_omni_exception,
     _single_source_pair_acceptance_issues,
@@ -35,6 +36,71 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
 
     def test_json_decode_errors_are_retried_as_transient_omni_failures(self) -> None:
         self.assertTrue(_is_transient_omni_exception(ValueError("JSONDecodeError: Expecting ',' delimiter")))
+
+    def test_volume_profile_relaxes_soft_scores_but_keeps_directional_gates(self) -> None:
+        inputs = {
+            "audio_delta_analysis": {
+                "accept": False,
+                "audio_delta_type": "audio_event",
+                "audio_delta_strength": 0.40,
+                "reference_audio_content": "quiet piano music",
+                "target_audio_content": "loud guitar music",
+                "audio_difference_specific": True,
+                "confidence": 0.40,
+            },
+            "audio_edit_generation": {
+                "accept": False,
+                "edit_text": "replace quiet piano music with loud guitar music",
+                "edit_text_audio_only": True,
+                "edit_text_specificity_score": 0.40,
+                "confidence": 0.40,
+            },
+            "audio_only_proposal": {"difference_type": "audio_event"},
+            "audio_only_verification": {
+                "accept": False,
+                "reference_satisfies_edit": False,
+                "target_satisfies_edit": True,
+                "audio_difference_specific": True,
+                "edit_text_audio_only": True,
+                "confidence": 0.40,
+            },
+            "video_only_shortcut": {
+                "accept": False,
+                "visual_context_preserved": True,
+                "visual_shortcut_risk": False,
+                "can_identify_target_without_audio": False,
+                "confidence": 0.40,
+            },
+            "full_av_consistency": {
+                "accept": False,
+                "visual_context_preserved": True,
+                "visual_shortcut_risk": False,
+                "audio_edit_still_valid": True,
+                "confidence": 0.40,
+            },
+            "quality": {
+                "video_context_strength": 0.30,
+                "asr_degeneracy_risk": 0.20,
+                "visual_delta_strength": 0.20,
+            },
+        }
+
+        strict_issues = _b_audio_blind_review_v2_issues(**inputs)
+        volume_issues = _b_audio_blind_review_v2_issues(
+            **inputs,
+            acceptance_profile="b_audio_blind_review_v2_volume",
+        )
+
+        self.assertIn("audio_delta_strength_below_threshold: 0.40 < 0.60", strict_issues)
+        self.assertEqual([], volume_issues)
+
+        broken_direction = dict(inputs["audio_only_verification"])
+        broken_direction["reference_satisfies_edit"] = True
+        directional_issues = _b_audio_blind_review_v2_issues(
+            **{**inputs, "audio_only_verification": broken_direction},
+            acceptance_profile="b_audio_blind_review_v2_volume",
+        )
+        self.assertIn("audio_only_reference_satisfies_edit", directional_issues)
 
     def test_contextual_asr_risk_default_does_not_override_explicit_high_risk(self) -> None:
         contextual = {"summary": "A news interview at a podium"}
@@ -1069,6 +1135,50 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
             self.assertEqual("extended", by_id["voxceleb_guarded"]["split_tier"])
             self.assertIn("voxceleb_main_guard", by_id["voxceleb_guarded"]["diagnostic_reason"])
             self.assertEqual("main", by_id["voxceleb_strong"]["split_tier"])
+
+    def test_volume_profile_accepted_non_speech_record_is_main(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir) / "run"
+            b_shards = run_root / "b_shards"
+            b_shards.mkdir(parents=True)
+            record = {
+                "proposal_id": "volume_sound_event",
+                "reference_video": "ref.mp4",
+                "target_video": "tgt.mp4",
+                "edit_text": "replace quiet room ambience with applause",
+                "difference": {"type": "audio_event"},
+                "accepted": True,
+                "b_subtype": "sound_event",
+                "audio_delta_strength": 0.40,
+                "video_context_strength": 0.30,
+                "asr_degeneracy_risk": 0.20,
+                "visual_shortcut_risk": False,
+                "audio_only_verification": {
+                    "accept": False,
+                    "reference_satisfies_edit": False,
+                    "target_satisfies_edit": True,
+                    "audio_difference_specific": True,
+                    "edit_text_audio_only": True,
+                },
+                "video_only_shortcut": {
+                    "can_identify_target_without_audio": False,
+                    "visual_shortcut_risk": False,
+                },
+                "quality": {
+                    "b_subtype": "sound_event",
+                    "acceptance_profile": "b_audio_blind_review_v2_volume",
+                },
+            }
+            self._write_jsonl(b_shards / "ranked_01.jsonl", [record])
+
+            merge_line_results(run_root=run_root, target_a_count=0, target_b_count=1, keep_all_b=True)
+
+            main_rows = [
+                json.loads(line)
+                for line in (run_root / "b_main_audio_cvr_triplets.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(["volume_sound_event"], [row["proposal_id"] for row in main_rows])
 
     def test_merge_b_line_mines_typed_hard_negatives_and_missing_reasons(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

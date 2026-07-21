@@ -11,6 +11,43 @@ from app.composed_data import ensure_layout
 
 
 class AudioCvrClipsTests(unittest.TestCase):
+    def test_clip_outputs_are_journaled_once_and_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            source = root / "raw" / "daily_omni" / "video" / "source.mp4"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"video")
+
+            def fake_extract(*, output_path: Path, **_: object) -> None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"clip")
+
+            media = {"has_video": True, "has_audio": True, "duration_seconds": 20.0}
+            with mock.patch("app.audio_cvr_clips.probe_media", return_value=media), mock.patch(
+                "app.audio_cvr_clips._extract_clip_atomic", side_effect=fake_extract
+            ):
+                first = build_audio_cvr_clips(
+                    root=root,
+                    datasets=["daily_omni"],
+                    clip_seconds=10,
+                    min_clip_seconds=8,
+                    max_clip_seconds=12,
+                )
+                resumed = build_audio_cvr_clips(
+                    root=root,
+                    datasets=["daily_omni"],
+                    clip_seconds=10,
+                    min_clip_seconds=8,
+                    max_clip_seconds=12,
+                )
+
+            progress_path = Path(first["progress_path"])
+            progress_rows = [line for line in progress_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(2, first["durable_clip_count"])
+            self.assertEqual(2, resumed["durable_clip_count"])
+            self.assertEqual(2, len(progress_rows))
+
     def test_builds_default_10s_clips_and_skips_sources_with_too_few_segments(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

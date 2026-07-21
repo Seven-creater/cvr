@@ -15,7 +15,9 @@ from app.composed_data import (
     build_ffmpeg_extract_command,
     ensure_layout,
     probe_media,
+    _append_jsonl_record,
     _display_path,
+    _load_jsonl,
     _safe_id,
     _stable_hash,
     _write_jsonl,
@@ -72,6 +74,12 @@ def build_audio_cvr_clips(
     manifest_dir = output_dir / "_manifests"
     manifest_dir.mkdir(parents=True, exist_ok=True)
     clip_set_name = _safe_id(output_dir.name or "audio_cvr_clips")
+    progress_path = manifest_dir / f"{clip_set_name}_progress.jsonl"
+    completed_clip_ids = {
+        str(row.get("clip_id") or "").strip()
+        for row in (_load_jsonl(progress_path) if progress_path.exists() else [])
+        if str(row.get("clip_id") or "").strip()
+    }
 
     clip_seconds = float(clip_seconds)
     min_clip_seconds = float(min_clip_seconds)
@@ -216,6 +224,9 @@ def build_audio_cvr_clips(
                         overwrite=overwrite,
                     )
                     extracted_count += 1
+                if not dry_run and output_path.exists() and clip_id not in completed_clip_ids:
+                    _append_jsonl_record(progress_path, {"event": "clip_ready", **record})
+                    completed_clip_ids.add(clip_id)
 
             if use_short_clip_group:
                 group_record = short_clip_groups.setdefault(
@@ -285,6 +296,8 @@ def build_audio_cvr_clips(
         "output_root": str(output_dir),
         "manifest_path": str(manifest_path),
         "groups_path": str(groups_path),
+        "progress_path": str(progress_path),
+        "durable_clip_count": len(completed_clip_ids),
         "dataset_names": dataset_names,
         "source_video_count": sum(final_source_counts.values()),
         "segment_count": len(segments),
