@@ -9,6 +9,7 @@ import numpy as np
 
 from app.e5_audio_delta_train import (
     DEFAULT_DATA_ROOT,
+    DeterministicEncoder,
     EvalGalleryItem,
     build_splits,
     cache_embeddings,
@@ -44,6 +45,87 @@ from app.audio_cvr_protocol_eval import mine_local_same_source, summarize_data, 
 
 
 class E5AudioDeltaTrainTests(unittest.TestCase):
+    def test_checkpoint_prefill_shards_resume_and_retry_transient_decode_failure(self) -> None:
+        class CountingEncoder:
+            def __init__(self, *, fail_once: bool = False, forbid_calls: bool = False) -> None:
+                self.inner = DeterministicEncoder()
+                self.fail_once = fail_once
+                self.forbid_calls = forbid_calls
+                self.calls = 0
+
+            def encode_document(self, inputs):
+                if self.forbid_calls:
+                    raise AssertionError("all payloads should have been loaded from checkpoints")
+                signatures = {
+                    ("mapping", *(str(key) for key in sorted(item)))
+                    if isinstance(item, dict)
+                    else ("scalar", type(item).__name__)
+                    for item in inputs
+                }
+                if len(signatures) != 1:
+                    raise AssertionError(f"checkpoint batches must use one input shape: {signatures}")
+                self.calls += len(inputs)
+                if self.fail_once:
+                    self.fail_once = False
+                    raise BlockingIOError(11, "Resource temporarily unavailable")
+                return self.inner.encode_document(inputs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+            self._write_jsonl(
+                records_dir / "eval_gallery.jsonl",
+                [
+                    {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "kind": "positive"},
+                    {"gallery_id": "reference::sample_1", "video": "/tmp/sample_1_ref.mp4", "kind": "reference_negative"},
+                    {"gallery_id": "distractor::1", "video": "/tmp/distractor.mp4", "kind": "distractor"},
+                ],
+            )
+            cache_dir = root / "cache"
+            first = CountingEncoder(fail_once=True)
+            cache_embeddings(
+                records_dir=records_dir,
+                output_dir=cache_dir,
+                encoder=first,
+                skip_train=True,
+                checkpoint_embeddings=True,
+                checkpoint_prefill_only=True,
+                checkpoint_shard_index=0,
+                checkpoint_shard_count=2,
+                encoding_item_batch_size=3,
+                encoding_retries=1,
+                encoding_retry_wait_seconds=0,
+            )
+            second = CountingEncoder()
+            cache_embeddings(
+                records_dir=records_dir,
+                output_dir=cache_dir,
+                encoder=second,
+                skip_train=True,
+                checkpoint_embeddings=True,
+                checkpoint_prefill_only=True,
+                checkpoint_shard_index=1,
+                checkpoint_shard_count=2,
+                encoding_item_batch_size=3,
+            )
+            cache_embeddings(
+                records_dir=records_dir,
+                output_dir=cache_dir,
+                encoder=CountingEncoder(forbid_calls=True),
+                skip_train=True,
+                checkpoint_embeddings=True,
+            )
+
+            self.assertGreater(first.calls, 0)
+            self.assertGreater(second.calls, 0)
+            self.assertTrue((cache_dir / "eval_embeddings.npz").exists())
+            self.assertTrue((cache_dir / "checkpoint_prefill_shard_000_of_002.json").exists())
+            self.assertTrue((cache_dir / "checkpoint_prefill_shard_001_of_002.json").exists())
+
     def test_prepare_omnicvr_and_per_query_reference_mask(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

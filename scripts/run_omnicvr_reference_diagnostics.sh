@@ -10,7 +10,7 @@ Usage:
     --output-dir /path/to/output \
     --expected-head GIT_COMMIT \
     --e5-model /path/to/e5-omni-7B \
-    --gpu-ids 0,1,2,3,4,5,6,7 \
+    --gpu-ids 0,1,2,3 \
     > /path/to/output.launch.log 2>&1 < /dev/null &
 
 The launcher performs a zero-shot cross-benchmark diagnostic on the official
@@ -25,7 +25,7 @@ ADAPTER_ROOT=""
 OUTPUT_DIR=""
 EXPECTED_HEAD=""
 E5_MODEL=""
-GPU_IDS="0,1,2,3,4,5,6,7"
+GPU_IDS="0,1,2,3"
 SEEDS="13,23,42,71,101"
 QUERY_COUNT=1000
 GALLERY_SIZE=2000
@@ -35,7 +35,11 @@ VIDEO_FPS=1
 VIDEO_MAX_PIXELS=401408
 BOOTSTRAP_SAMPLES=20000
 PERMUTATION_SAMPLES=20000
-MAX_EVAL_JOBS=8
+MAX_EVAL_JOBS=4
+CHECKPOINT_SHARDS_PER_MODE=2
+ENCODER_BATCH_SIZE=2
+ENCODING_ITEM_BATCH_SIZE=16
+ENCODING_RETRIES=4
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -54,6 +58,9 @@ while [[ $# -gt 0 ]]; do
     --bootstrap-samples) BOOTSTRAP_SAMPLES="$2"; shift 2 ;;
     --permutation-samples) PERMUTATION_SAMPLES="$2"; shift 2 ;;
     --max-eval-jobs) MAX_EVAL_JOBS="$2"; shift 2 ;;
+    --encoder-batch-size) ENCODER_BATCH_SIZE="$2"; shift 2 ;;
+    --encoding-item-batch-size) ENCODING_ITEM_BATCH_SIZE="$2"; shift 2 ;;
+    --encoding-retries) ENCODING_RETRIES="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -65,7 +72,7 @@ done
 
 IFS=',' read -ra GPU_ARRAY <<< "$GPU_IDS"
 IFS=',' read -ra SEED_ARRAY <<< "$SEEDS"
-[[ "${#GPU_ARRAY[@]}" -ge 2 ]] || { echo "ERROR: at least two GPU ids are required" >&2; exit 2; }
+[[ "${#GPU_ARRAY[@]}" -ge 4 ]] || { echo "ERROR: at least four GPU ids are required" >&2; exit 2; }
 [[ "${#SEED_ARRAY[@]}" -gt 0 ]] || { echo "ERROR: seeds must not be empty" >&2; exit 2; }
 
 mkdir -p "$OUTPUT_DIR/logs" "$OMNICVR_ROOT"
@@ -108,7 +115,9 @@ ACTUAL_HEAD="$(git rev-parse HEAD)"
 python3 -m py_compile app/e5_audio_delta_train.py app/audio_cvr_paper_experiment.py
 python3 -m unittest \
   tests.test_e5_audio_delta_train.E5AudioDeltaTrainTests.test_prepare_omnicvr_and_per_query_reference_mask \
-  tests.test_e5_audio_delta_train.E5AudioDeltaTrainTests.test_prepare_omnicvr_rejects_missing_source_candidate -v
+  tests.test_e5_audio_delta_train.E5AudioDeltaTrainTests.test_prepare_omnicvr_rejects_missing_source_candidate \
+  tests.test_e5_audio_delta_train.E5AudioDeltaTrainTests.test_checkpoint_prefill_shards_resume_and_retry_transient_decode_failure \
+  -v
 
 DATASET_REPO="$OMNICVR_ROOT/repository"
 ANNOTATION_PATH="$DATASET_REPO/omnicvr.jsonl"
@@ -196,15 +205,15 @@ PY
 CACHE_VAT="$OUTPUT_DIR/cache_V_A_T"
 CACHE_VT="$OUTPUT_DIR/cache_V_T"
 cache_mode() {
-  local mode="$1" gpu="$2" cache="$3" audio_mode="$4"
-  CUDA_VISIBLE_DEVICES="$gpu" python3 -m app.e5_audio_delta_train cache-embeddings \
+  local mode="$1" gpu="$2" cache="$3" audio_mode="$4" prefill_only="$5" shard_index="$6" reverse_order="$7" batch_size="$8"
+  local args=(python3 -m app.e5_audio_delta_train cache-embeddings
     --records-dir "$RECORDS_DIR" \
     --output-dir "$cache" \
     --e5-model "$E5_MODEL" \
     --device cuda \
     --torch-dtype bfloat16 \
     --attn-implementation sdpa \
-    --batch-size 1 \
+    --batch-size "$batch_size" \
     --video-max-pixels "$VIDEO_MAX_PIXELS" \
     --video-fps "$VIDEO_FPS" \
     --video-audio-mode "$audio_mode" \
@@ -212,12 +221,48 @@ cache_mode() {
     --document-input-mode video \
     --local-segments 0 \
     --skip-train \
-    > "$OUTPUT_DIR/logs/cache_${mode}.log" 2>&1
+    --checkpoint-embeddings \
+    --encoding-retries "$ENCODING_RETRIES" \
+    --encoding-retry-wait-seconds 3 \
+    --encoding-item-batch-size "$ENCODING_ITEM_BATCH_SIZE")
+  if [[ "$prefill_only" == "true" ]]; then
+    args+=(--checkpoint-prefill-only --checkpoint-shard-index "$shard_index" --checkpoint-shard-count "$CHECKPOINT_SHARDS_PER_MODE")
+  fi
+  [[ "$reverse_order" == "true" ]] && args+=(--checkpoint-reverse-order)
+  OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+    CUDA_VISIBLE_DEVICES="$gpu" "${args[@]}" \
+    > "$OUTPUT_DIR/logs/cache_${mode}_shard${shard_index}_${prefill_only}_batch${batch_size}.log" 2>&1
 }
 
-write_status "RUNNING" "cache" "encoding V+A+T and V+T in parallel"
-cache_mode V_A_T "${GPU_ARRAY[0]}" "$CACHE_VAT" on & CHILD_PIDS+=("$!")
-cache_mode V_T "${GPU_ARRAY[1]}" "$CACHE_VT" off & CHILD_PIDS+=("$!")
+run_prefill_round() {
+  local batch_size="$1" pid failed=0
+  CHILD_PIDS=()
+  cache_mode V_A_T "${GPU_ARRAY[0]}" "$CACHE_VAT" on true 0 false "$batch_size" & CHILD_PIDS+=("$!")
+  cache_mode V_A_T "${GPU_ARRAY[1]}" "$CACHE_VAT" on true 1 false "$batch_size" & CHILD_PIDS+=("$!")
+  cache_mode V_T "${GPU_ARRAY[2]}" "$CACHE_VT" off true 0 true "$batch_size" & CHILD_PIDS+=("$!")
+  cache_mode V_T "${GPU_ARRAY[3]}" "$CACHE_VT" off true 1 true "$batch_size" & CHILD_PIDS+=("$!")
+  for pid in "${CHILD_PIDS[@]}"; do
+    if ! wait "$pid"; then failed=1; fi
+  done
+  CHILD_PIDS=()
+  return "$failed"
+}
+
+write_status "RUNNING" "cache_prefill" "four GPUs encode disjoint checkpoint shards in parallel with batch=$ENCODER_BATCH_SIZE"
+ASSEMBLY_BATCH_SIZE="$ENCODER_BATCH_SIZE"
+if ! run_prefill_round "$ENCODER_BATCH_SIZE"; then
+  if [[ "$ENCODER_BATCH_SIZE" -le 1 ]]; then
+    echo "ERROR: checkpoint prefill failed with batch size 1" >&2
+    exit 6
+  fi
+  ASSEMBLY_BATCH_SIZE=1
+  write_status "RUNNING" "cache_prefill_fallback" "batch=$ENCODER_BATCH_SIZE failed; resuming item checkpoints with batch=1"
+  run_prefill_round 1
+fi
+
+write_status "RUNNING" "cache_assemble" "assembling final NPZ files from item checkpoints"
+cache_mode V_A_T "${GPU_ARRAY[0]}" "$CACHE_VAT" on false 0 false "$ASSEMBLY_BATCH_SIZE" & CHILD_PIDS+=("$!")
+cache_mode V_T "${GPU_ARRAY[2]}" "$CACHE_VT" off false 0 true "$ASSEMBLY_BATCH_SIZE" & CHILD_PIDS+=("$!")
 for pid in "${CHILD_PIDS[@]}"; do wait "$pid"; done
 CHILD_PIDS=()
 

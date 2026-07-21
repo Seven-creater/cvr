@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+import gc
 import hashlib
 import json
 from pathlib import Path
@@ -412,6 +413,14 @@ def cache_embeddings(
     local_segment_cache_dir: str | Path | None = None,
     segment_overlap: float = 0.0,
     skip_train: bool = False,
+    checkpoint_embeddings: bool = False,
+    encoding_retries: int = 0,
+    encoding_retry_wait_seconds: float = 2.0,
+    checkpoint_prefill_only: bool = False,
+    checkpoint_shard_index: int = 0,
+    checkpoint_shard_count: int = 1,
+    encoding_item_batch_size: int = 16,
+    checkpoint_reverse_order: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     records_root = Path(records_dir)
@@ -446,10 +455,36 @@ def cache_embeddings(
     document_input_mode = _normalize_document_input_mode(document_input_mode)
     runtime_info["query_input_mode"] = query_input_mode
     runtime_info["document_input_mode"] = document_input_mode
+    runtime_info["video_fps"] = int(video_fps)
+    runtime_info["video_max_pixels"] = int(video_max_pixels)
     runtime_info["audio_media_cache_dir"] = str(audio_media_cache_dir) if audio_media_cache_dir else str(output_root / "audio_media_cache")
     train_records = load_audio_delta_records(records_root / "train.jsonl")
     eval_records = load_audio_delta_records(records_root / "eval.jsonl")
     eval_gallery = load_eval_gallery_items(records_root / "eval_gallery.jsonl") if (records_root / "eval_gallery.jsonl").exists() else []
+    if checkpoint_prefill_only:
+        if not checkpoint_embeddings:
+            raise ValueError("checkpoint prefill requires --checkpoint-embeddings")
+        if local_segments > 0:
+            raise ValueError("checkpoint prefill currently requires --local-segments 0")
+        prefill_records = eval_records if skip_train else train_records + eval_records
+        prefill_gallery = eval_gallery
+        return _prefill_embedding_checkpoints(
+            records=prefill_records,
+            gallery_items=prefill_gallery,
+            encoder=encoder,
+            output_root=output_root,
+            runtime_info=runtime_info,
+            query_input_mode=query_input_mode,
+            document_input_mode=document_input_mode,
+            audio_media_cache_dir=audio_media_cache_dir,
+            shard_index=checkpoint_shard_index,
+            shard_count=checkpoint_shard_count,
+            item_batch_size=encoding_item_batch_size,
+            reverse_order=checkpoint_reverse_order,
+            retries=encoding_retries,
+            retry_wait_seconds=encoding_retry_wait_seconds,
+            progress=progress,
+        )
     if skip_train:
         train_summary = {"split": "train", "count": 0, "skipped": True}
     else:
@@ -466,6 +501,9 @@ def cache_embeddings(
             local_segment_mode=local_segment_mode,
             local_segment_cache_dir=local_segment_cache_dir,
             segment_overlap=segment_overlap,
+            checkpoint_embeddings=checkpoint_embeddings,
+            encoding_retries=encoding_retries,
+            encoding_retry_wait_seconds=encoding_retry_wait_seconds,
             progress=progress,
         )
     eval_summary = _cache_split_embeddings(
@@ -482,6 +520,9 @@ def cache_embeddings(
         local_segment_mode=local_segment_mode,
         local_segment_cache_dir=local_segment_cache_dir,
         segment_overlap=segment_overlap,
+        checkpoint_embeddings=checkpoint_embeddings,
+        encoding_retries=encoding_retries,
+        encoding_retry_wait_seconds=encoding_retry_wait_seconds,
         progress=progress,
     )
     summary = {
@@ -493,6 +534,9 @@ def cache_embeddings(
         "local_segment_cache_dir": str(local_segment_cache_dir) if local_segment_cache_dir else None,
         "segment_overlap": segment_overlap,
         "skip_train": bool(skip_train),
+        "checkpoint_embeddings": bool(checkpoint_embeddings),
+        "encoding_retries": max(0, int(encoding_retries)),
+        "encoding_retry_wait_seconds": max(0.0, float(encoding_retry_wait_seconds)),
         "train": train_summary,
         "eval": eval_summary,
     }
@@ -1482,6 +1526,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Encode only eval queries/gallery. Useful when one shared V+A+T train cache already exists.",
     )
+    cache.add_argument("--checkpoint-embeddings", action="store_true", help="Atomically cache each unique input embedding for safe resume.")
+    cache.add_argument("--encoding-retries", type=int, default=0, help="Retries for transient EAGAIN/PyAV scaling failures.")
+    cache.add_argument("--encoding-retry-wait-seconds", type=float, default=2.0)
+    cache.add_argument("--checkpoint-prefill-only", action="store_true", help="Fill one deterministic checkpoint shard without assembling the final NPZ.")
+    cache.add_argument("--checkpoint-shard-index", type=int, default=0)
+    cache.add_argument("--checkpoint-shard-count", type=int, default=1)
+    cache.add_argument("--encoding-item-batch-size", type=int, default=16)
+    cache.add_argument("--checkpoint-reverse-order", action="store_true")
 
     train = subparsers.add_parser("train-adapter")
     train.add_argument("--cache-dir", required=True)
@@ -1669,6 +1721,14 @@ def main() -> None:
             local_segment_cache_dir=args.local_segment_cache_dir,
             segment_overlap=args.segment_overlap,
             skip_train=args.skip_train,
+            checkpoint_embeddings=args.checkpoint_embeddings,
+            encoding_retries=args.encoding_retries,
+            encoding_retry_wait_seconds=args.encoding_retry_wait_seconds,
+            checkpoint_prefill_only=args.checkpoint_prefill_only,
+            checkpoint_shard_index=args.checkpoint_shard_index,
+            checkpoint_shard_count=args.checkpoint_shard_count,
+            encoding_item_batch_size=args.encoding_item_batch_size,
+            checkpoint_reverse_order=args.checkpoint_reverse_order,
             progress=progress,
         )
     elif args.command == "train-adapter":
@@ -1799,6 +1859,142 @@ def main() -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
 
 
+def _prefill_embedding_checkpoints(
+    *,
+    records: list[AudioDeltaRecord],
+    gallery_items: list[EvalGalleryItem],
+    encoder: Any,
+    output_root: Path,
+    runtime_info: dict[str, Any],
+    query_input_mode: str,
+    document_input_mode: str,
+    audio_media_cache_dir: str | Path | None,
+    shard_index: int,
+    shard_count: int,
+    item_batch_size: int,
+    reverse_order: bool,
+    retries: int,
+    retry_wait_seconds: float,
+    progress: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    shard_count = max(1, int(shard_count))
+    shard_index = int(shard_index)
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError(f"checkpoint shard index {shard_index} is outside [0, {shard_count})")
+    item_batch_size = max(1, int(item_batch_size))
+    audio_cache_root = Path(audio_media_cache_dir) if audio_media_cache_dir else output_root / "audio_media_cache"
+    checkpoint_root = _embedding_checkpoint_root(
+        output_root,
+        runtime_info=runtime_info,
+        query_input_mode=query_input_mode,
+        document_input_mode=document_input_mode,
+    )
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+
+    payload_by_path: dict[Path, Any] = {}
+    for record in records:
+        payloads = [
+            _query_payload(record, query_input_mode=query_input_mode, audio_cache_root=audio_cache_root),
+            _document_payload(record.target_video, document_input_mode=document_input_mode, audio_cache_root=audio_cache_root, sample_id=record.sample_id, role="target"),
+            _document_payload(record.reference_video, document_input_mode=document_input_mode, audio_cache_root=audio_cache_root, sample_id=record.sample_id, role="reference"),
+            record.edit_text,
+            record.old_audio or record.edit_text,
+            record.new_audio or record.edit_text,
+        ]
+        payloads.extend(
+            _document_payload(
+                str(negative.get("video", "")),
+                document_input_mode=document_input_mode,
+                audio_cache_root=audio_cache_root,
+                sample_id=record.sample_id,
+                role=str(negative.get("type", "negative")),
+            )
+            for negative in _ordered_negatives(record)
+            if str(negative.get("video", "")).strip()
+        )
+        for payload in payloads:
+            path = _embedding_checkpoint_path(checkpoint_root, payload)
+            payload_by_path.setdefault(path, payload)
+    for item in gallery_items:
+        payload = _document_payload(
+            item.video,
+            document_input_mode=document_input_mode,
+            audio_cache_root=audio_cache_root,
+            sample_id=item.gallery_id,
+            role=item.kind or "gallery",
+        )
+        path = _embedding_checkpoint_path(checkpoint_root, payload)
+        payload_by_path.setdefault(path, payload)
+
+    selected = [
+        (path, payload)
+        for path, payload in sorted(payload_by_path.items(), key=lambda item: str(item[0]))
+        if int(path.stem, 16) % shard_count == shard_index
+    ]
+    selected_by_signature: dict[tuple[str, ...], list[tuple[Path, Any]]] = defaultdict(list)
+    for path, payload in selected:
+        if isinstance(payload, dict):
+            signature = ("mapping", *(str(key) for key in sorted(payload)))
+        else:
+            signature = ("scalar", type(payload).__name__)
+        selected_by_signature[signature].append((path, payload))
+    ordered_groups = [selected_by_signature[key] for key in sorted(selected_by_signature)]
+    if reverse_order:
+        for group in ordered_groups:
+            group.reverse()
+    reused = 0
+    encoded = 0
+    processed = 0
+    for group in ordered_groups:
+        for start in range(0, len(group), item_batch_size):
+            batch = group[start : start + item_batch_size]
+            missing: list[tuple[Path, Any]] = []
+            for path, payload in batch:
+                if _load_embedding_checkpoint(path) is None:
+                    missing.append((path, payload))
+                else:
+                    reused += 1
+            if missing:
+                vectors = _encode_payload_batch_resilient(
+                    encoder,
+                    [payload for _, payload in missing],
+                    retries=retries,
+                    retry_wait_seconds=retry_wait_seconds,
+                    progress=progress,
+                )
+                if vectors.shape[0] != len(missing):
+                    raise ValueError("encoder returned the wrong number of checkpoint embeddings")
+                for (path, _), vector in zip(missing, vectors):
+                    _save_embedding_checkpoint(path, vector)
+                    encoded += 1
+            processed += len(batch)
+            _emit(
+                progress,
+                f"[e5-audio-delta] checkpoint shard {shard_index + 1}/{shard_count} {processed}/{len(selected)}",
+            )
+    summary = {
+        "mode": "checkpoint_prefill_only",
+        "output_dir": str(output_root),
+        "checkpoint_root": str(checkpoint_root),
+        "unique_payload_count": len(payload_by_path),
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "shard_payload_count": len(selected),
+        "encoded_count": encoded,
+        "reused_count": reused,
+        "item_batch_size": item_batch_size,
+        "batch_signature_counts": {
+            "|".join(signature): len(items)
+            for signature, items in sorted(selected_by_signature.items())
+        },
+        "reverse_order": bool(reverse_order),
+        "runtime": runtime_info,
+    }
+    summary_path = output_root / f"checkpoint_prefill_shard_{shard_index:03d}_of_{shard_count:03d}.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
 def _cache_split_embeddings(
     *,
     records: list[AudioDeltaRecord],
@@ -1814,6 +2010,9 @@ def _cache_split_embeddings(
     local_segment_mode: str,
     local_segment_cache_dir: str | Path | None,
     segment_overlap: float,
+    checkpoint_embeddings: bool,
+    encoding_retries: int,
+    encoding_retry_wait_seconds: float,
     progress: Callable[[str], None] | None,
 ) -> dict[str, Any]:
     if not records:
@@ -1823,6 +2022,25 @@ def _cache_split_embeddings(
     local_segment_mode = _normalize_local_segment_mode(local_segment_mode)
     local_cache_root = Path(local_segment_cache_dir) if local_segment_cache_dir else output_root / "local_media_cache"
     audio_cache_root = Path(audio_media_cache_dir) if audio_media_cache_dir else output_root / "audio_media_cache"
+    checkpoint_root = None
+    if checkpoint_embeddings:
+        checkpoint_root = _embedding_checkpoint_root(
+            output_root,
+            runtime_info=runtime_info,
+            query_input_mode=query_input_mode,
+            document_input_mode=document_input_mode,
+        )
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+
+    def encode_one(payload: Any) -> np.ndarray:
+        return _encode_one_resilient(
+            encoder,
+            payload,
+            checkpoint_root=checkpoint_root,
+            retries=encoding_retries,
+            retry_wait_seconds=encoding_retry_wait_seconds,
+            progress=progress,
+        )
     target_segment_rows: list[np.ndarray] = []
     reference_segment_rows: list[np.ndarray] = []
     negative_rows: list[list[np.ndarray]] = []
@@ -1837,8 +2055,7 @@ def _cache_split_embeddings(
         for index, record in enumerate(records, start=1):
             _emit(progress, f"[e5-audio-delta] cache {split} {index}/{len(records)} sample_id={record.sample_id}")
             arrays["query"].append(
-                _encode_one(
-                    encoder,
+                encode_one(
                     _query_payload(
                         record,
                         query_input_mode=query_input_mode,
@@ -1847,8 +2064,7 @@ def _cache_split_embeddings(
                 )
             )
             arrays["target"].append(
-                _encode_one(
-                    encoder,
+                encode_one(
                     _document_payload(
                         record.target_video,
                         document_input_mode=document_input_mode,
@@ -1859,8 +2075,7 @@ def _cache_split_embeddings(
                 )
             )
             arrays["reference"].append(
-                _encode_one(
-                    encoder,
+                encode_one(
                     _document_payload(
                         record.reference_video,
                         document_input_mode=document_input_mode,
@@ -1870,9 +2085,9 @@ def _cache_split_embeddings(
                     ),
                 )
             )
-            arrays["edit"].append(_encode_one(encoder, record.edit_text))
-            arrays["old_audio"].append(_encode_one(encoder, record.old_audio or record.edit_text))
-            arrays["new_audio"].append(_encode_one(encoder, record.new_audio or record.edit_text))
+            arrays["edit"].append(encode_one(record.edit_text))
+            arrays["old_audio"].append(encode_one(record.old_audio or record.edit_text))
+            arrays["new_audio"].append(encode_one(record.new_audio or record.edit_text))
             if local_segments > 0:
                 target_segment_rows.append(
                     _encode_many(
@@ -1912,8 +2127,7 @@ def _cache_split_embeddings(
                 if not video:
                     continue
                 neg_vectors.append(
-                    _encode_one(
-                        encoder,
+                    encode_one(
                         _document_payload(
                             video,
                             document_input_mode=document_input_mode,
@@ -1991,8 +2205,7 @@ def _cache_split_embeddings(
         for item_index, item in enumerate(gallery_items, start=1):
             _emit(progress, f"[e5-audio-delta] cache eval gallery {item_index}/{len(gallery_items)} gallery_id={item.gallery_id}")
             gallery_vectors.append(
-                _encode_one(
-                    encoder,
+                encode_one(
                     _document_payload(
                         item.video,
                         document_input_mode=document_input_mode,
@@ -2066,6 +2279,8 @@ def _cache_split_embeddings(
         "embeddings_path": str(npz_path),
         "records_path": str(records_path),
         "manifest_path": str(manifest_path),
+        "checkpoint_embeddings": bool(checkpoint_embeddings),
+        "checkpoint_root": str(checkpoint_root) if checkpoint_root else None,
     }
     (output_root / f"{split}_summary.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return metadata
@@ -3960,6 +4175,113 @@ def _encode_one(encoder: Any, payload: Any) -> np.ndarray:
 
 def _encode_many(encoder: Any, payloads: list[Any]) -> np.ndarray:
     return _normalize_rows(encoder.encode_document(payloads))
+
+
+def _embedding_checkpoint_root(
+    output_root: Path,
+    *,
+    runtime_info: dict[str, Any],
+    query_input_mode: str,
+    document_input_mode: str,
+) -> Path:
+    payload = {
+        "model_path": runtime_info.get("model_path"),
+        "video_audio_mode": runtime_info.get("video_audio_mode"),
+        "query_input_mode": query_input_mode,
+        "document_input_mode": document_input_mode,
+        "video_fps": runtime_info.get("video_fps"),
+        "video_max_pixels": runtime_info.get("video_max_pixels"),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:16]
+    return output_root / "item_embedding_cache" / fingerprint
+
+
+def _embedding_checkpoint_path(checkpoint_root: Path, payload: Any) -> Path:
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return checkpoint_root / digest[:2] / f"{digest}.npy"
+
+
+def _load_embedding_checkpoint(path: Path) -> np.ndarray | None:
+    if not path.exists():
+        return None
+    try:
+        value = np.asarray(np.load(str(path), allow_pickle=False), dtype=np.float32)
+    except Exception:
+        path.unlink(missing_ok=True)
+        return None
+    if value.ndim != 1 or value.size == 0 or not np.isfinite(value).all():
+        path.unlink(missing_ok=True)
+        return None
+    return value
+
+
+def _save_embedding_checkpoint(path: Path, value: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+    try:
+        with temp.open("wb") as handle:
+            np.save(handle, np.asarray(value, dtype=np.float32), allow_pickle=False)
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _retryable_encoding_error(exc: Exception) -> bool:
+    if int(getattr(exc, "errno", 0) or 0) == 11:
+        return True
+    text = str(exc).lower()
+    return "resource temporarily unavailable" in text or "failed initializing scaling graph" in text
+
+
+def _encode_payload_batch_resilient(
+    encoder: Any,
+    payloads: list[Any],
+    *,
+    retries: int,
+    retry_wait_seconds: float,
+    progress: Callable[[str], None] | None,
+) -> np.ndarray:
+    retries = max(0, int(retries))
+    for attempt in range(retries + 1):
+        try:
+            return _encode_many(encoder, payloads)
+        except Exception as exc:
+            if not _retryable_encoding_error(exc) or attempt >= retries:
+                raise
+            wait_seconds = max(0.0, float(retry_wait_seconds)) * (attempt + 1)
+            _emit(progress, f"[e5-audio-delta] transient decode failure; retry {attempt + 1}/{retries} after {wait_seconds:.1f}s: {exc}")
+            gc.collect()
+            time.sleep(wait_seconds)
+    raise RuntimeError("unreachable encoding retry state")
+
+
+def _encode_one_resilient(
+    encoder: Any,
+    payload: Any,
+    *,
+    checkpoint_root: Path | None,
+    retries: int,
+    retry_wait_seconds: float,
+    progress: Callable[[str], None] | None,
+) -> np.ndarray:
+    checkpoint_path = _embedding_checkpoint_path(checkpoint_root, payload) if checkpoint_root else None
+    if checkpoint_path:
+        cached = _load_embedding_checkpoint(checkpoint_path)
+        if cached is not None:
+            return cached
+    value = _encode_payload_batch_resilient(
+        encoder,
+        [payload],
+        retries=retries,
+        retry_wait_seconds=retry_wait_seconds,
+        progress=progress,
+    )[0]
+    if checkpoint_path:
+        _save_embedding_checkpoint(checkpoint_path, value)
+    return value
 
 
 def _local_video_payloads(
