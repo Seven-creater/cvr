@@ -4320,6 +4320,10 @@ def _retryable_encoding_error(exc: Exception) -> bool:
     return "resource temporarily unavailable" in text or "failed initializing scaling graph" in text
 
 
+def _skippable_media_encoding_error(exc: Exception) -> bool:
+    return _retryable_encoding_error(exc) or isinstance(exc, (ZeroDivisionError, EOFError))
+
+
 def _ensure_pyav_error_compat(av_module: Any | None = None) -> str | None:
     if av_module is None:
         try:
@@ -4379,7 +4383,7 @@ def _encode_checkpoint_batch_resilient(
             progress=progress,
         )
     except Exception as exc:
-        if not _retryable_encoding_error(exc):
+        if not _skippable_media_encoding_error(exc):
             raise
         if len(items) > 1:
             midpoint = len(items) // 2

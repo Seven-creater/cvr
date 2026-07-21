@@ -147,6 +147,8 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
                 for item in inputs:
                     if isinstance(item, dict) and "bad_distractor.mp4" in str(item.get("video", "")):
                         raise BlockingIOError(11, "Failed initializing scaling graph")
+                    if isinstance(item, dict) and "zero_frame.mp4" in str(item.get("video", "")):
+                        raise ZeroDivisionError("division by zero")
                 return self.inner.encode_document(inputs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -162,6 +164,7 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
                     {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "kind": "positive"},
                     {"gallery_id": "reference::sample_1", "video": "/tmp/sample_1_ref.mp4", "kind": "reference_negative"},
                     {"gallery_id": "distractor::bad", "video": "/tmp/bad_distractor.mp4", "kind": "candidate"},
+                    {"gallery_id": "distractor::zero", "video": "/tmp/zero_frame.mp4", "kind": "candidate"},
                     {"gallery_id": "distractor::good", "video": "/tmp/good_distractor.mp4", "kind": "candidate"},
                 ],
             )
@@ -192,10 +195,10 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             )
 
             with np.load(cache_dir / "eval_embeddings.npz", allow_pickle=False) as data:
-                self.assertEqual([1.0, 1.0, 0.0, 1.0], data["gallery_valid_mask"].tolist())
-                self.assertEqual([1.0, 1.0, 0.0, 1.0], data["candidate_gallery_mask"][0].tolist())
-            self.assertEqual(1, prefill["skipped_persistent_failure_count"])
-            self.assertEqual(1, summary["eval"]["failed_gallery_count"])
+                self.assertEqual([1.0, 1.0, 0.0, 0.0, 1.0], data["gallery_valid_mask"].tolist())
+                self.assertEqual([1.0, 1.0, 0.0, 0.0, 1.0], data["candidate_gallery_mask"][0].tolist())
+            self.assertEqual(2, prefill["skipped_persistent_failure_count"])
+            self.assertEqual(2, summary["eval"]["failed_gallery_count"])
             self.assertEqual(3, summary["eval"]["effective_gallery_count"])
             self.assertTrue((cache_dir / "eval_gallery_encoding_failures.jsonl").exists())
 
