@@ -2047,6 +2047,8 @@ def _cache_split_embeddings(
 ) -> dict[str, Any]:
     if not records:
         raise ValueError(f"{split} records are empty")
+    input_record_count = len(records)
+    excluded_records: list[dict[str, Any]] = []
     arrays: dict[str, list[np.ndarray]] = {key: [] for key in ("query", "target", "reference", "edit", "old_audio", "new_audio")}
     local_segments = max(0, int(local_segments))
     local_segment_mode = _normalize_local_segment_mode(local_segment_mode)
@@ -2065,6 +2067,55 @@ def _cache_split_embeddings(
         if skip_persistent_encoding_failures:
             failure_root = Path(encoding_failure_dir) if encoding_failure_dir else output_root / "failed_embedding_payloads"
             failure_root.mkdir(parents=True, exist_ok=True)
+
+    if failure_root:
+        retained_records: list[AudioDeltaRecord] = []
+        for record in records:
+            required_payloads = {
+                "query": _query_payload(record, query_input_mode=query_input_mode, audio_cache_root=audio_cache_root),
+                "target": _document_payload(
+                    record.target_video,
+                    document_input_mode=document_input_mode,
+                    audio_cache_root=audio_cache_root,
+                    sample_id=record.sample_id,
+                    role="target",
+                ),
+                "reference": _document_payload(
+                    record.reference_video,
+                    document_input_mode=document_input_mode,
+                    audio_cache_root=audio_cache_root,
+                    sample_id=record.sample_id,
+                    role="reference",
+                ),
+                "edit": record.edit_text,
+                "old_audio": record.old_audio or record.edit_text,
+                "new_audio": record.new_audio or record.edit_text,
+            }
+            failed_roles = [
+                role
+                for role, payload in required_payloads.items()
+                if _embedding_failure_path(failure_root, payload).exists()
+            ]
+            if failed_roles:
+                excluded_records.append(
+                    {
+                        "sample_id": record.sample_id,
+                        "failed_roles": failed_roles,
+                        "reference_video": record.reference_video,
+                        "target_video": record.target_video,
+                    }
+                )
+            else:
+                retained_records.append(record)
+        records = retained_records
+        if excluded_records:
+            _write_jsonl(output_root / f"{split}_excluded_encoding_failures.jsonl", excluded_records)
+            _emit(
+                progress,
+                f"[e5-audio-delta] excluded {len(excluded_records)} {split} records with persistently failing required media",
+            )
+        if not records:
+            raise ValueError(f"all {split} records were excluded by persistent encoding failures")
 
     def encode_one(payload: Any) -> np.ndarray:
         return _encode_one_resilient(
@@ -2319,7 +2370,10 @@ def _cache_split_embeddings(
     _write_jsonl(records_path, [asdict(record) for record in records])
     metadata = {
         "split": split,
+        "input_record_count": input_record_count,
         "record_count": len(records),
+        "excluded_record_count": len(excluded_records),
+        "excluded_sample_ids": [str(item["sample_id"]) for item in excluded_records],
         "embedding_shape": list(stacked["query"].shape),
         "negative_shape": list(stacked["negative"].shape),
         "gallery_shape": list(stacked["gallery"].shape) if "gallery" in stacked else None,

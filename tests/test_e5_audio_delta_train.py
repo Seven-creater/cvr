@@ -202,6 +202,82 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertEqual(3, summary["eval"]["effective_gallery_count"])
             self.assertTrue((cache_dir / "eval_gallery_encoding_failures.jsonl").exists())
 
+    def test_required_media_failure_excludes_same_query_across_modality_caches(self) -> None:
+        class BadRequiredEncoder:
+            def __init__(self) -> None:
+                self.inner = DeterministicEncoder()
+
+            def encode_document(self, inputs):
+                for item in inputs:
+                    if isinstance(item, dict) and "bad_tgt.mp4" in str(item.get("video", "")):
+                        raise ZeroDivisionError("division by zero")
+                return self.inner.encode_document(inputs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [
+                self._record("good", source="source_good", pair="pair_good"),
+                self._record("bad", source="source_bad", pair="pair_bad"),
+            ]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+            self._write_jsonl(
+                records_dir / "eval_gallery.jsonl",
+                [
+                    {"gallery_id": "positive::good", "video": "/tmp/good_tgt.mp4", "kind": "positive"},
+                    {"gallery_id": "reference::good", "video": "/tmp/good_ref.mp4", "kind": "reference_negative"},
+                    {"gallery_id": "positive::bad", "video": "/tmp/bad_tgt.mp4", "kind": "positive"},
+                    {"gallery_id": "reference::bad", "video": "/tmp/bad_ref.mp4", "kind": "reference_negative"},
+                ],
+            )
+            failure_dir = root / "shared_failures"
+            cache_on = root / "cache_on"
+            encoder = BadRequiredEncoder()
+            cache_embeddings(
+                records_dir=records_dir,
+                output_dir=cache_on,
+                encoder=encoder,
+                skip_train=True,
+                checkpoint_embeddings=True,
+                checkpoint_prefill_only=True,
+                encoding_item_batch_size=8,
+                encoding_retries=0,
+                skip_persistent_encoding_failures=True,
+                encoding_failure_dir=failure_dir,
+            )
+            summary_on = cache_embeddings(
+                records_dir=records_dir,
+                output_dir=cache_on,
+                encoder=encoder,
+                skip_train=True,
+                checkpoint_embeddings=True,
+                skip_persistent_encoding_failures=True,
+                encoding_failure_dir=failure_dir,
+            )
+            cache_off = root / "cache_off"
+            summary_off = cache_embeddings(
+                records_dir=records_dir,
+                output_dir=cache_off,
+                encoder=encoder,
+                skip_train=True,
+                checkpoint_embeddings=True,
+                video_audio_mode="off",
+                skip_persistent_encoding_failures=True,
+                encoding_failure_dir=failure_dir,
+            )
+
+            for cache_dir, summary in ((cache_on, summary_on), (cache_off, summary_off)):
+                cached_records = load_audio_delta_records(cache_dir / "eval_records.jsonl")
+                self.assertEqual(["good"], [record.sample_id for record in cached_records])
+                self.assertEqual(1, summary["eval"]["excluded_record_count"])
+                self.assertEqual(["bad"], summary["eval"]["excluded_sample_ids"])
+                with np.load(cache_dir / "eval_embeddings.npz", allow_pickle=False) as data:
+                    self.assertEqual((1, 4), data["candidate_gallery_mask"].shape)
+                    self.assertEqual([1.0, 1.0, 0.0, 1.0], data["gallery_valid_mask"].tolist())
+                self.assertTrue((cache_dir / "eval_excluded_encoding_failures.jsonl").exists())
+
     def test_prepare_omnicvr_and_per_query_reference_mask(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
