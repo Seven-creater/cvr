@@ -126,6 +126,67 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertTrue((cache_dir / "checkpoint_prefill_shard_000_of_002.json").exists())
             self.assertTrue((cache_dir / "checkpoint_prefill_shard_001_of_002.json").exists())
 
+    def test_persistent_gallery_failure_is_audited_and_masked(self) -> None:
+        class BadGalleryEncoder:
+            def __init__(self) -> None:
+                self.inner = DeterministicEncoder()
+
+            def encode_document(self, inputs):
+                for item in inputs:
+                    if isinstance(item, dict) and "bad_distractor.mp4" in str(item.get("video", "")):
+                        raise BlockingIOError(11, "Failed initializing scaling graph")
+                return self.inner.encode_document(inputs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+            self._write_jsonl(
+                records_dir / "eval_gallery.jsonl",
+                [
+                    {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "kind": "positive"},
+                    {"gallery_id": "reference::sample_1", "video": "/tmp/sample_1_ref.mp4", "kind": "reference_negative"},
+                    {"gallery_id": "distractor::bad", "video": "/tmp/bad_distractor.mp4", "kind": "candidate"},
+                    {"gallery_id": "distractor::good", "video": "/tmp/good_distractor.mp4", "kind": "candidate"},
+                ],
+            )
+            cache_dir = root / "cache"
+            failure_dir = root / "shared_failures"
+            encoder = BadGalleryEncoder()
+            prefill = cache_embeddings(
+                records_dir=records_dir,
+                output_dir=cache_dir,
+                encoder=encoder,
+                skip_train=True,
+                checkpoint_embeddings=True,
+                checkpoint_prefill_only=True,
+                encoding_item_batch_size=8,
+                encoding_retries=1,
+                encoding_retry_wait_seconds=0,
+                skip_persistent_encoding_failures=True,
+                encoding_failure_dir=failure_dir,
+            )
+            summary = cache_embeddings(
+                records_dir=records_dir,
+                output_dir=cache_dir,
+                encoder=encoder,
+                skip_train=True,
+                checkpoint_embeddings=True,
+                skip_persistent_encoding_failures=True,
+                encoding_failure_dir=failure_dir,
+            )
+
+            with np.load(cache_dir / "eval_embeddings.npz", allow_pickle=False) as data:
+                self.assertEqual([1.0, 1.0, 0.0, 1.0], data["gallery_valid_mask"].tolist())
+                self.assertEqual([1.0, 1.0, 0.0, 1.0], data["candidate_gallery_mask"][0].tolist())
+            self.assertEqual(1, prefill["skipped_persistent_failure_count"])
+            self.assertEqual(1, summary["eval"]["failed_gallery_count"])
+            self.assertEqual(3, summary["eval"]["effective_gallery_count"])
+            self.assertTrue((cache_dir / "eval_gallery_encoding_failures.jsonl").exists())
+
     def test_prepare_omnicvr_and_per_query_reference_mask(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -421,6 +421,8 @@ def cache_embeddings(
     checkpoint_shard_count: int = 1,
     encoding_item_batch_size: int = 16,
     checkpoint_reverse_order: bool = False,
+    skip_persistent_encoding_failures: bool = False,
+    encoding_failure_dir: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     records_root = Path(records_dir)
@@ -483,6 +485,8 @@ def cache_embeddings(
             reverse_order=checkpoint_reverse_order,
             retries=encoding_retries,
             retry_wait_seconds=encoding_retry_wait_seconds,
+            skip_persistent_failures=skip_persistent_encoding_failures,
+            failure_root=Path(encoding_failure_dir) if encoding_failure_dir else output_root / "failed_embedding_payloads",
             progress=progress,
         )
     if skip_train:
@@ -504,6 +508,8 @@ def cache_embeddings(
             checkpoint_embeddings=checkpoint_embeddings,
             encoding_retries=encoding_retries,
             encoding_retry_wait_seconds=encoding_retry_wait_seconds,
+            skip_persistent_encoding_failures=skip_persistent_encoding_failures,
+            encoding_failure_dir=encoding_failure_dir,
             progress=progress,
         )
     eval_summary = _cache_split_embeddings(
@@ -523,6 +529,8 @@ def cache_embeddings(
         checkpoint_embeddings=checkpoint_embeddings,
         encoding_retries=encoding_retries,
         encoding_retry_wait_seconds=encoding_retry_wait_seconds,
+        skip_persistent_encoding_failures=skip_persistent_encoding_failures,
+        encoding_failure_dir=encoding_failure_dir,
         progress=progress,
     )
     summary = {
@@ -537,6 +545,8 @@ def cache_embeddings(
         "checkpoint_embeddings": bool(checkpoint_embeddings),
         "encoding_retries": max(0, int(encoding_retries)),
         "encoding_retry_wait_seconds": max(0.0, float(encoding_retry_wait_seconds)),
+        "skip_persistent_encoding_failures": bool(skip_persistent_encoding_failures),
+        "encoding_failure_dir": str(encoding_failure_dir) if encoding_failure_dir else None,
         "train": train_summary,
         "eval": eval_summary,
     }
@@ -1534,6 +1544,12 @@ def build_parser() -> argparse.ArgumentParser:
     cache.add_argument("--checkpoint-shard-count", type=int, default=1)
     cache.add_argument("--encoding-item-batch-size", type=int, default=16)
     cache.add_argument("--checkpoint-reverse-order", action="store_true")
+    cache.add_argument(
+        "--skip-persistent-encoding-failures",
+        action="store_true",
+        help="Skip persistently failing non-critical gallery payloads and record them for an auditable shared mask.",
+    )
+    cache.add_argument("--encoding-failure-dir", default=None, help="Shared failed-payload marker directory across modality caches.")
 
     train = subparsers.add_parser("train-adapter")
     train.add_argument("--cache-dir", required=True)
@@ -1729,6 +1745,8 @@ def main() -> None:
             checkpoint_shard_count=args.checkpoint_shard_count,
             encoding_item_batch_size=args.encoding_item_batch_size,
             checkpoint_reverse_order=args.checkpoint_reverse_order,
+            skip_persistent_encoding_failures=args.skip_persistent_encoding_failures,
+            encoding_failure_dir=args.encoding_failure_dir,
             progress=progress,
         )
     elif args.command == "train-adapter":
@@ -1875,6 +1893,8 @@ def _prefill_embedding_checkpoints(
     reverse_order: bool,
     retries: int,
     retry_wait_seconds: float,
+    skip_persistent_failures: bool,
+    failure_root: Path,
     progress: Callable[[str], None] | None,
 ) -> dict[str, Any]:
     shard_count = max(1, int(shard_count))
@@ -1890,6 +1910,8 @@ def _prefill_embedding_checkpoints(
         document_input_mode=document_input_mode,
     )
     checkpoint_root.mkdir(parents=True, exist_ok=True)
+    if skip_persistent_failures:
+        failure_root.mkdir(parents=True, exist_ok=True)
 
     payload_by_path: dict[Path, Any] = {}
     for record in records:
@@ -1944,29 +1966,31 @@ def _prefill_embedding_checkpoints(
             group.reverse()
     reused = 0
     encoded = 0
+    skipped = 0
     processed = 0
     for group in ordered_groups:
         for start in range(0, len(group), item_batch_size):
             batch = group[start : start + item_batch_size]
             missing: list[tuple[Path, Any]] = []
             for path, payload in batch:
-                if _load_embedding_checkpoint(path) is None:
+                if skip_persistent_failures and _embedding_failure_path(failure_root, payload).exists():
+                    skipped += 1
+                elif _load_embedding_checkpoint(path) is None:
                     missing.append((path, payload))
                 else:
                     reused += 1
             if missing:
-                vectors = _encode_payload_batch_resilient(
+                batch_encoded, batch_skipped = _encode_checkpoint_batch_resilient(
                     encoder,
-                    [payload for _, payload in missing],
+                    missing,
                     retries=retries,
                     retry_wait_seconds=retry_wait_seconds,
+                    skip_persistent_failures=skip_persistent_failures,
+                    failure_root=failure_root,
                     progress=progress,
                 )
-                if vectors.shape[0] != len(missing):
-                    raise ValueError("encoder returned the wrong number of checkpoint embeddings")
-                for (path, _), vector in zip(missing, vectors):
-                    _save_embedding_checkpoint(path, vector)
-                    encoded += 1
+                encoded += batch_encoded
+                skipped += batch_skipped
             processed += len(batch)
             _emit(
                 progress,
@@ -1982,6 +2006,8 @@ def _prefill_embedding_checkpoints(
         "shard_payload_count": len(selected),
         "encoded_count": encoded,
         "reused_count": reused,
+        "skipped_persistent_failure_count": skipped,
+        "encoding_failure_dir": str(failure_root) if skip_persistent_failures else None,
         "item_batch_size": item_batch_size,
         "batch_signature_counts": {
             "|".join(signature): len(items)
@@ -2013,6 +2039,8 @@ def _cache_split_embeddings(
     checkpoint_embeddings: bool,
     encoding_retries: int,
     encoding_retry_wait_seconds: float,
+    skip_persistent_encoding_failures: bool,
+    encoding_failure_dir: str | Path | None,
     progress: Callable[[str], None] | None,
 ) -> dict[str, Any]:
     if not records:
@@ -2023,6 +2051,7 @@ def _cache_split_embeddings(
     local_cache_root = Path(local_segment_cache_dir) if local_segment_cache_dir else output_root / "local_media_cache"
     audio_cache_root = Path(audio_media_cache_dir) if audio_media_cache_dir else output_root / "audio_media_cache"
     checkpoint_root = None
+    failure_root = None
     if checkpoint_embeddings:
         checkpoint_root = _embedding_checkpoint_root(
             output_root,
@@ -2031,6 +2060,9 @@ def _cache_split_embeddings(
             document_input_mode=document_input_mode,
         )
         checkpoint_root.mkdir(parents=True, exist_ok=True)
+        if skip_persistent_encoding_failures:
+            failure_root = Path(encoding_failure_dir) if encoding_failure_dir else output_root / "failed_embedding_payloads"
+            failure_root.mkdir(parents=True, exist_ok=True)
 
     def encode_one(payload: Any) -> np.ndarray:
         return _encode_one_resilient(
@@ -2039,6 +2071,7 @@ def _cache_split_embeddings(
             checkpoint_root=checkpoint_root,
             retries=encoding_retries,
             retry_wait_seconds=encoding_retry_wait_seconds,
+            failure_root=failure_root,
             progress=progress,
         )
     target_segment_rows: list[np.ndarray] = []
@@ -2199,22 +2232,37 @@ def _cache_split_embeddings(
         positive_gallery_index: list[int] = []
         reference_gallery_index: list[int] = []
         candidate_gallery_mask: list[np.ndarray] = []
+        gallery_valid_mask: list[float] = []
+        failed_gallery_items: list[dict[str, Any]] = []
         gallery_records_path = output_root / "eval_gallery.jsonl"
         _write_jsonl(gallery_records_path, [asdict(item) for item in gallery_items])
         gallery_lookup = {item.gallery_id: index for index, item in enumerate(gallery_items)}
         for item_index, item in enumerate(gallery_items, start=1):
             _emit(progress, f"[e5-audio-delta] cache eval gallery {item_index}/{len(gallery_items)} gallery_id={item.gallery_id}")
-            gallery_vectors.append(
-                encode_one(
-                    _document_payload(
-                        item.video,
-                        document_input_mode=document_input_mode,
-                        audio_cache_root=audio_cache_root,
-                        sample_id=item.gallery_id,
-                        role=item.kind or "gallery",
-                    ),
-                )
+            payload = _document_payload(
+                item.video,
+                document_input_mode=document_input_mode,
+                audio_cache_root=audio_cache_root,
+                sample_id=item.gallery_id,
+                role=item.kind or "gallery",
             )
+            try:
+                gallery_vectors.append(encode_one(payload))
+                gallery_valid_mask.append(1.0)
+            except PersistentEncodingFailure as exc:
+                if not skip_persistent_encoding_failures:
+                    raise
+                gallery_vectors.append(np.zeros(stacked["query"].shape[1], dtype=np.float32))
+                gallery_valid_mask.append(0.0)
+                failed_gallery_items.append(
+                    {
+                        "gallery_index": item_index - 1,
+                        "gallery_id": item.gallery_id,
+                        "video": item.video,
+                        "kind": item.kind,
+                        "error": str(exc),
+                    }
+                )
             if local_segments > 0:
                 gallery_segment_rows.append(
                     _encode_many(
@@ -2247,16 +2295,22 @@ def _cache_split_embeddings(
                 row_mask[[gallery_lookup[str(item)] for item in candidate_ids]] = 1.0
             else:
                 row_mask = np.ones(len(gallery_items), dtype=np.float32)
+            row_mask *= np.asarray(gallery_valid_mask, dtype=np.float32)
             if row_mask[int(gallery_lookup[gallery_id])] <= 0:
-                raise ValueError(f"positive target is outside candidate gallery for {record.sample_id}")
+                raise ValueError(f"persistent encoding failure removed positive target for {record.sample_id}: {gallery_id}")
+            if reference_id in gallery_lookup and gallery_valid_mask[int(gallery_lookup[reference_id])] <= 0:
+                raise ValueError(f"persistent encoding failure removed reference for {record.sample_id}: {reference_id}")
             candidate_gallery_mask.append(row_mask)
         stacked["gallery"] = np.vstack(gallery_vectors).astype(np.float32)
+        stacked["gallery_valid_mask"] = np.asarray(gallery_valid_mask, dtype=np.float32)
         stacked["positive_gallery_index"] = np.asarray(positive_gallery_index, dtype=np.int64)
         stacked["candidate_gallery_mask"] = np.asarray(candidate_gallery_mask, dtype=np.float32)
         if len(reference_gallery_index) == len(records):
             stacked["reference_gallery_index"] = np.asarray(reference_gallery_index, dtype=np.int64)
         if local_segments > 0:
             stacked["gallery_segments"] = np.asarray(gallery_segment_rows, dtype=np.float32)
+        if failed_gallery_items:
+            _write_jsonl(output_root / "eval_gallery_encoding_failures.jsonl", failed_gallery_items)
     npz_path = output_root / f"{split}_embeddings.npz"
     np.savez(str(npz_path), **stacked)
     records_path = output_root / f"{split}_records.jsonl"
@@ -2268,6 +2322,8 @@ def _cache_split_embeddings(
         "negative_shape": list(stacked["negative"].shape),
         "gallery_shape": list(stacked["gallery"].shape) if "gallery" in stacked else None,
         "candidate_gallery_mask_shape": list(stacked["candidate_gallery_mask"].shape) if "candidate_gallery_mask" in stacked else None,
+        "failed_gallery_count": int(np.sum(stacked["gallery_valid_mask"] <= 0)) if "gallery_valid_mask" in stacked else 0,
+        "effective_gallery_count": int(np.sum(stacked["gallery_valid_mask"] > 0)) if "gallery_valid_mask" in stacked else None,
         "local_segments": local_segments,
         "local_segment_mode": local_segment_mode,
         "local_segment_cache_dir": str(local_cache_root) if local_segments > 0 and local_segment_mode == "ffmpeg" else None,
@@ -4229,6 +4285,32 @@ def _save_embedding_checkpoint(path: Path, value: np.ndarray) -> None:
         temp.unlink(missing_ok=True)
 
 
+class PersistentEncodingFailure(RuntimeError):
+    pass
+
+
+def _embedding_failure_path(failure_root: Path, payload: Any) -> Path:
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return failure_root / digest[:2] / f"{digest}.json"
+
+
+def _save_embedding_failure(path: Path, payload: Any, exc: Exception) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+    body = {
+        "payload": payload,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "recorded_at_unix": time.time(),
+    }
+    try:
+        temp.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def _retryable_encoding_error(exc: Exception) -> bool:
     if int(getattr(exc, "errno", 0) or 0) == 11:
         return True
@@ -4258,6 +4340,64 @@ def _encode_payload_batch_resilient(
     raise RuntimeError("unreachable encoding retry state")
 
 
+def _encode_checkpoint_batch_resilient(
+    encoder: Any,
+    items: list[tuple[Path, Any]],
+    *,
+    retries: int,
+    retry_wait_seconds: float,
+    skip_persistent_failures: bool,
+    failure_root: Path,
+    progress: Callable[[str], None] | None,
+) -> tuple[int, int]:
+    if not items:
+        return 0, 0
+    try:
+        vectors = _encode_payload_batch_resilient(
+            encoder,
+            [payload for _, payload in items],
+            retries=retries if len(items) == 1 else 0,
+            retry_wait_seconds=retry_wait_seconds,
+            progress=progress,
+        )
+    except Exception as exc:
+        if not _retryable_encoding_error(exc):
+            raise
+        if len(items) > 1:
+            midpoint = len(items) // 2
+            left = _encode_checkpoint_batch_resilient(
+                encoder,
+                items[:midpoint],
+                retries=retries,
+                retry_wait_seconds=retry_wait_seconds,
+                skip_persistent_failures=skip_persistent_failures,
+                failure_root=failure_root,
+                progress=progress,
+            )
+            right = _encode_checkpoint_batch_resilient(
+                encoder,
+                items[midpoint:],
+                retries=retries,
+                retry_wait_seconds=retry_wait_seconds,
+                skip_persistent_failures=skip_persistent_failures,
+                failure_root=failure_root,
+                progress=progress,
+            )
+            return left[0] + right[0], left[1] + right[1]
+        if not skip_persistent_failures:
+            raise
+        path, payload = items[0]
+        failure_path = _embedding_failure_path(failure_root, payload)
+        _save_embedding_failure(failure_path, payload, exc)
+        _emit(progress, f"[e5-audio-delta] skipped persistent encoding failure: {failure_path.name} error={exc}")
+        return 0, 1
+    if vectors.shape[0] != len(items):
+        raise ValueError("encoder returned the wrong number of checkpoint embeddings")
+    for (path, _), vector in zip(items, vectors):
+        _save_embedding_checkpoint(path, vector)
+    return len(items), 0
+
+
 def _encode_one_resilient(
     encoder: Any,
     payload: Any,
@@ -4265,8 +4405,13 @@ def _encode_one_resilient(
     checkpoint_root: Path | None,
     retries: int,
     retry_wait_seconds: float,
+    failure_root: Path | None,
     progress: Callable[[str], None] | None,
 ) -> np.ndarray:
+    if failure_root:
+        failure_path = _embedding_failure_path(failure_root, payload)
+        if failure_path.exists():
+            raise PersistentEncodingFailure(f"payload is marked as a persistent encoding failure: {failure_path}")
     checkpoint_path = _embedding_checkpoint_path(checkpoint_root, payload) if checkpoint_root else None
     if checkpoint_path:
         cached = _load_embedding_checkpoint(checkpoint_path)

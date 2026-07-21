@@ -204,6 +204,7 @@ PY
 
 CACHE_VAT="$OUTPUT_DIR/cache_V_A_T"
 CACHE_VT="$OUTPUT_DIR/cache_V_T"
+ENCODING_FAILURE_DIR="$OUTPUT_DIR/failed_embedding_payloads"
 cache_mode() {
   local mode="$1" gpu="$2" cache="$3" audio_mode="$4" prefill_only="$5" shard_index="$6" reverse_order="$7" batch_size="$8"
   local args=(python3 -m app.e5_audio_delta_train cache-embeddings
@@ -224,7 +225,9 @@ cache_mode() {
     --checkpoint-embeddings \
     --encoding-retries "$ENCODING_RETRIES" \
     --encoding-retry-wait-seconds 3 \
-    --encoding-item-batch-size "$ENCODING_ITEM_BATCH_SIZE")
+    --encoding-item-batch-size "$ENCODING_ITEM_BATCH_SIZE" \
+    --skip-persistent-encoding-failures \
+    --encoding-failure-dir "$ENCODING_FAILURE_DIR")
   if [[ "$prefill_only" == "true" ]]; then
     args+=(--checkpoint-prefill-only --checkpoint-shard-index "$shard_index" --checkpoint-shard-count "$CHECKPOINT_SHARDS_PER_MODE")
   fi
