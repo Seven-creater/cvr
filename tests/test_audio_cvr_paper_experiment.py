@@ -90,6 +90,86 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             self.assertTrue(audit["ready_for_training"])
             self.assertTrue((root / "audit" / "training_split_audit.md").exists())
 
+    def test_training_split_audit_allows_one_forward_and_inverse_per_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            forward = self._automatic_row("train", "source_train", "pair_train", subtype="sound_event")
+            inverse = dict(forward)
+            inverse.update(
+                {
+                    "reference_video": forward["target_video"],
+                    "target_video": forward["reference_video"],
+                    "edit_text": "remove a bell sound",
+                    "direction": "inverse",
+                    "is_inverse": True,
+                }
+            )
+            val = self._automatic_row("val", "source_val", "pair_val", subtype="music")
+            test = self._automatic_row("test", "source_test", "pair_test", subtype="sound_event")
+            self._write_jsonl(root / "train.jsonl", [forward, inverse])
+            self._write_jsonl(root / "val.jsonl", [val])
+            self._write_jsonl(root / "test.jsonl", [test])
+
+            summary = audit_training_splits(
+                train_path=root / "train.jsonl",
+                val_path=root / "val.jsonl",
+                test_path=root / "test.jsonl",
+                output_dir=root / "audit",
+            )
+
+            self.assertEqual(0, summary["violation_count"])
+            self.assertEqual(1, summary["train_forward_count"])
+            self.assertEqual(1, summary["train_inverse_count"])
+
+    def test_training_split_audit_rejects_duplicate_sample_in_same_direction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            forward = self._automatic_row("train", "source_train", "pair_train", subtype="sound_event")
+            val = self._automatic_row("val", "source_val", "pair_val", subtype="music")
+            test = self._automatic_row("test", "source_test", "pair_test", subtype="sound_event")
+            self._write_jsonl(root / "train.jsonl", [forward, dict(forward)])
+            self._write_jsonl(root / "val.jsonl", [val])
+            self._write_jsonl(root / "test.jsonl", [test])
+
+            with self.assertRaisesRegex(ValueError, "duplicate_sample_direction"):
+                audit_training_splits(
+                    train_path=root / "train.jsonl",
+                    val_path=root / "val.jsonl",
+                    test_path=root / "test.jsonl",
+                    output_dir=root / "audit",
+                )
+
+    def test_prepare_training_subset_resolves_relative_media_under_media_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            media_root = root / "media"
+            train = [self._automatic_row("train", "source_train", "pair_train", subtype="sound_event")]
+            val = [self._automatic_row("val", "source_val", "pair_val", subtype="music")]
+            test = [self._automatic_row("test", "source_test", "pair_test", subtype="sound_event")]
+            for row in train + val + test:
+                row["reference_video"] = f"clips/{row['sample_id']}_ref.mp4"
+                row["target_video"] = f"clips/{row['sample_id']}_target.mp4"
+                for role in ("reference_video", "target_video"):
+                    path = media_root / str(row[role])
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.touch()
+            self._write_jsonl(root / "train.jsonl", train)
+            self._write_jsonl(root / "val.jsonl", val)
+            self._write_jsonl(root / "test.jsonl", test)
+
+            summary = prepare_training_subset(
+                train_path=root / "train.jsonl",
+                val_path=root / "val.jsonl",
+                test_path=root / "test.jsonl",
+                output_dir=root / "subset",
+                expected_count=1,
+                require_existing_media=True,
+                media_root=media_root,
+            )
+
+            self.assertEqual(0, summary["missing_media_count"])
+            self.assertEqual(str(media_root.resolve()), summary["media_root"])
+
     def test_automatic_review_pool_merges_and_deduplicates_without_using_legacy_asr_risk(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

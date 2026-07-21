@@ -1075,15 +1075,30 @@ def audit_training_splits(
     )
     violations: list[dict[str, Any]] = list(leakage["violations"])
     for split_name, values in rows.items():
-        sample_counts = Counter(_sample_id(row) for row in values if _sample_id(row))
-        duplicate_samples = sorted(key for key, count in sample_counts.items() if count > 1)
-        if duplicate_samples:
+        sample_direction_counts = Counter(
+            (
+                _sample_id(row),
+                "inverse"
+                if _truthy(row.get("is_inverse"))
+                or str(row.get("direction") or "forward").strip().lower() == "inverse"
+                else "forward",
+            )
+            for row in values
+            if _sample_id(row)
+        )
+        duplicate_sample_directions = sorted(
+            key for key, count in sample_direction_counts.items() if count > 1
+        )
+        if duplicate_sample_directions:
             violations.append(
                 {
-                    "type": "duplicate_sample",
+                    "type": "duplicate_sample_direction",
                     "split": split_name,
-                    "count": len(duplicate_samples),
-                    "examples": duplicate_samples[:5],
+                    "count": len(duplicate_sample_directions),
+                    "examples": [
+                        {"sample_id": sample_id, "direction": direction}
+                        for sample_id, direction in duplicate_sample_directions[:5]
+                    ],
                 }
             )
     test_inverse = [
@@ -1168,6 +1183,7 @@ def prepare_training_subset(
     expected_count: int | None = None,
     expected_test_sha256: str | None = None,
     require_existing_media: bool = False,
+    media_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Freeze a source-disjoint non-speech training subset without model-score selection."""
     train_file, val_file, test_file = Path(train_path), Path(val_path), Path(test_path)
@@ -1208,12 +1224,28 @@ def prepare_training_subset(
     test_sha256 = hashlib.sha256(test_file.read_bytes()).hexdigest()
     if expected_test_sha256 and test_sha256 != str(expected_test_sha256).strip().lower():
         raise ValueError(f"test SHA256 mismatch: expected={expected_test_sha256} actual={test_sha256}")
+    media_root_path = Path(media_root).resolve() if media_root is not None else None
     missing_media: list[dict[str, str]] = []
     for row in selected + _read_jsonl(val_file) + _read_jsonl(test_file):
         for role in ("reference_video", "target_video"):
-            path = str(row.get(role) or "").strip()
-            if not path or not Path(path).exists():
-                missing_media.append({"sample_id": _sample_id(row), "role": role, "path": path})
+            value = str(row.get(role) or "").strip()
+            try:
+                resolved = (
+                    _resolve_media_path(media_root_path, value)
+                    if media_root_path is not None and value
+                    else Path(value).resolve()
+                )
+            except FileNotFoundError:
+                resolved = media_root_path / value if media_root_path is not None else Path(value)
+            if not value or not resolved.exists():
+                missing_media.append(
+                    {
+                        "sample_id": _sample_id(row),
+                        "role": role,
+                        "path": value,
+                        "resolved_path": str(resolved),
+                    }
+                )
     if require_existing_media and missing_media:
         raise ValueError(f"training subset audit found missing media: {missing_media[:5]}")
 
@@ -1233,6 +1265,7 @@ def prepare_training_subset(
     summary = {
         "protocol": "audiocvr_non_speech_training_subset_v1",
         "input_paths": {"train": str(train_file), "val": str(val_file), "test": str(test_file)},
+        "media_root": str(media_root_path) if media_root_path is not None else None,
         "output_path": str(subset_path),
         "eligible_subtypes": sorted(subtype_set),
         "forward_count": len(selected),
@@ -2355,6 +2388,7 @@ def build_parser() -> argparse.ArgumentParser:
     training_subset.add_argument("--expected-count", type=int)
     training_subset.add_argument("--expected-test-sha256")
     training_subset.add_argument("--require-existing-media", action="store_true")
+    training_subset.add_argument("--media-root")
 
     freeze = subparsers.add_parser("finalize-benchmark")
     freeze.add_argument("--candidate-path", required=True)
@@ -2507,6 +2541,7 @@ def main() -> None:
             expected_count=args.expected_count,
             expected_test_sha256=args.expected_test_sha256,
             require_existing_media=args.require_existing_media,
+            media_root=args.media_root,
         )
     elif args.command == "finalize-benchmark":
         if args.review_policy == "omni_consensus":

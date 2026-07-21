@@ -299,7 +299,7 @@ command and is not part of the paper method.
 For the frozen non-speech benchmark (`test=150`, `val=28`, `train=65`), use
 `scripts/run_audio_cvr_fewshot_bidir_final.sh`. It audits the frozen SHA and
 source-disjoint identities, verifies train-only inverse records with Omni,
-stops the recorded vLLM process group, and then runs the six-GPU E5 experiment.
+stops the recorded vLLM process group, and then runs the multi-GPU E5 experiment.
 Adapter rank/steps/learning rate are selected on validation only. The final
 evaluation uses five seeds, all seven audio-necessity modes, forward-only versus
 verified-bidirectional training, validation-tuned late fusion, and exact
@@ -315,7 +315,7 @@ setsid nohup bash scripts/run_audio_cvr_fewshot_bidir_final.sh \
   --omni-model <OMNI_MODEL_NAME> \
   --omni-start-command '<EXACT_VLLM_START_COMMAND>' \
   --omni-gpu-ids 0,1,2,3 \
-  --e5-gpu-ids 0,1,2,3,4,5 \
+  --e5-gpu-ids 0,1,2,3,4,5,6,7 \
   > logs/aaai_audiocvr_fewshot.log 2>&1 < /dev/null &
 ```
 

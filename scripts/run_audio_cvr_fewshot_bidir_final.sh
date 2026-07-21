@@ -17,7 +17,7 @@ Usage:
 
 The launcher is resumable and implements the frozen non-speech Audio-CVR experiment:
   data audit -> verified train-only inverse augmentation -> exact Omni cleanup
-  -> six-GPU E5 encoding -> validation-only low-rank selection
+  -> multi-GPU E5 encoding -> validation-only low-rank selection
   -> five-seed forward/bidirectional tests -> paired statistics.
 
 The server must pull a clean GitHub commit before running this script. The launcher
@@ -186,6 +186,7 @@ if [[ ! -s "$DATA_DIR/data_audit.json" ]]; then
     --eligible-subtypes sound_event,music \
     --expected-count "$EXPECTED_FORWARD_COUNT" \
     --expected-test-sha256 "$EXPECTED_TEST_SHA256" \
+    --media-root "$MEDIA_ROOT" \
     --require-existing-media \
     > "$OUTPUT_DIR/logs/prepare_training_subset.log" 2>&1
 fi
@@ -327,21 +328,11 @@ QUERY_MODES=(text_only video_only audio_only composed audio_text video_only comp
 DOCUMENT_MODES=(video video audio video audio video video)
 VIDEO_AUDIO_MODES=(on off off off off on on)
 gpu_cursor=0
-for index in 0 1 2 3 4 5; do
-  gpu="${E5_GPU_ARRAY[$index]}"
-  if [[ "$index" == "2" ]]; then
-    (
-      run_cache_sync "test_${MODE_NAMES[2]}" "$OUTPUT_DIR/records_test" \
-        "${QUERY_MODES[2]}" "${DOCUMENT_MODES[2]}" "${VIDEO_AUDIO_MODES[2]}" yes "$gpu"
-      run_cache_sync "test_${MODE_NAMES[6]}" "$OUTPUT_DIR/records_test" \
-        "${QUERY_MODES[6]}" "${DOCUMENT_MODES[6]}" "${VIDEO_AUDIO_MODES[6]}" yes "$gpu"
-    ) &
-    ACTIVE_PIDS+=("$!")
-    ACTIVE_LOGS+=("$OUTPUT_DIR/logs/cache_test_${MODE_NAMES[6]}.log")
-  else
-    launch_cache "test_${MODE_NAMES[$index]}" "$OUTPUT_DIR/records_test" \
-      "${QUERY_MODES[$index]}" "${DOCUMENT_MODES[$index]}" "${VIDEO_AUDIO_MODES[$index]}" yes "$gpu"
-  fi
+for index in "${!MODE_NAMES[@]}"; do
+  gpu="${E5_GPU_ARRAY[$((gpu_cursor % ${#E5_GPU_ARRAY[@]}))]}"
+  launch_cache "test_${MODE_NAMES[$index]}" "$OUTPUT_DIR/records_test" \
+    "${QUERY_MODES[$index]}" "${DOCUMENT_MODES[$index]}" "${VIDEO_AUDIO_MODES[$index]}" yes "$gpu"
+  gpu_cursor=$((gpu_cursor+1))
 done
 wait_jobs
 
