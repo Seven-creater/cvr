@@ -124,8 +124,15 @@ download_hf_mirror() {
     hf download "$HF_DATASET_ID" --repo-type dataset --local-dir "$DATASET_REPO"
   elif command -v huggingface-cli >/dev/null 2>&1; then
     huggingface-cli download "$HF_DATASET_ID" --repo-type dataset --local-dir "$DATASET_REPO"
+  elif python3 -c 'import huggingface_hub' >/dev/null 2>&1; then
+    python3 - "$HF_DATASET_ID" "$DATASET_REPO" <<'PY'
+from huggingface_hub import snapshot_download
+import sys
+
+snapshot_download(repo_id=sys.argv[1], repo_type="dataset", local_dir=sys.argv[2])
+PY
   else
-    echo "ERROR: neither hf nor huggingface-cli is installed" >&2
+    echo "ERROR: hf, huggingface-cli, and the Python huggingface_hub package are all unavailable" >&2
     return 1
   fi
 }
