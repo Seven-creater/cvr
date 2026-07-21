@@ -41,6 +41,7 @@ CHECKPOINT_SHARD_INDICES="0,1"
 ENCODER_BATCH_SIZE=2
 ENCODING_ITEM_BATCH_SIZE=16
 ENCODING_RETRIES=4
+SKIP_CHECKPOINT_PREFILL=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -64,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --encoding-retries) ENCODING_RETRIES="$2"; shift 2 ;;
     --checkpoint-shard-count) CHECKPOINT_SHARDS_PER_MODE="$2"; shift 2 ;;
     --checkpoint-shard-indices) CHECKPOINT_SHARD_INDICES="$2"; shift 2 ;;
+    --skip-checkpoint-prefill) SKIP_CHECKPOINT_PREFILL=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -269,16 +271,21 @@ run_prefill_round() {
   return "$failed"
 }
 
-write_status "RUNNING" "cache_prefill" "four GPUs encode checkpoint shards $CHECKPOINT_SHARD_INDICES/$CHECKPOINT_SHARDS_PER_MODE in parallel with batch=$ENCODER_BATCH_SIZE"
 ASSEMBLY_BATCH_SIZE="$ENCODER_BATCH_SIZE"
-if ! run_prefill_round "$ENCODER_BATCH_SIZE"; then
-  if [[ "$ENCODER_BATCH_SIZE" -le 1 ]]; then
-    echo "ERROR: checkpoint prefill failed with batch size 1" >&2
-    exit 6
-  fi
+if [[ "$SKIP_CHECKPOINT_PREFILL" == "true" ]]; then
   ASSEMBLY_BATCH_SIZE=1
-  write_status "RUNNING" "cache_prefill_fallback" "batch=$ENCODER_BATCH_SIZE failed; resuming item checkpoints with batch=1"
-  run_prefill_round 1
+  write_status "RUNNING" "cache_prefill_skipped" "using completed item checkpoints and shared failure markers"
+else
+  write_status "RUNNING" "cache_prefill" "four GPUs encode checkpoint shards $CHECKPOINT_SHARD_INDICES/$CHECKPOINT_SHARDS_PER_MODE in parallel with batch=$ENCODER_BATCH_SIZE"
+  if ! run_prefill_round "$ENCODER_BATCH_SIZE"; then
+    if [[ "$ENCODER_BATCH_SIZE" -le 1 ]]; then
+      echo "ERROR: checkpoint prefill failed with batch size 1" >&2
+      exit 6
+    fi
+    ASSEMBLY_BATCH_SIZE=1
+    write_status "RUNNING" "cache_prefill_fallback" "batch=$ENCODER_BATCH_SIZE failed; resuming item checkpoints with batch=1"
+    run_prefill_round 1
+  fi
 fi
 
 write_status "RUNNING" "cache_assemble" "assembling final NPZ files from item checkpoints"
