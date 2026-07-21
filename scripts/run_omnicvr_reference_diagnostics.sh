@@ -37,6 +37,7 @@ BOOTSTRAP_SAMPLES=20000
 PERMUTATION_SAMPLES=20000
 MAX_EVAL_JOBS=4
 CHECKPOINT_SHARDS_PER_MODE=2
+CHECKPOINT_SHARD_INDICES="0,1"
 ENCODER_BATCH_SIZE=2
 ENCODING_ITEM_BATCH_SIZE=16
 ENCODING_RETRIES=4
@@ -61,6 +62,8 @@ while [[ $# -gt 0 ]]; do
     --encoder-batch-size) ENCODER_BATCH_SIZE="$2"; shift 2 ;;
     --encoding-item-batch-size) ENCODING_ITEM_BATCH_SIZE="$2"; shift 2 ;;
     --encoding-retries) ENCODING_RETRIES="$2"; shift 2 ;;
+    --checkpoint-shard-count) CHECKPOINT_SHARDS_PER_MODE="$2"; shift 2 ;;
+    --checkpoint-shard-indices) CHECKPOINT_SHARD_INDICES="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -72,8 +75,19 @@ done
 
 IFS=',' read -ra GPU_ARRAY <<< "$GPU_IDS"
 IFS=',' read -ra SEED_ARRAY <<< "$SEEDS"
+IFS=',' read -ra CHECKPOINT_SHARD_ARRAY <<< "$CHECKPOINT_SHARD_INDICES"
 [[ "${#GPU_ARRAY[@]}" -ge 4 ]] || { echo "ERROR: at least four GPU ids are required" >&2; exit 2; }
 [[ "${#SEED_ARRAY[@]}" -gt 0 ]] || { echo "ERROR: seeds must not be empty" >&2; exit 2; }
+[[ "$((2 * ${#CHECKPOINT_SHARD_ARRAY[@]}))" -le "${#GPU_ARRAY[@]}" ]] || {
+  echo "ERROR: two modality workers per selected shard require at least $((2 * ${#CHECKPOINT_SHARD_ARRAY[@]})) GPUs" >&2
+  exit 2
+}
+for shard_index in "${CHECKPOINT_SHARD_ARRAY[@]}"; do
+  [[ "$shard_index" =~ ^[0-9]+$ ]] && [[ "$shard_index" -lt "$CHECKPOINT_SHARDS_PER_MODE" ]] || {
+    echo "ERROR: checkpoint shard index $shard_index is invalid for shard count $CHECKPOINT_SHARDS_PER_MODE" >&2
+    exit 2
+  }
+done
 
 mkdir -p "$OUTPUT_DIR/logs" "$OMNICVR_ROOT"
 STATUS_PATH="$OUTPUT_DIR/status.json"
@@ -238,12 +252,16 @@ cache_mode() {
 }
 
 run_prefill_round() {
-  local batch_size="$1" pid failed=0
+  local batch_size="$1" pid failed=0 worker_index=0 shard_index
   CHILD_PIDS=()
-  cache_mode V_A_T "${GPU_ARRAY[0]}" "$CACHE_VAT" on true 0 false "$batch_size" & CHILD_PIDS+=("$!")
-  cache_mode V_A_T "${GPU_ARRAY[1]}" "$CACHE_VAT" on true 1 false "$batch_size" & CHILD_PIDS+=("$!")
-  cache_mode V_T "${GPU_ARRAY[2]}" "$CACHE_VT" off true 0 true "$batch_size" & CHILD_PIDS+=("$!")
-  cache_mode V_T "${GPU_ARRAY[3]}" "$CACHE_VT" off true 1 true "$batch_size" & CHILD_PIDS+=("$!")
+  for shard_index in "${CHECKPOINT_SHARD_ARRAY[@]}"; do
+    cache_mode V_A_T "${GPU_ARRAY[$worker_index]}" "$CACHE_VAT" on true "$shard_index" false "$batch_size" & CHILD_PIDS+=("$!")
+    worker_index=$((worker_index + 1))
+  done
+  for shard_index in "${CHECKPOINT_SHARD_ARRAY[@]}"; do
+    cache_mode V_T "${GPU_ARRAY[$worker_index]}" "$CACHE_VT" off true "$shard_index" true "$batch_size" & CHILD_PIDS+=("$!")
+    worker_index=$((worker_index + 1))
+  done
   for pid in "${CHILD_PIDS[@]}"; do
     if ! wait "$pid"; then failed=1; fi
   done
@@ -251,7 +269,7 @@ run_prefill_round() {
   return "$failed"
 }
 
-write_status "RUNNING" "cache_prefill" "four GPUs encode disjoint checkpoint shards in parallel with batch=$ENCODER_BATCH_SIZE"
+write_status "RUNNING" "cache_prefill" "four GPUs encode checkpoint shards $CHECKPOINT_SHARD_INDICES/$CHECKPOINT_SHARDS_PER_MODE in parallel with batch=$ENCODER_BATCH_SIZE"
 ASSEMBLY_BATCH_SIZE="$ENCODER_BATCH_SIZE"
 if ! run_prefill_round "$ENCODER_BATCH_SIZE"; then
   if [[ "$ENCODER_BATCH_SIZE" -le 1 ]]; then
