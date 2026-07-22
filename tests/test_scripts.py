@@ -177,7 +177,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("SHARD_TIMEOUT_SECONDS=${SHARD_TIMEOUT_SECONDS:-3600}", script)
         self.assertIn("proposal_args=(", script)
         self.assertIn("python3 -m app.composed_data propose-single-source-pairs", script)
-        self.assertIn('timeout "$SHARD_TIMEOUT_SECONDS" "${proposal_args[@]}"', script)
+        self.assertIn('timeout --foreground "$SHARD_TIMEOUT_SECONDS" "${proposal_args[@]}"', script)
         self.assertIn("run_line_shards_with_retries", script)
         self.assertIn("ANNOTATION_RETRY_ATTEMPTS=${ANNOTATION_RETRY_ATTEMPTS:-4}", script)
         self.assertIn("MAX_TERMINAL_ANNOTATION_FAILURES=${MAX_TERMINAL_ANNOTATION_FAILURES:-0}", script)
