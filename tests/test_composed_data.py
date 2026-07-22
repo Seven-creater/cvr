@@ -4,6 +4,8 @@ import copy
 import hashlib
 import json
 import tempfile
+import threading
+import time
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -1874,6 +1876,8 @@ class ComposedDataTests(unittest.TestCase):
             self.assertEqual(expected, calls)
             self.assertEqual(2, summary["annotation_endpoint_count"])
             self.assertEqual(endpoints, summary["annotation_base_url_pool"])
+            self.assertEqual("endpoint_balanced", summary["annotation_scheduling_mode"])
+            self.assertEqual([2, 2], summary["annotation_endpoint_worker_limits"])
             records = [
                 json.loads(line)
                 for line in (root / "captions" / "clip_annotations.jsonl").read_text(encoding="utf-8").splitlines()
@@ -1883,6 +1887,82 @@ class ComposedDataTests(unittest.TestCase):
                 [endpoints.index(expected[record["clip_id"]]) for record in records],
                 [record["annotation_endpoint_index"] for record in records],
             )
+
+    def test_annotate_clips_reserves_concurrency_for_each_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            endpoints = ["http://127.0.0.1:8093/v1", "http://127.0.0.1:8094/v1"]
+            clip_ids: list[str] = []
+            endpoint_counts = Counter()
+            candidate_index = 0
+            while min(endpoint_counts.values(), default=0) < 4 or len(endpoint_counts) < len(endpoints):
+                clip_id = f"balanced_{candidate_index:03d}"
+                digest = hashlib.sha1(clip_id.encode("utf-8")).digest()
+                endpoint_index = int.from_bytes(digest[:8], byteorder="big") % len(endpoints)
+                if endpoint_counts[endpoint_index] < 4:
+                    clip_ids.append(clip_id)
+                    endpoint_counts[endpoint_index] += 1
+                candidate_index += 1
+
+            for clip_id in clip_ids:
+                (root / "clips" / f"{clip_id}.mp4").write_bytes(clip_id.encode("utf-8"))
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [
+                    {"clip_id": clip_id, "output_path": f"clips/{clip_id}.mp4"}
+                    for clip_id in clip_ids
+                ],
+            )
+
+            lock = threading.Lock()
+            active = Counter()
+            maximum = Counter()
+
+            class TrackingClient:
+                def __init__(self, *, base_url: str, **_: object) -> None:
+                    self.base_url = base_url
+
+                def annotate_clip(self, *, clip_path: str) -> tuple[dict[str, object], dict[str, object]]:
+                    with lock:
+                        active[self.base_url] += 1
+                        maximum[self.base_url] = max(maximum[self.base_url], active[self.base_url])
+                    time.sleep(0.02)
+                    with lock:
+                        active[self.base_url] -= 1
+                    clip_id = Path(clip_path).stem
+                    return (
+                        {
+                            "summary": f"{clip_id} summary",
+                            "subjects": [clip_id],
+                            "object_counts": {clip_id: 1},
+                            "actions": [],
+                            "scene": "test scene",
+                            "attributes": [],
+                            "on_screen_text": [],
+                            "speech": [],
+                            "audio_events": [],
+                            "modalities": ["visual"],
+                        },
+                        {"provider": "fake"},
+                    )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", TrackingClient):
+                summary = annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=root / "captions" / "clip_annotations.jsonl",
+                    base_url=endpoints[0],
+                    base_url_pool=",".join(endpoints),
+                    api_key="EMPTY",
+                    model="captioner-model",
+                    concurrency=4,
+                )
+
+            self.assertEqual("endpoint_balanced", summary["annotation_scheduling_mode"])
+            self.assertEqual([2, 2], summary["annotation_endpoint_worker_limits"])
+            self.assertEqual({endpoint: 2 for endpoint in endpoints}, dict(maximum))
 
     def test_concurrent_annotation_persists_successes_before_retrying_failed_clip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

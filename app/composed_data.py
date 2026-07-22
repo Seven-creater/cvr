@@ -3624,6 +3624,8 @@ def _annotate_clips_impl(
         else:
             pending_items.append(item)
 
+    endpoint_worker_limits: list[int] = []
+    annotation_scheduling_mode = "serial" if concurrency <= 1 else "global_pool"
     if concurrency <= 1:
         for item in pending_items:
             try:
@@ -3636,6 +3638,48 @@ def _annotate_clips_impl(
             if detective_to_single_pass:
                 detective_to_single_pass_count += 1
             _append_jsonl_record(output, record)
+    elif len(annotation_endpoints) > 1 and concurrency >= len(annotation_endpoints):
+        # A single global pool can become badly imbalanced when stable endpoint
+        # hashing sends several slow clips to the same service. Give every
+        # endpoint an independent worker budget so one queue cannot consume the
+        # concurrency reserved for the other GPU-backed services.
+        annotation_scheduling_mode = "endpoint_balanced"
+        workers_per_endpoint, extra_workers = divmod(concurrency, len(annotation_endpoints))
+        endpoint_worker_limits = [
+            workers_per_endpoint + int(endpoint_index < extra_workers)
+            for endpoint_index in range(len(annotation_endpoints))
+        ]
+        pending_by_endpoint: list[list[dict[str, Any]]] = [[] for _ in annotation_endpoints]
+        for item in pending_items:
+            endpoint_index, _ = endpoint_for_clip(str(item.get("clip_id", "")).strip())
+            pending_by_endpoint[endpoint_index].append(item)
+
+        executors: list[ThreadPoolExecutor] = []
+        futures: dict[Any, dict[str, Any]] = {}
+        try:
+            for endpoint_index, endpoint_items in enumerate(pending_by_endpoint):
+                if not endpoint_items:
+                    continue
+                executor = ThreadPoolExecutor(
+                    max_workers=min(endpoint_worker_limits[endpoint_index], len(endpoint_items))
+                )
+                executors.append(executor)
+                for item in endpoint_items:
+                    futures[executor.submit(annotate_one, item)] = item
+            for future in as_completed(futures):
+                try:
+                    record, detective_to_single_pass = future.result()
+                except Exception as exc:
+                    annotation_errors.append((futures[future], exc))
+                    continue
+                records_by_clip_id[str(record["clip_id"])] = record
+                annotated_count += 1
+                if detective_to_single_pass:
+                    detective_to_single_pass_count += 1
+                _append_jsonl_record(output, record)
+        finally:
+            for executor in executors:
+                executor.shutdown(wait=True)
     else:
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = {executor.submit(annotate_one, item): item for item in pending_items}
@@ -3703,6 +3747,8 @@ def _annotate_clips_impl(
         "concurrency": concurrency,
         "annotation_endpoint_count": len(annotation_endpoints),
         "annotation_base_url_pool": annotation_endpoints,
+        "annotation_scheduling_mode": annotation_scheduling_mode,
+        "annotation_endpoint_worker_limits": endpoint_worker_limits,
         "omni_retries": int(omni_retries),
         "fail_on_transient_omni_errors": bool(fail_on_transient_omni_errors),
         "partial_annotations": bool(terminal_failure_records),
