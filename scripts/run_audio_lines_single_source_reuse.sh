@@ -371,11 +371,21 @@ run_line_shards() {
 
 run_line_shards_with_retries() {
   local original_jobs="$PROPOSE_PARALLEL_JOBS"
+  local original_fail_on_transient="$FAIL_ON_TRANSIENT_OMNI_ERRORS"
   local attempt
   for ((attempt = 1; attempt <= SHARD_RETRY_ATTEMPTS; attempt++)); do
+    # The first pass remains strict so transient service failures get a clean
+    # retry. Later passes reject only the persistently failing candidate and
+    # continue through the shard instead of blocking every candidate behind it.
+    if [ "$attempt" -gt 1 ]; then
+      FAIL_ON_TRANSIENT_OMNI_ERRORS=0
+    else
+      FAIL_ON_TRANSIENT_OMNI_ERRORS="$original_fail_on_transient"
+    fi
     echo "[audio-lines] shard_round=$attempt/$SHARD_RETRY_ATTEMPTS parallel_jobs=$PROPOSE_PARALLEL_JOBS"
     if run_line_shards "$@"; then
       PROPOSE_PARALLEL_JOBS="$original_jobs"
+      FAIL_ON_TRANSIENT_OMNI_ERRORS="$original_fail_on_transient"
       return 0
     fi
     if [ "$attempt" -lt "$SHARD_RETRY_ATTEMPTS" ]; then
@@ -387,6 +397,7 @@ run_line_shards_with_retries() {
     fi
   done
   PROPOSE_PARALLEL_JOBS="$original_jobs"
+  FAIL_ON_TRANSIENT_OMNI_ERRORS="$original_fail_on_transient"
   return 1
 }
 
