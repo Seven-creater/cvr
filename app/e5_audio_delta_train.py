@@ -4376,7 +4376,10 @@ def _retryable_encoding_error(exc: Exception) -> bool:
 
 
 def _skippable_media_encoding_error(exc: Exception) -> bool:
-    return _retryable_encoding_error(exc) or isinstance(exc, (ZeroDivisionError, EOFError))
+    if _retryable_encoding_error(exc) or isinstance(exc, (ZeroDivisionError, EOFError, subprocess.CalledProcessError)):
+        return True
+    text = str(exc).lower()
+    return "inhomogeneous shape" in text or "setting an array element with a sequence" in text
 
 
 def _ensure_pyav_error_compat(av_module: Any | None = None) -> str | None:

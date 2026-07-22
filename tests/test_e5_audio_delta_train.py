@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -42,12 +43,25 @@ from app.e5_audio_delta_train import (
     _query_payload,
     _resolve_media_path,
     _save_embedding_npz_atomic,
+    _skippable_media_encoding_error,
     _video_payload,
 )
 from app.audio_cvr_protocol_eval import mine_local_same_source, summarize_data, summarize_evals
 
 
 class E5AudioDeltaTrainTests(unittest.TestCase):
+    def test_batch_shape_and_ffmpeg_failures_are_isolated_as_media_errors(self) -> None:
+        self.assertTrue(
+            _skippable_media_encoding_error(
+                ValueError("setting an array element with a sequence; detected an inhomogeneous shape")
+            )
+        )
+        self.assertTrue(
+            _skippable_media_encoding_error(
+                subprocess.CalledProcessError(254, ["ffmpeg", "-i", "broken.mp4"])
+            )
+        )
+
     def test_embedding_npz_is_written_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "cache" / "eval_embeddings.npz"
