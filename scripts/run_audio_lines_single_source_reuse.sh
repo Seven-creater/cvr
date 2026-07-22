@@ -47,6 +47,7 @@ OMNI_TRANSIENT_RETRIES=${OMNI_TRANSIENT_RETRIES:-2}
 FAIL_ON_TRANSIENT_OMNI_ERRORS=${FAIL_ON_TRANSIENT_OMNI_ERRORS:-1}
 ANNOTATION_RETRY_ATTEMPTS=${ANNOTATION_RETRY_ATTEMPTS:-4}
 SHARD_RETRY_ATTEMPTS=${SHARD_RETRY_ATTEMPTS:-4}
+MAX_TERMINAL_ANNOTATION_FAILURES=${MAX_TERMINAL_ANNOTATION_FAILURES:-0}
 RESUME=${RESUME:-0}
 CLIPS_MANIFEST_OVERRIDE=${CLIPS_MANIFEST_OVERRIDE:-}
 CLIP_GROUPS_OVERRIDE=${CLIP_GROUPS_OVERRIDE:-}
@@ -89,6 +90,7 @@ Options:
   --omni-transient-retries N
   --annotation-retry-attempts N
   --shard-retry-attempts N
+  --max-terminal-annotation-failures N
   --allow-transient-omni-fallback
   --resume
   --concurrency N
@@ -134,6 +136,7 @@ while [[ $# -gt 0 ]]; do
     --omni-transient-retries) OMNI_TRANSIENT_RETRIES="$2"; shift 2 ;;
     --annotation-retry-attempts) ANNOTATION_RETRY_ATTEMPTS="$2"; shift 2 ;;
     --shard-retry-attempts) SHARD_RETRY_ATTEMPTS="$2"; shift 2 ;;
+    --max-terminal-annotation-failures) MAX_TERMINAL_ANNOTATION_FAILURES="$2"; shift 2 ;;
     --allow-transient-omni-fallback) FAIL_ON_TRANSIENT_OMNI_ERRORS=0; shift ;;
     --resume) RESUME=1; shift ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
@@ -141,6 +144,11 @@ while [[ $# -gt 0 ]]; do
     *) echo "[audio-lines] unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [ "$MAX_TERMINAL_ANNOTATION_FAILURES" -lt 0 ]; then
+  echo "[audio-lines] --max-terminal-annotation-failures must be non-negative" >&2
+  exit 2
+fi
 
 jsonl_row_count() {
   local path="$1"
@@ -214,6 +222,39 @@ run_command_with_retries() {
     echo "[audio-lines] $label attempt=$attempt/$attempts start $(date)"
     if "$@"; then
       echo "[audio-lines] $label attempt=$attempt/$attempts done $(date)"
+      return 0
+    fi
+    if [ "$attempt" -lt "$attempts" ]; then
+      echo "[audio-lines] WARN $label attempt=$attempt/$attempts failed; completed JSONL rows are preserved, retrying" >&2
+      sleep $((attempt * 5))
+    fi
+  done
+  echo "[audio-lines] ERROR $label failed after $attempts attempts" >&2
+  return 1
+}
+
+run_annotation_with_retries() {
+  local label="$1"
+  local attempts="$2"
+  local max_terminal_failures="$3"
+  local terminal_failures_output="$4"
+  shift 4
+  local attempt
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    local command_args=("$@")
+    if [ "$attempt" -eq "$attempts" ] && [ "$max_terminal_failures" -gt 0 ]; then
+      command_args+=(
+        --max-terminal-failures "$max_terminal_failures"
+        --terminal-failures-output-path "$terminal_failures_output"
+      )
+      echo "[audio-lines] $label final attempt permits at most $max_terminal_failures terminal failure(s); failures are quarantined, never fabricated"
+    fi
+    echo "[audio-lines] $label attempt=$attempt/$attempts start $(date)"
+    if "${command_args[@]}"; then
+      if [ "$attempt" -lt "$attempts" ] && [ -e "$terminal_failures_output" ]; then
+        : > "$terminal_failures_output"
+      fi
+      echo "[audio-lines] $label attempt=$attempt/$attempts done $(date) terminal_failures=$(jsonl_row_count "$terminal_failures_output")"
       return 0
     fi
     if [ "$attempt" -lt "$attempts" ]; then
@@ -362,6 +403,8 @@ CLIPS_TO_ANNOTATE="$RUN_ROOT/clips_to_annotate.jsonl"
 AUDIO_REFRESH_MANIFEST="$RUN_ROOT/audio_refresh_clips.jsonl"
 SEGMENT_ANNOTATIONS="$RUN_ROOT/single_source_annotations.jsonl"
 AUDIO_REFRESH_ANNOTATIONS="$RUN_ROOT/audio_refresh_annotations.jsonl"
+TERMINAL_ANNOTATION_FAILURES="$RUN_ROOT/terminal_annotation_failures.jsonl"
+TERMINAL_AUDIO_REFRESH_FAILURES="$RUN_ROOT/terminal_audio_refresh_failures.jsonl"
 WHOLE_ANNOTATION="$RUN_ROOT/single_source_whole_annotation.jsonl"
 PAIR_CANDIDATES="$RUN_ROOT/single_source_pair_candidates.jsonl"
 A_CANDIDATES="$RUN_ROOT/a_candidates.jsonl"
@@ -447,7 +490,12 @@ else
   if is_audio_focused_profile; then
     annotation_args+=(--audio-focused)
   fi
-  run_command_with_retries "segment annotation" "$ANNOTATION_RETRY_ATTEMPTS" "${annotation_args[@]}"
+  run_annotation_with_retries \
+    "segment annotation" \
+    "$ANNOTATION_RETRY_ATTEMPTS" \
+    "$MAX_TERMINAL_ANNOTATION_FAILURES" \
+    "$TERMINAL_ANNOTATION_FAILURES" \
+    "${annotation_args[@]}"
 fi
 
 if [ "$SKIP_ANNOTATION_REFRESH" != "1" ] && [ -z "$CLIPS_MANIFEST_OVERRIDE" ] && [ "$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")" -gt 0 ]; then
@@ -469,7 +517,12 @@ if [ "$SKIP_ANNOTATION_REFRESH" != "1" ] && [ -z "$CLIPS_MANIFEST_OVERRIDE" ] &&
   if is_audio_focused_profile; then
     refresh_annotation_args+=(--audio-focused)
   fi
-  run_command_with_retries "audio refresh annotation" "$ANNOTATION_RETRY_ATTEMPTS" "${refresh_annotation_args[@]}"
+  run_annotation_with_retries \
+    "audio refresh annotation" \
+    "$ANNOTATION_RETRY_ATTEMPTS" \
+    "$MAX_TERMINAL_ANNOTATION_FAILURES" \
+    "$TERMINAL_AUDIO_REFRESH_FAILURES" \
+    "${refresh_annotation_args[@]}"
   python3 -m app.audio_lines_single_source merge-annotations \
     --base-annotations-path "$SEGMENT_ANNOTATIONS" \
     --refresh-annotations-path "$AUDIO_REFRESH_ANNOTATIONS" \

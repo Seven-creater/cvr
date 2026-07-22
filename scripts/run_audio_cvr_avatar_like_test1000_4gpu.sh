@@ -36,8 +36,9 @@ PILOT_DATASETS=${PILOT_DATASETS:-existing_vggsound,avqa_videos,avscapbench}
 PILOT_GROUPS_PER_DATASET=${PILOT_GROUPS_PER_DATASET:-300}
 PILOT_SECOND_GROUPS_PER_DATASET=${PILOT_SECOND_GROUPS_PER_DATASET:-600}
 PROPOSE_SHARDS=${PROPOSE_SHARDS:-128}
-PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-24}
+PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-32}
 CONCURRENCY=${CONCURRENCY:-24}
+MAX_TERMINAL_ANNOTATION_FAILURES=${MAX_TERMINAL_ANNOTATION_FAILURES:-5}
 QUALITY_PROFILE=${QUALITY_PROFILE:-b_audio_blind_review_v2_volume}
 REQUEST_TIMEOUT_SECONDS=${REQUEST_TIMEOUT_SECONDS:-240}
 SHARD_TIMEOUT_SECONDS=${SHARD_TIMEOUT_SECONDS:-21600}
@@ -75,6 +76,7 @@ Options:
   --propose-shards N
   --propose-parallel-jobs N
   --concurrency N
+  --max-terminal-annotation-failures N
   --quality-profile NAME
   --exclude-overlap-with PATH (repeatable)
   --existing-test-path PATH
@@ -106,6 +108,7 @@ while [[ $# -gt 0 ]]; do
     --propose-shards) PROPOSE_SHARDS="$2"; shift 2 ;;
     --propose-parallel-jobs) PROPOSE_PARALLEL_JOBS="$2"; shift 2 ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
+    --max-terminal-annotation-failures) MAX_TERMINAL_ANNOTATION_FAILURES="$2"; shift 2 ;;
     --quality-profile) QUALITY_PROFILE="$2"; shift 2 ;;
     --exclude-overlap-with) EXCLUDE_OVERLAP_PATHS+=("$2"); shift 2 ;;
     --existing-test-path) EXISTING_TEST_PATH="$2"; shift 2 ;;
@@ -385,6 +388,7 @@ run_bline_phase() {
     --propose-shards "$PROPOSE_SHARDS"
     --propose-parallel-jobs "$PROPOSE_PARALLEL_JOBS"
     --concurrency "$CONCURRENCY"
+    --max-terminal-annotation-failures "$MAX_TERMINAL_ANNOTATION_FAILURES"
     --request-timeout-seconds "$REQUEST_TIMEOUT_SECONDS"
     --shard-timeout-seconds "$SHARD_TIMEOUT_SECONDS"
     --target-b-count 1000000

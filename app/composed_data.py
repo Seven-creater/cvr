@@ -3348,6 +3348,8 @@ def annotate_clips(
     omni_retries: int = 0,
     fail_on_transient_omni_errors: bool = False,
     base_url_pool: str | None = None,
+    max_terminal_failures: int = 0,
+    terminal_failures_output_path: str | Path | None = None,
 ) -> dict[str, Any]:
     return _annotate_clips_impl(
         root=root,
@@ -3363,6 +3365,8 @@ def annotate_clips(
         omni_retries=omni_retries,
         fail_on_transient_omni_errors=fail_on_transient_omni_errors,
         base_url_pool=base_url_pool,
+        max_terminal_failures=max_terminal_failures,
+        terminal_failures_output_path=terminal_failures_output_path,
     )
 
 
@@ -3381,6 +3385,8 @@ def detective_annotate_clips(
     omni_retries: int = 0,
     fail_on_transient_omni_errors: bool = False,
     base_url_pool: str | None = None,
+    max_terminal_failures: int = 0,
+    terminal_failures_output_path: str | Path | None = None,
 ) -> dict[str, Any]:
     return _annotate_clips_impl(
         root=root,
@@ -3397,6 +3403,8 @@ def detective_annotate_clips(
         omni_retries=omni_retries,
         fail_on_transient_omni_errors=fail_on_transient_omni_errors,
         base_url_pool=base_url_pool,
+        max_terminal_failures=max_terminal_failures,
+        terminal_failures_output_path=terminal_failures_output_path,
     )
 
 
@@ -3416,6 +3424,8 @@ def _annotate_clips_impl(
     omni_retries: int = 0,
     fail_on_transient_omni_errors: bool = False,
     base_url_pool: str | None = None,
+    max_terminal_failures: int = 0,
+    terminal_failures_output_path: str | Path | None = None,
 ) -> dict[str, Any]:
     layout = ensure_layout(root)
     manifest_path = Path(clips_manifest_path)
@@ -3435,6 +3445,10 @@ def _annotate_clips_impl(
     annotation_endpoints = [value.strip() for value in endpoint_text.split(",") if value.strip()]
     if not annotation_endpoints:
         raise ValueError("annotation base URL pool is empty")
+    max_terminal_failures = max(0, int(max_terminal_failures or 0))
+    terminal_failures_output = Path(terminal_failures_output_path) if terminal_failures_output_path else None
+    if max_terminal_failures and terminal_failures_output is None:
+        raise ValueError("terminal_failures_output_path is required when max_terminal_failures is positive")
 
     def endpoint_for_clip(clip_id: str) -> tuple[int, str]:
         digest = hashlib.sha1(clip_id.encode("utf-8")).digest()
@@ -3572,7 +3586,7 @@ def _annotate_clips_impl(
     annotated_count = 0
     reused_count = 0
     detective_to_single_pass_count = 0
-    annotation_errors: list[Exception] = []
+    annotation_errors: list[tuple[dict[str, Any], Exception]] = []
     for item in clips:
         clip_id = str(item.get("clip_id", "")).strip()
         if not clip_id:
@@ -3586,7 +3600,11 @@ def _annotate_clips_impl(
 
     if concurrency <= 1:
         for item in pending_items:
-            record, detective_to_single_pass = annotate_one(item)
+            try:
+                record, detective_to_single_pass = annotate_one(item)
+            except Exception as exc:
+                annotation_errors.append((item, exc))
+                continue
             records_by_clip_id[str(record["clip_id"])] = record
             annotated_count += 1
             if detective_to_single_pass:
@@ -3594,14 +3612,14 @@ def _annotate_clips_impl(
             _append_jsonl_record(output, record)
     else:
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [executor.submit(annotate_one, item) for item in pending_items]
+            futures = {executor.submit(annotate_one, item): item for item in pending_items}
             for future in as_completed(futures):
                 try:
                     record, detective_to_single_pass = future.result()
                 except Exception as exc:
                     # Keep draining completed futures so successful annotations are
                     # durably appended before the outer retry handles failed clips.
-                    annotation_errors.append(exc)
+                    annotation_errors.append((futures[future], exc))
                     continue
                 records_by_clip_id[str(record["clip_id"])] = record
                 annotated_count += 1
@@ -3609,17 +3627,35 @@ def _annotate_clips_impl(
                     detective_to_single_pass_count += 1
                 _append_jsonl_record(output, record)
 
-    if annotation_errors:
+    terminal_failure_records = [
+        {
+            "clip_id": str(item.get("clip_id", "")).strip(),
+            "output_path": str(item.get("output_path", "")).strip(),
+            "dataset": str(item.get("dataset", "")).strip() or None,
+            "source_asset_id": str(item.get("source_asset_id", "")).strip() or None,
+            "terminal_failure": True,
+            "omitted_from_annotations": True,
+            "reason": "annotation_failed_after_retry_budget",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        for item, exc in annotation_errors
+    ]
+    if terminal_failures_output is not None:
+        _write_jsonl(terminal_failures_output, terminal_failure_records)
+
+    if annotation_errors and len(annotation_errors) > max_terminal_failures:
         raise RuntimeError(
             f"{len(annotation_errors)} clip annotation request(s) failed; "
             "successful concurrent annotations were persisted"
-        ) from annotation_errors[0]
+        ) from annotation_errors[0][1]
 
     output_records: list[dict[str, Any]] = []
     for item in clips:
         clip_id = str(item.get("clip_id", "")).strip()
-        record = records_by_clip_id[clip_id]
-        output_records.append(record)
+        record = records_by_clip_id.get(clip_id)
+        if record is not None:
+            output_records.append(record)
 
     fallback_count = 0
     for record in output_records:
@@ -3631,6 +3667,7 @@ def _annotate_clips_impl(
         "clips_manifest_path": str(manifest_path),
         "output_path": str(output),
         "clip_count": len(output_records),
+        "input_clip_count": len(clips),
         "annotated_count": annotated_count,
         "reused_count": reused_count,
         "fallback_count": fallback_count,
@@ -3642,6 +3679,10 @@ def _annotate_clips_impl(
         "annotation_base_url_pool": annotation_endpoints,
         "omni_retries": int(omni_retries),
         "fail_on_transient_omni_errors": bool(fail_on_transient_omni_errors),
+        "partial_annotations": bool(terminal_failure_records),
+        "terminal_failure_count": len(terminal_failure_records),
+        "max_terminal_failures": max_terminal_failures,
+        "terminal_failures_output_path": str(terminal_failures_output) if terminal_failures_output else None,
     }
 
 
@@ -19878,6 +19919,8 @@ def build_parser() -> argparse.ArgumentParser:
     annotate_clips_parser.add_argument("--concurrency", type=int, default=1)
     annotate_clips_parser.add_argument("--omni-retries", type=int, default=0)
     annotate_clips_parser.add_argument("--fail-on-transient-omni-errors", action="store_true")
+    annotate_clips_parser.add_argument("--max-terminal-failures", type=int, default=0)
+    annotate_clips_parser.add_argument("--terminal-failures-output-path")
     annotate_clips_parser.add_argument("--overwrite", action="store_true")
 
     detective_annotate_parser = subparsers.add_parser("detective-annotate-clips")
@@ -19892,6 +19935,8 @@ def build_parser() -> argparse.ArgumentParser:
     detective_annotate_parser.add_argument("--concurrency", type=int, default=1)
     detective_annotate_parser.add_argument("--omni-retries", type=int, default=0)
     detective_annotate_parser.add_argument("--fail-on-transient-omni-errors", action="store_true")
+    detective_annotate_parser.add_argument("--max-terminal-failures", type=int, default=0)
+    detective_annotate_parser.add_argument("--terminal-failures-output-path")
     detective_annotate_parser.add_argument("--overwrite", action="store_true")
     detective_annotate_parser.add_argument("--audio-focused", action="store_true")
 
@@ -20099,6 +20144,8 @@ def main() -> None:
             omni_retries=args.omni_retries,
             fail_on_transient_omni_errors=args.fail_on_transient_omni_errors,
             base_url_pool=args.base_url_pool,
+            max_terminal_failures=args.max_terminal_failures,
+            terminal_failures_output_path=args.terminal_failures_output_path,
             overwrite=args.overwrite,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -20195,6 +20242,8 @@ def main() -> None:
             omni_retries=args.omni_retries,
             fail_on_transient_omni_errors=args.fail_on_transient_omni_errors,
             base_url_pool=args.base_url_pool,
+            max_terminal_failures=args.max_terminal_failures,
+            terminal_failures_output_path=args.terminal_failures_output_path,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

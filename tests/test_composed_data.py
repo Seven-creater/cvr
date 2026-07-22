@@ -1946,6 +1946,138 @@ class ComposedDataTests(unittest.TestCase):
             final = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
             self.assertEqual(clip_ids, [record["clip_id"] for record in final])
 
+    def test_concurrent_annotation_quarantines_bounded_terminal_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            clip_ids = ["clip_a", "clip_b", "clip_c"]
+            for clip_id in clip_ids:
+                (root / "clips" / f"{clip_id}.mp4").write_bytes(clip_id.encode("utf-8"))
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [
+                    {
+                        "clip_id": clip_id,
+                        "dataset": "test_dataset",
+                        "output_path": f"clips/{clip_id}.mp4",
+                    }
+                    for clip_id in clip_ids
+                ],
+            )
+            output_path = root / "captions" / "clip_annotations.jsonl"
+            failure_path = root / "captions" / "terminal_annotation_failures.jsonl"
+
+            def annotation_payload(clip_id: str) -> tuple[dict[str, object], dict[str, object]]:
+                return (
+                    {
+                        "summary": f"{clip_id} summary",
+                        "subjects": [clip_id],
+                        "object_counts": {clip_id: 1},
+                        "actions": [],
+                        "scene": "test scene",
+                        "attributes": [],
+                        "on_screen_text": [],
+                        "speech": [],
+                        "audio_events": [],
+                        "modalities": ["visual"],
+                    },
+                    {"provider": "fake"},
+                )
+
+            class FailOneClient:
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def annotate_clip(self, *, clip_path: str) -> tuple[dict[str, object], dict[str, object]]:
+                    clip_id = Path(clip_path).stem
+                    if clip_id == "clip_b":
+                        raise RuntimeError("response did not contain a JSON object")
+                    return annotation_payload(clip_id)
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", FailOneClient):
+                summary = annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=output_path,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="captioner-model",
+                    concurrency=3,
+                    fail_on_transient_omni_errors=True,
+                    max_terminal_failures=1,
+                    terminal_failures_output_path=failure_path,
+                )
+
+            records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            failures = [json.loads(line) for line in failure_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(["clip_a", "clip_c"], [record["clip_id"] for record in records])
+            self.assertFalse(any(record.get("fallback_used") for record in records))
+            self.assertEqual(3, summary["input_clip_count"])
+            self.assertEqual(2, summary["clip_count"])
+            self.assertEqual(1, summary["terminal_failure_count"])
+            self.assertTrue(summary["partial_annotations"])
+            self.assertEqual("clip_b", failures[0]["clip_id"])
+            self.assertEqual("test_dataset", failures[0]["dataset"])
+            self.assertTrue(failures[0]["omitted_from_annotations"])
+            self.assertEqual("annotation_failed_after_retry_budget", failures[0]["reason"])
+
+    def test_concurrent_annotation_rejects_terminal_failures_above_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            clip_ids = ["clip_a", "clip_b", "clip_c"]
+            for clip_id in clip_ids:
+                (root / "clips" / f"{clip_id}.mp4").write_bytes(clip_id.encode("utf-8"))
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [{"clip_id": clip_id, "output_path": f"clips/{clip_id}.mp4"} for clip_id in clip_ids],
+            )
+            failure_path = root / "captions" / "terminal_annotation_failures.jsonl"
+
+            class FailTwoClient:
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def annotate_clip(self, *, clip_path: str) -> tuple[dict[str, object], dict[str, object]]:
+                    clip_id = Path(clip_path).stem
+                    if clip_id != "clip_a":
+                        raise RuntimeError("response did not contain a JSON object")
+                    return (
+                        {
+                            "summary": "clip a summary",
+                            "subjects": ["clip_a"],
+                            "object_counts": {"clip_a": 1},
+                            "actions": [],
+                            "scene": "test scene",
+                            "attributes": [],
+                            "on_screen_text": [],
+                            "speech": [],
+                            "audio_events": [],
+                            "modalities": ["visual"],
+                        },
+                        {"provider": "fake"},
+                    )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", FailTwoClient):
+                with self.assertRaisesRegex(RuntimeError, r"2 clip annotation request\(s\) failed"):
+                    annotate_clips(
+                        root=root,
+                        clips_manifest_path=manifest_path,
+                        output_path=root / "captions" / "clip_annotations.jsonl",
+                        base_url="http://127.0.0.1:8093/v1",
+                        api_key="EMPTY",
+                        model="captioner-model",
+                        concurrency=3,
+                        fail_on_transient_omni_errors=True,
+                        max_terminal_failures=1,
+                        terminal_failures_output_path=failure_path,
+                    )
+
+            failures = [json.loads(line) for line in failure_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual({"clip_b", "clip_c"}, {record["clip_id"] for record in failures})
+
     def test_detective_annotate_clips_persists_each_record_and_resumes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

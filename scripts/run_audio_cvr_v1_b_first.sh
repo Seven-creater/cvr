@@ -22,6 +22,7 @@ ANNOTATION_TIMEOUT_SECONDS=${ANNOTATION_TIMEOUT_SECONDS:-900}
 TARGET_B_COUNT=${TARGET_B_COUNT:-1000000}
 OMNI_TRANSIENT_RETRIES=${OMNI_TRANSIENT_RETRIES:-2}
 FAIL_ON_TRANSIENT_OMNI_ERRORS=${FAIL_ON_TRANSIENT_OMNI_ERRORS:-1}
+MAX_TERMINAL_ANNOTATION_FAILURES=${MAX_TERMINAL_ANNOTATION_FAILURES:-0}
 RESUME=${RESUME:-0}
 QUALITY_PROFILE=${QUALITY_PROFILE:-b_audio_blind_review_v2}
 CLIPS_MANIFEST_OVERRIDE=${CLIPS_MANIFEST_OVERRIDE:-}
@@ -48,6 +49,7 @@ Options:
   --shard-timeout-seconds N
   --target-b-count N
   --quality-profile b_audio_blind_review_v2|b_audio_blind_review_v2_volume
+  --max-terminal-annotation-failures N
   --clips-manifest-override PATH
   --clip-groups-override PATH
   --resume
@@ -72,6 +74,7 @@ while [[ $# -gt 0 ]]; do
     --shard-timeout-seconds) SHARD_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --target-b-count) TARGET_B_COUNT="$2"; shift 2 ;;
     --quality-profile) QUALITY_PROFILE="$2"; shift 2 ;;
+    --max-terminal-annotation-failures) MAX_TERMINAL_ANNOTATION_FAILURES="$2"; shift 2 ;;
     --clips-manifest-override) CLIPS_MANIFEST_OVERRIDE="$2"; shift 2 ;;
     --clip-groups-override) CLIP_GROUPS_OVERRIDE="$2"; shift 2 ;;
     --resume) RESUME=1; shift ;;
@@ -112,6 +115,7 @@ export FORCE_AUDIO_FOCUSED_REFRESH=1
 export FRESH_ANNOTATIONS=1
 export OMNI_TRANSIENT_RETRIES
 export FAIL_ON_TRANSIENT_OMNI_ERRORS
+export MAX_TERMINAL_ANNOTATION_FAILURES
 export RESUME
 
 echo "[audio-cvr-v1-b] run_root=$RUN_ROOT"
@@ -143,6 +147,7 @@ runner_args=(
   --fresh-annotations
   --force-audio-focused-refresh
   --omni-transient-retries "$OMNI_TRANSIENT_RETRIES"
+  --max-terminal-annotation-failures "$MAX_TERMINAL_ANNOTATION_FAILURES"
 )
 if [ -n "$BASE_URL_POOL" ]; then
   runner_args+=(--base-url-pool "$BASE_URL_POOL")
