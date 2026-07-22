@@ -1124,13 +1124,47 @@ def _record_subtype(row: dict[str, Any]) -> str:
 
 def _record_dataset(row: dict[str, Any]) -> str:
     explicit = _first_text(row, "dataset", "source_dataset").lower().replace("-", "_")
-    if explicit:
+    if explicit and explicit not in {"unknown", "none", "null", "n/a", "na"}:
         return explicit
-    text = " ".join(
-        (_first_text(row, "reference_video"), _first_text(row, "target_video"))
-    ).lower()
-    for dataset in ("existing_vggsound", "avqa_videos", "vggsound", "avatar"):
-        if dataset in text:
+
+    search_values: list[str] = []
+    for key in (
+        "clip_id",
+        "group_id",
+        "source_clip_id",
+        "source_clip_ids",
+        "candidate_clip_ids",
+        "source_folder",
+        "source_path",
+        "output_path",
+        "reference_video",
+        "target_video",
+        "group_tags",
+    ):
+        value = row.get(key)
+        if isinstance(value, (list, tuple, set)):
+            search_values.extend(str(item) for item in value)
+        elif value is not None:
+            search_values.append(str(value))
+    payload = row.get("source_payload")
+    if isinstance(payload, dict):
+        search_values.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    text = " ".join(search_values).lower().replace("-", "_")
+    aliases = (
+        ("existing_vggsound", ("existing_vggsound",)),
+        ("avqa_videos", ("avqa_videos", "avqa_video")),
+        ("avscapbench", ("avscapbench", "avscap_bench")),
+        ("ave_dataset", ("ave_dataset", "ave_videos")),
+        ("vgg_monoaudio", ("vgg_monoaudio",)),
+        ("daily_omni", ("daily_omni",)),
+        ("worldsense", ("worldsense",)),
+        ("voxceleb", ("voxceleb",)),
+        ("vggsound", ("vggsound",)),
+        ("avatar", ("avatar",)),
+        ("hdtf", ("hdtf",)),
+    )
+    for dataset, tokens in aliases:
+        if any(token in text for token in tokens):
             return dataset
     return "unknown"
 

@@ -192,9 +192,17 @@ class AudioCvrSourceIngestTests(unittest.TestCase):
                 for group_index in range(4):
                     group_id = f"{dataset}_group_{group_index}"
                     clip_ids = [f"{group_id}_clip_{clip_index}" for clip_index in range(2)]
-                    groups.append({"group_id": group_id, "dataset": dataset, "candidate_clip_ids": clip_ids})
+                    groups.append(
+                        {
+                            "group_id": group_id,
+                            "dataset": "unknown",
+                            "source_clip_ids": [f"{dataset}_source_{group_index}"],
+                            "source_folder": f"raw/{dataset}/{group_index}",
+                            "candidate_clip_ids": clip_ids,
+                        }
+                    )
                     clips.extend(
-                        {"clip_id": clip_id, "group_id": group_id, "dataset": dataset, "output_path": f"clips/{clip_id}.mp4"}
+                        {"clip_id": clip_id, "group_id": group_id, "dataset": "unknown", "output_path": f"clips/{clip_id}.mp4"}
                         for clip_id in clip_ids
                     )
             annotated_clip = "avqa_videos_group_3_clip_0"
@@ -230,6 +238,10 @@ class AudioCvrSourceIngestTests(unittest.TestCase):
                 {"avqa_videos": 2, "existing_vggsound": 2, "avscapbench": 2},
                 first["selected_dataset_group_counts"],
             )
+            self.assertEqual(
+                {"avqa_videos": 4, "existing_vggsound": 4, "avscapbench": 4},
+                first["selected_dataset_clip_counts"],
+            )
             self.assertEqual(first["selected_dataset_group_counts"], second["selected_dataset_group_counts"])
             self.assertEqual(
                 (root / "pilot_a" / "pilot_clips_to_annotate.jsonl").read_text(encoding="utf-8"),
@@ -237,7 +249,7 @@ class AudioCvrSourceIngestTests(unittest.TestCase):
             )
             self.assertFalse(first["selection_uses_model_scores"])
             self.assertEqual("round_robin_by_dataset_and_source_group", first["annotation_order"])
-            first_six_datasets = [row["dataset"] for row in selected_clips[:6]]
+            first_six_datasets = [row["clip_id"].split("_group_", 1)[0] for row in selected_clips[:6]]
             self.assertEqual(
                 ["avqa_videos", "avqa_videos", "existing_vggsound", "existing_vggsound", "avscapbench", "avscapbench"],
                 first_six_datasets,
