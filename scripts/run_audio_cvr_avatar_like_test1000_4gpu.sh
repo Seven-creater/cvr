@@ -31,6 +31,9 @@ PILOT_MIN_MUSIC=${PILOT_MIN_MUSIC:-20}
 PILOT_BORDERLINE_TOTAL=${PILOT_BORDERLINE_TOTAL:-85}
 PILOT_BORDERLINE_SOUND_EVENT=${PILOT_BORDERLINE_SOUND_EVENT:-68}
 PILOT_BORDERLINE_MUSIC=${PILOT_BORDERLINE_MUSIC:-17}
+PILOT_DATASETS=${PILOT_DATASETS:-existing_vggsound,avqa_videos,avscapbench}
+PILOT_GROUPS_PER_DATASET=${PILOT_GROUPS_PER_DATASET:-200}
+PILOT_SECOND_GROUPS_PER_DATASET=${PILOT_SECOND_GROUPS_PER_DATASET:-400}
 PROPOSE_SHARDS=${PROPOSE_SHARDS:-128}
 PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-24}
 CONCURRENCY=${CONCURRENCY:-24}
@@ -64,6 +67,9 @@ Options:
   --max-b-candidates N
   --pilot-candidates N
   --pilot-second-candidates N
+  --pilot-datasets NAME[,NAME]
+  --pilot-groups-per-dataset N
+  --pilot-second-groups-per-dataset N
   --propose-shards N
   --propose-parallel-jobs N
   --concurrency N
@@ -91,6 +97,9 @@ while [[ $# -gt 0 ]]; do
     --max-b-candidates) MAX_B_CANDIDATES="$2"; shift 2 ;;
     --pilot-candidates) PILOT_CANDIDATES="$2"; shift 2 ;;
     --pilot-second-candidates) PILOT_SECOND_CANDIDATES="$2"; shift 2 ;;
+    --pilot-datasets) PILOT_DATASETS="$2"; shift 2 ;;
+    --pilot-groups-per-dataset) PILOT_GROUPS_PER_DATASET="$2"; shift 2 ;;
+    --pilot-second-groups-per-dataset) PILOT_SECOND_GROUPS_PER_DATASET="$2"; shift 2 ;;
     --propose-shards) PROPOSE_SHARDS="$2"; shift 2 ;;
     --propose-parallel-jobs) PROPOSE_PARALLEL_JOBS="$2"; shift 2 ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
@@ -122,6 +131,10 @@ if [ "$PILOT_CANDIDATES" -le 0 ] || [ "$PILOT_SECOND_CANDIDATES" -lt "$PILOT_CAN
 fi
 if [ $((PILOT_SECOND_CANDIDATES % PILOT_CANDIDATES)) -ne 0 ]; then
   echo "[avatar-like-test1000] second pilot candidate count must be an integer multiple of the first pilot" >&2
+  exit 2
+fi
+if [ "$PILOT_GROUPS_PER_DATASET" -le 0 ] || [ "$PILOT_SECOND_GROUPS_PER_DATASET" -lt "$PILOT_GROUPS_PER_DATASET" ]; then
+  echo "[avatar-like-test1000] require 0 < pilot groups <= second pilot groups" >&2
   exit 2
 fi
 
@@ -295,9 +308,47 @@ else
   "${clip_args[@]}" 2>&1 | tee -a "$RUN_ROOT/logs/clip_build.log"
 fi
 
+FULL_CLIPS_MANIFEST="$RUN_ROOT/clips_to_annotate.jsonl"
+FULL_CLIP_GROUPS="$RUN_ROOT/single_source_clip_groups.jsonl"
+PILOT_DIR="$RUN_ROOT/stratified_pilot_${PILOT_CANDIDATES}"
+SECOND_PILOT_DIR="$RUN_ROOT/stratified_pilot_${PILOT_SECOND_CANDIDATES}"
+if [ ! -s "$FULL_CLIPS_MANIFEST" ] || [ ! -s "$FULL_CLIP_GROUPS" ]; then
+  if [ -s "$RUN_ROOT/single_source_annotations.jsonl" ]; then
+    echo "[avatar-like-test1000] annotations exist but full prepared manifests are missing; refusing to overwrite durable work" >&2
+    exit 2
+  fi
+  python3 -m app.audio_lines_single_source prepare-existing \
+    --root "$CONSTRUCTION_ROOT" \
+    --single-source-root "$SINGLE_SOURCE_ROOT" \
+    --run-root "$RUN_ROOT" \
+    --max-source-folders 0 \
+    --min-clips-per-folder 2 \
+    --no-annotation-reuse \
+    > "$RUN_ROOT/logs/prepare_full_clip_manifests.log"
+fi
+write_status "RUNNING" "prepare_stratified_pilot" "selecting source-stratified clip groups before Omni annotation"
+python3 -m app.audio_cvr_source_ingest prepare-stratified-clip-pilot \
+  --clips-manifest "$FULL_CLIPS_MANIFEST" \
+  --clip-groups "$FULL_CLIP_GROUPS" \
+  --existing-annotations "$RUN_ROOT/single_source_annotations.jsonl" \
+  --output-dir "$PILOT_DIR" \
+  --dataset "$PILOT_DATASETS" \
+  --groups-per-dataset "$PILOT_GROUPS_PER_DATASET" \
+  > "$RUN_ROOT/logs/prepare_stratified_pilot_${PILOT_CANDIDATES}.log"
+python3 -m app.audio_cvr_source_ingest prepare-stratified-clip-pilot \
+  --clips-manifest "$FULL_CLIPS_MANIFEST" \
+  --clip-groups "$FULL_CLIP_GROUPS" \
+  --existing-annotations "$RUN_ROOT/single_source_annotations.jsonl" \
+  --output-dir "$SECOND_PILOT_DIR" \
+  --dataset "$PILOT_DATASETS" \
+  --groups-per-dataset "$PILOT_SECOND_GROUPS_PER_DATASET" \
+  > "$RUN_ROOT/logs/prepare_stratified_pilot_${PILOT_SECOND_CANDIDATES}.log"
+
 run_bline_phase() {
   local candidate_limit="$1"
   local phase_name="$2"
+  local clips_override="${3:-}"
+  local groups_override="${4:-}"
   local phase_log="$RUN_ROOT/logs/bline_${phase_name}.log"
   local phase_dir="$RUN_ROOT/staged_review"
   local phase_marker="$phase_dir/phase_${candidate_limit}_complete.json"
@@ -324,6 +375,12 @@ run_bline_phase() {
     --quality-profile "$QUALITY_PROFILE"
     --resume
   )
+  if [ -n "$clips_override" ] || [ -n "$groups_override" ]; then
+    args+=(
+      --clips-manifest-override "$clips_override"
+      --clip-groups-override "$groups_override"
+    )
+  fi
   write_status "RUNNING" "omni_review_${phase_name}" "reviewing cumulative candidate limit=$candidate_limit; existing Omni service remains running"
   "${args[@]}" 2>&1 | tee -a "$RUN_ROOT/logs/bline.log" "$phase_log"
   PHASE_MARKER="$phase_marker" CANDIDATE_LIMIT="$candidate_limit" RUN_ROOT="$RUN_ROOT" python3 - <<'PY'
@@ -399,13 +456,21 @@ stop_after_pilot() {
   exit 0
 }
 
-run_bline_phase "$PILOT_CANDIDATES" "pilot_${PILOT_CANDIDATES}"
+run_bline_phase \
+  "$PILOT_CANDIDATES" \
+  "pilot_${PILOT_CANDIDATES}" \
+  "$PILOT_DIR/pilot_clips_to_annotate.jsonl" \
+  "$PILOT_DIR/pilot_clip_groups.jsonl"
 pilot_decision=$(assess_pilot_phase "$PILOT_CANDIDATES" "pilot_${PILOT_CANDIDATES}" 1)
 if [ "$pilot_decision" = "FAIL" ]; then
   stop_after_pilot "PILOT_REJECTED" "first $PILOT_CANDIDATES candidates cannot support the requested Test1000 mix"
 fi
 if [ "$pilot_decision" = "BORDERLINE" ]; then
-  run_bline_phase "$PILOT_SECOND_CANDIDATES" "pilot_${PILOT_SECOND_CANDIDATES}"
+  run_bline_phase \
+    "$PILOT_SECOND_CANDIDATES" \
+    "pilot_${PILOT_SECOND_CANDIDATES}" \
+    "$SECOND_PILOT_DIR/pilot_clips_to_annotate.jsonl" \
+    "$SECOND_PILOT_DIR/pilot_clip_groups.jsonl"
   second_scale=$((PILOT_SECOND_CANDIDATES / PILOT_CANDIDATES))
   second_decision=$(assess_pilot_phase "$PILOT_SECOND_CANDIDATES" "pilot_${PILOT_SECOND_CANDIDATES}" "$second_scale")
   if [ "$second_decision" != "GO" ]; then

@@ -24,6 +24,8 @@ OMNI_TRANSIENT_RETRIES=${OMNI_TRANSIENT_RETRIES:-2}
 FAIL_ON_TRANSIENT_OMNI_ERRORS=${FAIL_ON_TRANSIENT_OMNI_ERRORS:-1}
 RESUME=${RESUME:-0}
 QUALITY_PROFILE=${QUALITY_PROFILE:-b_audio_blind_review_v2}
+CLIPS_MANIFEST_OVERRIDE=${CLIPS_MANIFEST_OVERRIDE:-}
+CLIP_GROUPS_OVERRIDE=${CLIP_GROUPS_OVERRIDE:-}
 
 usage() {
   cat <<'EOF'
@@ -46,6 +48,8 @@ Options:
   --shard-timeout-seconds N
   --target-b-count N
   --quality-profile b_audio_blind_review_v2|b_audio_blind_review_v2_volume
+  --clips-manifest-override PATH
+  --clip-groups-override PATH
   --resume
 EOF
 }
@@ -68,6 +72,8 @@ while [[ $# -gt 0 ]]; do
     --shard-timeout-seconds) SHARD_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --target-b-count) TARGET_B_COUNT="$2"; shift 2 ;;
     --quality-profile) QUALITY_PROFILE="$2"; shift 2 ;;
+    --clips-manifest-override) CLIPS_MANIFEST_OVERRIDE="$2"; shift 2 ;;
+    --clip-groups-override) CLIP_GROUPS_OVERRIDE="$2"; shift 2 ;;
     --resume) RESUME=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[audio-cvr-v1-b] unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -140,6 +146,12 @@ runner_args=(
 )
 if [ -n "$BASE_URL_POOL" ]; then
   runner_args+=(--base-url-pool "$BASE_URL_POOL")
+fi
+if [ -n "$CLIPS_MANIFEST_OVERRIDE" ] || [ -n "$CLIP_GROUPS_OVERRIDE" ]; then
+  runner_args+=(
+    --clips-manifest-override "$CLIPS_MANIFEST_OVERRIDE"
+    --clip-groups-override "$CLIP_GROUPS_OVERRIDE"
+  )
 fi
 if [ "$RESUME" = "1" ]; then
   runner_args+=(--resume)

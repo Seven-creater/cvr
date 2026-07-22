@@ -15,6 +15,7 @@ from app.audio_cvr_source_ingest import (
     extend_frozen_test,
     parse_avqa_video_identity,
     prepare_mirror_sources,
+    prepare_stratified_clip_pilot,
 )
 
 
@@ -181,6 +182,60 @@ class AudioCvrSourceIngestTests(unittest.TestCase):
                 self.assertEqual(expected, summary["decision"])
                 self.assertTrue((run_root / "assessment" / "pilot_assessment.md").exists())
                 self.assertFalse(summary["selection_uses_model_scores"])
+
+    def test_stratified_clip_pilot_is_balanced_deterministic_and_preserves_annotations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clips: list[dict] = []
+            groups: list[dict] = []
+            for dataset in ("avqa_videos", "existing_vggsound", "avscapbench"):
+                for group_index in range(4):
+                    group_id = f"{dataset}_group_{group_index}"
+                    clip_ids = [f"{group_id}_clip_{clip_index}" for clip_index in range(2)]
+                    groups.append({"group_id": group_id, "dataset": dataset, "candidate_clip_ids": clip_ids})
+                    clips.extend(
+                        {"clip_id": clip_id, "group_id": group_id, "dataset": dataset, "output_path": f"clips/{clip_id}.mp4"}
+                        for clip_id in clip_ids
+                    )
+            annotated_clip = "avqa_videos_group_3_clip_0"
+            self._write_jsonl(root / "clips.jsonl", clips)
+            self._write_jsonl(root / "groups.jsonl", groups)
+            self._write_jsonl(root / "annotations.jsonl", [{"clip_id": annotated_clip}])
+
+            first = prepare_stratified_clip_pilot(
+                clips_manifest_path=root / "clips.jsonl",
+                clip_groups_path=root / "groups.jsonl",
+                existing_annotations_path=root / "annotations.jsonl",
+                output_dir=root / "pilot_a",
+                datasets=["avqa_videos", "existing_vggsound", "avscapbench"],
+                groups_per_dataset=2,
+                seed=7,
+            )
+            second = prepare_stratified_clip_pilot(
+                clips_manifest_path=root / "clips.jsonl",
+                clip_groups_path=root / "groups.jsonl",
+                existing_annotations_path=root / "annotations.jsonl",
+                output_dir=root / "pilot_b",
+                datasets=["avqa_videos", "existing_vggsound", "avscapbench"],
+                groups_per_dataset=2,
+                seed=7,
+            )
+
+            selected_clips = _load_jsonl(root / "pilot_a" / "pilot_clips_to_annotate.jsonl")
+            selected_ids = {row["clip_id"] for row in selected_clips}
+            self.assertIn(annotated_clip, selected_ids)
+            self.assertEqual(6, first["pilot_group_count"])
+            self.assertEqual(12, first["pilot_clip_count"])
+            self.assertEqual(
+                {"avqa_videos": 2, "existing_vggsound": 2, "avscapbench": 2},
+                first["selected_dataset_group_counts"],
+            )
+            self.assertEqual(first["selected_dataset_group_counts"], second["selected_dataset_group_counts"])
+            self.assertEqual(
+                (root / "pilot_a" / "pilot_clips_to_annotate.jsonl").read_text(encoding="utf-8"),
+                (root / "pilot_b" / "pilot_clips_to_annotate.jsonl").read_text(encoding="utf-8"),
+            )
+            self.assertFalse(first["selection_uses_model_scores"])
 
     def test_source_ingest_journals_each_decision_and_resumes_without_duplication(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

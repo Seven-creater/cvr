@@ -437,6 +437,140 @@ def summarize_supplement_run(*, run_root: str | Path) -> dict[str, Any]:
     return {"rejection_breakdown": rejection_payload, "subtype_dataset_crosstab": crosstab_payload}
 
 
+def prepare_stratified_clip_pilot(
+    *,
+    clips_manifest_path: str | Path,
+    clip_groups_path: str | Path,
+    existing_annotations_path: str | Path,
+    output_dir: str | Path,
+    datasets: list[str],
+    groups_per_dataset: int = 200,
+    seed: int = DEFAULT_SEED,
+) -> dict[str, Any]:
+    """Build a deterministic, source-stratified clip subset for a fast yield pilot.
+
+    Groups containing durable annotations are mandatory so switching an in-flight
+    full annotation run to the pilot never discards completed model work.
+    """
+    clips_path = Path(clips_manifest_path)
+    groups_path = Path(clip_groups_path)
+    annotations_path = Path(existing_annotations_path)
+    output_root = Path(output_dir)
+    if groups_per_dataset <= 0:
+        raise ValueError("groups_per_dataset must be positive")
+    normalized_datasets = list(dict.fromkeys(value.strip() for value in datasets if value.strip()))
+    if not normalized_datasets:
+        raise ValueError("at least one pilot dataset is required")
+
+    clips = _load_jsonl(clips_path)
+    groups = _load_jsonl(groups_path)
+    annotations = _load_jsonl(annotations_path)
+    if not clips:
+        raise ValueError(f"clip manifest is empty: {clips_path}")
+    if not groups:
+        raise ValueError(f"clip groups are empty: {groups_path}")
+
+    clip_by_id: dict[str, dict[str, Any]] = {}
+    clip_to_group: dict[str, str] = {}
+    group_by_id: dict[str, dict[str, Any]] = {}
+    for clip in clips:
+        clip_id = _first_text(clip, "clip_id")
+        group_id = _first_text(clip, "group_id")
+        if not clip_id or not group_id:
+            raise ValueError("every clip must have clip_id and group_id")
+        if clip_id in clip_by_id:
+            raise ValueError(f"duplicate clip_id in manifest: {clip_id}")
+        clip_by_id[clip_id] = clip
+        clip_to_group[clip_id] = group_id
+    for group in groups:
+        group_id = _first_text(group, "group_id")
+        if not group_id:
+            raise ValueError("every clip group must have group_id")
+        if group_id in group_by_id:
+            raise ValueError(f"duplicate group_id in manifest: {group_id}")
+        group_by_id[group_id] = group
+
+    durable_clip_ids = {_first_text(row, "clip_id") for row in annotations if _first_text(row, "clip_id")}
+    unknown_durable = sorted(durable_clip_ids - set(clip_by_id))
+    if unknown_durable:
+        raise ValueError(
+            "durable annotations are not present in the full clip manifest: "
+            + ", ".join(unknown_durable[:5])
+        )
+    mandatory_group_ids = {clip_to_group[clip_id] for clip_id in durable_clip_ids}
+
+    groups_by_dataset: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for group in groups:
+        dataset = _record_dataset(group)
+        groups_by_dataset[dataset].append(group)
+
+    selected_group_ids = set(mandatory_group_ids)
+    requested_dataset_group_counts: dict[str, int] = {}
+    available_dataset_group_counts: dict[str, int] = {}
+    for dataset in normalized_datasets:
+        available = groups_by_dataset.get(dataset, [])
+        available_dataset_group_counts[dataset] = len(available)
+        ranked = sorted(
+            available,
+            key=lambda row: hashlib.sha256(
+                f"{seed}|{dataset}|{_first_text(row, 'group_id')}".encode("utf-8")
+            ).hexdigest(),
+        )
+        mandatory_for_dataset = {
+            _first_text(row, "group_id")
+            for row in available
+            if _first_text(row, "group_id") in mandatory_group_ids
+        }
+        target = max(groups_per_dataset, len(mandatory_for_dataset))
+        chosen = set(mandatory_for_dataset)
+        for row in ranked:
+            if len(chosen) >= min(target, len(ranked)):
+                break
+            chosen.add(_first_text(row, "group_id"))
+        selected_group_ids.update(chosen)
+        requested_dataset_group_counts[dataset] = len(chosen)
+
+    selected_groups = [group for group in groups if _first_text(group, "group_id") in selected_group_ids]
+    selected_clip_ids: set[str] = set(durable_clip_ids)
+    for group in selected_groups:
+        candidate_ids = group.get("candidate_clip_ids") or []
+        if not isinstance(candidate_ids, list):
+            raise ValueError(f"candidate_clip_ids must be a list for group {_first_text(group, 'group_id')}")
+        selected_clip_ids.update(str(value).strip() for value in candidate_ids if str(value).strip())
+    unknown_selected = sorted(selected_clip_ids - set(clip_by_id))
+    if unknown_selected:
+        raise ValueError("clip groups reference missing clip ids: " + ", ".join(unknown_selected[:5]))
+    selected_clips = [clip for clip in clips if _first_text(clip, "clip_id") in selected_clip_ids]
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    pilot_clips_path = output_root / "pilot_clips_to_annotate.jsonl"
+    pilot_groups_path = output_root / "pilot_clip_groups.jsonl"
+    _write_jsonl(pilot_clips_path, selected_clips)
+    _write_jsonl(pilot_groups_path, selected_groups)
+    summary = {
+        "status": "complete",
+        "selection_policy": "stable_hash_stratified_by_dataset_with_durable_annotation_groups",
+        "selection_uses_model_scores": False,
+        "seed": seed,
+        "datasets": normalized_datasets,
+        "groups_per_dataset": groups_per_dataset,
+        "full_clip_count": len(clips),
+        "full_group_count": len(groups),
+        "pilot_clip_count": len(selected_clips),
+        "pilot_group_count": len(selected_groups),
+        "durable_annotation_count": len(durable_clip_ids),
+        "mandatory_group_count": len(mandatory_group_ids),
+        "available_dataset_group_counts": available_dataset_group_counts,
+        "selected_dataset_group_counts": dict(Counter(_record_dataset(row) for row in selected_groups)),
+        "selected_dataset_clip_counts": dict(Counter(_record_dataset(row) for row in selected_clips)),
+        "requested_dataset_group_counts": requested_dataset_group_counts,
+        "pilot_clips_path": str(pilot_clips_path.resolve()),
+        "pilot_groups_path": str(pilot_groups_path.resolve()),
+    }
+    _write_json(output_root / "stratified_clip_pilot_summary.json", summary)
+    return summary
+
+
 def assess_pilot_yield(
     *,
     run_root: str | Path,
@@ -541,7 +675,12 @@ def assess_pilot_yield(
         "requested_candidate_count": requested_candidates,
         "reviewed_candidate_count": reviewed_count,
         "ranked_accepted_count": sum(1 for row in ranked_rows if _truthy(row.get("accepted"))),
+        "reviewed_dataset_counts": dict(Counter(_record_dataset(row) for row in ranked_rows)),
+        "ranked_accepted_dataset_counts": dict(
+            Counter(_record_dataset(row) for row in ranked_rows if _truthy(row.get("accepted")))
+        ),
         "b_main_count": len(main_rows),
+        "b_main_dataset_counts": dict(Counter(_record_dataset(row) for row in main_rows)),
         "eligible_unique_count": total,
         "eligible_subtype_counts": dict(subtype_counts),
         "eligible_dataset_counts": dict(Counter(_record_dataset(row) for row in selected)),
@@ -1235,6 +1374,15 @@ def build_parser() -> argparse.ArgumentParser:
     assess.add_argument("--borderline-music", type=int, required=True)
     assess.add_argument("--seed", type=int, default=DEFAULT_SEED)
 
+    pilot = subparsers.add_parser("prepare-stratified-clip-pilot")
+    pilot.add_argument("--clips-manifest", required=True)
+    pilot.add_argument("--clip-groups", required=True)
+    pilot.add_argument("--existing-annotations", required=True)
+    pilot.add_argument("--output-dir", required=True)
+    pilot.add_argument("--dataset", action="append", default=[])
+    pilot.add_argument("--groups-per-dataset", type=int, default=200)
+    pilot.add_argument("--seed", type=int, default=DEFAULT_SEED)
+
     extend = subparsers.add_parser("extend-frozen-test")
     extend.add_argument("--existing-test", required=True)
     extend.add_argument("--candidate-path", required=True)
@@ -1280,6 +1428,17 @@ def main() -> None:
             borderline_total=args.borderline_total,
             borderline_sound_event=args.borderline_sound_event,
             borderline_music=args.borderline_music,
+            seed=args.seed,
+        )
+    elif args.command == "prepare-stratified-clip-pilot":
+        datasets = [part.strip() for raw in args.dataset for part in str(raw).split(",") if part.strip()]
+        result = prepare_stratified_clip_pilot(
+            clips_manifest_path=args.clips_manifest,
+            clip_groups_path=args.clip_groups,
+            existing_annotations_path=args.existing_annotations,
+            output_dir=args.output_dir,
+            datasets=datasets,
+            groups_per_dataset=args.groups_per_dataset,
             seed=args.seed,
         )
     elif args.command == "extend-frozen-test":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -523,7 +524,14 @@ def split_audio_line_candidates(
     return summary
 
 
-def shard_jsonl(*, input_path: str | Path, output_dir: str | Path, shards: int, prefix: str) -> dict[str, Any]:
+def shard_jsonl(
+    *,
+    input_path: str | Path,
+    output_dir: str | Path,
+    shards: int,
+    prefix: str,
+    stable_key: str | None = None,
+) -> dict[str, Any]:
     records = list(_load_jsonl(Path(input_path)))
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -531,12 +539,25 @@ def shard_jsonl(*, input_path: str | Path, output_dir: str | Path, shards: int, 
     shard_paths: list[str] = []
     buckets = [[] for _ in range(shards)]
     for index, record in enumerate(records):
-        buckets[index % shards].append(record)
+        if stable_key:
+            value = str(record.get(stable_key) or "").strip()
+            if not value:
+                raise ValueError(f"record {index} is missing stable shard key {stable_key!r}")
+            bucket_index = int(hashlib.sha256(value.encode("utf-8")).hexdigest(), 16) % shards
+        else:
+            bucket_index = index % shards
+        buckets[bucket_index].append(record)
     for shard_index, bucket in enumerate(buckets, start=1):
         path = output_root / f"{prefix}_shard_{shard_index:02d}.jsonl"
         _write_jsonl(path, bucket)
         shard_paths.append(str(path))
-    manifest = {"input_path": str(input_path), "record_count": len(records), "shards": shards, "shard_paths": shard_paths}
+    manifest = {
+        "input_path": str(input_path),
+        "record_count": len(records),
+        "shards": shards,
+        "stable_key": stable_key,
+        "shard_paths": shard_paths,
+    }
     (output_root / f"{prefix}_shards.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return manifest
 
@@ -3115,6 +3136,7 @@ def build_parser() -> argparse.ArgumentParser:
     shard.add_argument("--output-dir", required=True)
     shard.add_argument("--shards", type=int, default=1)
     shard.add_argument("--prefix", required=True)
+    shard.add_argument("--stable-key")
 
     merge = subparsers.add_parser("merge-line-results")
     merge.add_argument("--run-root", required=True)
@@ -3179,7 +3201,13 @@ def main() -> None:
             b_candidate_mode=args.b_candidate_mode,
         )
     elif args.command == "shard-jsonl":
-        result = shard_jsonl(input_path=args.input_path, output_dir=args.output_dir, shards=args.shards, prefix=args.prefix)
+        result = shard_jsonl(
+            input_path=args.input_path,
+            output_dir=args.output_dir,
+            shards=args.shards,
+            prefix=args.prefix,
+            stable_key=args.stable_key,
+        )
     elif args.command == "merge-line-results":
         result = merge_line_results(
             run_root=args.run_root,

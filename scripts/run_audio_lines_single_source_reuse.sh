@@ -48,6 +48,8 @@ FAIL_ON_TRANSIENT_OMNI_ERRORS=${FAIL_ON_TRANSIENT_OMNI_ERRORS:-1}
 ANNOTATION_RETRY_ATTEMPTS=${ANNOTATION_RETRY_ATTEMPTS:-4}
 SHARD_RETRY_ATTEMPTS=${SHARD_RETRY_ATTEMPTS:-4}
 RESUME=${RESUME:-0}
+CLIPS_MANIFEST_OVERRIDE=${CLIPS_MANIFEST_OVERRIDE:-}
+CLIP_GROUPS_OVERRIDE=${CLIP_GROUPS_OVERRIDE:-}
 
 usage() {
   cat <<'EOF'
@@ -82,6 +84,8 @@ Options:
   --fresh-annotations
   --force-audio-focused-refresh
   --annotation-search-root PATH
+  --clips-manifest-override PATH
+  --clip-groups-override PATH
   --omni-transient-retries N
   --annotation-retry-attempts N
   --shard-retry-attempts N
@@ -125,6 +129,8 @@ while [[ $# -gt 0 ]]; do
       ANNOTATION_SEARCH_ROOTS="${ANNOTATION_SEARCH_ROOTS:+$ANNOTATION_SEARCH_ROOTS,}$2"
       shift 2
       ;;
+    --clips-manifest-override) CLIPS_MANIFEST_OVERRIDE="$2"; shift 2 ;;
+    --clip-groups-override) CLIP_GROUPS_OVERRIDE="$2"; shift 2 ;;
     --omni-transient-retries) OMNI_TRANSIENT_RETRIES="$2"; shift 2 ;;
     --annotation-retry-attempts) ANNOTATION_RETRY_ATTEMPTS="$2"; shift 2 ;;
     --shard-retry-attempts) SHARD_RETRY_ATTEMPTS="$2"; shift 2 ;;
@@ -361,6 +367,18 @@ PAIR_CANDIDATES="$RUN_ROOT/single_source_pair_candidates.jsonl"
 A_CANDIDATES="$RUN_ROOT/a_candidates.jsonl"
 B_CANDIDATES="$RUN_ROOT/b_candidates.jsonl"
 
+if [ -n "$CLIPS_MANIFEST_OVERRIDE" ] || [ -n "$CLIP_GROUPS_OVERRIDE" ]; then
+  if [ -z "$CLIPS_MANIFEST_OVERRIDE" ] || [ -z "$CLIP_GROUPS_OVERRIDE" ]; then
+    echo "[audio-lines] clip manifest and clip groups overrides must be supplied together" >&2
+    exit 2
+  fi
+  CLIPS_TO_ANNOTATE="$CLIPS_MANIFEST_OVERRIDE"
+  CLIP_GROUPS="$CLIP_GROUPS_OVERRIDE"
+  require_file "$CLIPS_TO_ANNOTATE" "override clips manifest"
+  require_file "$CLIP_GROUPS" "override clip groups"
+  echo "[audio-lines] using stratified manifests clips=$CLIPS_TO_ANNOTATE groups=$CLIP_GROUPS"
+fi
+
 annotation_search_args=()
 if [ -n "$ANNOTATION_SEARCH_ROOTS" ]; then
   IFS=',' read -r -a annotation_search_roots <<< "$ANNOTATION_SEARCH_ROOTS"
@@ -431,7 +449,7 @@ else
   run_command_with_retries "segment annotation" "$ANNOTATION_RETRY_ATTEMPTS" "${annotation_args[@]}"
 fi
 
-if [ "$SKIP_ANNOTATION_REFRESH" != "1" ] && [ "$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")" -gt 0 ]; then
+if [ "$SKIP_ANNOTATION_REFRESH" != "1" ] && [ -z "$CLIPS_MANIFEST_OVERRIDE" ] && [ "$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")" -gt 0 ]; then
   echo "[audio-lines] audio refresh annotation start rows=$(jsonl_row_count "$AUDIO_REFRESH_MANIFEST")"
   refresh_annotation_args=(
     python3 -m app.composed_data detective-annotate-clips
@@ -491,7 +509,8 @@ if [ "$AUDIO_DATASET_LINE" = "both" ] || [ "$AUDIO_DATASET_LINE" = "visual_audio
     --input-path "$A_CANDIDATES" \
     --output-dir "$RUN_ROOT/a_shards" \
     --shards "$PROPOSE_SHARDS" \
-    --prefix a
+    --prefix a \
+    --stable-key proposal_id
   run_line_shards_with_retries "a_visual_audio_anchor" "$RUN_ROOT/a_shards" "a" "a" "audio_matters" "visual_audio_anchor" "$TARGET_A_COUNT"
 fi
 
@@ -503,7 +522,8 @@ if [ "$AUDIO_DATASET_LINE" = "both" ] || [ "$AUDIO_DATASET_LINE" = "speech_audio
     --input-path "$B_CANDIDATES" \
     --output-dir "$RUN_ROOT/b_shards" \
     --shards "$PROPOSE_SHARDS" \
-    --prefix b
+    --prefix b \
+    --stable-key proposal_id
   run_line_shards_with_retries "b_speech_audio_content" "$RUN_ROOT/b_shards" "b" "b" "$B_ACCEPTANCE_PROFILE" "speech_audio_content" "$TARGET_B_COUNT"
 fi
 

@@ -11,6 +11,7 @@ from app.audio_lines_single_source import (
     build_b_splits,
     merge_line_results,
     prepare_existing_single_source_clips,
+    shard_jsonl,
     split_audio_line_candidates,
     _b_asr_degeneracy_risk,
     _b_asr_degeneracy_risk_source,
@@ -36,6 +37,39 @@ class AudioLinesSingleSourceTests(unittest.TestCase):
 
     def test_json_decode_errors_are_retried_as_transient_omni_failures(self) -> None:
         self.assertTrue(_is_transient_omni_exception(ValueError("JSONDecodeError: Expecting ',' delimiter")))
+
+    def test_stable_sharding_keeps_proposal_in_same_bucket_across_cumulative_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            subset = [{"proposal_id": f"proposal_{index}"} for index in range(4)]
+            superset = list(reversed(subset)) + [{"proposal_id": "proposal_new"}]
+            self._write_jsonl(root / "subset.jsonl", subset)
+            self._write_jsonl(root / "superset.jsonl", superset)
+            shard_jsonl(
+                input_path=root / "subset.jsonl",
+                output_dir=root / "subset_shards",
+                shards=3,
+                prefix="b",
+                stable_key="proposal_id",
+            )
+            shard_jsonl(
+                input_path=root / "superset.jsonl",
+                output_dir=root / "superset_shards",
+                shards=3,
+                prefix="b",
+                stable_key="proposal_id",
+            )
+
+            def assignment(directory: Path) -> dict[str, str]:
+                return {
+                    row["proposal_id"]: path.name
+                    for path in directory.glob("b_shard_*.jsonl")
+                    for row in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+                }
+
+            first = assignment(root / "subset_shards")
+            second = assignment(root / "superset_shards")
+            self.assertEqual(first, {key: second[key] for key in first})
 
     def test_volume_profile_relaxes_soft_scores_but_keeps_directional_gates(self) -> None:
         inputs = {

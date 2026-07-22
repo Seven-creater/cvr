@@ -273,6 +273,10 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('tee -a "$RUN_ROOT/logs/bline.log"', script)
         self.assertIn("PILOT_CANDIDATES=${PILOT_CANDIDATES:-700}", script)
         self.assertIn("PILOT_SECOND_CANDIDATES=${PILOT_SECOND_CANDIDATES:-1400}", script)
+        self.assertIn("PILOT_GROUPS_PER_DATASET=${PILOT_GROUPS_PER_DATASET:-200}", script)
+        self.assertIn("PILOT_SECOND_GROUPS_PER_DATASET=${PILOT_SECOND_GROUPS_PER_DATASET:-400}", script)
+        self.assertIn("prepare-stratified-clip-pilot", script)
+        self.assertIn("--clips-manifest-override", script)
         self.assertIn("assess-pilot", script)
         self.assertIn('run_bline_phase "$MAX_B_CANDIDATES"', script)
         self.assertIn('phase_${candidate_limit}_complete.json', script)
@@ -287,8 +291,12 @@ class ScriptTests(unittest.TestCase):
         self.assertNotIn("kill -", script)
 
         reuse_script = Path("scripts/run_audio_lines_single_source_reuse.sh").read_text(encoding="utf-8")
+        reuse_argument_loop = reuse_script.split("done", 1)[0]
         self.assertIn('if [ "$RESUME" = "1" ] && [ -s "$CLIPS_TO_ANNOTATE" ]', reuse_script)
         self.assertIn("resume preserves prepared manifests and durable annotation output", reuse_script)
+        self.assertIn("--stable-key proposal_id", reuse_script)
+        self.assertIn('--clips-manifest-override) CLIPS_MANIFEST_OVERRIDE="$2"', reuse_argument_loop)
+        self.assertIn('--clip-groups-override) CLIP_GROUPS_OVERRIDE="$2"', reuse_argument_loop)
 
     def test_audio_cvr_v1_b_first_4gpu_fast_starts_omni_and_uses_b_first_pipeline(self) -> None:
         script = Path("scripts/run_audio_cvr_v1_b_first_4gpu_fast.sh").read_text(encoding="utf-8")
