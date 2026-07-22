@@ -236,6 +236,12 @@ class AudioCvrSourceIngestTests(unittest.TestCase):
                 (root / "pilot_b" / "pilot_clips_to_annotate.jsonl").read_text(encoding="utf-8"),
             )
             self.assertFalse(first["selection_uses_model_scores"])
+            self.assertEqual("round_robin_by_dataset_and_source_group", first["annotation_order"])
+            first_six_datasets = [row["dataset"] for row in selected_clips[:6]]
+            self.assertEqual(
+                ["avqa_videos", "avqa_videos", "existing_vggsound", "existing_vggsound", "avscapbench", "avscapbench"],
+                first_six_datasets,
+            )
 
     def test_source_ingest_journals_each_decision_and_resumes_without_duplication(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

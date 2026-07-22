@@ -530,7 +530,28 @@ def prepare_stratified_clip_pilot(
         selected_group_ids.update(chosen)
         requested_dataset_group_counts[dataset] = len(chosen)
 
-    selected_groups = [group for group in groups if _first_text(group, "group_id") in selected_group_ids]
+    selected_group_rows = [group for group in groups if _first_text(group, "group_id") in selected_group_ids]
+    ordered_by_dataset: dict[str, list[dict[str, Any]]] = {}
+    for dataset in normalized_datasets:
+        ordered_by_dataset[dataset] = sorted(
+            (row for row in selected_group_rows if _record_dataset(row) == dataset),
+            key=lambda row: hashlib.sha256(
+                f"{seed}|{dataset}|{_first_text(row, 'group_id')}".encode("utf-8")
+            ).hexdigest(),
+        )
+    selected_groups: list[dict[str, Any]] = []
+    for index in range(max((len(rows) for rows in ordered_by_dataset.values()), default=0)):
+        for dataset in normalized_datasets:
+            rows = ordered_by_dataset[dataset]
+            if index < len(rows):
+                selected_groups.append(rows[index])
+    ordered_ids = {_first_text(row, "group_id") for row in selected_groups}
+    selected_groups.extend(
+        sorted(
+            (row for row in selected_group_rows if _first_text(row, "group_id") not in ordered_ids),
+            key=lambda row: (_record_dataset(row), _first_text(row, "group_id")),
+        )
+    )
     selected_clip_ids: set[str] = set(durable_clip_ids)
     for group in selected_groups:
         candidate_ids = group.get("candidate_clip_ids") or []
@@ -540,7 +561,17 @@ def prepare_stratified_clip_pilot(
     unknown_selected = sorted(selected_clip_ids - set(clip_by_id))
     if unknown_selected:
         raise ValueError("clip groups reference missing clip ids: " + ", ".join(unknown_selected[:5]))
-    selected_clips = [clip for clip in clips if _first_text(clip, "clip_id") in selected_clip_ids]
+    selected_clips: list[dict[str, Any]] = []
+    emitted_clip_ids: set[str] = set()
+    for group in selected_groups:
+        for clip_id in group.get("candidate_clip_ids") or []:
+            normalized_clip_id = str(clip_id).strip()
+            if normalized_clip_id in selected_clip_ids and normalized_clip_id not in emitted_clip_ids:
+                selected_clips.append(clip_by_id[normalized_clip_id])
+                emitted_clip_ids.add(normalized_clip_id)
+    missing_emitted = sorted(selected_clip_ids - emitted_clip_ids)
+    if missing_emitted:
+        raise ValueError("selected clips are absent from ordered group membership: " + ", ".join(missing_emitted[:5]))
 
     output_root.mkdir(parents=True, exist_ok=True)
     pilot_clips_path = output_root / "pilot_clips_to_annotate.jsonl"
@@ -550,6 +581,7 @@ def prepare_stratified_clip_pilot(
     summary = {
         "status": "complete",
         "selection_policy": "stable_hash_stratified_by_dataset_with_durable_annotation_groups",
+        "annotation_order": "round_robin_by_dataset_and_source_group",
         "selection_uses_model_scores": False,
         "seed": seed,
         "datasets": normalized_datasets,
