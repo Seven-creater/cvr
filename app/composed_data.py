@@ -3283,12 +3283,25 @@ def propose_single_source_pairs(
 def _call_omni_with_retries(*, label: str, retries: int, fail_on_transient: bool, func: Any) -> Any:
     attempts = max(0, int(retries or 0)) + 1
     last_exc: Exception | None = None
+    consecutive_malformed_responses = 0
     for attempt in range(1, attempts + 1):
         try:
             return func()
         except Exception as exc:
             last_exc = exc
             transient = _is_transient_omni_exception(exc)
+            if _is_malformed_omni_response_exception(exc):
+                consecutive_malformed_responses += 1
+            else:
+                consecutive_malformed_responses = 0
+            if consecutive_malformed_responses >= 2:
+                print(
+                    "[omni-retry] repeated malformed response; opening per-call circuit "
+                    f"label={label} attempt={attempt}/{attempts} error={type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise
             if not transient or attempt >= attempts:
                 raise
             wait_seconds = min(30.0, 2.0 * attempt)
@@ -3332,6 +3345,19 @@ def _is_transient_omni_exception(exc: BaseException) -> bool:
         "unterminated string",
     )
     return any(marker in text for marker in transient_markers)
+
+
+def _is_malformed_omni_response_exception(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    malformed_markers = (
+        "jsondecodeerror",
+        "response did not contain a json object",
+        "model response must decode to a json object",
+        "expecting ',' delimiter",
+        "expecting property name enclosed in double quotes",
+        "unterminated string",
+    )
+    return any(marker in text for marker in malformed_markers)
 
 
 def annotate_clips(
