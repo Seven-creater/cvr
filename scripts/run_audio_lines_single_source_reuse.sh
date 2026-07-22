@@ -335,7 +335,9 @@ run_line_shards() {
         proposal_args+=(--fail-on-transient-omni-errors)
       fi
       set +e
-      timeout "$SHARD_TIMEOUT_SECONDS" "${proposal_args[@]}"
+      # Keep the proposal process in the launcher's process group so an exact
+      # group-level cleanup cannot leave a timeout-owned orphan writer behind.
+      timeout --foreground "$SHARD_TIMEOUT_SECONDS" "${proposal_args[@]}"
       status=$?
       set -e
       if [ "$status" -eq 0 ]; then
