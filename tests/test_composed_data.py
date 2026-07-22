@@ -25,6 +25,7 @@ from app.composed_data import (
     _build_pair_candidates,
     _build_proposal_id,
     _candidate_pre_propose_reject_reasons,
+    _call_omni_with_retries,
     _finalize_pair_verification,
     _has_intraclip_difference_conflict,
     _judge_accepts,
@@ -84,6 +85,23 @@ from app.composed_omni import ALLOWED_DIFFERENCE_TYPES
 
 
 class ComposedDataTests(unittest.TestCase):
+    def test_omni_retry_opens_circuit_after_repeated_malformed_responses(self) -> None:
+        calls = 0
+
+        def malformed_response() -> None:
+            nonlocal calls
+            calls += 1
+            raise ValueError("response did not contain a JSON object")
+
+        with self.assertRaisesRegex(ValueError, "did not contain a JSON object"):
+            _call_omni_with_retries(
+                label="malformed-test",
+                retries=8,
+                fail_on_transient=False,
+                func=malformed_response,
+            )
+        self.assertEqual(2, calls)
+
     def _write_jsonl(self, path: Path, records: list[dict]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as handle:
