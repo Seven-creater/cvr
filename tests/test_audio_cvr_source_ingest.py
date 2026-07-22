@@ -11,6 +11,7 @@ from app.audio_cvr_source_ingest import (
     DatasetSpec,
     _download_dataset,
     _load_jsonl,
+    assess_pilot_yield,
     extend_frozen_test,
     parse_avqa_video_identity,
     prepare_mirror_sources,
@@ -141,6 +142,45 @@ class AudioCvrSourceIngestTests(unittest.TestCase):
                     sound_event_target=2,
                     music_target=2,
                 )
+
+    def test_assess_pilot_yield_distinguishes_go_borderline_and_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            existing_path = root / "test150.jsonl"
+            self._write_jsonl(existing_path, [self._row("old", "sound_event", "old_source", dataset="avatar")])
+
+            cases = (
+                ("go", 4, 2, "GO"),
+                ("borderline", 3, 1, "BORDERLINE"),
+                ("fail", 2, 0, "FAIL"),
+            )
+            for name, sound_count, music_count, expected in cases:
+                run_root = root / name
+                main_rows = [self._row(f"{name}_s{i}", "sound_event", f"{name}_ss{i}") for i in range(sound_count)]
+                main_rows += [self._row(f"{name}_m{i}", "music", f"{name}_ms{i}") for i in range(music_count)]
+                ranked_rows = [dict(row, accepted=True) for row in main_rows]
+                while len(ranked_rows) < 10:
+                    ranked_rows.append({"proposal_id": f"rejected_{name}_{len(ranked_rows)}", "accepted": False})
+                self._write_jsonl(run_root / "b_main_audio_cvr_triplets.jsonl", main_rows)
+                self._write_jsonl(run_root / "b_ranked_single_source_pairs.jsonl", ranked_rows)
+
+                summary = assess_pilot_yield(
+                    run_root=run_root,
+                    existing_test_path=existing_path,
+                    output_dir=run_root / "assessment",
+                    requested_candidates=10,
+                    full_candidate_target=100,
+                    min_total=6,
+                    min_sound_event=4,
+                    min_music=2,
+                    borderline_total=4,
+                    borderline_sound_event=3,
+                    borderline_music=1,
+                )
+
+                self.assertEqual(expected, summary["decision"])
+                self.assertTrue((run_root / "assessment" / "pilot_assessment.md").exists())
+                self.assertFalse(summary["selection_uses_model_scores"])
 
     def test_source_ingest_journals_each_decision_and_resumes_without_duplication(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -23,6 +23,14 @@ MIN_CLIP_SECONDS=${MIN_CLIP_SECONDS:-6}
 MAX_CLIP_SECONDS=${MAX_CLIP_SECONDS:-9}
 MAX_CLIPS_PER_SOURCE=${MAX_CLIPS_PER_SOURCE:-2}
 MAX_B_CANDIDATES=${MAX_B_CANDIDATES:-7000}
+PILOT_CANDIDATES=${PILOT_CANDIDATES:-700}
+PILOT_SECOND_CANDIDATES=${PILOT_SECOND_CANDIDATES:-1400}
+PILOT_MIN_TOTAL=${PILOT_MIN_TOTAL:-100}
+PILOT_MIN_SOUND_EVENT=${PILOT_MIN_SOUND_EVENT:-75}
+PILOT_MIN_MUSIC=${PILOT_MIN_MUSIC:-20}
+PILOT_BORDERLINE_TOTAL=${PILOT_BORDERLINE_TOTAL:-85}
+PILOT_BORDERLINE_SOUND_EVENT=${PILOT_BORDERLINE_SOUND_EVENT:-68}
+PILOT_BORDERLINE_MUSIC=${PILOT_BORDERLINE_MUSIC:-17}
 PROPOSE_SHARDS=${PROPOSE_SHARDS:-128}
 PROPOSE_PARALLEL_JOBS=${PROPOSE_PARALLEL_JOBS:-24}
 CONCURRENCY=${CONCURRENCY:-24}
@@ -54,6 +62,8 @@ Options:
   --max-clip-seconds N
   --max-clips-per-source N
   --max-b-candidates N
+  --pilot-candidates N
+  --pilot-second-candidates N
   --propose-shards N
   --propose-parallel-jobs N
   --concurrency N
@@ -79,6 +89,8 @@ while [[ $# -gt 0 ]]; do
     --max-clip-seconds) MAX_CLIP_SECONDS="$2"; shift 2 ;;
     --max-clips-per-source) MAX_CLIPS_PER_SOURCE="$2"; shift 2 ;;
     --max-b-candidates) MAX_B_CANDIDATES="$2"; shift 2 ;;
+    --pilot-candidates) PILOT_CANDIDATES="$2"; shift 2 ;;
+    --pilot-second-candidates) PILOT_SECOND_CANDIDATES="$2"; shift 2 ;;
     --propose-shards) PROPOSE_SHARDS="$2"; shift 2 ;;
     --propose-parallel-jobs) PROPOSE_PARALLEL_JOBS="$2"; shift 2 ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
@@ -102,6 +114,14 @@ if [ -z "$EXISTING_TEST_PATH" ]; then
 fi
 if [ ! -s "$EXISTING_TEST_PATH" ]; then
   echo "[avatar-like-test1000] existing test is missing or empty: $EXISTING_TEST_PATH" >&2
+  exit 2
+fi
+if [ "$PILOT_CANDIDATES" -le 0 ] || [ "$PILOT_SECOND_CANDIDATES" -lt "$PILOT_CANDIDATES" ] || [ "$MAX_B_CANDIDATES" -lt "$PILOT_SECOND_CANDIDATES" ]; then
+  echo "[avatar-like-test1000] require 0 < pilot <= second pilot <= max B candidates" >&2
+  exit 2
+fi
+if [ $((PILOT_SECOND_CANDIDATES % PILOT_CANDIDATES)) -ne 0 ]; then
+  echo "[avatar-like-test1000] second pilot candidate count must be an integer multiple of the first pilot" >&2
   exit 2
 fi
 
@@ -235,29 +255,126 @@ done
 write_status "RUNNING" "clip_build" "building 6-9 second source-aware clips"
 "${clip_args[@]}" 2>&1 | tee -a "$RUN_ROOT/logs/clip_build.log"
 
-bline_args=(
-  bash scripts/run_audio_cvr_v1_b_first.sh
-  --root "$CONSTRUCTION_ROOT"
-  --single-source-root "$SINGLE_SOURCE_ROOT"
-  --run-root "$RUN_ROOT"
-  --base-url "$BASE_URL"
-  --base-url-pool "$BASE_URL"
-  --model "$MODEL"
-  --max-b-candidates "$MAX_B_CANDIDATES"
-  --propose-shards "$PROPOSE_SHARDS"
-  --propose-parallel-jobs "$PROPOSE_PARALLEL_JOBS"
-  --concurrency "$CONCURRENCY"
-  --request-timeout-seconds "$REQUEST_TIMEOUT_SECONDS"
-  --shard-timeout-seconds "$SHARD_TIMEOUT_SECONDS"
-  --target-b-count 1000000
-  --quality-profile "$QUALITY_PROFILE"
-)
-if [ "$RESUME" = "1" ]; then
-  bline_args+=(--resume)
+run_bline_phase() {
+  local candidate_limit="$1"
+  local phase_name="$2"
+  local phase_log="$RUN_ROOT/logs/bline_${phase_name}.log"
+  local phase_dir="$RUN_ROOT/staged_review"
+  local phase_marker="$phase_dir/phase_${candidate_limit}_complete.json"
+  mkdir -p "$phase_dir"
+  if [ -s "$phase_marker" ]; then
+    echo "[avatar-like-test1000] phase candidate_limit=$candidate_limit already complete; continuing from the next cumulative range"
+    return 0
+  fi
+  local args=(
+    bash scripts/run_audio_cvr_v1_b_first.sh
+    --root "$CONSTRUCTION_ROOT"
+    --single-source-root "$SINGLE_SOURCE_ROOT"
+    --run-root "$RUN_ROOT"
+    --base-url "$BASE_URL"
+    --base-url-pool "$BASE_URL"
+    --model "$MODEL"
+    --max-b-candidates "$candidate_limit"
+    --propose-shards "$PROPOSE_SHARDS"
+    --propose-parallel-jobs "$PROPOSE_PARALLEL_JOBS"
+    --concurrency "$CONCURRENCY"
+    --request-timeout-seconds "$REQUEST_TIMEOUT_SECONDS"
+    --shard-timeout-seconds "$SHARD_TIMEOUT_SECONDS"
+    --target-b-count 1000000
+    --quality-profile "$QUALITY_PROFILE"
+    --resume
+  )
+  write_status "RUNNING" "omni_review_${phase_name}" "reviewing cumulative candidate limit=$candidate_limit; existing Omni service remains running"
+  "${args[@]}" 2>&1 | tee -a "$RUN_ROOT/logs/bline.log" "$phase_log"
+  PHASE_MARKER="$phase_marker" CANDIDATE_LIMIT="$candidate_limit" RUN_ROOT="$RUN_ROOT" python3 - <<'PY'
+import hashlib
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+root = Path(os.environ["RUN_ROOT"])
+ranked = root / "b_ranked_single_source_pairs.jsonl"
+candidates = root / "b_candidates.jsonl"
+
+def count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("rb") as handle:
+        return sum(1 for line in handle if line.strip())
+
+def digest(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+payload = {
+    "state": "COMPLETE",
+    "candidate_limit": int(os.environ["CANDIDATE_LIMIT"]),
+    "ranked_count": count(ranked),
+    "candidate_count": count(candidates),
+    "accepted_progress_count": sum(count(path) for path in root.glob("b_shards/accepted_progress_*.jsonl")),
+    "rejected_progress_count": sum(count(path) for path in root.glob("b_shards/rejected_progress_*.jsonl")),
+    "candidate_sha256": digest(candidates),
+    "completed_at": datetime.now(timezone.utc).isoformat(),
+    "resume_policy": "proposal_id_checkpoint; only unseen cumulative candidates call Omni",
+}
+marker = Path(os.environ["PHASE_MARKER"])
+temporary = marker.with_name(f".{marker.name}.tmp.{os.getpid()}")
+temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+os.replace(temporary, marker)
+PY
+}
+
+assess_pilot_phase() {
+  local candidate_limit="$1"
+  local output_name="$2"
+  local scale="$3"
+  local assessment_dir="$RUN_ROOT/pilot_assessments/$output_name"
+  python3 -m app.audio_cvr_source_ingest assess-pilot \
+    --run-root "$RUN_ROOT" \
+    --existing-test "$EXISTING_TEST_PATH" \
+    --output-dir "$assessment_dir" \
+    --requested-candidates "$candidate_limit" \
+    --full-candidate-target "$MAX_B_CANDIDATES" \
+    --min-total "$((PILOT_MIN_TOTAL * scale))" \
+    --min-sound-event "$((PILOT_MIN_SOUND_EVENT * scale))" \
+    --min-music "$((PILOT_MIN_MUSIC * scale))" \
+    --borderline-total "$((PILOT_BORDERLINE_TOTAL * scale))" \
+    --borderline-sound-event "$((PILOT_BORDERLINE_SOUND_EVENT * scale))" \
+    --borderline-music "$((PILOT_BORDERLINE_MUSIC * scale))" \
+    > "$RUN_ROOT/logs/assess_${output_name}.log"
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["decision"])' \
+    "$assessment_dir/pilot_assessment.json"
+}
+
+stop_after_pilot() {
+  local state="$1"
+  local detail="$2"
+  write_status "$state" "pilot_decision" "$detail; all progress preserved; existing Omni service remains running"
+  trap - EXIT
+  echo "[avatar-like-test1000] $state: $detail"
+  exit 0
+}
+
+run_bline_phase "$PILOT_CANDIDATES" "pilot_${PILOT_CANDIDATES}"
+pilot_decision=$(assess_pilot_phase "$PILOT_CANDIDATES" "pilot_${PILOT_CANDIDATES}" 1)
+if [ "$pilot_decision" = "FAIL" ]; then
+  stop_after_pilot "PILOT_REJECTED" "first $PILOT_CANDIDATES candidates cannot support the requested Test1000 mix"
+fi
+if [ "$pilot_decision" = "BORDERLINE" ]; then
+  run_bline_phase "$PILOT_SECOND_CANDIDATES" "pilot_${PILOT_SECOND_CANDIDATES}"
+  second_scale=$((PILOT_SECOND_CANDIDATES / PILOT_CANDIDATES))
+  second_decision=$(assess_pilot_phase "$PILOT_SECOND_CANDIDATES" "pilot_${PILOT_SECOND_CANDIDATES}" "$second_scale")
+  if [ "$second_decision" != "GO" ]; then
+    stop_after_pilot "PILOT_REJECTED" "cumulative $PILOT_SECOND_CANDIDATES-candidate review did not reach the scaled GO thresholds"
+  fi
 fi
 
-write_status "RUNNING" "omni_review" "reviewing up to $MAX_B_CANDIDATES candidates with concurrency=$PROPOSE_PARALLEL_JOBS on the existing GPU 0-3 service"
-"${bline_args[@]}" 2>&1 | tee -a "$RUN_ROOT/logs/bline.log"
+write_status "RUNNING" "pilot_passed" "pilot yield supports Test1000; expanding review from durable progress without stopping Omni"
+run_bline_phase "$MAX_B_CANDIDATES" "full_${MAX_B_CANDIDATES}"
 
 write_status "RUNNING" "postprocess" "building splits, quality reports, and local candidates"
 python3 -m app.audio_lines_single_source build-b-splits \

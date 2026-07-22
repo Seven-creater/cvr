@@ -381,31 +381,35 @@ if [ "$SKIP_ANNOTATION_REFRESH" = "1" ]; then
   require_file "$SEGMENT_ANNOTATIONS" "segment annotations"
   require_file "$CLIP_GROUPS" "clip groups"
 else
-  prepare_existing_args=(
-    python3
-    -m
-    app.audio_lines_single_source
-    prepare-existing
-    --root "$ROOT"
-    --single-source-root "$SINGLE_SOURCE_ROOT"
-    --run-root "$RUN_ROOT"
-    --max-source-folders "$MAX_SOURCE_FOLDERS"
-    --min-clips-per-folder "$MIN_CLIPS_PER_FOLDER"
-  )
-  if [ "$MAX_CLIPS" != "0" ]; then
-    prepare_existing_args+=(--max-clips "$MAX_CLIPS")
+  if [ "$RESUME" = "1" ] && [ -s "$CLIPS_TO_ANNOTATE" ] && [ -s "$CLIP_GROUPS" ]; then
+    echo "[audio-lines] resume preserves prepared manifests and durable annotation output in $RUN_ROOT"
+  else
+    prepare_existing_args=(
+      python3
+      -m
+      app.audio_lines_single_source
+      prepare-existing
+      --root "$ROOT"
+      --single-source-root "$SINGLE_SOURCE_ROOT"
+      --run-root "$RUN_ROOT"
+      --max-source-folders "$MAX_SOURCE_FOLDERS"
+      --min-clips-per-folder "$MIN_CLIPS_PER_FOLDER"
+    )
+    if [ "$MAX_CLIPS" != "0" ]; then
+      prepare_existing_args+=(--max-clips "$MAX_CLIPS")
+    fi
+    if [ "${#annotation_search_args[@]}" -gt 0 ]; then
+      prepare_existing_args+=("${annotation_search_args[@]}")
+    elif [ "$FRESH_ANNOTATIONS" != "1" ]; then
+      prepare_existing_args+=(--annotation-search-root "$REPO_ROOT/runs" --annotation-search-root "$ROOT")
+    elif [ "$FRESH_ANNOTATIONS" = "1" ]; then
+      prepare_existing_args+=(--no-annotation-reuse)
+    fi
+    if [ "$FORCE_AUDIO_FOCUSED_REFRESH" = "1" ]; then
+      prepare_existing_args+=(--force-audio-focused-refresh)
+    fi
+    "${prepare_existing_args[@]}"
   fi
-  if [ "${#annotation_search_args[@]}" -gt 0 ]; then
-    prepare_existing_args+=("${annotation_search_args[@]}")
-  elif [ "$FRESH_ANNOTATIONS" != "1" ]; then
-    prepare_existing_args+=(--annotation-search-root "$REPO_ROOT/runs" --annotation-search-root "$ROOT")
-  elif [ "$FRESH_ANNOTATIONS" = "1" ]; then
-    prepare_existing_args+=(--no-annotation-reuse)
-  fi
-  if [ "$FORCE_AUDIO_FOCUSED_REFRESH" = "1" ]; then
-    prepare_existing_args+=(--force-audio-focused-refresh)
-  fi
-  "${prepare_existing_args[@]}"
 
   require_file "$CLIPS_TO_ANNOTATE" "clips manifest"
   annotation_args=(

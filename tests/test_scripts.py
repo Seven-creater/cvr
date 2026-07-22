@@ -271,9 +271,20 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('"service_owned": False', script)
         self.assertIn('history_path = path.with_name("status_history.jsonl")', script)
         self.assertIn('tee -a "$RUN_ROOT/logs/bline.log"', script)
+        self.assertIn("PILOT_CANDIDATES=${PILOT_CANDIDATES:-700}", script)
+        self.assertIn("PILOT_SECOND_CANDIDATES=${PILOT_SECOND_CANDIDATES:-1400}", script)
+        self.assertIn("assess-pilot", script)
+        self.assertIn('run_bline_phase "$MAX_B_CANDIDATES"', script)
+        self.assertIn('phase_${candidate_limit}_complete.json', script)
+        self.assertIn("only unseen cumulative candidates call Omni", script)
+        self.assertIn("existing Omni service remains running", script)
         self.assertNotIn("vllm.entrypoints.openai.api_server", script)
         self.assertNotIn("pkill", script)
         self.assertNotIn("kill -", script)
+
+        reuse_script = Path("scripts/run_audio_lines_single_source_reuse.sh").read_text(encoding="utf-8")
+        self.assertIn('if [ "$RESUME" = "1" ] && [ -s "$CLIPS_TO_ANNOTATE" ]', reuse_script)
+        self.assertIn("resume preserves prepared manifests and durable annotation output", reuse_script)
 
     def test_audio_cvr_v1_b_first_4gpu_fast_starts_omni_and_uses_b_first_pipeline(self) -> None:
         script = Path("scripts/run_audio_cvr_v1_b_first_4gpu_fast.sh").read_text(encoding="utf-8")

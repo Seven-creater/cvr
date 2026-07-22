@@ -437,6 +437,154 @@ def summarize_supplement_run(*, run_root: str | Path) -> dict[str, Any]:
     return {"rejection_breakdown": rejection_payload, "subtype_dataset_crosstab": crosstab_payload}
 
 
+def assess_pilot_yield(
+    *,
+    run_root: str | Path,
+    existing_test_path: str | Path,
+    output_dir: str | Path,
+    requested_candidates: int,
+    full_candidate_target: int,
+    min_total: int,
+    min_sound_event: int,
+    min_music: int,
+    borderline_total: int,
+    borderline_sound_event: int,
+    borderline_music: int,
+    seed: int = DEFAULT_SEED,
+) -> dict[str, Any]:
+    """Assess whether a staged B-line review can support the Test1000 extension.
+
+    The decision is based only on accepted B-main records and frozen-benchmark
+    identity constraints. Retrieval scores are deliberately unavailable here.
+    """
+    root = Path(run_root)
+    output_root = Path(output_dir)
+    if requested_candidates <= 0 or full_candidate_target < requested_candidates:
+        raise ValueError("candidate targets must be positive and full_candidate_target >= requested_candidates")
+    threshold_values = (
+        min_total,
+        min_sound_event,
+        min_music,
+        borderline_total,
+        borderline_sound_event,
+        borderline_music,
+    )
+    if any(value < 0 for value in threshold_values):
+        raise ValueError("pilot thresholds must be non-negative")
+
+    existing = _load_jsonl(Path(existing_test_path))
+    main_rows = _load_jsonl(root / "b_main_audio_cvr_triplets.jsonl")
+    ranked_rows = _load_jsonl(root / "b_ranked_single_source_pairs.jsonl")
+    if not existing:
+        raise ValueError(f"existing frozen test is empty: {existing_test_path}")
+    if not ranked_rows:
+        raise ValueError(f"pilot ranked output is empty: {root / 'b_ranked_single_source_pairs.jsonl'}")
+
+    excluded = _record_identity_sets(existing)
+    rejection_counts: Counter[str] = Counter()
+    eligible: list[dict[str, Any]] = []
+    for row in main_rows:
+        reason = _test_extension_rejection_reason(row, excluded)
+        if reason:
+            rejection_counts[reason] += 1
+            continue
+        eligible.append(row)
+
+    eligible.sort(key=lambda row: (_record_subtype(row), _test_extension_sort_key(row, seed=seed)))
+    selected: list[dict[str, Any]] = []
+    selected_ids = {key: set(values) for key, values in excluded.items()}
+    for row in eligible:
+        identities = {
+            "source": _record_source_id(row),
+            "pair": _record_pair_id(row),
+            "sample": _record_sample_id(row),
+        }
+        duplicate = next((label for label, value in identities.items() if value in selected_ids[label]), "")
+        if duplicate:
+            rejection_counts[f"duplicate_pilot_{duplicate}"] += 1
+            continue
+        selected.append(row)
+        for label, value in identities.items():
+            selected_ids[label].add(value)
+
+    subtype_counts = Counter(_record_subtype(row) for row in selected)
+    total = len(selected)
+    go = (
+        total >= min_total
+        and subtype_counts["sound_event"] >= min_sound_event
+        and subtype_counts["music"] >= min_music
+    )
+    borderline = (
+        total >= borderline_total
+        and subtype_counts["sound_event"] >= borderline_sound_event
+        and subtype_counts["music"] >= borderline_music
+    )
+    decision = "GO" if go else "BORDERLINE" if borderline else "FAIL"
+    reviewed_count = len(ranked_rows)
+    denominator = max(reviewed_count, 1)
+    scale = full_candidate_target / denominator
+    projected = {
+        "total": int(total * scale),
+        "sound_event": int(subtype_counts["sound_event"] * scale),
+        "music": int(subtype_counts["music"] * scale),
+    }
+    shortfalls = {
+        "total": max(0, min_total - total),
+        "sound_event": max(0, min_sound_event - subtype_counts["sound_event"]),
+        "music": max(0, min_music - subtype_counts["music"]),
+    }
+    summary = {
+        "decision": decision,
+        "continue_recommended": decision in {"GO", "BORDERLINE"},
+        "run_root": str(root.resolve()),
+        "existing_test_path": str(Path(existing_test_path).resolve()),
+        "requested_candidate_count": requested_candidates,
+        "reviewed_candidate_count": reviewed_count,
+        "ranked_accepted_count": sum(1 for row in ranked_rows if _truthy(row.get("accepted"))),
+        "b_main_count": len(main_rows),
+        "eligible_unique_count": total,
+        "eligible_subtype_counts": dict(subtype_counts),
+        "eligible_dataset_counts": dict(Counter(_record_dataset(row) for row in selected)),
+        "eligible_unique_source_count": len({_record_source_id(row) for row in selected}),
+        "acceptance_rate_over_reviewed": total / denominator,
+        "projected_at_full_candidate_target": projected,
+        "full_candidate_target": full_candidate_target,
+        "go_thresholds": {
+            "total": min_total,
+            "sound_event": min_sound_event,
+            "music": min_music,
+        },
+        "borderline_thresholds": {
+            "total": borderline_total,
+            "sound_event": borderline_sound_event,
+            "music": borderline_music,
+        },
+        "go_shortfalls": shortfalls,
+        "rejection_counts": dict(rejection_counts),
+        "selection_uses_model_scores": False,
+        "omni_service_action": "leave_running",
+    }
+    output_root.mkdir(parents=True, exist_ok=True)
+    _write_json(output_root / "pilot_assessment.json", summary)
+    markdown = "\n".join(
+        (
+            "# Audio-CVR staged pilot assessment",
+            "",
+            f"- Decision: **{decision}**",
+            f"- Reviewed candidates: {reviewed_count} / requested {requested_candidates}",
+            f"- Eligible unique additions: {total}",
+            f"- Sound event / music: {subtype_counts['sound_event']} / {subtype_counts['music']}",
+            f"- Acceptance rate: {total / denominator:.2%}",
+            f"- Projected at {full_candidate_target}: {projected}",
+            f"- GO shortfalls: {shortfalls}",
+            "- Omni service action: leave running",
+            "",
+        )
+    )
+    _write_text_atomic(output_root / "pilot_assessment.md", markdown)
+    return summary
+
+
 def extend_frozen_test(
     *,
     existing_test_path: str | Path,
@@ -1073,6 +1221,20 @@ def build_parser() -> argparse.ArgumentParser:
     summarize = subparsers.add_parser("summarize-run")
     summarize.add_argument("--run-root", required=True)
 
+    assess = subparsers.add_parser("assess-pilot")
+    assess.add_argument("--run-root", required=True)
+    assess.add_argument("--existing-test", required=True)
+    assess.add_argument("--output-dir", required=True)
+    assess.add_argument("--requested-candidates", type=int, required=True)
+    assess.add_argument("--full-candidate-target", type=int, default=7000)
+    assess.add_argument("--min-total", type=int, required=True)
+    assess.add_argument("--min-sound-event", type=int, required=True)
+    assess.add_argument("--min-music", type=int, required=True)
+    assess.add_argument("--borderline-total", type=int, required=True)
+    assess.add_argument("--borderline-sound-event", type=int, required=True)
+    assess.add_argument("--borderline-music", type=int, required=True)
+    assess.add_argument("--seed", type=int, default=DEFAULT_SEED)
+
     extend = subparsers.add_parser("extend-frozen-test")
     extend.add_argument("--existing-test", required=True)
     extend.add_argument("--candidate-path", required=True)
@@ -1105,6 +1267,21 @@ def main() -> None:
         )
     elif args.command == "summarize-run":
         result = summarize_supplement_run(run_root=args.run_root)
+    elif args.command == "assess-pilot":
+        result = assess_pilot_yield(
+            run_root=args.run_root,
+            existing_test_path=args.existing_test,
+            output_dir=args.output_dir,
+            requested_candidates=args.requested_candidates,
+            full_candidate_target=args.full_candidate_target,
+            min_total=args.min_total,
+            min_sound_event=args.min_sound_event,
+            min_music=args.min_music,
+            borderline_total=args.borderline_total,
+            borderline_sound_event=args.borderline_sound_event,
+            borderline_music=args.borderline_music,
+            seed=args.seed,
+        )
     elif args.command == "extend-frozen-test":
         result = extend_frozen_test(
             existing_test_path=args.existing_test,
