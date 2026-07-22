@@ -41,12 +41,22 @@ from app.e5_audio_delta_train import (
     _ensure_pyav_error_compat,
     _query_payload,
     _resolve_media_path,
+    _save_embedding_npz_atomic,
     _video_payload,
 )
 from app.audio_cvr_protocol_eval import mine_local_same_source, summarize_data, summarize_evals
 
 
 class E5AudioDeltaTrainTests(unittest.TestCase):
+    def test_embedding_npz_is_written_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "cache" / "eval_embeddings.npz"
+            _save_embedding_npz_atomic(path, {"query": np.asarray([[1.0, 2.0]], dtype=np.float32)})
+
+            with np.load(path, allow_pickle=False) as loaded:
+                np.testing.assert_array_equal(loaded["query"], np.asarray([[1.0, 2.0]], dtype=np.float32))
+            self.assertEqual([], list(path.parent.glob(f".{path.name}.*.tmp")))
+
     def test_pyav_error_compat_maps_legacy_name_to_ffmpeg_error(self) -> None:
         class FakeFFmpegError(OSError):
             pass

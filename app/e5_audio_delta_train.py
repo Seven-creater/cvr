@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 import gc
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
 import shutil
@@ -2365,7 +2366,7 @@ def _cache_split_embeddings(
         if failed_gallery_items:
             _write_jsonl(output_root / "eval_gallery_encoding_failures.jsonl", failed_gallery_items)
     npz_path = output_root / f"{split}_embeddings.npz"
-    np.savez(str(npz_path), **stacked)
+    _save_embedding_npz_atomic(npz_path, stacked)
     records_path = output_root / f"{split}_records.jsonl"
     _write_jsonl(records_path, [asdict(record) for record in records])
     metadata = {
@@ -2436,8 +2437,8 @@ def _cache_embeddings_from_reuse(
             eval_stacked["reference_gallery_index"] = np.asarray(reference_index, dtype=np.int64)
         _write_jsonl(output_root / "eval_gallery.jsonl", [asdict(item) for item in new_gallery_items])
 
-    np.savez(str(output_root / "train_embeddings.npz"), **train_stacked)
-    np.savez(str(output_root / "eval_embeddings.npz"), **eval_stacked)
+    _save_embedding_npz_atomic(output_root / "train_embeddings.npz", train_stacked)
+    _save_embedding_npz_atomic(output_root / "eval_embeddings.npz", eval_stacked)
     _write_jsonl(output_root / "train_records.jsonl", [asdict(record) for record in new_train_records])
     _write_jsonl(output_root / "eval_records.jsonl", [asdict(record) for record in new_eval_records])
     _copy_if_exists(reuse_cache_root / "train_manifest.jsonl", output_root / "train_manifest.jsonl")
@@ -4889,6 +4890,19 @@ def _load_embedding_npz(path: Path) -> dict[str, np.ndarray]:
         raise FileNotFoundError(f"embedding cache not found: {path}")
     loaded = np.load(str(path))
     return {key: loaded[key].astype(np.float32) for key in loaded.files}
+
+
+def _save_embedding_npz_atomic(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+    try:
+        with temp.open("wb") as handle:
+            np.savez(handle, **arrays)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def _hash_embedding(item: Any, *, dim: int) -> np.ndarray:
