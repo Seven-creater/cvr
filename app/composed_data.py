@@ -3572,6 +3572,7 @@ def _annotate_clips_impl(
     annotated_count = 0
     reused_count = 0
     detective_to_single_pass_count = 0
+    annotation_errors: list[Exception] = []
     for item in clips:
         clip_id = str(item.get("clip_id", "")).strip()
         if not clip_id:
@@ -3595,12 +3596,24 @@ def _annotate_clips_impl(
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [executor.submit(annotate_one, item) for item in pending_items]
             for future in as_completed(futures):
-                record, detective_to_single_pass = future.result()
+                try:
+                    record, detective_to_single_pass = future.result()
+                except Exception as exc:
+                    # Keep draining completed futures so successful annotations are
+                    # durably appended before the outer retry handles failed clips.
+                    annotation_errors.append(exc)
+                    continue
                 records_by_clip_id[str(record["clip_id"])] = record
                 annotated_count += 1
                 if detective_to_single_pass:
                     detective_to_single_pass_count += 1
                 _append_jsonl_record(output, record)
+
+    if annotation_errors:
+        raise RuntimeError(
+            f"{len(annotation_errors)} clip annotation request(s) failed; "
+            "successful concurrent annotations were persisted"
+        ) from annotation_errors[0]
 
     output_records: list[dict[str, Any]] = []
     for item in clips:
