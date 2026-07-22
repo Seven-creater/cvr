@@ -436,6 +436,7 @@ else
     --clips-manifest-path "$CLIPS_TO_ANNOTATE"
     --output-path "$SEGMENT_ANNOTATIONS"
     --base-url "$BASE_URL"
+    --base-url-pool "$BASE_URL_POOL"
     --api-key EMPTY
     --model "$MODEL"
     --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS"
@@ -457,6 +458,7 @@ if [ "$SKIP_ANNOTATION_REFRESH" != "1" ] && [ -z "$CLIPS_MANIFEST_OVERRIDE" ] &&
     --clips-manifest-path "$AUDIO_REFRESH_MANIFEST"
     --output-path "$AUDIO_REFRESH_ANNOTATIONS"
     --base-url "$BASE_URL"
+    --base-url-pool "$BASE_URL_POOL"
     --api-key EMPTY
     --model "$MODEL"
     --timeout-seconds "$ANNOTATION_TIMEOUT_SECONDS"

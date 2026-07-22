@@ -3347,6 +3347,7 @@ def annotate_clips(
     concurrency: int = 1,
     omni_retries: int = 0,
     fail_on_transient_omni_errors: bool = False,
+    base_url_pool: str | None = None,
 ) -> dict[str, Any]:
     return _annotate_clips_impl(
         root=root,
@@ -3361,6 +3362,7 @@ def annotate_clips(
         concurrency=concurrency,
         omni_retries=omni_retries,
         fail_on_transient_omni_errors=fail_on_transient_omni_errors,
+        base_url_pool=base_url_pool,
     )
 
 
@@ -3378,6 +3380,7 @@ def detective_annotate_clips(
     audio_focused: bool = False,
     omni_retries: int = 0,
     fail_on_transient_omni_errors: bool = False,
+    base_url_pool: str | None = None,
 ) -> dict[str, Any]:
     return _annotate_clips_impl(
         root=root,
@@ -3393,6 +3396,7 @@ def detective_annotate_clips(
         audio_focused=audio_focused,
         omni_retries=omni_retries,
         fail_on_transient_omni_errors=fail_on_transient_omni_errors,
+        base_url_pool=base_url_pool,
     )
 
 
@@ -3411,6 +3415,7 @@ def _annotate_clips_impl(
     audio_focused: bool = False,
     omni_retries: int = 0,
     fail_on_transient_omni_errors: bool = False,
+    base_url_pool: str | None = None,
 ) -> dict[str, Any]:
     layout = ensure_layout(root)
     manifest_path = Path(clips_manifest_path)
@@ -3426,15 +3431,25 @@ def _annotate_clips_impl(
     if not output.exists():
         _write_jsonl(output, [])
     concurrency = max(1, int(concurrency or 1))
+    endpoint_text = base_url_pool if base_url_pool is not None else base_url
+    annotation_endpoints = [value.strip() for value in endpoint_text.split(",") if value.strip()]
+    if not annotation_endpoints:
+        raise ValueError("annotation base URL pool is empty")
+
+    def endpoint_for_clip(clip_id: str) -> tuple[int, str]:
+        digest = hashlib.sha1(clip_id.encode("utf-8")).digest()
+        endpoint_index = int.from_bytes(digest[:8], byteorder="big") % len(annotation_endpoints)
+        return endpoint_index, annotation_endpoints[endpoint_index]
 
     def annotate_one(item: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        clip_id = str(item.get("clip_id", "")).strip()
+        endpoint_index, endpoint = endpoint_for_clip(clip_id)
         local_client = OpenAIComposedDataClient(
-            base_url=base_url,
+            base_url=endpoint,
             api_key=api_key,
             model=model,
             timeout_seconds=timeout_seconds,
         )
-        clip_id = str(item.get("clip_id", "")).strip()
         clip_path = _resolve_under_root(layout["root"], str(item.get("output_path", "")).strip())
         if not clip_path.exists():
             raise FileNotFoundError(f"clip output does not exist: {clip_path}")
@@ -3530,6 +3545,7 @@ def _annotate_clips_impl(
             "source_asset_id": str(item.get("source_asset_id", "")).strip() or None,
             "fallback_used": fallback_used,
             "raw_model_output": raw_model_output,
+            "annotation_endpoint_index": endpoint_index,
         }
         if detective:
             record.update(
@@ -3609,6 +3625,8 @@ def _annotate_clips_impl(
         "audio_focused_annotation": bool(audio_focused),
         "detective_to_single_pass_count": detective_to_single_pass_count if detective else 0,
         "concurrency": concurrency,
+        "annotation_endpoint_count": len(annotation_endpoints),
+        "annotation_base_url_pool": annotation_endpoints,
         "omni_retries": int(omni_retries),
         "fail_on_transient_omni_errors": bool(fail_on_transient_omni_errors),
     }
@@ -19840,6 +19858,7 @@ def build_parser() -> argparse.ArgumentParser:
     annotate_clips_parser.add_argument("--clips-manifest-path", required=True)
     annotate_clips_parser.add_argument("--output-path")
     annotate_clips_parser.add_argument("--base-url", required=True)
+    annotate_clips_parser.add_argument("--base-url-pool")
     annotate_clips_parser.add_argument("--api-key", required=True)
     annotate_clips_parser.add_argument("--model", required=True)
     annotate_clips_parser.add_argument("--timeout-seconds", type=float, default=180.0)
@@ -19853,6 +19872,7 @@ def build_parser() -> argparse.ArgumentParser:
     detective_annotate_parser.add_argument("--clips-manifest-path", required=True)
     detective_annotate_parser.add_argument("--output-path")
     detective_annotate_parser.add_argument("--base-url", required=True)
+    detective_annotate_parser.add_argument("--base-url-pool")
     detective_annotate_parser.add_argument("--api-key", required=True)
     detective_annotate_parser.add_argument("--model", required=True)
     detective_annotate_parser.add_argument("--timeout-seconds", type=float, default=180.0)
@@ -20065,6 +20085,7 @@ def main() -> None:
             concurrency=args.concurrency,
             omni_retries=args.omni_retries,
             fail_on_transient_omni_errors=args.fail_on_transient_omni_errors,
+            base_url_pool=args.base_url_pool,
             overwrite=args.overwrite,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -20160,6 +20181,7 @@ def main() -> None:
             audio_focused=args.audio_focused,
             omni_retries=args.omni_retries,
             fail_on_transient_omni_errors=args.fail_on_transient_omni_errors,
+            base_url_pool=args.base_url_pool,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

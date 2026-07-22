@@ -14,6 +14,7 @@ export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 ROOT=${ROOT:-/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval}
 RUN_ROOT=${RUN_ROOT:-$REPO_ROOT/runs/audio_cvr_avatar_like_test1000_$(date +%Y%m%d_%H%M%S)}
 BASE_URL=${BASE_URL:-http://127.0.0.1:8093/v1}
+BASE_URL_POOL=${BASE_URL_POOL:-$BASE_URL}
 MODEL=${MODEL:-qwen3-omni-30b-a3b-instruct}
 HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
 DATASETS=${DATASETS:-existing_vggsound,avqa_videos,ave_dataset,avscapbench}
@@ -56,6 +57,7 @@ Options:
   --root PATH
   --run-root PATH
   --base-url URL
+  --base-url-pool URL[,URL]
   --model NAME
   --hf-endpoint URL
   --datasets NAME[,NAME]
@@ -86,6 +88,7 @@ while [[ $# -gt 0 ]]; do
     --root) ROOT="$2"; shift 2 ;;
     --run-root) RUN_ROOT="$2"; shift 2 ;;
     --base-url) BASE_URL="$2"; shift 2 ;;
+    --base-url-pool) BASE_URL_POOL="$2"; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
     --hf-endpoint) HF_ENDPOINT="$2"; shift 2 ;;
     --datasets) DATASETS="$2"; shift 2 ;;
@@ -191,7 +194,16 @@ on_exit() {
 trap on_exit EXIT
 
 write_status "RUNNING" "preflight" "checking frozen test and existing Omni service"
-curl -fsS -m 30 "$BASE_URL/models" > "$RUN_ROOT/logs/omni_models.json"
+IFS=',' read -r -a BASE_URL_POOL_ITEMS <<< "$BASE_URL_POOL"
+if [ "${#BASE_URL_POOL_ITEMS[@]}" -eq 0 ]; then
+  echo "[avatar-like-test1000] empty Omni base URL pool" >&2
+  exit 2
+fi
+for endpoint_index in "${!BASE_URL_POOL_ITEMS[@]}"; do
+  endpoint="${BASE_URL_POOL_ITEMS[$endpoint_index]}"
+  curl -fsS -m 30 "$endpoint/models" > "$RUN_ROOT/logs/omni_models_${endpoint_index}.json"
+done
+cp "$RUN_ROOT/logs/omni_models_0.json" "$RUN_ROOT/logs/omni_models.json"
 MODEL=$(python3 - "$RUN_ROOT/logs/omni_models.json" "$MODEL" <<'PY'
 import json
 import pathlib
@@ -212,10 +224,14 @@ else:
 PY
 )
 echo "$MODEL" > "$RUN_ROOT/logs/resolved_omni_model.txt"
-curl -fsS -m 90 "$BASE_URL/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Reply with OK only."}],"max_tokens":8}' \
-  > "$RUN_ROOT/logs/omni_health_chat.json"
+for endpoint_index in "${!BASE_URL_POOL_ITEMS[@]}"; do
+  endpoint="${BASE_URL_POOL_ITEMS[$endpoint_index]}"
+  curl -fsS -m 90 "$endpoint/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Reply with OK only."}],"max_tokens":8}' \
+    > "$RUN_ROOT/logs/omni_health_chat_${endpoint_index}.json"
+done
+cp "$RUN_ROOT/logs/omni_health_chat_0.json" "$RUN_ROOT/logs/omni_health_chat.json"
 
 actual_test_sha=$(sha256sum "$EXISTING_TEST_PATH" | awk '{print $1}')
 if [ -n "$EXPECTED_EXISTING_TEST_SHA256" ] && [ "$actual_test_sha" != "$EXPECTED_EXISTING_TEST_SHA256" ]; then
@@ -363,7 +379,7 @@ run_bline_phase() {
     --single-source-root "$SINGLE_SOURCE_ROOT"
     --run-root "$RUN_ROOT"
     --base-url "$BASE_URL"
-    --base-url-pool "$BASE_URL"
+    --base-url-pool "$BASE_URL_POOL"
     --model "$MODEL"
     --max-b-candidates "$candidate_limit"
     --propose-shards "$PROPOSE_SHARDS"
