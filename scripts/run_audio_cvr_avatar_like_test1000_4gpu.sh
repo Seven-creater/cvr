@@ -233,8 +233,27 @@ if [ "$RESUME" = "1" ]; then
   ingest_args+=(--resume)
 fi
 
-write_status "RUNNING" "source_ingest" "downloading and staging VGGSound-family videos"
-"${ingest_args[@]}" 2>&1 | tee -a "$RUN_ROOT/logs/source_ingest.log"
+if [ "$RESUME" = "1" ] && python3 - "$RUN_ROOT/source_ingest_summary.json" "$RUN_ROOT/provenance_manifest.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+summary_path = Path(sys.argv[1])
+manifest_path = Path(sys.argv[2])
+if not summary_path.is_file() or not manifest_path.is_file():
+    raise SystemExit(1)
+summary = json.loads(summary_path.read_text(encoding="utf-8"))
+selected = int(summary.get("selected_source_count") or 0)
+rows = sum(1 for line in manifest_path.open("rb") if line.strip())
+raise SystemExit(0 if selected > 0 and rows == selected else 1)
+PY
+then
+  write_status "RUNNING" "source_ingest_cached" "freezing completed source ingest; newly downloaded media will not be injected into this run"
+  echo "[avatar-like-test1000] reuse completed source ingest from $RUN_ROOT"
+else
+  write_status "RUNNING" "source_ingest" "downloading and staging VGGSound-family videos"
+  "${ingest_args[@]}" 2>&1 | tee -a "$RUN_ROOT/logs/source_ingest.log"
+fi
 
 clip_args=(
   python3 -m app.audio_cvr_clips
@@ -252,8 +271,29 @@ for dataset in "${dataset_items[@]}"; do
   clip_args+=(--dataset "$dataset")
 done
 
-write_status "RUNNING" "clip_build" "building 6-9 second source-aware clips"
-"${clip_args[@]}" 2>&1 | tee -a "$RUN_ROOT/logs/clip_build.log"
+CLIP_SUMMARY="$SINGLE_SOURCE_ROOT/_manifests/audio_cvr_avatar_like_6_9s_summary.json"
+if [ "$RESUME" = "1" ] && python3 - "$CLIP_SUMMARY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+summary_path = Path(sys.argv[1])
+if not summary_path.is_file():
+    raise SystemExit(1)
+summary = json.loads(summary_path.read_text(encoding="utf-8"))
+segments = int(summary.get("segment_count") or 0)
+durable = int(summary.get("durable_clip_count") or 0)
+manifest = Path(str(summary.get("manifest_path") or ""))
+groups = Path(str(summary.get("groups_path") or ""))
+raise SystemExit(0 if segments > 0 and durable == segments and manifest.is_file() and groups.is_file() else 1)
+PY
+then
+  write_status "RUNNING" "clip_build_cached" "reusing the completed clip inventory without rescanning newly extracted sources"
+  echo "[avatar-like-test1000] reuse completed clip build summary=$CLIP_SUMMARY"
+else
+  write_status "RUNNING" "clip_build" "building 6-9 second source-aware clips"
+  "${clip_args[@]}" 2>&1 | tee -a "$RUN_ROOT/logs/clip_build.log"
+fi
 
 run_bline_phase() {
   local candidate_limit="$1"
