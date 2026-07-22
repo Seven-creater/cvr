@@ -2176,6 +2176,84 @@ class ComposedDataTests(unittest.TestCase):
             failures = [json.loads(line) for line in failure_path.read_text(encoding="utf-8").splitlines() if line.strip()]
             self.assertEqual({"clip_b", "clip_c"}, {record["clip_id"] for record in failures})
 
+    def test_concurrent_annotation_resume_reuses_terminal_failure_quarantine(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_layout(root)
+            clip_ids = ["clip_a", "clip_b"]
+            for clip_id in clip_ids:
+                (root / "clips" / f"{clip_id}.mp4").write_bytes(clip_id.encode("utf-8"))
+            manifest_path = root / "metadata" / "clips.jsonl"
+            self._write_jsonl(
+                manifest_path,
+                [{"clip_id": clip_id, "output_path": f"clips/{clip_id}.mp4"} for clip_id in clip_ids],
+            )
+            output_path = root / "captions" / "clip_annotations.jsonl"
+            failure_path = root / "captions" / "terminal_annotation_failures.jsonl"
+
+            class FirstRunClient:
+                def __init__(self, **_: object) -> None:
+                    pass
+
+                def annotate_clip(self, *, clip_path: str) -> tuple[dict[str, object], dict[str, object]]:
+                    clip_id = Path(clip_path).stem
+                    if clip_id == "clip_b":
+                        raise RuntimeError("response did not contain a JSON object")
+                    return (
+                        {
+                            "summary": "clip a summary",
+                            "subjects": ["clip_a"],
+                            "object_counts": {"clip_a": 1},
+                            "actions": [],
+                            "scene": "test scene",
+                            "attributes": [],
+                            "on_screen_text": [],
+                            "speech": [],
+                            "audio_events": [],
+                            "modalities": ["visual"],
+                        },
+                        {"provider": "fake"},
+                    )
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", FirstRunClient):
+                annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=output_path,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="captioner-model",
+                    concurrency=2,
+                    fail_on_transient_omni_errors=True,
+                    max_terminal_failures=1,
+                    terminal_failures_output_path=failure_path,
+                )
+
+            class MustNotRunClient:
+                def __init__(self, **_: object) -> None:
+                    raise AssertionError("quarantined clips must not be submitted again on resume")
+
+            with mock.patch("app.composed_data.OpenAIComposedDataClient", MustNotRunClient):
+                summary = annotate_clips(
+                    root=root,
+                    clips_manifest_path=manifest_path,
+                    output_path=output_path,
+                    base_url="http://127.0.0.1:8093/v1",
+                    api_key="EMPTY",
+                    model="captioner-model",
+                    concurrency=2,
+                    fail_on_transient_omni_errors=True,
+                    max_terminal_failures=1,
+                    terminal_failures_output_path=failure_path,
+                )
+
+            self.assertEqual(1, summary["reused_count"])
+            self.assertEqual(1, summary["reused_terminal_failure_count"])
+            self.assertEqual(0, summary["annotated_count"])
+            self.assertEqual(1, summary["terminal_failure_count"])
+            failures = [json.loads(line) for line in failure_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(["clip_b"], [record["clip_id"] for record in failures])
+
     def test_detective_annotate_clips_persists_each_record_and_resumes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -3475,6 +3475,16 @@ def _annotate_clips_impl(
     terminal_failures_output = Path(terminal_failures_output_path) if terminal_failures_output_path else None
     if max_terminal_failures and terminal_failures_output is None:
         raise ValueError("terminal_failures_output_path is required when max_terminal_failures is positive")
+    existing_terminal_failures: dict[str, dict[str, Any]] = {}
+    if (
+        max_terminal_failures
+        and terminal_failures_output is not None
+        and terminal_failures_output.exists()
+    ):
+        for failure_record in _load_jsonl(terminal_failures_output):
+            failed_clip_id = str(failure_record.get("clip_id", "")).strip()
+            if failed_clip_id:
+                existing_terminal_failures[failed_clip_id] = failure_record
 
     def endpoint_for_clip(clip_id: str) -> tuple[int, str]:
         digest = hashlib.sha1(clip_id.encode("utf-8")).digest()
@@ -3611,6 +3621,7 @@ def _annotate_clips_impl(
     pending_items: list[dict[str, Any]] = []
     annotated_count = 0
     reused_count = 0
+    reused_terminal_failure_count = 0
     detective_to_single_pass_count = 0
     annotation_errors: list[tuple[dict[str, Any], Exception]] = []
     for item in clips:
@@ -3621,6 +3632,12 @@ def _annotate_clips_impl(
         if clip_id in existing_records:
             records_by_clip_id[clip_id] = existing_records[clip_id]
             reused_count += 1
+        elif clip_id in existing_terminal_failures:
+            # A terminal failure is durable progress. Repeatedly sending the
+            # same deterministic bad-media/bad-JSON item makes every resume
+            # stall at the tail of an otherwise completed run. A caller can
+            # explicitly retry quarantined items by setting the limit to zero.
+            reused_terminal_failure_count += 1
         else:
             pending_items.append(item)
 
@@ -3697,9 +3714,11 @@ def _annotate_clips_impl(
                     detective_to_single_pass_count += 1
                 _append_jsonl_record(output, record)
 
-    terminal_failure_records = [
-        {
-            "clip_id": str(item.get("clip_id", "")).strip(),
+    terminal_failures_by_clip_id = dict(existing_terminal_failures)
+    for item, exc in annotation_errors:
+        failed_clip_id = str(item.get("clip_id", "")).strip()
+        terminal_failures_by_clip_id[failed_clip_id] = {
+            "clip_id": failed_clip_id,
             "output_path": str(item.get("output_path", "")).strip(),
             "dataset": str(item.get("dataset", "")).strip() or None,
             "source_asset_id": str(item.get("source_asset_id", "")).strip() or None,
@@ -3709,16 +3728,26 @@ def _annotate_clips_impl(
             "error_type": type(exc).__name__,
             "error": str(exc),
         }
-        for item, exc in annotation_errors
+    successful_clip_ids = set(records_by_clip_id)
+    terminal_failures_by_clip_id = {
+        clip_id: record
+        for clip_id, record in terminal_failures_by_clip_id.items()
+        if clip_id not in successful_clip_ids
+    }
+    terminal_failure_records = [
+        terminal_failures_by_clip_id[clip_id]
+        for item in clips
+        if (clip_id := str(item.get("clip_id", "")).strip()) in terminal_failures_by_clip_id
     ]
     if terminal_failures_output is not None:
         _write_jsonl(terminal_failures_output, terminal_failure_records)
 
-    if annotation_errors and len(annotation_errors) > max_terminal_failures:
+    if len(terminal_failure_records) > max_terminal_failures:
+        first_error = annotation_errors[0][1] if annotation_errors else None
         raise RuntimeError(
-            f"{len(annotation_errors)} clip annotation request(s) failed; "
+            f"{len(terminal_failure_records)} clip annotation request(s) failed; "
             "successful concurrent annotations were persisted"
-        ) from annotation_errors[0][1]
+        ) from first_error
 
     output_records: list[dict[str, Any]] = []
     for item in clips:
@@ -3740,6 +3769,7 @@ def _annotate_clips_impl(
         "input_clip_count": len(clips),
         "annotated_count": annotated_count,
         "reused_count": reused_count,
+        "reused_terminal_failure_count": reused_terminal_failure_count,
         "fallback_count": fallback_count,
         "annotation_mode": "detective" if detective else "single_pass",
         "audio_focused_annotation": bool(audio_focused),
