@@ -6,6 +6,7 @@ import subprocess
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -41,6 +42,7 @@ from app.e5_audio_delta_train import (
     _document_payload,
     _ensure_pyav_error_compat,
     _query_payload,
+    MediaPayloadPreparationFailure,
     _resolve_media_path,
     _save_embedding_npz_atomic,
     _skippable_media_encoding_error,
@@ -61,6 +63,51 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
                 subprocess.CalledProcessError(254, ["ffmpeg", "-i", "broken.mp4"])
             )
         )
+        self.assertTrue(_skippable_media_encoding_error(TypeError("Incorrect format used for video")))
+        self.assertTrue(
+            _skippable_media_encoding_error(ValueError("could not convert string to float: 'broken.mp4'"))
+        )
+
+    def test_prefill_persists_audio_preparation_failure_without_aborting_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+            self._write_jsonl(
+                records_dir / "eval_gallery.jsonl",
+                [
+                    {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "kind": "positive"},
+                    {"gallery_id": "reference::sample_1", "video": "/tmp/sample_1_ref.mp4", "kind": "reference_negative"},
+                ],
+            )
+            failure_dir = root / "failures"
+            prepared_payload = {"audio": str(root / "missing.wav")}
+            failure = MediaPayloadPreparationFailure(
+                payload=prepared_payload,
+                source="/tmp/missing.mp4",
+                role="reference",
+                cause=subprocess.CalledProcessError(254, ["ffmpeg"]),
+            )
+            with patch("app.e5_audio_delta_train._audio_media_path", side_effect=failure):
+                summary = cache_embeddings(
+                    records_dir=records_dir,
+                    output_dir=root / "cache",
+                    encoder=DeterministicEncoder(),
+                    skip_train=True,
+                    query_input_mode="audio_only",
+                    checkpoint_embeddings=True,
+                    checkpoint_prefill_only=True,
+                    skip_persistent_encoding_failures=True,
+                    encoding_failure_dir=failure_dir,
+                )
+
+            self.assertEqual(1, summary["skipped_persistent_failure_count"])
+            failure_files = list(failure_dir.rglob("*.json"))
+            self.assertEqual(1, len(failure_files))
+            self.assertEqual(prepared_payload, json.loads(failure_files[0].read_text(encoding="utf-8"))["payload"])
 
     def test_embedding_npz_is_written_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

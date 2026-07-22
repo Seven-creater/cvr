@@ -1916,23 +1916,62 @@ def _prefill_embedding_checkpoints(
     if skip_persistent_failures:
         failure_root.mkdir(parents=True, exist_ok=True)
 
+    def prepare_payload(factory: Callable[[], Any]) -> Any:
+        try:
+            return factory()
+        except MediaPayloadPreparationFailure as exc:
+            if not skip_persistent_failures:
+                raise
+            failure_path = _embedding_failure_path(failure_root, exc.payload)
+            if not failure_path.exists():
+                _save_embedding_failure(failure_path, exc.payload, exc)
+            _emit(
+                progress,
+                f"[e5-audio-delta] skipped media preparation failure: {failure_path.name} error={exc}",
+            )
+            return exc.payload
+
     payload_by_path: dict[Path, Any] = {}
     for record in records:
         payloads = [
-            _query_payload(record, query_input_mode=query_input_mode, audio_cache_root=audio_cache_root),
-            _document_payload(record.target_video, document_input_mode=document_input_mode, audio_cache_root=audio_cache_root, sample_id=record.sample_id, role="target"),
-            _document_payload(record.reference_video, document_input_mode=document_input_mode, audio_cache_root=audio_cache_root, sample_id=record.sample_id, role="reference"),
+            prepare_payload(
+                lambda record=record: _query_payload(
+                    record,
+                    query_input_mode=query_input_mode,
+                    audio_cache_root=audio_cache_root,
+                )
+            ),
+            prepare_payload(
+                lambda record=record: _document_payload(
+                    record.target_video,
+                    document_input_mode=document_input_mode,
+                    audio_cache_root=audio_cache_root,
+                    sample_id=record.sample_id,
+                    role="target",
+                )
+            ),
+            prepare_payload(
+                lambda record=record: _document_payload(
+                    record.reference_video,
+                    document_input_mode=document_input_mode,
+                    audio_cache_root=audio_cache_root,
+                    sample_id=record.sample_id,
+                    role="reference",
+                )
+            ),
             record.edit_text,
             record.old_audio or record.edit_text,
             record.new_audio or record.edit_text,
         ]
         payloads.extend(
-            _document_payload(
-                str(negative.get("video", "")),
-                document_input_mode=document_input_mode,
-                audio_cache_root=audio_cache_root,
-                sample_id=record.sample_id,
-                role=str(negative.get("type", "negative")),
+            prepare_payload(
+                lambda negative=negative, record=record: _document_payload(
+                    str(negative.get("video", "")),
+                    document_input_mode=document_input_mode,
+                    audio_cache_root=audio_cache_root,
+                    sample_id=record.sample_id,
+                    role=str(negative.get("type", "negative")),
+                )
             )
             for negative in _ordered_negatives(record)
             if str(negative.get("video", "")).strip()
@@ -1941,12 +1980,14 @@ def _prefill_embedding_checkpoints(
             path = _embedding_checkpoint_path(checkpoint_root, payload)
             payload_by_path.setdefault(path, payload)
     for item in gallery_items:
-        payload = _document_payload(
-            item.video,
-            document_input_mode=document_input_mode,
-            audio_cache_root=audio_cache_root,
-            sample_id=item.gallery_id,
-            role=item.kind or "gallery",
+        payload = prepare_payload(
+            lambda item=item: _document_payload(
+                item.video,
+                document_input_mode=document_input_mode,
+                audio_cache_root=audio_cache_root,
+                sample_id=item.gallery_id,
+                role=item.kind or "gallery",
+            )
         )
         path = _embedding_checkpoint_path(checkpoint_root, payload)
         payload_by_path.setdefault(path, payload)
@@ -2069,24 +2110,45 @@ def _cache_split_embeddings(
             failure_root = Path(encoding_failure_dir) if encoding_failure_dir else output_root / "failed_embedding_payloads"
             failure_root.mkdir(parents=True, exist_ok=True)
 
+    def prepare_payload(factory: Callable[[], Any]) -> Any:
+        try:
+            return factory()
+        except MediaPayloadPreparationFailure as exc:
+            if failure_root is None:
+                raise
+            failure_path = _embedding_failure_path(failure_root, exc.payload)
+            if not failure_path.exists():
+                _save_embedding_failure(failure_path, exc.payload, exc)
+            return exc.payload
+
     if failure_root:
         retained_records: list[AudioDeltaRecord] = []
         for record in records:
             required_payloads = {
-                "query": _query_payload(record, query_input_mode=query_input_mode, audio_cache_root=audio_cache_root),
-                "target": _document_payload(
-                    record.target_video,
-                    document_input_mode=document_input_mode,
-                    audio_cache_root=audio_cache_root,
-                    sample_id=record.sample_id,
-                    role="target",
+                "query": prepare_payload(
+                    lambda record=record: _query_payload(
+                        record,
+                        query_input_mode=query_input_mode,
+                        audio_cache_root=audio_cache_root,
+                    )
                 ),
-                "reference": _document_payload(
-                    record.reference_video,
-                    document_input_mode=document_input_mode,
-                    audio_cache_root=audio_cache_root,
-                    sample_id=record.sample_id,
-                    role="reference",
+                "target": prepare_payload(
+                    lambda record=record: _document_payload(
+                        record.target_video,
+                        document_input_mode=document_input_mode,
+                        audio_cache_root=audio_cache_root,
+                        sample_id=record.sample_id,
+                        role="target",
+                    )
+                ),
+                "reference": prepare_payload(
+                    lambda record=record: _document_payload(
+                        record.reference_video,
+                        document_input_mode=document_input_mode,
+                        audio_cache_root=audio_cache_root,
+                        sample_id=record.sample_id,
+                        role="reference",
+                    )
                 ),
                 "edit": record.edit_text,
                 "old_audio": record.old_audio or record.edit_text,
@@ -2213,17 +2275,23 @@ def _cache_split_embeddings(
                 video = str(negative.get("video", "")).strip()
                 if not video:
                     continue
-                neg_vectors.append(
-                    encode_one(
-                        _document_payload(
+                negative_payload = prepare_payload(
+                    lambda negative=negative, record=record, video=video: _document_payload(
                             video,
                             document_input_mode=document_input_mode,
                             audio_cache_root=audio_cache_root,
                             sample_id=record.sample_id,
                             role=str(negative.get("type", "negative")),
-                        ),
                     )
                 )
+                try:
+                    neg_vectors.append(encode_one(negative_payload))
+                    negative_is_valid = True
+                except PersistentEncodingFailure:
+                    if not skip_persistent_encoding_failures:
+                        raise
+                    neg_vectors.append(np.zeros_like(arrays["target"][-1]))
+                    negative_is_valid = False
                 if local_segments > 0:
                     neg_segment_vectors.append(
                         _encode_many(
@@ -2239,8 +2307,10 @@ def _cache_split_embeddings(
                             ),
                         )
                     )
-                neg_mask_row.append(1.0)
-                neg_effective_row.append(_static_negative_effective_weight(record, negative))
+                neg_mask_row.append(1.0 if negative_is_valid else 0.0)
+                neg_effective_row.append(
+                    _static_negative_effective_weight(record, negative) if negative_is_valid else 0.0
+                )
                 neg_type_row.append(str(negative.get("type", "")).strip() or "unknown")
             while len(neg_vectors) < len(DEFAULT_NEGATIVE_TYPES):
                 neg_vectors.append(np.zeros_like(arrays["target"][-1]))
@@ -2293,12 +2363,14 @@ def _cache_split_embeddings(
         gallery_lookup = {item.gallery_id: index for index, item in enumerate(gallery_items)}
         for item_index, item in enumerate(gallery_items, start=1):
             _emit(progress, f"[e5-audio-delta] cache eval gallery {item_index}/{len(gallery_items)} gallery_id={item.gallery_id}")
-            payload = _document_payload(
-                item.video,
-                document_input_mode=document_input_mode,
-                audio_cache_root=audio_cache_root,
-                sample_id=item.gallery_id,
-                role=item.kind or "gallery",
+            payload = prepare_payload(
+                lambda item=item: _document_payload(
+                    item.video,
+                    document_input_mode=document_input_mode,
+                    audio_cache_root=audio_cache_root,
+                    sample_id=item.gallery_id,
+                    role=item.kind or "gallery",
+                )
             )
             try:
                 gallery_vectors.append(encode_one(payload))
@@ -4222,6 +4294,15 @@ def _normalize_document_input_mode(value: str) -> str:
     return mode
 
 
+class MediaPayloadPreparationFailure(RuntimeError):
+    def __init__(self, *, payload: Any, source: str, role: str, cause: Exception) -> None:
+        self.payload = payload
+        self.source = source
+        self.role = role
+        self.cause = cause
+        super().__init__(f"failed to prepare {role} media from {source}: {cause}")
+
+
 def _audio_media_path(video_path: str, *, cache_root: str | Path | None, sample_id: str = "", role: str = "audio") -> str:
     source = Path(_resolve_media_path(video_path))
     if source.suffix.lower() in {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}:
@@ -4254,9 +4335,14 @@ def _audio_media_path(video_path: str, *, cache_root: str | Path | None, sample_
     try:
         subprocess.run(command, check=True)
         temp.replace(output)
-    except Exception:
+    except Exception as exc:
         temp.unlink(missing_ok=True)
-        raise
+        raise MediaPayloadPreparationFailure(
+            payload={"audio": str(output)},
+            source=str(source),
+            role=role,
+            cause=exc,
+        ) from exc
     return str(output)
 
 
@@ -4379,7 +4465,12 @@ def _skippable_media_encoding_error(exc: Exception) -> bool:
     if _retryable_encoding_error(exc) or isinstance(exc, (ZeroDivisionError, EOFError, subprocess.CalledProcessError)):
         return True
     text = str(exc).lower()
-    return "inhomogeneous shape" in text or "setting an array element with a sequence" in text
+    return (
+        "inhomogeneous shape" in text
+        or "setting an array element with a sequence" in text
+        or "incorrect format used for video" in text
+        or "could not convert string to float" in text
+    )
 
 
 def _ensure_pyav_error_compat(av_module: Any | None = None) -> str | None:
