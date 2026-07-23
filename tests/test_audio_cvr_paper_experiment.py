@@ -29,6 +29,16 @@ from app.e5_audio_delta_train import _AudioDeltaAdapter, _import_torch
 
 
 class AudioCVRPaperExperimentTests(unittest.TestCase):
+    def test_canonical_subtype_reads_volume_review_difference_type(self) -> None:
+        from app.audio_cvr_paper_experiment import _canonical_subtype
+
+        self.assertEqual(_canonical_subtype({"difference": {"type": "audio_event"}}), "sound_event")
+        self.assertEqual(_canonical_subtype({"difference": {"type": "music"}}), "music")
+        self.assertEqual(
+            _canonical_subtype({"difference": {"type": "speech"}}),
+            "speech_topic_in_video_context",
+        )
+
     def test_fixed_test_fill_prepare_excludes_fixed_source_and_resolves_each_media_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
