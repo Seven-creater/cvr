@@ -3241,6 +3241,7 @@ def main() -> None:
             candidate_path=args.candidate_path,
             pass1_review_paths=args.pass1_review_path,
             pass2_review_paths=args.pass2_review_path,
+            preverified_candidate_paths=args.preverified_candidate_path,
             exclude_paths=args.exclude_path,
             output_dir=args.output_dir,
             target_count=args.target_count,
