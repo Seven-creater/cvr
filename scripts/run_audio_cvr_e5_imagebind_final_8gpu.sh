@@ -466,6 +466,37 @@ run_e5_evaluation() {
   write_status "EVALUATING" "e5_evaluation" "evaluating five frozen adapters, seven modes, and exact source masking"
   active=()
   active_logs=()
+  eval_output_matches_cache() {
+    "$PYTHON_BIN" - "$1" "$2" <<'PY'
+import json
+import pathlib
+import sys
+
+cache_dir, eval_dir = map(pathlib.Path, sys.argv[1:])
+cache_records = cache_dir / "eval_records.jsonl"
+summary_path = eval_dir / "summary.json"
+score_path = eval_dir / "per_query_scores.jsonl"
+if not all(path.is_file() and path.stat().st_size > 0 for path in (cache_records, summary_path, score_path)):
+    raise SystemExit(1)
+
+load = lambda path: [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+cache_rows = load(cache_records)
+score_rows = load(score_path)
+summary = json.loads(summary_path.read_text())
+sample_id = lambda row: str(row.get("sample_id") or row.get("proposal_id") or "")
+cache_ids = [sample_id(row) for row in cache_rows]
+score_ids = [sample_id(row) for row in score_rows]
+valid = (
+    len(cache_rows) == len(score_rows)
+    and int(summary.get("eval_count", -1)) == len(cache_rows)
+    and len(set(cache_ids)) == len(cache_ids)
+    and len(set(score_ids)) == len(score_ids)
+    and set(cache_ids) == set(score_ids)
+    and all(cache_ids)
+)
+raise SystemExit(0 if valid else 1)
+PY
+  }
   for seed in "${SEEDS[@]}"; do
     adapter="$ADAPTER_ROOT/seed_${seed}/adapter"
     [[ -s "$adapter/adapter.pt" && -s "$adapter/adapter_config.json" ]] || { echo "Missing frozen adapter: $adapter" >&2; exit 6; }
@@ -474,11 +505,19 @@ run_e5_evaluation() {
       [[ "$mode" == "V_T" || "$mode" == "V_A_T" ]] && suffixes+=("_no_ref")
       for suffix in "${suffixes[@]}"; do
         eval_dir="$E5_EVAL_ROOT/seed_${seed}/eval_${mode}${suffix}"
-        [[ -s "$eval_dir/summary.json" && -s "$eval_dir/per_query_scores.jsonl" ]] && continue
+        cache_dir="$(e5_cache_dir "$mode")"
+        if eval_output_matches_cache "$cache_dir" "$eval_dir"; then
+          continue
+        fi
+        if [[ -d "$eval_dir" ]]; then
+          stale_dir="${eval_dir}.stale_$(date +%Y%m%d_%H%M%S)"
+          mv "$eval_dir" "$stale_dir"
+          echo "Archived stale E5 evaluation: $eval_dir -> $stale_dir"
+        fi
         gpu="${GPUS[$(( ${#active[@]} % 8 ))]}"; log="$OUT_ROOT/logs/eval_seed${seed}_${mode}${suffix}.log"
         (
           export CUDA_VISIBLE_DEVICES="$gpu"
-          args=("$PYTHON_BIN" -m app.e5_audio_delta_train eval --cache-dir "$(e5_cache_dir "$mode")" \
+          args=("$PYTHON_BIN" -m app.e5_audio_delta_train eval --cache-dir "$cache_dir" \
             --adapter-dir "$adapter" --output-dir "$eval_dir" --device cuda --topk 1,5,10 --save-topk 20)
           [[ "$suffix" == "_no_ref" ]] && args+=(--exclude-query-reference)
           exec "${args[@]}"
@@ -502,15 +541,22 @@ run_e5_evaluation() {
 }
 
 final_audit() {
-  "$PYTHON_BIN" - "$FINAL_RECORDS" "$E5_ROOT" "$IMAGEBIND_ASSEMBLY/records.jsonl" "$OUT_ROOT/common_query_audit.json" <<'PY'
+  "$PYTHON_BIN" - "$FINAL_RECORDS" "$E5_ROOT" "$E5_EVAL_ROOT" "$IMAGEBIND_ASSEMBLY/records.jsonl" "$OUT_ROOT/common_query_audit.json" <<'PY'
 import json, pathlib, sys
-final_path, e5_root, imagebind_records, output = map(pathlib.Path, sys.argv[1:])
+final_path, e5_root, e5_eval_root, imagebind_records, output = map(pathlib.Path, sys.argv[1:])
 load = lambda p: [json.loads(line) for line in p.read_text().splitlines() if line.strip()]
 sid = lambda row: str(row.get("sample_id") or row.get("proposal_id") or "")
 final_ids = {sid(row) for row in load(final_path)}
 sets = {"imagebind": {sid(row) for row in load(imagebind_records)}}
 for mode in ("T_only_fullAV", "V_only", "A_only", "V_T", "A_T", "V_A", "V_A_T"):
     sets[f"e5_{mode}"] = {sid(row) for row in load(e5_root / f"cache_{mode}" / "eval_records.jsonl")}
+for seed in (13, 23, 42, 71, 101):
+    for mode in ("T_only_fullAV", "V_only", "A_only", "V_T", "A_T", "V_A", "V_A_T"):
+        suffixes = ("", "_no_ref") if mode in {"V_T", "V_A_T"} else ("",)
+        for suffix in suffixes:
+            name = f"{mode}{suffix}"
+            path = e5_eval_root / f"seed_{seed}" / f"eval_{name}" / "per_query_scores.jsonl"
+            sets[f"e5_eval_seed{seed}_{name}"] = {sid(row) for row in load(path)}
 common = set.intersection(*sets.values())
 payload = {
     "final_query_count": len(final_ids), "common_query_count": len(common),
