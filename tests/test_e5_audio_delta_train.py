@@ -515,6 +515,44 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertEqual("the mayor's remarks", records[0].new_audio)
             self.assertEqual("reference_negative", records[0].hard_negatives[0]["type"])
 
+    def test_prepare_resolves_stale_media_paths_from_explicit_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_run = root / "dataset_run"
+            dataset_run.mkdir()
+            media_root = root / "construction_data"
+            reference = media_root / "clips" / "source_a" / "reference.mp4"
+            target = media_root / "clips" / "source_a" / "target.mp4"
+            negative = media_root / "clips" / "source_b" / "negative.mp4"
+            for path in (reference, target, negative):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"video")
+
+            row = self._record(
+                "main_1",
+                source="source_a",
+                pair="pair_a",
+                negatives=[{"type": "visual_hard", "video": "clips/source_b/negative.mp4"}],
+            )
+            row["reference_video"] = "/retired/data/root/clips/source_a/reference.mp4"
+            row["target_video"] = "clips/source_a/target.mp4"
+            self._write_jsonl(dataset_run / "b_main_audio_cvr_triplets.jsonl", [row])
+
+            summary = prepare_records(
+                run_root=dataset_run,
+                output_dir=root / "records",
+                max_train_records=1,
+                max_eval_records=1,
+                media_roots=[media_root],
+                require_existing_media=True,
+            )
+            prepared = load_audio_delta_records(root / "records" / "eval.jsonl")[0]
+
+            self.assertEqual(str(reference.resolve()), prepared.reference_video)
+            self.assertEqual(str(target.resolve()), prepared.target_video)
+            self.assertEqual(str(negative.resolve()), prepared.hard_negatives[0]["video"])
+            self.assertEqual(0, summary["media_resolution"]["eval"]["unresolved_required_count"])
+
     def test_prepare_can_build_eval_gallery_with_random_distractors(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

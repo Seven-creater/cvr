@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import gc
 import hashlib
 import json
@@ -155,6 +155,8 @@ def prepare_records(
     local_same_source_candidates_path: str | Path | None = None,
     distractor_pool_path: str | Path | None = None,
     distractor_seed: int = 13,
+    media_roots: list[str | Path] | None = None,
+    require_existing_media: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     dataset_root = Path(run_root)
@@ -172,6 +174,17 @@ def prepare_records(
         train_records = train_records[:max_train_records]
     if max_eval_records > 0:
         eval_records = eval_records[:max_eval_records]
+    normalized_media_roots = [Path(root).expanduser().resolve() for root in (media_roots or [])]
+    train_records, train_media_resolution = _resolve_record_media_paths(
+        train_records,
+        normalized_media_roots,
+        require_existing=require_existing_media,
+    )
+    eval_records, eval_media_resolution = _resolve_record_media_paths(
+        eval_records,
+        normalized_media_roots,
+        require_existing=require_existing_media,
+    )
     train_path = output_root / "train.jsonl"
     eval_path = output_root / "eval.jsonl"
     _write_jsonl(train_path, [asdict(record) for record in train_records])
@@ -203,6 +216,12 @@ def prepare_records(
         "eval_count": len(eval_records),
         "train_paths": [str(path) for path in train_paths],
         "eval_paths": [str(path) for path in eval_paths],
+        "media_resolution": {
+            "roots": [str(path) for path in normalized_media_roots],
+            "train": train_media_resolution,
+            "eval": eval_media_resolution,
+            "require_existing_media": bool(require_existing_media),
+        },
         "outputs": {
             "train": str(train_path),
             "eval": str(eval_path),
@@ -1509,6 +1528,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pilot-only distractor pool JSONL. Defaults to the current run's annotation/segment manifests.",
     )
     prepare.add_argument("--distractor-seed", type=int, default=13)
+    prepare.add_argument(
+        "--media-root",
+        action="append",
+        default=[],
+        help="Root used to resolve relative or stale absolute media paths before writing E5 records. Repeat as needed.",
+    )
+    prepare.add_argument(
+        "--require-existing-media",
+        action="store_true",
+        help="Fail during preparation when a selected record's reference or target cannot be resolved.",
+    )
 
     prepare_omnicvr = subparsers.add_parser("prepare-omnicvr")
     prepare_omnicvr.add_argument("--annotation-path", required=True)
@@ -1730,6 +1760,8 @@ def main() -> None:
             local_same_source_candidates_path=args.local_same_source_candidates,
             distractor_pool_path=args.distractor_pool_path,
             distractor_seed=args.distractor_seed,
+            media_roots=args.media_root,
+            require_existing_media=args.require_existing_media,
             progress=progress,
         )
     elif args.command == "prepare-omnicvr":
@@ -4306,6 +4338,102 @@ def _load_records_from_paths(paths: list[str | Path]) -> list[AudioDeltaRecord]:
     for path in paths:
         records.extend(load_audio_delta_records(path))
     return records
+
+
+def _resolve_record_media_paths(
+    records: list[AudioDeltaRecord],
+    media_roots: list[Path],
+    *,
+    require_existing: bool,
+) -> tuple[list[AudioDeltaRecord], dict[str, Any]]:
+    resolved_records: list[AudioDeltaRecord] = []
+    resolved_count = 0
+    unresolved: list[dict[str, str]] = []
+    for record in records:
+        reference, reference_resolved = _resolve_media_from_roots(record.reference_video, media_roots)
+        target, target_resolved = _resolve_media_from_roots(record.target_video, media_roots)
+        resolved_count += int(reference_resolved) + int(target_resolved)
+        for role, original, was_resolved in (
+            ("reference", record.reference_video, reference_resolved),
+            ("target", record.target_video, target_resolved),
+        ):
+            if not was_resolved:
+                unresolved.append({"sample_id": record.sample_id, "role": role, "path": original})
+
+        hard_negatives: list[dict[str, str]] = []
+        for negative in record.hard_negatives:
+            normalized = dict(negative)
+            video = str(normalized.get("video") or "").strip()
+            if video:
+                resolved_video, was_resolved = _resolve_media_from_roots(video, media_roots)
+                if was_resolved:
+                    normalized["video"] = resolved_video
+                    resolved_count += 1
+            hard_negatives.append(normalized)
+
+        source_payload = dict(record.source_payload)
+        source_payload["reference_video"] = reference
+        source_payload["target_video"] = target
+        if "reference_path" in source_payload:
+            source_payload["reference_path"] = reference
+        if "target_path" in source_payload:
+            source_payload["target_path"] = target
+        resolved_records.append(
+            replace(
+                record,
+                reference_video=reference,
+                target_video=target,
+                hard_negatives=tuple(hard_negatives),
+                source_payload=source_payload,
+            )
+        )
+
+    if require_existing and unresolved:
+        examples = unresolved[:5]
+        raise FileNotFoundError(
+            f"failed to resolve {len(unresolved)} required record media path(s) "
+            f"from roots={[str(path) for path in media_roots]}; examples={examples}"
+        )
+    return resolved_records, {
+        "record_count": len(records),
+        "resolved_path_count": resolved_count,
+        "unresolved_required_count": len(unresolved),
+        "unresolved_required_examples": unresolved[:20],
+    }
+
+
+def _resolve_media_from_roots(raw_path: str, media_roots: list[Path]) -> tuple[str, bool]:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return raw, False
+    path = Path(raw).expanduser()
+    if path.is_file():
+        return str(path.resolve()), True
+
+    relative_candidates: list[Path] = []
+    if not path.is_absolute():
+        relative_candidates.append(path)
+    normalized_parts = tuple(part for part in path.parts if part not in {path.anchor, "/", "\\"})
+    for marker in ("clips", "raw", "raw_datasets"):
+        if marker in normalized_parts:
+            relative_candidates.append(Path(*normalized_parts[normalized_parts.index(marker) :]))
+    unique_candidates: list[Path] = []
+    seen: set[str] = set()
+    for candidate in relative_candidates:
+        key = candidate.as_posix()
+        if key not in seen:
+            seen.add(key)
+            unique_candidates.append(candidate)
+
+    for root in media_roots:
+        for relative in unique_candidates:
+            candidates = [root / relative]
+            if relative.parts and relative.parts[0] == root.name:
+                candidates.append(root / Path(*relative.parts[1:]))
+            for candidate in candidates:
+                if candidate.is_file():
+                    return str(candidate.resolve()), True
+    return raw, False
 
 
 def _dedupe_records(records: list[AudioDeltaRecord]) -> list[AudioDeltaRecord]:

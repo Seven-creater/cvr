@@ -275,6 +275,7 @@ PY
   "$PYTHON_BIN" -m app.e5_audio_delta_train prepare \
     --dataset-run-root "$DATASET_RUN_ROOT" --output-dir "$E5_RECORDS" \
     --train-path "$TRAIN_RECORDS" --eval-path "$FINAL_RECORDS" \
+    "${media_root_args[@]}" --require-existing-media \
     --max-train-records 0 --max-eval-records 0 \
     --eval-gallery-size 2000 --eval-gallery-protocol reference --distractor-seed 20260723 \
     > "$OUT_ROOT/logs/e5_prepare.log" 2>&1
