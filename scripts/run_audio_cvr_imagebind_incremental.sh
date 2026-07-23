@@ -163,19 +163,20 @@ for root in "${MEDIA_ROOTS[@]}"; do
 done
 
 run_workers() {
-  local kind="$1" inventory="$2" label="$3"
+  local media_inventory="$1" text_inventory="$2" label="$3"
   local shard_count="${#GPUS[@]}"
   OWN_PIDS=()
   MONITOR_PIDS=()
   for index in "${!GPUS[@]}"; do
     local gpu="${GPUS[$index]}"
-    local log="$OUT_ROOT/logs/${label}_${kind}_shard_${index}_of_${shard_count}.log"
+    local log="$OUT_ROOT/logs/${label}_both_shard_${index}_of_${shard_count}.log"
     OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 CUDA_VISIBLE_DEVICES="$gpu" \
       nice -n 10 "$PYTHON_BIN" -m app.audio_cvr_external_baseline cache-imagebind \
-        --inventory "$inventory" \
+        --inventory-kind both \
+        --media-inventory "$media_inventory" \
+        --text-inventory "$text_inventory" \
         --cache-root "$CACHE_ROOT" \
         --model-dir "$MODEL_DIR" \
-        --kind "$kind" \
         --shard-index "$index" \
         --shard-count "$shard_count" \
         --device cuda:0 \
@@ -184,7 +185,7 @@ run_workers() {
         > "$log" 2>&1 &
     local pid=$!
     OWN_PIDS+=("$pid")
-    echo "$pid" > "$OUT_ROOT/pids/${label}_${kind}_${index}.pid"
+    echo "$pid" > "$OUT_ROOT/pids/${label}_both_${index}.pid"
     monitor_own_worker "$pid" "$gpu" "$OUT_ROOT/logs/gpu_safety.log" &
     MONITOR_PIDS+=("$!")
   done
@@ -201,12 +202,15 @@ run_workers() {
 }
 
 run_inventory_cache() {
-  local inventory_dir="$1" label="$2"
-  run_workers media "$inventory_dir/media_inventory.jsonl" "$label"
-  # Text is much smaller, but remains sharded so every item has the same resume guarantees.
-  run_workers text "$inventory_dir/text_inventory.jsonl" "$label"
+  local inventory_dir="$1" label="$2" audit_inventory_dir="${3:-$1}"
+  local media_name="media_inventory.jsonl" text_name="text_inventory.jsonl"
+  if [[ "$label" == "final1000_delta" ]]; then
+    media_name="delta_media_inventory.jsonl"
+    text_name="delta_text_inventory.jsonl"
+  fi
+  run_workers "$inventory_dir/$media_name" "$inventory_dir/$text_name" "$label"
   "$PYTHON_BIN" -m app.audio_cvr_external_baseline audit-cache \
-    --inventory-dir "$inventory_dir" \
+    --inventory-dir "$audit_inventory_dir" \
     --cache-root "$CACHE_ROOT" \
     --output "$OUT_ROOT/${label}_cache_audit.json" \
     > "$OUT_ROOT/logs/${label}_cache_audit.log" 2>&1
@@ -253,8 +257,8 @@ final_args+=("${media_root_args[@]}")
   --output-dir "$DELTA_DIR" \
   > "$OUT_ROOT/logs/final_delta.log" 2>&1
 
-write_status "RUNNING" "final1000_delta_cache" "reusing pre516 cache and encoding only missing final items"
-run_inventory_cache "$FINAL_INVENTORY" "final1000"
+write_status "RUNNING" "final1000_delta_cache" "reusing pre516 cache and encoding only delta inventories"
+run_inventory_cache "$DELTA_DIR" "final1000_delta" "$FINAL_INVENTORY"
 
 write_status "RUNNING" "assemble" "assembling one common valid-query set and 2N target/reference gallery"
 assemble_args=(

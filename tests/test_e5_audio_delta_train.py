@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -208,6 +209,56 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertTrue((cache_dir / "eval_embeddings.npz").exists())
             self.assertTrue((cache_dir / "checkpoint_prefill_shard_000_of_002.json").exists())
             self.assertTrue((cache_dir / "checkpoint_prefill_shard_001_of_002.json").exists())
+
+    def test_checkpoint_only_assembly_does_not_load_encoder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records_dir = root / "records"
+            records_dir.mkdir()
+            rows = [self._record("sample_1", source="source_a", pair="pair_a")]
+            self._write_jsonl(records_dir / "train.jsonl", rows)
+            self._write_jsonl(records_dir / "eval.jsonl", rows)
+            self._write_jsonl(
+                records_dir / "eval_gallery.jsonl",
+                [
+                    {"gallery_id": "positive::sample_1", "video": "/tmp/sample_1_tgt.mp4", "kind": "positive"},
+                    {"gallery_id": "reference::sample_1", "video": "/tmp/sample_1_ref.mp4", "kind": "reference_negative"},
+                ],
+            )
+            cache_dir = root / "cache"
+            failure_dir = root / "current_failures"
+            cache_embeddings(
+                records_dir=records_dir,
+                output_dir=cache_dir,
+                encoder=DeterministicEncoder(),
+                skip_train=True,
+                checkpoint_embeddings=True,
+                checkpoint_prefill_only=True,
+                skip_persistent_encoding_failures=True,
+                encoding_failure_dir=failure_dir,
+            )
+            current_summary = cache_dir / "checkpoint_prefill_shard_000_of_001.json"
+            historical_payload = json.loads(current_summary.read_text(encoding="utf-8"))
+            historical_payload["encoding_failure_dir"] = str(root / "historical_failures")
+            historical_summary = cache_dir / "checkpoint_prefill_shard_001_of_002.json"
+            historical_summary.write_text(json.dumps(historical_payload), encoding="utf-8")
+            current_mtime = current_summary.stat().st_mtime
+            os.utime(historical_summary, (current_mtime - 10, current_mtime - 10))
+
+            with patch("app.e5_audio_delta_train.load_e5_encoder", side_effect=AssertionError("encoder must not load")):
+                summary = cache_embeddings(
+                    records_dir=records_dir,
+                    output_dir=cache_dir,
+                    skip_train=True,
+                    checkpoint_embeddings=True,
+                    assemble_from_checkpoints_only=True,
+                    skip_persistent_encoding_failures=True,
+                    encoding_failure_dir=failure_dir,
+                )
+
+            self.assertEqual("assemble_from_checkpoints_only", summary["mode"])
+            self.assertTrue((cache_dir / "eval_embeddings.npz").is_file())
+            self.assertEqual(1, summary["eval"]["record_count"])
 
     def test_persistent_gallery_failure_is_audited_and_masked(self) -> None:
         class BadGalleryEncoder:

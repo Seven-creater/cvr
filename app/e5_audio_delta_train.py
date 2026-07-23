@@ -418,6 +418,7 @@ def cache_embeddings(
     encoding_retries: int = 0,
     encoding_retry_wait_seconds: float = 2.0,
     checkpoint_prefill_only: bool = False,
+    assemble_from_checkpoints_only: bool = False,
     checkpoint_shard_index: int = 0,
     checkpoint_shard_count: int = 1,
     encoding_item_batch_size: int = 16,
@@ -429,11 +430,30 @@ def cache_embeddings(
     records_root = Path(records_dir)
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+    if checkpoint_prefill_only and assemble_from_checkpoints_only:
+        raise ValueError("checkpoint prefill and checkpoint-only assembly are mutually exclusive")
     if reuse_cache_from:
+        if assemble_from_checkpoints_only:
+            raise ValueError("checkpoint-only assembly cannot be combined with --reuse-cache-from")
         return _cache_embeddings_from_reuse(
             records_root=records_root,
             output_root=output_root,
             reuse_cache_root=Path(reuse_cache_from),
+            progress=progress,
+        )
+    if assemble_from_checkpoints_only:
+        if encoder is not None or mock_encoder:
+            raise ValueError("checkpoint-only assembly does not load or accept an encoder")
+        if not checkpoint_embeddings:
+            raise ValueError("checkpoint-only assembly requires --checkpoint-embeddings")
+        if local_segments > 0:
+            raise ValueError("checkpoint-only assembly currently requires --local-segments 0")
+        return _assemble_embeddings_from_checkpoints(
+            records_root=records_root,
+            output_root=output_root,
+            skip_train=skip_train,
+            skip_persistent_failures=skip_persistent_encoding_failures,
+            encoding_failure_dir=Path(encoding_failure_dir) if encoding_failure_dir else None,
             progress=progress,
         )
     pyav_error_compat = _ensure_pyav_error_compat()
@@ -1543,6 +1563,11 @@ def build_parser() -> argparse.ArgumentParser:
     cache.add_argument("--encoding-retries", type=int, default=0, help="Retries for transient EAGAIN/PyAV scaling failures.")
     cache.add_argument("--encoding-retry-wait-seconds", type=float, default=2.0)
     cache.add_argument("--checkpoint-prefill-only", action="store_true", help="Fill one deterministic checkpoint shard without assembling the final NPZ.")
+    cache.add_argument(
+        "--assemble-from-checkpoints-only",
+        action="store_true",
+        help="Assemble NPZ outputs from existing item checkpoints without loading the E5 encoder.",
+    )
     cache.add_argument("--checkpoint-shard-index", type=int, default=0)
     cache.add_argument("--checkpoint-shard-count", type=int, default=1)
     cache.add_argument("--encoding-item-batch-size", type=int, default=16)
@@ -1744,6 +1769,7 @@ def main() -> None:
             encoding_retries=args.encoding_retries,
             encoding_retry_wait_seconds=args.encoding_retry_wait_seconds,
             checkpoint_prefill_only=args.checkpoint_prefill_only,
+            assemble_from_checkpoints_only=args.assemble_from_checkpoints_only,
             checkpoint_shard_index=args.checkpoint_shard_index,
             checkpoint_shard_count=args.checkpoint_shard_count,
             encoding_item_batch_size=args.encoding_item_batch_size,
@@ -1878,6 +1904,141 @@ def main() -> None:
     else:
         raise ValueError(f"unknown command: {args.command}")
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+
+
+class _CheckpointOnlyEncoder:
+    def encode_document(self, _inputs: list[Any]) -> np.ndarray:
+        raise FileNotFoundError(
+            "an embedding checkpoint required for assembly is missing; resume checkpoint prefill before assembling"
+        )
+
+
+def _checkpoint_prefill_metadata(output_root: Path) -> tuple[dict[str, Any], Path, Path | None]:
+    summaries: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(output_root.glob("checkpoint_prefill_shard_*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid checkpoint prefill summary: {path}") from exc
+        if payload.get("mode") == "checkpoint_prefill_only":
+            summaries.append((path, payload))
+    if not summaries:
+        raise FileNotFoundError(f"no checkpoint prefill summaries found in: {output_root}")
+
+    checkpoint_roots = {str(Path(item["checkpoint_root"]).resolve()) for _, item in summaries}
+    if len(checkpoint_roots) != 1:
+        raise ValueError(f"checkpoint prefill summaries disagree on checkpoint root: {sorted(checkpoint_roots)}")
+    runtimes = [dict(item.get("runtime") or {}) for _, item in summaries]
+    fingerprint_fields = (
+        "model_path",
+        "video_audio_mode",
+        "query_input_mode",
+        "document_input_mode",
+        "video_fps",
+        "video_max_pixels",
+        "audio_media_cache_dir",
+    )
+    signatures = {
+        tuple(json.dumps(runtime.get(field), sort_keys=True, default=str) for field in fingerprint_fields)
+        for runtime in runtimes
+    }
+    if len(signatures) != 1:
+        raise ValueError("checkpoint prefill summaries were produced with incompatible encoder or input settings")
+    runtime = runtimes[0]
+    query_input_mode = _normalize_query_input_mode(str(runtime.get("query_input_mode") or "composed"))
+    document_input_mode = _normalize_document_input_mode(str(runtime.get("document_input_mode") or "video"))
+    checkpoint_root = Path(next(iter(checkpoint_roots)))
+    expected_root = _embedding_checkpoint_root(
+        output_root,
+        runtime_info=runtime,
+        query_input_mode=query_input_mode,
+        document_input_mode=document_input_mode,
+    ).resolve()
+    if checkpoint_root != expected_root:
+        raise ValueError(f"checkpoint root fingerprint mismatch: summary={checkpoint_root} expected={expected_root}")
+
+    # A resumed cache can contain historical summaries from earlier shard layouts.
+    # The newest summary describes the failure manifest used by the current pass.
+    _, latest_summary = max(summaries, key=lambda item: item[0].stat().st_mtime_ns)
+    failure_value = latest_summary.get("encoding_failure_dir")
+    failure_root = Path(str(failure_value)).resolve() if failure_value else None
+    return runtime, checkpoint_root, failure_root
+
+
+def _assemble_embeddings_from_checkpoints(
+    *,
+    records_root: Path,
+    output_root: Path,
+    skip_train: bool,
+    skip_persistent_failures: bool,
+    encoding_failure_dir: Path | None,
+    progress: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    runtime_info, checkpoint_root, recorded_failure_root = _checkpoint_prefill_metadata(output_root)
+    query_input_mode = _normalize_query_input_mode(str(runtime_info.get("query_input_mode") or "composed"))
+    document_input_mode = _normalize_document_input_mode(str(runtime_info.get("document_input_mode") or "video"))
+    failure_root = encoding_failure_dir or recorded_failure_root
+    if skip_persistent_failures and failure_root is None:
+        failure_root = output_root / "failed_embedding_payloads"
+    if recorded_failure_root and encoding_failure_dir and recorded_failure_root.resolve() != encoding_failure_dir.resolve():
+        raise ValueError(
+            f"checkpoint-only assembly failure root differs from prefill: "
+            f"prefill={recorded_failure_root} requested={encoding_failure_dir}"
+        )
+
+    train_records = load_audio_delta_records(records_root / "train.jsonl")
+    eval_records = load_audio_delta_records(records_root / "eval.jsonl")
+    eval_gallery = (
+        load_eval_gallery_items(records_root / "eval_gallery.jsonl")
+        if (records_root / "eval_gallery.jsonl").exists()
+        else []
+    )
+    encoder = _CheckpointOnlyEncoder()
+    common = {
+        "encoder": encoder,
+        "output_root": output_root,
+        "runtime_info": runtime_info,
+        "query_input_mode": query_input_mode,
+        "document_input_mode": document_input_mode,
+        "audio_media_cache_dir": runtime_info.get("audio_media_cache_dir"),
+        "local_segments": 0,
+        "local_segment_mode": "prompt",
+        "local_segment_cache_dir": None,
+        "segment_overlap": 0.0,
+        "checkpoint_embeddings": True,
+        "encoding_retries": 0,
+        "encoding_retry_wait_seconds": 0.0,
+        "skip_persistent_encoding_failures": skip_persistent_failures,
+        "encoding_failure_dir": str(failure_root) if failure_root else None,
+        "progress": progress,
+    }
+    if skip_train:
+        train_summary: dict[str, Any] = {"split": "train", "count": 0, "skipped": True}
+    else:
+        train_summary = _cache_split_embeddings(records=train_records, split="train", **common)
+    eval_summary = _cache_split_embeddings(
+        records=eval_records,
+        split="eval",
+        eval_gallery=eval_gallery,
+        **common,
+    )
+    summary = {
+        "mode": "assemble_from_checkpoints_only",
+        "records_dir": str(records_root),
+        "output_dir": str(output_root),
+        "checkpoint_root": str(checkpoint_root),
+        "runtime": runtime_info,
+        "skip_train": bool(skip_train),
+        "skip_persistent_encoding_failures": bool(skip_persistent_failures),
+        "encoding_failure_dir": str(failure_root) if failure_root else None,
+        "train": train_summary,
+        "eval": eval_summary,
+    }
+    (output_root / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return summary
 
 
 def _prefill_embedding_checkpoints(

@@ -16,6 +16,7 @@ from app.audio_cvr_external_baseline import (
     audit_cache,
     build_delta_inventory,
     cache_imagebind,
+    cache_imagebind_bundle,
     evaluate_embeddings,
     prepare_inventory,
     summarize_results,
@@ -134,6 +135,33 @@ class AudioCVRExternalBaselineTests(unittest.TestCase):
             self.assertTrue(audit["complete"])
             self.assertEqual(10, audit["media"]["complete_count"])
             self.assertEqual(2, audit["text"]["complete_count"])
+
+    def test_bundle_loads_imagebind_once_for_media_and_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            records, _ = self._fixture(root)
+            inventory = root / "inventory"
+            prepare_inventory(records, inventory, [root])
+            cache = root / "cache"
+            model = self._model_dir(root)
+            _FakeEncoder.init_count = 0
+            with mock.patch("app.audio_cvr_external_baseline.ImageBindEncoder", _FakeEncoder):
+                summary = cache_imagebind_bundle(
+                    inventory / "media_inventory.jsonl",
+                    inventory / "text_inventory.jsonl",
+                    cache,
+                    model,
+                    root,
+                    shard_index=0,
+                    shard_count=1,
+                    device="cpu",
+                    batch_size=2,
+                    retries=2,
+                )
+            self.assertEqual(1, _FakeEncoder.init_count)
+            self.assertEqual("both", summary["kind"])
+            self.assertEqual(12, summary["encoded_count"])
+            self.assertTrue(audit_cache(inventory, cache, root / "audit.json")["complete"])
 
     def test_delta_inventory_contains_only_new_items(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

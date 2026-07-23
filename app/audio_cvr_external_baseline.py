@@ -680,6 +680,7 @@ def cache_imagebind(
     device: str,
     batch_size: int,
     retries: int,
+    encoder: ImageBindEncoder | None = None,
 ) -> dict[str, Any]:
     if kind not in {"media", "text"}:
         raise ValueError(f"invalid cache kind: {kind}")
@@ -704,7 +705,6 @@ def cache_imagebind(
         else:
             pending.append((item, location, state))
 
-    encoder: ImageBindEncoder | None = None
     encoded_count = 0
     failed = 0
     for start in range(0, len(pending), max(1, batch_size)):
@@ -759,6 +759,72 @@ def cache_imagebind(
         "batch_size": batch_size,
     }
     _atomic_json(summary_path, summary)
+    return summary
+
+
+def cache_imagebind_bundle(
+    media_inventory_path: Path,
+    text_inventory_path: Path,
+    cache_root: Path,
+    model_dir: Path,
+    vendor_root: Path,
+    *,
+    shard_index: int,
+    shard_count: int,
+    device: str,
+    batch_size: int,
+    retries: int,
+) -> dict[str, Any]:
+    if not 0 <= shard_index < shard_count:
+        raise ValueError(f"invalid shard {shard_index}/{shard_count}")
+    media_rows = _load_jsonl(media_inventory_path)
+    text_rows = _load_jsonl(text_inventory_path)
+    has_selected_items = any(index % shard_count == shard_index for index in range(len(media_rows))) or any(
+        index % shard_count == shard_index for index in range(len(text_rows))
+    )
+    encoder = ImageBindEncoder(model_dir, device, vendor_root) if has_selected_items else None
+    media_summary = cache_imagebind(
+        media_inventory_path,
+        cache_root,
+        model_dir,
+        vendor_root,
+        kind="media",
+        shard_index=shard_index,
+        shard_count=shard_count,
+        device=device,
+        batch_size=batch_size,
+        retries=retries,
+        encoder=encoder,
+    )
+    text_summary = cache_imagebind(
+        text_inventory_path,
+        cache_root,
+        model_dir,
+        vendor_root,
+        kind="text",
+        shard_index=shard_index,
+        shard_count=shard_count,
+        device=device,
+        batch_size=batch_size,
+        retries=retries,
+        encoder=encoder,
+    )
+    summary = {
+        "kind": "both",
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "device": device,
+        "model_loaded": encoder is not None,
+        "media": media_summary,
+        "text": text_summary,
+        "encoded_count": int(media_summary["encoded_count"]) + int(text_summary["encoded_count"]),
+        "reused_count": int(media_summary["reused_count"]) + int(text_summary["reused_count"]),
+        "failed_count": int(media_summary["failed_count"]) + int(text_summary["failed_count"]),
+    }
+    _atomic_json(
+        cache_root / "shard_summaries" / f"both_shard_{shard_index:03d}_of_{shard_count:03d}.json",
+        summary,
+    )
     return summary
 
 
@@ -1319,7 +1385,9 @@ def build_parser() -> argparse.ArgumentParser:
     inventory.add_argument("--allow-missing-media", action="store_true")
 
     cache = subparsers.add_parser("cache-imagebind")
-    cache.add_argument("--inventory", type=Path, required=True)
+    cache.add_argument("--inventory", type=Path)
+    cache.add_argument("--media-inventory", type=Path)
+    cache.add_argument("--text-inventory", type=Path)
     cache.add_argument("--cache-root", type=Path, required=True)
     cache.add_argument("--model-dir", type=Path, required=True)
     cache.add_argument(
@@ -1327,7 +1395,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(__file__).resolve().parents[1] / "third_party" / "imagebind_5120b6bb",
     )
-    cache.add_argument("--kind", choices=("media", "text"), required=True)
+    cache.add_argument(
+        "--kind",
+        "--inventory-kind",
+        dest="inventory_kind",
+        choices=("media", "text", "both"),
+        required=True,
+    )
     cache.add_argument("--shard-index", type=int, required=True)
     cache.add_argument("--shard-count", type=int, required=True)
     cache.add_argument("--device", required=True)
@@ -1381,18 +1455,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             allow_missing_media=args.allow_missing_media,
         )
     elif args.command == "cache-imagebind":
-        payload = cache_imagebind(
-            args.inventory,
-            args.cache_root,
-            args.model_dir,
-            args.vendor_root,
-            kind=args.kind,
-            shard_index=args.shard_index,
-            shard_count=args.shard_count,
-            device=args.device,
-            batch_size=args.batch_size,
-            retries=args.encoding_retries,
-        )
+        if args.inventory_kind == "both":
+            if not args.media_inventory or not args.text_inventory:
+                raise ValueError("--inventory-kind both requires --media-inventory and --text-inventory")
+            payload = cache_imagebind_bundle(
+                args.media_inventory,
+                args.text_inventory,
+                args.cache_root,
+                args.model_dir,
+                args.vendor_root,
+                shard_index=args.shard_index,
+                shard_count=args.shard_count,
+                device=args.device,
+                batch_size=args.batch_size,
+                retries=args.encoding_retries,
+            )
+        else:
+            inventory_path = args.inventory or (
+                args.media_inventory if args.inventory_kind == "media" else args.text_inventory
+            )
+            if inventory_path is None:
+                raise ValueError("--inventory is required for a single ImageBind inventory kind")
+            payload = cache_imagebind(
+                inventory_path,
+                args.cache_root,
+                args.model_dir,
+                args.vendor_root,
+                kind=args.inventory_kind,
+                shard_index=args.shard_index,
+                shard_count=args.shard_count,
+                device=args.device,
+                batch_size=args.batch_size,
+                retries=args.encoding_retries,
+            )
     elif args.command == "prepare-delta":
         payload = build_delta_inventory(args.pre_inventory_dir, args.final_inventory_dir, args.output_dir)
     elif args.command == "audit-cache":
