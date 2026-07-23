@@ -397,7 +397,7 @@ def prepare_fixed_test_fill_review(
         roots = tuple(Path.cwd() for _ in paths)
 
     raw_rows: list[dict[str, Any]] = []
-    for priority, (path, media_root) in enumerate(zip(paths, roots, strict=True)):
+    for priority, (path, media_root) in enumerate(zip(paths, roots)):
         for row in _read_jsonl(path):
             normalized = _normalize_automatic_pool_row(row, input_path=path)
             normalized["fill_source_priority"] = int(priority)
@@ -2456,7 +2456,7 @@ def aggregate_final(
             scores_path = eval_dir / "per_query_scores.jsonl"
             if not summary_path.exists() or not scores_path.exists():
                 continue
-            mode = eval_dir.name.removeprefix("eval_")
+            mode = eval_dir.name[len("eval_") :] if eval_dir.name.startswith("eval_") else eval_dir.name
             runs[(seed, mode)] = {
                 "seed": seed,
                 "mode": mode,
