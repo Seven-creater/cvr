@@ -197,6 +197,7 @@ stop_recorded_omni() {
     done
     curl -fsS --max-time 2 "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1 && { echo "Omni port $port remains open" >&2; exit 4; }
   done
+  return 0
 }
 
 media_root_args=()
