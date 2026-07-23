@@ -160,7 +160,8 @@ run_review_pass() {
       --review-pass-id "$pass_id" "${pass1_args[@]}" \
       --repeat-review-fraction 0.20 --random-seed "$RANDOM_SEED" \
       --shard-index "$shard" --shard-count "$SHARD_COUNT" \
-      --timeout-seconds 240 --omni-retries 2 --resume \
+      --timeout-seconds 240 --omni-retries 2 \
+      --audio-review-max-seconds 3 --resume \
       > "$OUT_ROOT/logs/pass${pass_id}_shard_$(printf '%02d' "$shard").log" 2>&1 &
     running=$((running + 1))
     if (( running >= PARALLEL_JOBS )); then

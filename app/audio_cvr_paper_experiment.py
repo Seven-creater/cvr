@@ -5,10 +5,12 @@ from collections import Counter, defaultdict
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
 import statistics
+import subprocess
 import sys
 from typing import Any, Iterable
 
@@ -620,6 +622,7 @@ def review_benchmark_omni(
     shard_count: int = 1,
     timeout_seconds: float = 180.0,
     omni_retries: int = 2,
+    audio_review_max_seconds: float = 0.0,
     resume: bool = False,
     fail_on_error: bool = False,
 ) -> dict[str, Any]:
@@ -695,6 +698,40 @@ def review_benchmark_omni(
                 cache_dir=cache_root / "audio_only",
                 clip_id=f"{sample_id}_target",
             )
+            audio_review_window: dict[str, Any] = {}
+            if float(audio_review_max_seconds) > 0:
+                reference_start = _ave_review_audio_start(
+                    row,
+                    role="reference",
+                    max_seconds=float(audio_review_max_seconds),
+                )
+                target_start = _ave_review_audio_start(
+                    row,
+                    role="target",
+                    max_seconds=float(audio_review_max_seconds),
+                )
+                reference_audio = _trim_review_audio_cache(
+                    audio_path=reference_audio,
+                    cache_dir=cache_root / "audio_review_windows",
+                    sample_id=sample_id,
+                    role="reference",
+                    start_seconds=reference_start,
+                    max_seconds=float(audio_review_max_seconds),
+                )
+                target_audio = _trim_review_audio_cache(
+                    audio_path=target_audio,
+                    cache_dir=cache_root / "audio_review_windows",
+                    sample_id=sample_id,
+                    role="target",
+                    start_seconds=target_start,
+                    max_seconds=float(audio_review_max_seconds),
+                )
+                audio_review_window = {
+                    "max_seconds": float(audio_review_max_seconds),
+                    "reference_start_seconds": reference_start,
+                    "target_start_seconds": target_start,
+                    "purpose": "context_length_bounded_audio_only_verification",
+                }
             reference_silent = _extract_video_only_cache(
                 video_path=reference_path,
                 cache_dir=cache_root / "video_only",
@@ -772,6 +809,8 @@ def review_benchmark_omni(
                     "raw_context_verification": raw_context,
                 }
             )
+            if audio_review_window:
+                review["audio_review_window"] = audio_review_window
         except Exception as exc:
             if fail_on_error:
                 raise
@@ -2782,6 +2821,7 @@ def build_parser() -> argparse.ArgumentParser:
     automatic_review.add_argument("--shard-count", type=int, default=1)
     automatic_review.add_argument("--timeout-seconds", type=float, default=180.0)
     automatic_review.add_argument("--omni-retries", type=int, default=2)
+    automatic_review.add_argument("--audio-review-max-seconds", type=float, default=0.0)
     automatic_review.add_argument("--resume", action="store_true")
     automatic_review.add_argument("--fail-on-error", action="store_true")
 
@@ -2961,6 +3001,7 @@ def main() -> None:
             shard_count=args.shard_count,
             timeout_seconds=args.timeout_seconds,
             omni_retries=args.omni_retries,
+            audio_review_max_seconds=args.audio_review_max_seconds,
             resume=args.resume,
             fail_on_error=args.fail_on_error,
         )
@@ -4067,6 +4108,98 @@ def _existing_min_stage_confidence(row: dict[str, Any]) -> float:
             except (TypeError, ValueError):
                 pass
     return min(values) if values else 0.0
+
+
+def _ave_review_audio_start(
+    row: dict[str, Any],
+    *,
+    role: str,
+    max_seconds: float,
+    clip_seconds: float = 6.0,
+) -> float:
+    if role not in {"reference", "target"}:
+        raise ValueError("role must be reference or target")
+    window = min(float(clip_seconds), max(0.1, float(max_seconds)))
+    latest_start = max(0.0, float(clip_seconds) - window)
+    try:
+        clip_start = float(row.get(f"{role}_start_seconds") or 0.0)
+        event_start = float(row.get("ave_event_start") or 0.0) - clip_start
+        event_end = float(row.get("ave_event_end") or 0.0) - clip_start
+    except (TypeError, ValueError):
+        return 0.0
+
+    starts: list[float] = []
+    current = 0.0
+    while current <= latest_start + 1e-9:
+        starts.append(round(current, 6))
+        current += 0.5
+    overlaps = [
+        (
+            max(0.0, min(start + window, event_end) - max(start, event_start)),
+            start,
+        )
+        for start in starts
+    ]
+    if role == "target":
+        return max(overlaps, key=lambda value: (value[0], -value[1]))[1]
+    return min(overlaps, key=lambda value: (value[0], value[1]))[1]
+
+
+def _trim_review_audio_cache(
+    *,
+    audio_path: Path,
+    cache_dir: Path,
+    sample_id: str,
+    role: str,
+    start_seconds: float,
+    max_seconds: float,
+) -> Path:
+    stat = audio_path.stat()
+    key = json.dumps(
+        {
+            "path": str(audio_path.resolve()),
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+            "role": role,
+            "start_seconds": round(float(start_seconds), 6),
+            "max_seconds": round(float(max_seconds), 6),
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_id).strip("_") or "sample"
+    output_path = cache_dir / f"{safe_id}_{role}_{digest}.wav"
+    if output_path.is_file() and output_path.stat().st_size > 0:
+        return output_path
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp.wav")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{float(start_seconds):.3f}",
+        "-i",
+        str(audio_path),
+        "-t",
+        f"{float(max_seconds):.3f}",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(temp_path),
+    ]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if not temp_path.is_file() or temp_path.stat().st_size <= 0:
+            raise RuntimeError("ffmpeg produced an empty review audio window")
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+    return output_path
 
 
 def _resolve_media_path(media_root: Path, value: str) -> Path:

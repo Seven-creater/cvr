@@ -9,6 +9,7 @@ from app.audio_cvr_ave import (
     boundary_candidate,
     extract_youtube_ids,
 )
+from app.audio_cvr_paper_experiment import _ave_review_audio_start
 
 
 class AudioCvrAveTest(unittest.TestCase):
@@ -49,6 +50,22 @@ class AudioCvrAveTest(unittest.TestCase):
         self.assertEqual(
             extract_youtube_ids(rows),
             {"ZwJZo1k9jlA", "_yJcmmwiMcZ", "abcdefghijk"},
+        )
+
+    def test_review_audio_windows_keep_target_event_and_avoid_reference_event(self) -> None:
+        row = {
+            "reference_start_seconds": 0.0,
+            "target_start_seconds": 4.0,
+            "ave_event_start": 6.0,
+            "ave_event_end": 9.0,
+        }
+        self.assertEqual(
+            _ave_review_audio_start(row, role="reference", max_seconds=3.0),
+            0.0,
+        )
+        self.assertEqual(
+            _ave_review_audio_start(row, role="target", max_seconds=3.0),
+            2.0,
         )
 
 
