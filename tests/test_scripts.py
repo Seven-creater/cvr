@@ -1189,8 +1189,11 @@ class ScriptTests(unittest.TestCase):
 
         self.assertIn("prepare-fixed-test-fill-review", script)
         self.assertIn("finalize-fixed-test-fill", script)
-        self.assertIn("accepted_progress_*.jsonl", script)
-        self.assertIn("rejected_progress_*.jsonl", script)
+        self.assertIn('root.glob("ranked_*.jsonl")', script)
+        self.assertIn('root.glob("accepted_[0-9]*.jsonl")', script)
+        self.assertIn("candidate_unique=", script)
+        self.assertNotIn('root.glob("accepted_progress_*.jsonl")', script)
+        self.assertNotIn('root.glob("rejected_progress_*.jsonl")', script)
         self.assertIn("--review-pass-id", script)
         self.assertIn("--resume", script)
         self.assertIn("--exclude-path", script)
