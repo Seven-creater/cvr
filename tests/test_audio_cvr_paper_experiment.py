@@ -144,24 +144,38 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             preverified = self._automatic_row(
                 "preverified", "source_preverified", "pair_preverified", subtype="sound_event"
             )
-            preverified.update(
-                {
-                    "final_omni_accept": True,
-                    "local_gate_passed": True,
-                    "final_omni_verification": {"accept": True, "confidence": 0.9},
-                }
+            review_reject_preverified = self._automatic_row(
+                "review_reject",
+                "source_review_reject",
+                "pair_review_reject",
+                subtype="sound_event",
             )
+            for row in (preverified, review_reject_preverified):
+                row.update(
+                    {
+                        "final_omni_accept": True,
+                        "local_gate_passed": True,
+                        "final_omni_verification": {"accept": True, "confidence": 0.9},
+                    }
+                )
             fixed_path = root / "fixed.jsonl"
             candidate_path = root / "candidates.jsonl"
             preverified_path = root / "preverified.jsonl"
             pass1_path = root / "pass1.jsonl"
             pass2_path = root / "pass2.jsonl"
             self._write_jsonl(fixed_path, [fixed])
-            self._write_jsonl(candidate_path, [reviewed])
-            self._write_jsonl(preverified_path, [preverified])
+            review_reject_candidate = dict(review_reject_preverified)
+            self._write_jsonl(candidate_path, [reviewed, review_reject_candidate])
             self._write_jsonl(
-                pass1_path, [self._model_review("reviewed", subtype="music")]
+                preverified_path, [preverified, review_reject_preverified]
             )
+            first_reviews = [
+                self._model_review("reviewed", subtype="music"),
+                self._model_review("review_reject", subtype="sound_event"),
+            ]
+            first_reviews[1]["decision"] = "reject"
+            first_reviews[1]["reject_reasons"] = ["video_only_gate_failed"]
+            self._write_jsonl(pass1_path, first_reviews)
             second = self._model_review("reviewed", subtype="music")
             second["review_pass_id"] = 2
             second["decision"] = "reject"
@@ -175,17 +189,26 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
                 pass2_review_paths=[pass2_path],
                 preverified_candidate_paths=[preverified_path],
                 output_dir=root / "final",
-                target_count=3,
+                target_count=4,
                 max_speech_count=0,
-                sound_event_ratio=2 / 3,
+                sound_event_ratio=0.75,
                 repeat_review_fraction=1.0,
                 repeat_review_policy="audit_only",
+                allow_preverified_review_disagreement=True,
             )
 
             rows = self._read_jsonl(root / "final" / "test_main_1000.jsonl")
-            self.assertEqual({"fixed", "reviewed", "preverified"}, {row["sample_id"] for row in rows})
+            self.assertEqual(
+                {"fixed", "reviewed", "review_reject", "preverified"},
+                {row["sample_id"] for row in rows},
+            )
             selected = {row["sample_id"]: row for row in rows}
             self.assertTrue(selected["preverified"]["construction_preverified"])
+            self.assertTrue(selected["review_reject"]["independent_review_disagreement"])
+            self.assertEqual(
+                ["video_only_gate_failed"],
+                selected["review_reject"]["independent_review_reject_reasons"],
+            )
             self.assertEqual("audit_only", selected["reviewed"]["repeat_review_policy"])
             self.assertEqual("audit_only", manifest["repeat_review_policy"])
             self.assertEqual(1, manifest["review_agreement"]["disagreement_count"])

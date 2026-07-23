@@ -1291,6 +1291,7 @@ def finalize_fixed_test_fill(
     sound_event_ratio: float = 0.80,
     repeat_review_fraction: float = 0.20,
     repeat_review_policy: str = "gate",
+    allow_preverified_review_disagreement: bool = False,
     random_seed: int = 20260720,
 ) -> dict[str, Any]:
     """Extend a fixed test set with reviewed or construction-preverified candidates."""
@@ -1340,10 +1341,10 @@ def finalize_fixed_test_fill(
     preverified_by_id: dict[str, dict[str, Any]] = {}
     for row in preverified_rows:
         sample_id = _sample_id(row)
-        if not sample_id or sample_id in candidate_by_id or sample_id in preverified_by_id:
+        if not sample_id or sample_id in preverified_by_id:
             continue
         preverified_by_id[sample_id] = row
-    candidate_by_id.update(preverified_by_id)
+        candidate_by_id.setdefault(sample_id, row)
     repeat_ids = _deterministic_repeat_ids(
         [
             candidate_by_id[sample_id]
@@ -1365,6 +1366,20 @@ def finalize_fixed_test_fill(
                 continue
             reason = _construction_preverified_reject_reason(row)
             enriched = _row_with_construction_verification(row, reject_reason=reason)
+        elif (
+            first.get("decision") != "pass"
+            and allow_preverified_review_disagreement
+            and sample_id in preverified_by_id
+        ):
+            preverified = preverified_by_id[sample_id]
+            reason = _construction_preverified_reject_reason(preverified)
+            enriched = _row_with_construction_verification(
+                preverified, reject_reason=reason, review_disagreement=True
+            )
+            enriched["automatic_review_pass1"] = first
+            enriched["independent_review_reject_reasons"] = list(
+                first.get("reject_reasons") or []
+            )
         else:
             reason = _automatic_consensus_reject_reason(
                 first,
@@ -1440,6 +1455,9 @@ def finalize_fixed_test_fill(
         "max_speech_count": int(max_speech_count),
         "sound_event_ratio": float(sound_event_ratio),
         "repeat_review_policy": repeat_review_policy,
+        "allow_preverified_review_disagreement": bool(
+            allow_preverified_review_disagreement
+        ),
         "fixed_subtypes": dict(sorted(fixed_counts.items())),
         "eligible_subtypes": dict(
             sorted(Counter(_canonical_subtype(row) for row in consensus_rows).items())
@@ -1499,6 +1517,9 @@ def finalize_fixed_test_fill(
         "candidate_path": str(candidate_path),
         "preverified_candidate_paths": [str(path) for path in preverified_paths],
         "repeat_review_policy": repeat_review_policy,
+        "allow_preverified_review_disagreement": bool(
+            allow_preverified_review_disagreement
+        ),
         "test_target_count": int(target_count),
         "test_final_count": len(final_rows),
         "test_subtype_distribution": capacity_summary["final_subtypes"],
@@ -2184,7 +2205,7 @@ def _construction_preverified_reject_reason(row: dict[str, Any]) -> str:
 
 
 def _row_with_construction_verification(
-    row: dict[str, Any], *, reject_reason: str
+    row: dict[str, Any], *, reject_reason: str, review_disagreement: bool = False
 ) -> dict[str, Any]:
     output = dict(row)
     final_review = row.get("final_omni_verification")
@@ -2198,6 +2219,8 @@ def _row_with_construction_verification(
     output["human_validated"] = False
     output["model_verified"] = not bool(reject_reason)
     output["construction_preverified"] = True
+    output["independent_review_disagreement"] = bool(review_disagreement)
+    output["fill_source_priority"] = 100 if review_disagreement else 50
     output["automatic_review_consensus"] = None
     output["automatic_consensus_reasons"] = [reject_reason] if reject_reason else []
     output["repeat_review_policy"] = "not_selected_for_repeat_audit"
@@ -3040,6 +3063,9 @@ def build_parser() -> argparse.ArgumentParser:
     fixed_fill_finalize.add_argument(
         "--repeat-review-policy", choices=("gate", "audit_only"), default="gate"
     )
+    fixed_fill_finalize.add_argument(
+        "--allow-preverified-review-disagreement", action="store_true"
+    )
     fixed_fill_finalize.add_argument("--random-seed", type=int, default=20260720)
 
     split_audit = subparsers.add_parser("audit-training-splits")
@@ -3222,6 +3248,7 @@ def main() -> None:
             sound_event_ratio=args.sound_event_ratio,
             repeat_review_fraction=args.repeat_review_fraction,
             repeat_review_policy=args.repeat_review_policy,
+            allow_preverified_review_disagreement=args.allow_preverified_review_disagreement,
             random_seed=args.random_seed,
         )
     elif args.command == "audit-training-splits":
