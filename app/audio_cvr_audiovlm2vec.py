@@ -393,10 +393,12 @@ class Qwen2AudioCaptioner:
         prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
         inputs = self.processor(
             text=prompt,
-            audios=[waveform],
+            audio=[waveform],
             sampling_rate=16000,
             return_tensors="pt",
         )
+        if "input_features" not in inputs:
+            raise ValueError("Qwen2-Audio processor did not return audio features")
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
         with self.torch.inference_mode():
             generated = self.model.generate(
