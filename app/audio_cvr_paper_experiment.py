@@ -3885,7 +3885,18 @@ def _percentile(sorted_values: list[float], fraction: float) -> float:
 
 
 def _subtype(row: dict[str, Any]) -> str:
-    return str(row.get("b_subtype") or row.get("audio_delta_type") or "unknown")
+    explicit = row.get("b_subtype") or row.get("audio_delta_type") or row.get("difference_type")
+    if explicit:
+        return str(explicit)
+    difference = row.get("difference")
+    if isinstance(difference, dict):
+        return str(
+            difference.get("type")
+            or difference.get("subtype")
+            or difference.get("category")
+            or "unknown"
+        )
+    return "unknown"
 
 
 def _canonical_subtype(row: dict[str, Any]) -> str:
