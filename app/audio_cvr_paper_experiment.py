@@ -623,6 +623,7 @@ def review_benchmark_omni(
     timeout_seconds: float = 180.0,
     omni_retries: int = 2,
     audio_review_max_seconds: float = 0.0,
+    skip_review_errors: bool = False,
     resume: bool = False,
     fail_on_error: bool = False,
 ) -> dict[str, Any]:
@@ -814,14 +815,23 @@ def review_benchmark_omni(
         except Exception as exc:
             if fail_on_error:
                 raise
+            terminal_skip = bool(skip_review_errors)
             review = {
                 "sample_id": sample_id,
                 "reviewer_type": "omni",
                 "review_profile": AUTOMATIC_REVIEW_PROFILE,
                 "review_pass_id": int(review_pass_id),
                 "model": model,
-                "decision": "error",
-                "reject_reasons": [f"review_error:{type(exc).__name__}:{exc}"],
+                "decision": "reject" if terminal_skip else "error",
+                "reject_reasons": [
+                    (
+                        "review_skipped_after_error"
+                        if terminal_skip
+                        else "review_error"
+                    )
+                    + f":{type(exc).__name__}:{exc}"
+                ],
+                "terminal_review_error": terminal_skip,
             }
         _append_jsonl(output_file, review)
         decision_counts[str(review.get("decision") or "unknown")] += 1
@@ -2822,6 +2832,11 @@ def build_parser() -> argparse.ArgumentParser:
     automatic_review.add_argument("--timeout-seconds", type=float, default=180.0)
     automatic_review.add_argument("--omni-retries", type=int, default=2)
     automatic_review.add_argument("--audio-review-max-seconds", type=float, default=0.0)
+    automatic_review.add_argument(
+        "--skip-review-errors",
+        action="store_true",
+        help="Record exhausted review errors as terminal rejects instead of retryable errors.",
+    )
     automatic_review.add_argument("--resume", action="store_true")
     automatic_review.add_argument("--fail-on-error", action="store_true")
 
@@ -3002,6 +3017,7 @@ def main() -> None:
             timeout_seconds=args.timeout_seconds,
             omni_retries=args.omni_retries,
             audio_review_max_seconds=args.audio_review_max_seconds,
+            skip_review_errors=args.skip_review_errors,
             resume=args.resume,
             fail_on_error=args.fail_on_error,
         )
