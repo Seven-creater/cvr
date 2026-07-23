@@ -27,7 +27,7 @@ Usage: run_audio_cvr_fixed_test1000_fill.sh \
   --vgg-media-root PATH --legacy-media-root PATH --fresh-media-root PATH \
   --exclude-path TRAIN_OR_VAL_JSONL [--exclude-path ...] --out-root PATH
 
-The launcher waits for all VGG candidate shards, snapshots accepted progress,
+The launcher waits for all VGG candidate shards, snapshots final accepted rows,
 reviews only source-disjoint additions on four existing Omni endpoints, and
 freezes an immutable Test1000. It never starts or stops Omni services.
 EOF
@@ -99,27 +99,36 @@ trap cleanup EXIT INT TERM
 progress_counts() {
   python3 - "$VGG_RUN" <<'PY'
 from pathlib import Path
+import json
 import sys
 root = Path(sys.argv[1]) / "b_shards"
-def lines(paths):
-    total = 0
+
+def proposal_ids(paths):
+    ids = set()
     for path in paths:
-        with path.open("rb") as handle:
-            total += sum(1 for _ in handle)
-    return total
-candidate = lines(root.glob("b_shard_*.jsonl"))
-accepted = lines(root.glob("accepted_progress_*.jsonl"))
-rejected = lines(root.glob("rejected_progress_*.jsonl"))
-print(candidate, accepted, rejected)
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                key = str(row.get("proposal_id") or row.get("candidate_id") or "").strip()
+                if key:
+                    ids.add(key)
+    return ids
+
+candidates = proposal_ids(root.glob("b_shard_*.jsonl"))
+ranked = proposal_ids(root.glob("ranked_*.jsonl"))
+accepted = proposal_ids(root.glob("accepted_[0-9]*.jsonl"))
+rejected = proposal_ids(root.glob("rejected_[0-9]*.jsonl"))
+print(len(candidates), len(ranked), len(accepted), len(rejected), len(accepted & rejected))
 PY
 }
 
 write_status "RUNNING" "waiting_vgg" "waiting for all VGG candidate progress to be durable"
 while true; do
-  read -r candidate accepted rejected < <(progress_counts)
-  reviewed=$((accepted + rejected))
-  write_status "RUNNING" "waiting_vgg" "candidate=$candidate reviewed=$reviewed accepted=$accepted rejected=$rejected"
-  if (( candidate > 0 && reviewed >= candidate )); then break; fi
+  read -r candidate ranked accepted rejected overlap < <(progress_counts)
+  write_status "RUNNING" "waiting_vgg" "candidate_unique=$candidate ranked_unique=$ranked final_accepted_unique=$accepted final_rejected_unique=$rejected terminal_overlap=$overlap"
+  if (( candidate > 0 && ranked >= candidate )); then break; fi
   sleep "$WAIT_SECONDS"
 done
 
@@ -129,7 +138,7 @@ from pathlib import Path
 import json, os, sys, tempfile
 root, output = Path(sys.argv[1]) / "b_shards", Path(sys.argv[2])
 rows = {}
-for path in sorted(root.glob("accepted_progress_*.jsonl")):
+for path in sorted(root.glob("accepted_[0-9]*.jsonl")):
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip(): continue
         row = json.loads(line)
