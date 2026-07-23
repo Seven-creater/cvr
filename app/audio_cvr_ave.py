@@ -413,7 +413,15 @@ def prepare_ave_boundary_pool(
         if (candidate := boundary_candidate(annotation, clip_seconds=clip_seconds)) is not None
     ]
     candidates.sort(key=lambda item: _candidate_sort_key(item, int(random_seed)))
-    selected = candidates[: max(0, int(max_candidates))]
+    unique_candidates: list[BoundaryCandidate] = []
+    seen_video_ids: set[str] = set()
+    for candidate in candidates:
+        video_id = candidate.annotation.video_id
+        if video_id in seen_video_ids:
+            continue
+        seen_video_ids.add(video_id)
+        unique_candidates.append(candidate)
+    selected = unique_candidates[: max(0, int(max_candidates))]
 
     _write_jsonl_atomic(
         output_root / "selected_boundary_candidates.jsonl",
@@ -485,6 +493,8 @@ def prepare_ave_boundary_pool(
         "annotation_count_non_speech_with_media": len(annotations),
         "excluded_youtube_id_count": len(excluded_video_ids),
         "boundary_eligible_count": len(candidates),
+        "boundary_eligible_unique_source_count": len(unique_candidates),
+        "duplicate_source_candidates_dropped": len(candidates) - len(unique_candidates),
         "selected_count": len(selected),
         "successful_candidate_count": len(rows),
         "clip_failure_count": len(failures),
