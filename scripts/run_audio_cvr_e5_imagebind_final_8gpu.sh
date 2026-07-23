@@ -20,6 +20,7 @@ GPU_IDS="0,1,2,3,4,5,6,7"
 FINAL_SEEDS="13,23,42,71,101"
 EXPECTED_PRE_SHA256="6f4f17aada3967a72ee0eaf5305c9f3a8fd5dc3ab76f6b867e94f37766977db1"
 EXPECTED_FINAL_SHA256=""
+EXPECTED_FINAL_SUBTYPES="sound_event=800,music=200"
 EXPECTED_PRE_MEDIA=1044
 EXPECTED_PRE_TEXT=469
 WAIT_SECONDS=60
@@ -73,6 +74,7 @@ while [[ $# -gt 0 ]]; do
     --final-seeds) FINAL_SEEDS="$2"; shift 2 ;;
     --expected-pre-sha256) EXPECTED_PRE_SHA256="$2"; shift 2 ;;
     --expected-final-sha256) EXPECTED_FINAL_SHA256="$2"; shift 2 ;;
+    --expected-final-subtypes) EXPECTED_FINAL_SUBTYPES="$2"; shift 2 ;;
     --expected-pre-media) EXPECTED_PRE_MEDIA="$2"; shift 2 ;;
     --expected-pre-text) EXPECTED_PRE_TEXT="$2"; shift 2 ;;
     --media-root) MEDIA_ROOTS+=("$2"); shift 2 ;;
@@ -245,7 +247,7 @@ PY
     --output-dir "$OUT_ROOT/split_audit" > "$OUT_ROOT/logs/split_audit.log" 2>&1
 
   final_args=(--records "$FINAL_RECORDS" --output-dir "$FINAL_INVENTORY" "${media_root_args[@]}" \
-    --expected-count 1000 --expected-subtypes sound_event=800,music=200 \
+    --expected-count 1000 --expected-subtypes "$EXPECTED_FINAL_SUBTYPES" \
     --inherited-records "$PRE_RECORDS" --require-unique-source-pair)
   [[ -n "$EXPECTED_FINAL_SHA256" ]] && final_args+=(--expected-sha256 "$EXPECTED_FINAL_SHA256")
   "$PYTHON_BIN" -m app.audio_cvr_external_baseline prepare-inventory "${final_args[@]}" \
