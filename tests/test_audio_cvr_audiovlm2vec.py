@@ -97,6 +97,31 @@ class AudioCVRAudioVLM2VecTests(unittest.TestCase):
         self.assertEqual(4, with_ref["candidate_count_min"])
         self.assertEqual(3, without_ref["candidate_count_min"])
 
+    def test_missing_sample_id_uses_stable_proposal_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            reference = root / "reference.mp4"
+            target = root / "target.mp4"
+            reference.write_bytes(b"reference")
+            target.write_bytes(b"target")
+            source = root / "test.jsonl"
+            _write_jsonl(
+                source,
+                [
+                    {
+                        "proposal_id": "proposal_stable_001",
+                        "reference_video": reference.name,
+                        "target_video": target.name,
+                        "edit_text": "add a bell sound",
+                    }
+                ],
+            )
+            output = root / "prepared"
+            _audio_cvr_records(source, output, [root], split_name="test", expected_count=1)
+            record = json.loads((output / "test_records.jsonl").read_text().splitlines()[0])
+            self.assertEqual("proposal_stable_001", record["sample_id"])
+            self.assertEqual("proposal_stable_001", record["record_id"])
+
     def test_prompts_keep_modes_scientifically_distinct(self) -> None:
         common = {
             "dataset": "audiocvr",

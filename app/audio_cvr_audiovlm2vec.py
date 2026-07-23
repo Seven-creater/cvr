@@ -137,7 +137,15 @@ def _audio_cvr_records(
     source_rows = _load_jsonl(input_path)
     if expected_count is not None and len(source_rows) != expected_count:
         raise ValueError(f"{input_path}: expected {expected_count} rows, found {len(source_rows)}")
-    sample_ids = [str(row.get("sample_id") or "").strip() for row in source_rows]
+    sample_ids = [
+        str(
+            row.get("sample_id")
+            or row.get("proposal_id")
+            or row.get("candidate_id")
+            or ""
+        ).strip()
+        for row in source_rows
+    ]
     if any(not value for value in sample_ids):
         raise ValueError(f"{input_path}: sample_id values must be non-empty")
     sample_counts = Counter(sample_ids)
