@@ -132,6 +132,64 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             self.assertEqual(0, manifest["leakage_audit"]["violation_count"])
             self.assertFalse(manifest["selection_uses_model_scores"])
 
+    def test_fixed_test_fill_can_audit_repeat_reviews_and_use_construction_preverified_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixed = self._automatic_row(
+                "fixed", "source_fixed", "pair_fixed", subtype="sound_event"
+            )
+            reviewed = self._automatic_row(
+                "reviewed", "source_reviewed", "pair_reviewed", subtype="music"
+            )
+            preverified = self._automatic_row(
+                "preverified", "source_preverified", "pair_preverified", subtype="sound_event"
+            )
+            preverified.update(
+                {
+                    "final_omni_accept": True,
+                    "local_gate_passed": True,
+                    "final_omni_verification": {"accept": True, "confidence": 0.9},
+                }
+            )
+            fixed_path = root / "fixed.jsonl"
+            candidate_path = root / "candidates.jsonl"
+            preverified_path = root / "preverified.jsonl"
+            pass1_path = root / "pass1.jsonl"
+            pass2_path = root / "pass2.jsonl"
+            self._write_jsonl(fixed_path, [fixed])
+            self._write_jsonl(candidate_path, [reviewed])
+            self._write_jsonl(preverified_path, [preverified])
+            self._write_jsonl(
+                pass1_path, [self._model_review("reviewed", subtype="music")]
+            )
+            second = self._model_review("reviewed", subtype="music")
+            second["review_pass_id"] = 2
+            second["decision"] = "reject"
+            second["reject_reasons"] = ["sampled_repeat_disagreement"]
+            self._write_jsonl(pass2_path, [second])
+
+            manifest = finalize_fixed_test_fill(
+                fixed_test_path=fixed_path,
+                candidate_path=candidate_path,
+                pass1_review_paths=[pass1_path],
+                pass2_review_paths=[pass2_path],
+                preverified_candidate_paths=[preverified_path],
+                output_dir=root / "final",
+                target_count=3,
+                max_speech_count=0,
+                sound_event_ratio=2 / 3,
+                repeat_review_fraction=1.0,
+                repeat_review_policy="audit_only",
+            )
+
+            rows = self._read_jsonl(root / "final" / "test_main_1000.jsonl")
+            self.assertEqual({"fixed", "reviewed", "preverified"}, {row["sample_id"] for row in rows})
+            selected = {row["sample_id"]: row for row in rows}
+            self.assertTrue(selected["preverified"]["construction_preverified"])
+            self.assertEqual("audit_only", selected["reviewed"]["repeat_review_policy"])
+            self.assertEqual("audit_only", manifest["repeat_review_policy"])
+            self.assertEqual(1, manifest["review_agreement"]["disagreement_count"])
+
     def test_prepare_training_subset_filters_non_speech_and_preserves_holdout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

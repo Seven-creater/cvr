@@ -1283,26 +1283,36 @@ def finalize_fixed_test_fill(
     candidate_path: str | Path,
     pass1_review_paths: Iterable[str | Path],
     pass2_review_paths: Iterable[str | Path],
+    preverified_candidate_paths: Iterable[str | Path] = (),
     output_dir: str | Path,
     exclude_paths: Iterable[str | Path] = (),
     target_count: int = 1000,
     max_speech_count: int = 50,
     sound_event_ratio: float = 0.80,
     repeat_review_fraction: float = 0.20,
+    repeat_review_policy: str = "gate",
     random_seed: int = 20260720,
 ) -> dict[str, Any]:
-    """Extend a fixed test set with source-disjoint Omni-consensus candidates."""
+    """Extend a fixed test set with reviewed or construction-preverified candidates."""
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     fixed_path = Path(fixed_test_path)
     fixed_original = _read_jsonl(fixed_path)
     candidates = _read_jsonl(Path(candidate_path))
+    preverified_paths = tuple(Path(path) for path in preverified_candidate_paths)
+    preverified_rows = [
+        _normalize_automatic_pool_row(row, input_path=path)
+        for path in preverified_paths
+        for row in _read_jsonl(path)
+    ]
     if not fixed_original or not candidates:
         raise ValueError("fixed-test finalization requires non-empty fixed test and candidates")
     if int(target_count) < len(fixed_original):
         raise ValueError("target_count cannot be smaller than the fixed test")
     if not 0.0 <= float(sound_event_ratio) <= 1.0:
         raise ValueError("sound_event_ratio must be in [0, 1]")
+    if repeat_review_policy not in {"gate", "audit_only"}:
+        raise ValueError("repeat_review_policy must be gate or audit_only")
 
     fixed_normalized = [
         _normalize_automatic_pool_row(row, input_path=fixed_path) for row in fixed_original
@@ -1327,6 +1337,13 @@ def finalize_fixed_test_fill(
     if not pass1:
         raise ValueError("fixed-test fill finalization requires pass-1 reviews")
     candidate_by_id = {_sample_id(row): row for row in candidates}
+    preverified_by_id: dict[str, dict[str, Any]] = {}
+    for row in preverified_rows:
+        sample_id = _sample_id(row)
+        if not sample_id or sample_id in candidate_by_id or sample_id in preverified_by_id:
+            continue
+        preverified_by_id[sample_id] = row
+    candidate_by_id.update(preverified_by_id)
     repeat_ids = _deterministic_repeat_ids(
         [
             candidate_by_id[sample_id]
@@ -1343,17 +1360,24 @@ def finalize_fixed_test_fill(
     for sample_id, row in candidate_by_id.items():
         first = pass1.get(sample_id)
         if first is None:
-            rejection_counts["missing_pass1_review"] += 1
-            continue
-        reason = _automatic_consensus_reject_reason(
-            first, pass2.get(sample_id), repeated=sample_id in repeat_ids
-        )
-        enriched = _row_with_automatic_review(
-            row, first, pass2.get(sample_id), consensus_reason=reason
-        )
+            if sample_id not in preverified_by_id:
+                rejection_counts["missing_pass1_review"] += 1
+                continue
+            reason = _construction_preverified_reject_reason(row)
+            enriched = _row_with_construction_verification(row, reject_reason=reason)
+        else:
+            reason = _automatic_consensus_reject_reason(
+                first,
+                pass2.get(sample_id),
+                repeated=sample_id in repeat_ids and repeat_review_policy == "gate",
+            )
+            enriched = _row_with_automatic_review(
+                row, first, pass2.get(sample_id), consensus_reason=reason
+            )
+            enriched["repeat_review_policy"] = repeat_review_policy
         if reason:
             rejection_counts[reason] += 1
-            if _automatic_review_is_diagnostic(first, pass2.get(sample_id)):
+            if first is None or _automatic_review_is_diagnostic(first, pass2.get(sample_id)):
                 diagnostic_rows.append(enriched)
             continue
         if _row_overlaps_identities(enriched, protected_identities):
@@ -1405,6 +1429,8 @@ def finalize_fixed_test_fill(
         "target_count": int(target_count),
         "fixed_test_count": len(fixed_original),
         "exclude_paths": [str(path) for path in protected_paths],
+        "preverified_candidate_paths": [str(path) for path in preverified_paths],
+        "preverified_candidate_count": len(preverified_by_id),
         "protected_exclude_count": len(protected_rows),
         "candidate_count": len(candidates),
         "consensus_eligible_count": len(consensus_rows),
@@ -1413,6 +1439,7 @@ def finalize_fixed_test_fill(
         "shortfall": max(0, int(target_count) - len(final_rows)),
         "max_speech_count": int(max_speech_count),
         "sound_event_ratio": float(sound_event_ratio),
+        "repeat_review_policy": repeat_review_policy,
         "fixed_subtypes": dict(sorted(fixed_counts.items())),
         "eligible_subtypes": dict(
             sorted(Counter(_canonical_subtype(row) for row in consensus_rows).items())
@@ -1470,6 +1497,8 @@ def finalize_fixed_test_fill(
         "fixed_test_count": len(fixed_original),
         "exclude_paths": [str(path) for path in protected_paths],
         "candidate_path": str(candidate_path),
+        "preverified_candidate_paths": [str(path) for path in preverified_paths],
+        "repeat_review_policy": repeat_review_policy,
         "test_target_count": int(target_count),
         "test_final_count": len(final_rows),
         "test_subtype_distribution": capacity_summary["final_subtypes"],
@@ -2114,6 +2143,88 @@ def _row_with_automatic_review(
     else:
         output["split_tier"] = "diagnostic"
         output["benchmark_eligible"] = False
+    return output
+
+
+def _construction_preverified_reject_reason(row: dict[str, Any]) -> str:
+    """Validate a prior B-line acceptance without pretending it is a repeat review."""
+    if _canonical_subtype(row) not in {"sound_event", "music"}:
+        return "construction_preverified_non_speech_only"
+    if not _truthy(row.get("final_omni_accept")):
+        return "construction_final_omni_not_accepted"
+    if not _truthy(row.get("local_gate_passed")):
+        return "construction_local_gate_failed"
+    if _truthy(row.get("fallback")) or _truthy(row.get("fallback_used")):
+        return "construction_fallback_used"
+
+    audio = row.get("audio_only_verification")
+    if not isinstance(audio, dict) or not _truthy(audio.get("accept")):
+        return "construction_audio_only_not_accepted"
+    if _truthy(audio.get("reference_satisfies_edit")):
+        return "construction_reference_satisfies_edit"
+    if not _truthy(audio.get("target_satisfies_edit")):
+        return "construction_target_does_not_satisfy_edit"
+    if not _truthy(audio.get("edit_text_audio_only")):
+        return "construction_edit_not_audio_only"
+
+    video = row.get("video_only_shortcut")
+    if not isinstance(video, dict):
+        return "construction_video_only_review_missing"
+    if _truthy(video.get("can_identify_target_without_audio")):
+        return "construction_video_only_shortcut"
+    if not _truthy(video.get("visual_context_preserved")):
+        return "construction_visual_context_not_preserved"
+
+    full_av = row.get("full_av_consistency")
+    if not isinstance(full_av, dict) or not _truthy(full_av.get("accept")):
+        return "construction_full_av_not_accepted"
+    if not _truthy(full_av.get("audio_edit_still_valid")):
+        return "construction_audio_edit_invalid_in_full_av"
+    return ""
+
+
+def _row_with_construction_verification(
+    row: dict[str, Any], *, reject_reason: str
+) -> dict[str, Any]:
+    output = dict(row)
+    final_review = row.get("final_omni_verification")
+    final_review = final_review if isinstance(final_review, dict) else {}
+    local_report = row.get("local_gate_report")
+    local_report = local_report if isinstance(local_report, dict) else {}
+    output["reviewer_type"] = "omni_construction_pipeline"
+    output["review_profile"] = str(
+        row.get("acceptance_profile") or "b_audio_blind_review_v2"
+    )
+    output["human_validated"] = False
+    output["model_verified"] = not bool(reject_reason)
+    output["construction_preverified"] = True
+    output["automatic_review_consensus"] = None
+    output["automatic_consensus_reasons"] = [reject_reason] if reject_reason else []
+    output["repeat_review_policy"] = "not_selected_for_repeat_audit"
+    output["min_stage_confidence"] = min(
+        float(row.get("confidence") or 0.0),
+        float(final_review.get("confidence") or 0.0),
+    )
+    output["video_context_strength"] = float(
+        row.get("video_context_strength")
+        or final_review.get("video_context_strength")
+        or local_report.get("video_context_strength")
+        or 0.0
+    )
+    output["recomputed_asr_risk"] = float(
+        row.get("asr_degeneracy_risk")
+        or final_review.get("asr_degeneracy_risk")
+        or local_report.get("asr_degeneracy_risk")
+        or 0.0
+    )
+    output["transcript_like"] = False
+    output["full_av_required"] = True
+    if reject_reason:
+        output["split_tier"] = "diagnostic"
+        output["benchmark_eligible"] = False
+    else:
+        output["split_tier"] = "main"
+        output["benchmark_eligible"] = True
     return output
 
 
@@ -2916,13 +3027,19 @@ def build_parser() -> argparse.ArgumentParser:
     fixed_fill_finalize.add_argument("--fixed-test-path", required=True)
     fixed_fill_finalize.add_argument("--candidate-path", required=True)
     fixed_fill_finalize.add_argument("--pass1-review-path", action="append", required=True)
-    fixed_fill_finalize.add_argument("--pass2-review-path", action="append", required=True)
+    fixed_fill_finalize.add_argument("--pass2-review-path", action="append", default=[])
+    fixed_fill_finalize.add_argument(
+        "--preverified-candidate-path", action="append", default=[]
+    )
     fixed_fill_finalize.add_argument("--exclude-path", action="append", default=[])
     fixed_fill_finalize.add_argument("--output-dir", required=True)
     fixed_fill_finalize.add_argument("--target-count", type=int, default=1000)
     fixed_fill_finalize.add_argument("--max-speech-count", type=int, default=50)
     fixed_fill_finalize.add_argument("--sound-event-ratio", type=float, default=0.80)
     fixed_fill_finalize.add_argument("--repeat-review-fraction", type=float, default=0.20)
+    fixed_fill_finalize.add_argument(
+        "--repeat-review-policy", choices=("gate", "audit_only"), default="gate"
+    )
     fixed_fill_finalize.add_argument("--random-seed", type=int, default=20260720)
 
     split_audit = subparsers.add_parser("audit-training-splits")
@@ -3080,6 +3197,7 @@ def main() -> None:
             candidate_path=args.candidate_path,
             pass1_review_paths=args.pass1_review_path,
             pass2_review_paths=args.pass2_review_path,
+            preverified_candidate_paths=args.preverified_candidate_path,
             output_dir=args.output_dir,
             subtype_targets=_parse_named_ints(args.subtype_targets),
             validation_targets=_parse_named_ints(args.validation_targets),
@@ -3103,6 +3221,7 @@ def main() -> None:
             max_speech_count=args.max_speech_count,
             sound_event_ratio=args.sound_event_ratio,
             repeat_review_fraction=args.repeat_review_fraction,
+            repeat_review_policy=args.repeat_review_policy,
             random_seed=args.random_seed,
         )
     elif args.command == "audit-training-splits":
