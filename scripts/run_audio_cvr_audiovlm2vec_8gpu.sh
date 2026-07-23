@@ -403,9 +403,13 @@ payload = {
 assert not violations, payload
 PY
 
-tar -czf "$OUTPUT_DIR/audiovlm2vec_paper_results.tar.gz" \
-  -C "$OUTPUT_DIR" records/prepare_summary.json caption_audit.json embedding_audit.json \
-  zero_shot final_results task_adapters/*/train_summary.json task_adapters/*/loss_curve.jsonl
+(
+  cd "$OUTPUT_DIR"
+  tar -czf audiovlm2vec_paper_results.tar.gz \
+    records/prepare_summary.json caption_audit.json embedding_audit.json \
+    zero_shot final_results \
+    task_adapters/*/train_summary.json task_adapters/*/loss_curve.jsonl
+)
 
 write_status "COMPLETE" "complete" "Audio-CVR1000 and OmniCVR1000 independent VLM2Vec diagnostics complete"
 trap - EXIT INT TERM
