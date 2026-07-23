@@ -1184,6 +1184,20 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('f"candidate_{candidate_index:03d}.png"', helper)
         self.assertIn("src_ref_image_generation_manifest", script)
 
+    def test_fixed_test1000_fill_launcher_is_resumable_and_does_not_manage_omni(self) -> None:
+        script = Path("scripts/run_audio_cvr_fixed_test1000_fill.sh").read_text(encoding="utf-8")
+
+        self.assertIn("prepare-fixed-test-fill-review", script)
+        self.assertIn("finalize-fixed-test-fill", script)
+        self.assertIn("accepted_progress_*.jsonl", script)
+        self.assertIn("rejected_progress_*.jsonl", script)
+        self.assertIn("--review-pass-id", script)
+        self.assertIn("--resume", script)
+        self.assertIn("--exclude-path", script)
+        self.assertIn("never starts or stops Omni services", script)
+        self.assertNotIn("pkill", script)
+        self.assertNotIn("kill -", script)
+
 
 if __name__ == "__main__":
     unittest.main()

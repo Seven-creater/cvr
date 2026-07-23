@@ -16,8 +16,10 @@ from app.audio_cvr_paper_experiment import (
     audit_training_splits,
     finalize_automatic_benchmark,
     finalize_benchmark,
+    finalize_fixed_test_fill,
     prepare_automatic_benchmark_review,
     prepare_benchmark_review,
+    prepare_fixed_test_fill_review,
     prepare_paper_splits,
     prepare_training_subset,
     score_fusion,
@@ -27,6 +29,90 @@ from app.e5_audio_delta_train import _AudioDeltaAdapter, _import_torch
 
 
 class AudioCVRPaperExperimentTests(unittest.TestCase):
+    def test_fixed_test_fill_prepare_excludes_fixed_source_and_resolves_each_media_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixed = self._automatic_row("fixed", "source_fixed", "pair_fixed", subtype="sound_event")
+            overlap = self._automatic_row("overlap", "source_fixed", "pair_overlap", subtype="music")
+            protected = self._automatic_row("protected", "source_protected", "pair_protected", subtype="music")
+            protected_overlap = self._automatic_row(
+                "protected_overlap", "source_protected", "pair_other", subtype="sound_event"
+            )
+            candidate = self._automatic_row("candidate", "source_new", "pair_new", subtype="music")
+            candidate["reference_video"] = "clips/candidate_ref.mp4"
+            candidate["target_video"] = "clips/candidate_target.mp4"
+            fixed_path = root / "fixed.jsonl"
+            protected_path = root / "protected.jsonl"
+            input_path = root / "input.jsonl"
+            media_root = root / "media"
+            self._write_jsonl(fixed_path, [fixed])
+            self._write_jsonl(protected_path, [protected])
+            self._write_jsonl(input_path, [overlap, protected_overlap, candidate])
+
+            summary = prepare_fixed_test_fill_review(
+                fixed_test_path=fixed_path,
+                input_paths=[input_path],
+                input_media_roots=[media_root],
+                exclude_paths=[protected_path],
+                output_dir=root / "fill",
+            )
+
+            self.assertEqual(1, summary["review_candidate_count"])
+            self.assertEqual(2, summary["fixed_overlap_drop_counts"]["source_seen_in_fixed_or_protected"])
+            rows = self._read_jsonl(root / "fill" / "automatic_review_candidates.jsonl")
+            self.assertEqual("candidate", rows[0]["sample_id"])
+            self.assertEqual(str((media_root / "clips/candidate_ref.mp4").resolve()), rows[0]["reference_video"])
+            self.assertFalse(summary["selection_uses_model_scores"])
+
+    def test_fixed_test_fill_finalize_preserves_fixed_rows_and_caps_contextual_speech(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixed = [
+                self._automatic_row("fixed_sound", "source_fixed_sound", "pair_fixed_sound", subtype="sound_event"),
+                self._automatic_row("fixed_music", "source_fixed_music", "pair_fixed_music", subtype="music"),
+            ]
+            candidates = [
+                self._automatic_row("new_sound", "source_new_sound", "pair_new_sound", subtype="sound_event"),
+                self._automatic_row("new_music", "source_new_music", "pair_new_music", subtype="music"),
+                self._automatic_row(
+                    "new_speech",
+                    "source_new_speech",
+                    "pair_new_speech",
+                    subtype="speech_topic_in_video_context",
+                ),
+            ]
+            fixed_path = root / "fixed.jsonl"
+            candidate_path = root / "candidates.jsonl"
+            pass1_path = root / "pass1.jsonl"
+            pass2_path = root / "pass2.jsonl"
+            self._write_jsonl(fixed_path, fixed)
+            self._write_jsonl(candidate_path, candidates)
+            reviews = [
+                self._model_review(str(row["sample_id"]), subtype=str(row["b_subtype"]))
+                for row in candidates
+            ]
+            self._write_jsonl(pass1_path, reviews)
+            self._write_jsonl(pass2_path, reviews)
+
+            manifest = finalize_fixed_test_fill(
+                fixed_test_path=fixed_path,
+                candidate_path=candidate_path,
+                pass1_review_paths=[pass1_path],
+                pass2_review_paths=[pass2_path],
+                output_dir=root / "final",
+                target_count=5,
+                max_speech_count=1,
+                sound_event_ratio=0.8,
+                repeat_review_fraction=0.2,
+            )
+
+            final_rows = self._read_jsonl(root / "final" / "test_main_1000.jsonl")
+            self.assertEqual(5, len(final_rows))
+            self.assertEqual(["fixed_sound", "fixed_music"], [row["sample_id"] for row in final_rows[:2]])
+            self.assertEqual(1, manifest["test_subtype_distribution"]["speech_topic_in_video_context"])
+            self.assertEqual(0, manifest["leakage_audit"]["violation_count"])
+            self.assertFalse(manifest["selection_uses_model_scores"])
+
     def test_prepare_training_subset_filters_non_speech_and_preserves_holdout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

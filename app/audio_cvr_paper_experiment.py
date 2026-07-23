@@ -355,6 +355,141 @@ def prepare_automatic_benchmark_review(
     return summary
 
 
+def prepare_fixed_test_fill_review(
+    *,
+    fixed_test_path: str | Path,
+    input_paths: Iterable[str | Path],
+    output_dir: str | Path,
+    input_media_roots: Iterable[str | Path] | None = None,
+    exclude_paths: Iterable[str | Path] = (),
+    random_seed: int = 20260720,
+    max_per_source: int = 1,
+) -> dict[str, Any]:
+    """Prepare model-blind candidates that can extend an immutable test set."""
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    fixed_path = Path(fixed_test_path)
+    fixed_rows = _read_jsonl(fixed_path)
+    if not fixed_rows:
+        raise ValueError("fixed test input contains no records")
+    normalized_fixed = [
+        _normalize_automatic_pool_row(row, input_path=fixed_path) for row in fixed_rows
+    ]
+    fixed_identities = _identity_sets(normalized_fixed)
+    fixed_duplicate_audit = _within_split_duplicate_audit(normalized_fixed)
+    if fixed_duplicate_audit["violation_count"]:
+        raise ValueError(f"fixed test contains duplicate identities: {fixed_duplicate_audit}")
+    protected_paths = tuple(Path(path) for path in exclude_paths)
+    protected_rows = [
+        _normalize_automatic_pool_row(row, input_path=path)
+        for path in protected_paths
+        for row in _read_jsonl(path)
+    ]
+    protected_identities = _identity_sets(normalized_fixed + protected_rows)
+
+    paths = tuple(Path(path) for path in input_paths)
+    roots = tuple(Path(path) for path in (input_media_roots or ()))
+    if not paths:
+        raise ValueError("at least one --input-path is required")
+    if roots and len(roots) != len(paths):
+        raise ValueError("--input-media-root count must match --input-path count")
+    if not roots:
+        roots = tuple(Path.cwd() for _ in paths)
+
+    raw_rows: list[dict[str, Any]] = []
+    for priority, (path, media_root) in enumerate(zip(paths, roots, strict=True)):
+        for row in _read_jsonl(path):
+            normalized = _normalize_automatic_pool_row(row, input_path=path)
+            normalized["fill_source_priority"] = int(priority)
+            normalized["fill_source_path"] = str(path)
+            normalized["fill_media_root"] = str(media_root)
+            raw_rows.append(normalized)
+    if not raw_rows:
+        raise ValueError("fixed-test fill inputs contain no records")
+
+    filter_counts: Counter[str] = Counter()
+    filtered: list[dict[str, Any]] = []
+    for row in raw_rows:
+        reason = _automatic_pool_filter_reason(row)
+        if reason:
+            filter_counts[reason] += 1
+        else:
+            filtered.append(row)
+    deduplicated, duplicate_counts = _deduplicate_automatic_pool(
+        filtered, random_seed=int(random_seed)
+    )
+
+    overlap_counts: Counter[str] = Counter()
+    candidates: list[dict[str, Any]] = []
+    source_counts: Counter[str] = Counter()
+    for row in sorted(deduplicated, key=lambda item: _fixed_fill_priority(item, int(random_seed))):
+        overlap = _fixed_fill_overlap_reason(row, protected_identities)
+        if overlap:
+            overlap_counts[overlap] += 1
+            continue
+        source_id = _primary_source_id(row)
+        if source_counts[source_id] >= max(1, int(max_per_source)):
+            overlap_counts["duplicate_candidate_source"] += 1
+            continue
+        source_counts[source_id] += 1
+        candidates.append(_resolve_fill_media_paths(row))
+    if not candidates:
+        raise ValueError("no source-disjoint fixed-test fill candidates remain")
+
+    pool_path = output_root / "fill_candidate_pool_deduplicated.jsonl"
+    candidate_path = output_root / "automatic_review_candidates.jsonl"
+    provenance_path = output_root / "candidate_provenance.jsonl"
+    summary_path = output_root / "fill_pool_summary.json"
+    _write_jsonl(pool_path, candidates)
+    _write_jsonl(candidate_path, candidates)
+    _write_jsonl(
+        provenance_path,
+        [
+            {
+                "sample_id": _sample_id(row),
+                "pair_group_id": _pair_id(row),
+                "source_disjoint_group_id": _primary_source_id(row),
+                "dataset": _dataset(row),
+                "b_subtype": _canonical_subtype(row),
+                "input_path": row.get("fill_source_path"),
+                "input_priority": row.get("fill_source_priority"),
+            }
+            for row in candidates
+        ],
+    )
+    summary = {
+        "protocol": "audiocvr_fixed_test_fill_pool_v1",
+        "selection_uses_model_scores": False,
+        "fixed_test_path": str(fixed_path),
+        "fixed_test_count": len(normalized_fixed),
+        "exclude_paths": [str(path) for path in protected_paths],
+        "protected_exclude_count": len(protected_rows),
+        "input_paths": [str(path) for path in paths],
+        "input_media_roots": [str(path) for path in roots],
+        "input_count": len(raw_rows),
+        "post_filter_count": len(filtered),
+        "deduplicated_count": len(deduplicated),
+        "review_candidate_count": len(candidates),
+        "filter_rejection_counts": dict(sorted(filter_counts.items())),
+        "duplicate_drop_counts": dict(sorted(duplicate_counts.items())),
+        "fixed_overlap_drop_counts": dict(sorted(overlap_counts.items())),
+        "candidate_subtypes": dict(
+            sorted(Counter(_canonical_subtype(row) for row in candidates).items())
+        ),
+        "candidate_datasets": dict(sorted(Counter(_dataset(row) for row in candidates).items())),
+        "random_seed": int(random_seed),
+        "max_per_source": max(1, int(max_per_source)),
+        "outputs": {
+            "candidate_pool": str(pool_path),
+            "review_candidates": str(candidate_path),
+            "provenance": str(provenance_path),
+            "summary": str(summary_path),
+        },
+    }
+    _write_json(summary_path, summary)
+    return summary
+
+
 def _normalize_automatic_pool_row(row: dict[str, Any], *, input_path: Path) -> dict[str, Any]:
     normalized = dict(row)
     subtype = _canonical_subtype(normalized)
@@ -1050,6 +1185,229 @@ def finalize_automatic_benchmark(
     return manifest
 
 
+def finalize_fixed_test_fill(
+    *,
+    fixed_test_path: str | Path,
+    candidate_path: str | Path,
+    pass1_review_paths: Iterable[str | Path],
+    pass2_review_paths: Iterable[str | Path],
+    output_dir: str | Path,
+    exclude_paths: Iterable[str | Path] = (),
+    target_count: int = 1000,
+    max_speech_count: int = 50,
+    sound_event_ratio: float = 0.80,
+    repeat_review_fraction: float = 0.20,
+    random_seed: int = 20260720,
+) -> dict[str, Any]:
+    """Extend a fixed test set with source-disjoint Omni-consensus candidates."""
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    fixed_path = Path(fixed_test_path)
+    fixed_original = _read_jsonl(fixed_path)
+    candidates = _read_jsonl(Path(candidate_path))
+    if not fixed_original or not candidates:
+        raise ValueError("fixed-test finalization requires non-empty fixed test and candidates")
+    if int(target_count) < len(fixed_original):
+        raise ValueError("target_count cannot be smaller than the fixed test")
+    if not 0.0 <= float(sound_event_ratio) <= 1.0:
+        raise ValueError("sound_event_ratio must be in [0, 1]")
+
+    fixed_normalized = [
+        _normalize_automatic_pool_row(row, input_path=fixed_path) for row in fixed_original
+    ]
+    fixed_duplicate_audit = _within_split_duplicate_audit(fixed_normalized)
+    if fixed_duplicate_audit["violation_count"]:
+        raise ValueError(f"fixed test contains duplicate identities: {fixed_duplicate_audit}")
+    fixed_identities = _identity_sets(fixed_normalized)
+    protected_paths = tuple(Path(path) for path in exclude_paths)
+    protected_rows = [
+        _normalize_automatic_pool_row(row, input_path=path)
+        for path in protected_paths
+        for row in _read_jsonl(path)
+    ]
+    protected_identities = _identity_sets(fixed_normalized + protected_rows)
+
+    candidate_ids = [_sample_id(row) for row in candidates]
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise ValueError("fixed-test fill candidate pool contains duplicate sample_id values")
+    pass1 = _automatic_reviews_by_sample(_read_many_jsonl(pass1_review_paths))
+    pass2 = _automatic_reviews_by_sample(_read_many_jsonl(pass2_review_paths))
+    if not pass1:
+        raise ValueError("fixed-test fill finalization requires pass-1 reviews")
+    candidate_by_id = {_sample_id(row): row for row in candidates}
+    repeat_ids = _deterministic_repeat_ids(
+        [
+            candidate_by_id[sample_id]
+            for sample_id, review in pass1.items()
+            if sample_id in candidate_by_id and review.get("decision") == "pass"
+        ],
+        fraction=float(repeat_review_fraction),
+        random_seed=int(random_seed),
+    )
+    agreement = _automatic_review_agreement(pass1, pass2, repeat_ids)
+    rejection_counts: Counter[str] = Counter()
+    consensus_rows: list[dict[str, Any]] = []
+    diagnostic_rows: list[dict[str, Any]] = []
+    for sample_id, row in candidate_by_id.items():
+        first = pass1.get(sample_id)
+        if first is None:
+            rejection_counts["missing_pass1_review"] += 1
+            continue
+        reason = _automatic_consensus_reject_reason(
+            first, pass2.get(sample_id), repeated=sample_id in repeat_ids
+        )
+        enriched = _row_with_automatic_review(
+            row, first, pass2.get(sample_id), consensus_reason=reason
+        )
+        if reason:
+            rejection_counts[reason] += 1
+            if _automatic_review_is_diagnostic(first, pass2.get(sample_id)):
+                diagnostic_rows.append(enriched)
+            continue
+        if _row_overlaps_identities(enriched, protected_identities):
+            rejection_counts["overlaps_fixed_or_protected_after_review"] += 1
+            continue
+        if _canonical_subtype(enriched) == "speech_topic_in_video_context" and not _fixed_fill_speech_allowed(enriched):
+            rejection_counts["speech_gate_failed"] += 1
+            diagnostic_rows.append(enriched)
+            continue
+        consensus_rows.append(enriched)
+
+    selected: list[dict[str, Any]] = []
+    selected_identities = {
+        key: set(values) for key, values in protected_identities.items()
+    }
+
+    def take(rows: Iterable[dict[str, Any]], limit: int) -> None:
+        for row in sorted(rows, key=lambda item: _fixed_fill_priority(item, int(random_seed))):
+            if len(selected) >= limit or len(fixed_original) + len(selected) >= int(target_count):
+                break
+            if _row_overlaps_identities(row, selected_identities):
+                continue
+            selected.append(row)
+            current = _identity_sets([row])
+            for key in selected_identities:
+                selected_identities[key].update(current[key])
+
+    fixed_counts = Counter(_canonical_subtype(row) for row in fixed_normalized)
+    desired_sound = round(int(target_count) * float(sound_event_ratio))
+    desired_music = int(target_count) - desired_sound
+    sound_rows = [row for row in consensus_rows if _canonical_subtype(row) == "sound_event"]
+    music_rows = [row for row in consensus_rows if _canonical_subtype(row) == "music"]
+    speech_rows = [
+        row for row in consensus_rows if _canonical_subtype(row) == "speech_topic_in_video_context"
+    ]
+    take(sound_rows, max(0, desired_sound - fixed_counts["sound_event"]))
+    take(music_rows, len(selected) + max(0, desired_music - fixed_counts["music"]))
+    remaining_non_speech = [
+        row for row in sound_rows + music_rows if _sample_id(row) not in {_sample_id(item) for item in selected}
+    ]
+    take(remaining_non_speech, int(target_count) - len(fixed_original))
+
+    speech_capacity = max(0, int(max_speech_count) - fixed_counts["speech_topic_in_video_context"])
+    take(speech_rows, len(selected) + speech_capacity)
+
+    final_rows = list(fixed_original) + selected
+    final_normalized = fixed_normalized + selected
+    capacity_summary = {
+        "target_count": int(target_count),
+        "fixed_test_count": len(fixed_original),
+        "exclude_paths": [str(path) for path in protected_paths],
+        "protected_exclude_count": len(protected_rows),
+        "candidate_count": len(candidates),
+        "consensus_eligible_count": len(consensus_rows),
+        "selected_addition_count": len(selected),
+        "final_count": len(final_rows),
+        "shortfall": max(0, int(target_count) - len(final_rows)),
+        "max_speech_count": int(max_speech_count),
+        "sound_event_ratio": float(sound_event_ratio),
+        "fixed_subtypes": dict(sorted(fixed_counts.items())),
+        "eligible_subtypes": dict(
+            sorted(Counter(_canonical_subtype(row) for row in consensus_rows).items())
+        ),
+        "selected_subtypes": dict(
+            sorted(Counter(_canonical_subtype(row) for row in selected).items())
+        ),
+        "final_subtypes": dict(
+            sorted(Counter(_canonical_subtype(row) for row in final_normalized).items())
+        ),
+        "rejection_counts": dict(sorted(rejection_counts.items())),
+    }
+    _write_json(output_root / "fill_capacity_summary.json", capacity_summary)
+    if len(final_rows) < int(target_count):
+        raise ValueError(
+            f"fixed-test fill produced {len(final_rows)} records; target is {target_count}; "
+            f"capacity={capacity_summary}"
+        )
+
+    duplicate_audit = _within_split_duplicate_audit(final_normalized)
+    if duplicate_audit["violation_count"]:
+        raise ValueError(f"fixed-test fill contains duplicate identities: {duplicate_audit}")
+    speech_count = sum(
+        _canonical_subtype(row) == "speech_topic_in_video_context" for row in final_normalized
+    )
+    if speech_count > int(max_speech_count):
+        raise ValueError("fixed-test fill exceeded max_speech_count")
+
+    test_path = output_root / "test_main_1000.jsonl"
+    _write_jsonl(test_path, final_rows)
+    test_hash = _sha256_file(test_path)
+    _write_json(output_root / "review_agreement_summary.json", agreement)
+    _write_json(output_root / "dedup_audit.json", duplicate_audit)
+    leakage_audit = {
+        "violation_count": duplicate_audit["violation_count"],
+        "duplicate_sample_count": duplicate_audit["duplicate_sample_count"],
+        "duplicate_source_count": duplicate_audit["duplicate_source_count"],
+        "duplicate_pair_count": duplicate_audit["duplicate_pair_count"],
+        "fixed_addition_overlap_count": 0,
+        "protected_addition_overlap_count": 0,
+        "missing_media_field_count": sum(
+            not _first_text(row, ("reference_video",)) or not _first_text(row, ("target_video",))
+            for row in final_rows
+        ),
+    }
+    _write_json(output_root / "leakage_audit.json", leakage_audit)
+    _write_jsonl(output_root / "test_asr_diagnostic.jsonl", diagnostic_rows)
+    manifest = {
+        "protocol": "audiocvr_fixed_test_fill_v1",
+        "human_validated": False,
+        "automatically_curated": True,
+        "model_verified_additions": True,
+        "selection_uses_model_scores": False,
+        "fixed_test_path": str(fixed_path),
+        "fixed_test_count": len(fixed_original),
+        "exclude_paths": [str(path) for path in protected_paths],
+        "candidate_path": str(candidate_path),
+        "test_target_count": int(target_count),
+        "test_final_count": len(final_rows),
+        "test_subtype_distribution": capacity_summary["final_subtypes"],
+        "test_dataset_distribution": dict(
+            sorted(Counter(_dataset(row) for row in final_normalized).items())
+        ),
+        "selected_addition_count": len(selected),
+        "selected_addition_sources": dict(
+            sorted(Counter(str(row.get("fill_source_path") or "unknown") for row in selected).items())
+        ),
+        "review_agreement": agreement,
+        "review_rejection_counts": dict(sorted(rejection_counts.items())),
+        "dedup_audit": duplicate_audit,
+        "leakage_audit": leakage_audit,
+        "test_main_sha256": test_hash,
+        "random_seed": int(random_seed),
+        "outputs": {
+            "test_main": str(test_path),
+            "manifest": str(output_root / "frozen_benchmark_manifest.json"),
+            "sha256": str(output_root / "frozen_benchmark.sha256"),
+        },
+        "limitation": "Automatically curated and model-verified additions; not fully human-validated.",
+    }
+    _write_json(output_root / "frozen_benchmark_manifest.json", manifest)
+    (output_root / "frozen_benchmark.sha256").write_text(
+        f"{test_hash}  test_main_1000.jsonl\n", encoding="ascii"
+    )
+    return manifest
+
+
 def audit_training_splits(
     *,
     train_path: str | Path,
@@ -1707,6 +2065,73 @@ def _row_overlaps_identities(row: dict[str, Any], identities: dict[str, set[str]
     return bool(source & identities["source"] or pair & identities["pair"] or sample & identities["sample"])
 
 
+def _fixed_fill_overlap_reason(row: dict[str, Any], identities: dict[str, set[str]]) -> str:
+    source = _row_identity_values(row, ("source_disjoint_group_id", "raw_source_id", "source_id"))
+    if source & identities["source"]:
+        return "source_seen_in_fixed_or_protected"
+    pair = _row_identity_values(row, ("inverse_pair_group_id", "pair_group_id"))
+    if pair & identities["pair"]:
+        return "pair_seen_in_fixed_or_protected"
+    sample = {_sample_id(row)} - {""}
+    if sample & identities["sample"]:
+        return "sample_seen_in_fixed_or_protected"
+    return ""
+
+
+def _fixed_fill_priority(row: dict[str, Any], random_seed: int) -> tuple[Any, ...]:
+    return (
+        int(row.get("fill_source_priority") or 0),
+        -float(_review_field(row, "min_stage_confidence") or 0.0),
+        -float(_review_field(row, "video_context_strength") or 0.0),
+        -_numeric_field(row, "audio_delta_strength"),
+        *_automatic_pool_priority(row, random_seed),
+    )
+
+
+def _resolve_fill_media_paths(row: dict[str, Any]) -> dict[str, Any]:
+    output = dict(row)
+    media_root = Path(str(output.get("fill_media_root") or Path.cwd()))
+    for field in ("reference_video", "target_video"):
+        value = _first_text(output, (field,))
+        if not value:
+            continue
+        path = Path(value)
+        output[field] = str((path if path.is_absolute() else media_root / path).resolve())
+    return output
+
+
+def _fixed_fill_speech_allowed(row: dict[str, Any]) -> bool:
+    if _canonical_subtype(row) != "speech_topic_in_video_context":
+        return True
+    return (
+        str(_review_field(row, "speech_role") or "") in {"contextual_speech", "speech_with_event"}
+        and not _truthy(_review_field(row, "transcript_like"))
+        and _truthy(_review_field(row, "full_av_required"))
+        and float(_review_field(row, "recomputed_asr_risk") or 0.0) <= 0.35
+    )
+
+
+def _within_split_duplicate_audit(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    values = list(rows)
+
+    def duplicate_values(key_fn: Any) -> list[str]:
+        counts = Counter(str(key_fn(row) or "").strip() for row in values)
+        return sorted(key for key, count in counts.items() if key and count > 1)
+
+    duplicate_samples = duplicate_values(_sample_id)
+    duplicate_sources = duplicate_values(_primary_source_id)
+    duplicate_pairs = duplicate_values(_pair_id)
+    return {
+        "violation_count": len(duplicate_samples) + len(duplicate_sources) + len(duplicate_pairs),
+        "duplicate_sample_count": len(duplicate_samples),
+        "duplicate_source_count": len(duplicate_sources),
+        "duplicate_pair_count": len(duplicate_pairs),
+        "duplicate_sample_examples": duplicate_samples[:10],
+        "duplicate_source_examples": duplicate_sources[:10],
+        "duplicate_pair_examples": duplicate_pairs[:10],
+    }
+
+
 def _voxceleb_automatic_review_allowed(row: dict[str, Any]) -> bool:
     if _dataset(row) != "voxceleb":
         return True
@@ -2332,6 +2757,15 @@ def build_parser() -> argparse.ArgumentParser:
     automatic_prepare.add_argument("--max-per-source", type=int, default=2)
     automatic_prepare.add_argument("--random-seed", type=int, default=20260720)
 
+    fixed_fill_prepare = subparsers.add_parser("prepare-fixed-test-fill-review")
+    fixed_fill_prepare.add_argument("--fixed-test-path", required=True)
+    fixed_fill_prepare.add_argument("--input-path", action="append", required=True)
+    fixed_fill_prepare.add_argument("--input-media-root", action="append", default=[])
+    fixed_fill_prepare.add_argument("--exclude-path", action="append", default=[])
+    fixed_fill_prepare.add_argument("--output-dir", required=True)
+    fixed_fill_prepare.add_argument("--max-per-source", type=int, default=1)
+    fixed_fill_prepare.add_argument("--random-seed", type=int, default=20260720)
+
     automatic_review = subparsers.add_parser("review-benchmark-omni")
     automatic_review.add_argument("--candidate-path", required=True)
     automatic_review.add_argument("--output-path", required=True)
@@ -2372,6 +2806,19 @@ def build_parser() -> argparse.ArgumentParser:
     automatic_finalize.add_argument("--max-voxceleb-ratio", type=float, default=0.05)
     automatic_finalize.add_argument("--max-per-source", type=int, default=1)
     automatic_finalize.add_argument("--random-seed", type=int, default=20260720)
+
+    fixed_fill_finalize = subparsers.add_parser("finalize-fixed-test-fill")
+    fixed_fill_finalize.add_argument("--fixed-test-path", required=True)
+    fixed_fill_finalize.add_argument("--candidate-path", required=True)
+    fixed_fill_finalize.add_argument("--pass1-review-path", action="append", required=True)
+    fixed_fill_finalize.add_argument("--pass2-review-path", action="append", required=True)
+    fixed_fill_finalize.add_argument("--exclude-path", action="append", default=[])
+    fixed_fill_finalize.add_argument("--output-dir", required=True)
+    fixed_fill_finalize.add_argument("--target-count", type=int, default=1000)
+    fixed_fill_finalize.add_argument("--max-speech-count", type=int, default=50)
+    fixed_fill_finalize.add_argument("--sound-event-ratio", type=float, default=0.80)
+    fixed_fill_finalize.add_argument("--repeat-review-fraction", type=float, default=0.20)
+    fixed_fill_finalize.add_argument("--random-seed", type=int, default=20260720)
 
     split_audit = subparsers.add_parser("audit-training-splits")
     split_audit.add_argument("--train-path", required=True)
@@ -2487,6 +2934,16 @@ def main() -> None:
             max_per_source=args.max_per_source,
             random_seed=args.random_seed,
         )
+    elif args.command == "prepare-fixed-test-fill-review":
+        result = prepare_fixed_test_fill_review(
+            fixed_test_path=args.fixed_test_path,
+            input_paths=args.input_path,
+            input_media_roots=args.input_media_root,
+            exclude_paths=args.exclude_path,
+            output_dir=args.output_dir,
+            max_per_source=args.max_per_source,
+            random_seed=args.random_seed,
+        )
     elif args.command == "review-benchmark-omni":
         result = review_benchmark_omni(
             candidate_path=args.candidate_path,
@@ -2522,6 +2979,20 @@ def main() -> None:
             max_hdtf_ratio=args.max_hdtf_ratio,
             max_voxceleb_ratio=args.max_voxceleb_ratio,
             max_per_source=args.max_per_source,
+            random_seed=args.random_seed,
+        )
+    elif args.command == "finalize-fixed-test-fill":
+        result = finalize_fixed_test_fill(
+            fixed_test_path=args.fixed_test_path,
+            candidate_path=args.candidate_path,
+            pass1_review_paths=args.pass1_review_path,
+            pass2_review_paths=args.pass2_review_path,
+            exclude_paths=args.exclude_path,
+            output_dir=args.output_dir,
+            target_count=args.target_count,
+            max_speech_count=args.max_speech_count,
+            sound_event_ratio=args.sound_event_ratio,
+            repeat_review_fraction=args.repeat_review_fraction,
             random_seed=args.random_seed,
         )
     elif args.command == "audit-training-splits":
