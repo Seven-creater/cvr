@@ -623,7 +623,10 @@ def review_benchmark_omni(
     timeout_seconds: float = 180.0,
     omni_retries: int = 2,
     audio_review_max_seconds: float = 0.0,
+    video_review_max_dimension: int = 0,
+    video_review_fps: float = 0.0,
     skip_review_errors: bool = False,
+    retry_terminal_review_errors: bool = False,
     resume: bool = False,
     fail_on_error: bool = False,
 ) -> dict[str, Any]:
@@ -663,7 +666,15 @@ def review_benchmark_omni(
     completed_ids: set[str] = set()
     if resume and output_file.exists():
         existing_rows = _read_jsonl(output_file)
-        retained_rows = [row for row in existing_rows if str(row.get("decision") or "") != "error"]
+        retained_rows = [
+            row
+            for row in existing_rows
+            if str(row.get("decision") or "") != "error"
+            and not (
+                retry_terminal_review_errors
+                and bool(row.get("terminal_review_error"))
+            )
+        ]
         completed_ids = {_sample_id(row) for row in retained_rows}
         if len(retained_rows) != len(existing_rows):
             _write_jsonl(output_file, retained_rows)
@@ -686,9 +697,35 @@ def review_benchmark_omni(
         sample_id = _sample_id(row)
         if sample_id in completed_ids:
             continue
+        review_stage = "media_prepare"
         try:
             reference_path = _resolve_media_path(media_root_path, _first_text(row, ("reference_video", "reference_clip_path")))
             target_path = _resolve_media_path(media_root_path, _first_text(row, ("target_video", "target_clip_path")))
+            reference_review_video = reference_path
+            target_review_video = target_path
+            video_review_proxy: dict[str, Any] = {}
+            if int(video_review_max_dimension) > 0 or float(video_review_fps) > 0:
+                reference_review_video = _transcode_review_video_cache(
+                    video_path=reference_path,
+                    cache_dir=cache_root / "video_review_proxies",
+                    sample_id=sample_id,
+                    role="reference",
+                    max_dimension=int(video_review_max_dimension),
+                    fps=float(video_review_fps),
+                )
+                target_review_video = _transcode_review_video_cache(
+                    video_path=target_path,
+                    cache_dir=cache_root / "video_review_proxies",
+                    sample_id=sample_id,
+                    role="target",
+                    max_dimension=int(video_review_max_dimension),
+                    fps=float(video_review_fps),
+                )
+                video_review_proxy = {
+                    "max_dimension": int(video_review_max_dimension),
+                    "fps": float(video_review_fps),
+                    "purpose": "context_length_bounded_video_verification",
+                }
             reference_audio = _extract_audio_only_cache(
                 video_path=reference_path,
                 cache_dir=cache_root / "audio_only",
@@ -734,18 +771,19 @@ def review_benchmark_omni(
                     "purpose": "context_length_bounded_audio_only_verification",
                 }
             reference_silent = _extract_video_only_cache(
-                video_path=reference_path,
+                video_path=reference_review_video,
                 cache_dir=cache_root / "video_only",
                 clip_id=f"{sample_id}_reference",
             )
             target_silent = _extract_video_only_cache(
-                video_path=target_path,
+                video_path=target_review_video,
                 cache_dir=cache_root / "video_only",
                 clip_id=f"{sample_id}_target",
             )
             edit_text = str(row.get("edit_text") or row.get("audio_only_edit_text") or "").strip()
             proposal = _automatic_audio_proposal(row)
             local_gate = row.get("local_gate_report") if isinstance(row.get("local_gate_report"), dict) else {}
+            review_stage = "audio_only"
             audio_verify, raw_audio = _call_omni_with_retries(
                 label=f"benchmark_audio_only:{sample_id}:pass{review_pass_id}",
                 retries=int(omni_retries),
@@ -757,6 +795,7 @@ def review_benchmark_omni(
                     audio_only_proposal=proposal,
                 ),
             )
+            review_stage = "video_only"
             video_verify, raw_video = _call_omni_with_retries(
                 label=f"benchmark_video_only:{sample_id}:pass{review_pass_id}",
                 retries=int(omni_retries),
@@ -769,25 +808,27 @@ def review_benchmark_omni(
                     local_gate_report=local_gate,
                 ),
             )
+            review_stage = "full_av"
             full_av, raw_full_av = _call_omni_with_retries(
                 label=f"benchmark_full_av:{sample_id}:pass{review_pass_id}",
                 retries=int(omni_retries),
                 fail_on_transient=bool(fail_on_error),
                 func=lambda: client.verify_b_line_full_av_consistency(
-                    reference_clip_path=str(reference_path),
-                    target_clip_path=str(target_path),
+                    reference_clip_path=str(reference_review_video),
+                    target_clip_path=str(target_review_video),
                     edit_text=edit_text,
                     audio_only_evidence={"proposal": proposal, "verification": audio_verify},
                     local_gate_report=local_gate,
                 ),
             )
+            review_stage = "context"
             context, raw_context = _call_omni_with_retries(
                 label=f"benchmark_context:{sample_id}:pass{review_pass_id}",
                 retries=int(omni_retries),
                 fail_on_transient=bool(fail_on_error),
                 func=lambda: client.audit_audiocvr_benchmark_context(
-                    reference_clip_path=str(reference_path),
-                    target_clip_path=str(target_path),
+                    reference_clip_path=str(reference_review_video),
+                    target_clip_path=str(target_review_video),
                     edit_text=edit_text,
                     audio_only_evidence={"proposal": proposal, "verification": audio_verify},
                     review_pass_id=int(review_pass_id),
@@ -812,6 +853,8 @@ def review_benchmark_omni(
             )
             if audio_review_window:
                 review["audio_review_window"] = audio_review_window
+            if video_review_proxy:
+                review["video_review_proxy"] = video_review_proxy
         except Exception as exc:
             if fail_on_error:
                 raise
@@ -829,7 +872,7 @@ def review_benchmark_omni(
                         if terminal_skip
                         else "review_error"
                     )
-                    + f":{type(exc).__name__}:{exc}"
+                    + f":{review_stage}:{type(exc).__name__}:{exc}"
                 ],
                 "terminal_review_error": terminal_skip,
             }
@@ -2832,10 +2875,17 @@ def build_parser() -> argparse.ArgumentParser:
     automatic_review.add_argument("--timeout-seconds", type=float, default=180.0)
     automatic_review.add_argument("--omni-retries", type=int, default=2)
     automatic_review.add_argument("--audio-review-max-seconds", type=float, default=0.0)
+    automatic_review.add_argument("--video-review-max-dimension", type=int, default=0)
+    automatic_review.add_argument("--video-review-fps", type=float, default=0.0)
     automatic_review.add_argument(
         "--skip-review-errors",
         action="store_true",
         help="Record exhausted review errors as terminal rejects instead of retryable errors.",
+    )
+    automatic_review.add_argument(
+        "--retry-terminal-review-errors",
+        action="store_true",
+        help="On resume, retry rows previously recorded as terminal review errors.",
     )
     automatic_review.add_argument("--resume", action="store_true")
     automatic_review.add_argument("--fail-on-error", action="store_true")
@@ -3017,7 +3067,10 @@ def main() -> None:
             timeout_seconds=args.timeout_seconds,
             omni_retries=args.omni_retries,
             audio_review_max_seconds=args.audio_review_max_seconds,
+            video_review_max_dimension=args.video_review_max_dimension,
+            video_review_fps=args.video_review_fps,
             skip_review_errors=args.skip_review_errors,
+            retry_terminal_review_errors=args.retry_terminal_review_errors,
             resume=args.resume,
             fail_on_error=args.fail_on_error,
         )
@@ -4211,6 +4264,81 @@ def _trim_review_audio_cache(
         subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if not temp_path.is_file() or temp_path.stat().st_size <= 0:
             raise RuntimeError("ffmpeg produced an empty review audio window")
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+    return output_path
+
+
+def _transcode_review_video_cache(
+    *,
+    video_path: Path,
+    cache_dir: Path,
+    sample_id: str,
+    role: str,
+    max_dimension: int,
+    fps: float,
+) -> Path:
+    stat = video_path.stat()
+    dimension = max(2, int(max_dimension))
+    frame_rate = max(0.1, float(fps))
+    key = json.dumps(
+        {
+            "path": str(video_path.resolve()),
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+            "role": role,
+            "max_dimension": dimension,
+            "fps": round(frame_rate, 6),
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_id).strip("_") or "sample"
+    output_path = cache_dir / f"{safe_id}_{role}_{digest}.mp4"
+    if output_path.is_file() and output_path.stat().st_size > 0:
+        return output_path
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp.mp4")
+    video_filter = (
+        f"fps={frame_rate:g},"
+        f"scale={dimension}:{dimension}:force_original_aspect_ratio=decrease,"
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    )
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-vf",
+        video_filter,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "26",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "96k",
+        "-movflags",
+        "+faststart",
+        str(temp_path),
+    ]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if not temp_path.is_file() or temp_path.stat().st_size <= 0:
+            raise RuntimeError("ffmpeg produced an empty review video proxy")
         os.replace(temp_path, output_path)
     finally:
         if temp_path.exists():
