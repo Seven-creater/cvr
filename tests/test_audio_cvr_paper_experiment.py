@@ -30,13 +30,22 @@ from app.e5_audio_delta_train import _AudioDeltaAdapter, _import_torch
 
 class AudioCVRPaperExperimentTests(unittest.TestCase):
     def test_canonical_subtype_reads_volume_review_difference_type(self) -> None:
-        from app.audio_cvr_paper_experiment import _canonical_subtype
+        from app.audio_cvr_paper_experiment import _canonical_subtype, _stable_sample_id
 
         self.assertEqual(_canonical_subtype({"difference": {"type": "audio_event"}}), "sound_event")
         self.assertEqual(_canonical_subtype({"difference": {"type": "music"}}), "music")
         self.assertEqual(
             _canonical_subtype({"difference": {"type": "speech"}}),
             "speech_topic_in_video_context",
+        )
+        self.assertEqual(
+            _stable_sample_id(
+                {
+                    "sample_id": "covr_omni_pilot_0001",
+                    "proposal_id": "speech_audio_content_audio_first_audio_event_0122ccff7d7b",
+                }
+            ),
+            "speech_audio_content_audio_first_audio_event_0122ccff7d7b",
         )
 
     def test_fixed_test_fill_prepare_excludes_fixed_source_and_resolves_each_media_root(self) -> None:

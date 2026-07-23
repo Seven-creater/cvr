@@ -3958,9 +3958,15 @@ def _stable_source_id(row: dict[str, Any]) -> str:
 
 
 def _stable_sample_id(row: dict[str, Any]) -> str:
-    explicit = _first_text(row, ("sample_id", "proposal_id", "clip_id"))
-    if explicit:
-        return explicit
+    sample_id = _first_text(row, ("sample_id",))
+    placeholder_sample_id = bool(re.fullmatch(r"covr_omni_pilot_\d+", sample_id, flags=re.IGNORECASE))
+    if sample_id and not placeholder_sample_id:
+        return sample_id
+    proposal_id = _first_text(row, ("proposal_id", "candidate_id", "clip_id"))
+    if proposal_id:
+        return proposal_id
+    if sample_id:
+        return sample_id
     digest = hashlib.sha256(
         "|".join(
             (
