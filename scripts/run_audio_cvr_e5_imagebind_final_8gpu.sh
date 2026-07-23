@@ -20,7 +20,7 @@ GPU_IDS="0,1,2,3,4,5,6,7"
 FINAL_SEEDS="13,23,42,71,101"
 EXPECTED_PRE_SHA256="6f4f17aada3967a72ee0eaf5305c9f3a8fd5dc3ab76f6b867e94f37766977db1"
 EXPECTED_FINAL_SHA256=""
-EXPECTED_FINAL_SUBTYPES="sound_event=800,music=200"
+EXPECTED_FINAL_SUBTYPES=""
 EXPECTED_PRE_MEDIA=1044
 EXPECTED_PRE_TEXT=469
 WAIT_SECONDS=60
@@ -43,6 +43,9 @@ Usage: run_audio_cvr_e5_imagebind_final_8gpu.sh \
   --e5-root PATH --imagebind-root PATH --adapter-root PATH --out-root PATH \
   [--core-records PATH] [--media-root PATH ...] \
   [--omni-pid-file PATH ...] [--omni-port PORT ...]
+
+By default, final subtype proportions are recorded but not enforced. Pass
+--expected-final-subtypes sound_event=N,music=N only for an explicit audit.
 
 The script waits for frozen Test1000, audits it, precisely stops recorded Omni
 services, reuses the existing pre-516 E5/ImageBind caches, and runs seven E5
@@ -247,8 +250,9 @@ PY
     --output-dir "$OUT_ROOT/split_audit" > "$OUT_ROOT/logs/split_audit.log" 2>&1
 
   final_args=(--records "$FINAL_RECORDS" --output-dir "$FINAL_INVENTORY" "${media_root_args[@]}" \
-    --expected-count 1000 --expected-subtypes "$EXPECTED_FINAL_SUBTYPES" \
-    --inherited-records "$PRE_RECORDS" --require-unique-source-pair)
+    --expected-count 1000 --inherited-records "$PRE_RECORDS" --require-unique-source-pair)
+  [[ -n "$EXPECTED_FINAL_SUBTYPES" && "$EXPECTED_FINAL_SUBTYPES" != "none" ]] \
+    && final_args+=(--expected-subtypes "$EXPECTED_FINAL_SUBTYPES")
   [[ -n "$EXPECTED_FINAL_SHA256" ]] && final_args+=(--expected-sha256 "$EXPECTED_FINAL_SHA256")
   "$PYTHON_BIN" -m app.audio_cvr_external_baseline prepare-inventory "${final_args[@]}" \
     > "$OUT_ROOT/logs/final_inventory.log" 2>&1

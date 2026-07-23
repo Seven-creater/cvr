@@ -193,6 +193,42 @@ class AudioCVRExternalBaselineTests(unittest.TestCase):
             self.assertGreater(summary["media"]["delta_count"], 0)
             self.assertEqual(1, summary["text"]["delta_count"])
 
+    def test_delta_inventory_accepts_content_identical_media_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pre_records, pre_rows = self._fixture(root, count=1)
+            pre = root / "pre"
+            prepare_inventory(pre_records, pre, [root])
+
+            mirror = root / "mirror"
+            mirror.mkdir()
+            final_rows = json.loads(json.dumps(pre_rows))
+            for key in ("reference_video", "target_video"):
+                source = root / final_rows[0][key]
+                target = mirror / source.name
+                target.write_bytes(source.read_bytes())
+            for negative in final_rows[0]["hard_negatives"]:
+                source = root / negative["video"]
+                target = mirror / source.name
+                target.write_bytes(source.read_bytes())
+            final_records = mirror / "records.jsonl"
+            _write_jsonl(final_records, final_rows)
+            final = root / "final"
+            prepare_inventory(final_records, final, [mirror], inherited_records=pre_records)
+
+            summary = build_delta_inventory(pre, final, root / "delta")
+
+            self.assertEqual(0, summary["media"]["unresolved_removed_count"])
+            self.assertGreater(summary["media"]["content_replacement_count"], 0)
+            self.assertEqual(
+                summary["media"]["removed_count"],
+                summary["media"]["content_replacement_count"],
+            )
+            self.assertEqual(
+                summary["media"]["final_count"],
+                summary["media"]["delta_count"],
+            )
+
     def test_exact_reference_masking_masks_one_item_per_query(self) -> None:
         scores = np.asarray([[0.8, 0.1, 0.9, 0.0], [0.0, 0.7, 0.2, 0.8]], dtype=np.float32)
         positives = np.asarray([0, 1])

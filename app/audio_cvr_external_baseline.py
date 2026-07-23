@@ -1318,8 +1318,42 @@ def build_delta_inventory(pre_dir: Path, final_dir: Path, output_dir: Path) -> d
         final_ids = {str(row[id_key]) for row in final_rows}
         delta = [row for row in final_rows if str(row[id_key]) not in pre_ids]
         removed = sorted(pre_ids - final_ids)
-        if removed:
-            raise ValueError(f"final {kind} inventory dropped {len(removed)} preexisting IDs")
+        content_replacements: list[dict[str, str]] = []
+        unresolved_removed = list(removed)
+        if kind == "media" and removed:
+            pre_by_id = {str(row[id_key]): row for row in pre_rows}
+            final_by_video: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for row in final_rows:
+                final_by_video[str(row.get("video") or "")].append(row)
+            unresolved_removed = []
+            for item_id in removed:
+                pre_row = pre_by_id[item_id]
+                candidates = final_by_video.get(str(pre_row.get("video") or ""), [])
+                pre_hash = _sha256_file(Path(str(pre_row["resolved_media_path"])))
+                replacement = next(
+                    (
+                        row
+                        for row in candidates
+                        if _sha256_file(Path(str(row["resolved_media_path"]))) == pre_hash
+                    ),
+                    None,
+                )
+                if replacement is None:
+                    unresolved_removed.append(item_id)
+                    continue
+                content_replacements.append(
+                    {
+                        "pre_media_id": item_id,
+                        "final_media_id": str(replacement[id_key]),
+                        "video": str(pre_row.get("video") or ""),
+                        "source_sha256": pre_hash,
+                    }
+                )
+        if unresolved_removed:
+            raise ValueError(
+                f"final {kind} inventory dropped {len(unresolved_removed)} preexisting IDs "
+                "without content-identical logical replacements"
+            )
         _atomic_jsonl(output_dir / f"delta_{kind}_inventory.jsonl", delta)
         summary[kind] = {
             "pre_count": len(pre_rows),
@@ -1327,6 +1361,9 @@ def build_delta_inventory(pre_dir: Path, final_dir: Path, output_dir: Path) -> d
             "reused_count": len(pre_ids & final_ids),
             "delta_count": len(delta),
             "removed_count": len(removed),
+            "content_replacement_count": len(content_replacements),
+            "content_replacements": content_replacements,
+            "unresolved_removed_count": len(unresolved_removed),
         }
     _atomic_json(output_dir / "reuse_audit.json", summary)
     return summary
