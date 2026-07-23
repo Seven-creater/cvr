@@ -2678,6 +2678,8 @@ def aggregate_final(
     for seed in seeds:
         seed_root = root / f"seed_{seed}"
         for eval_dir in seed_root.glob("eval_*"):
+            if ".stale_" in eval_dir.name:
+                continue
             summary_path = eval_dir / "summary.json"
             scores_path = eval_dir / "per_query_scores.jsonl"
             if not summary_path.exists() or not scores_path.exists():

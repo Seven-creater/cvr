@@ -916,6 +916,31 @@ class AudioCVRPaperExperimentTests(unittest.TestCase):
             self.assertTrue((root / "stats" / "audio_gain_summary.md").exists())
             self.assertTrue((root / "stats" / "error_breakdown.json").exists())
 
+    def test_final_aggregation_ignores_archived_stale_evaluations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            final = root / "final"
+            for seed in (13, 23):
+                self._write_final_eval(final / f"seed_{seed}" / "eval_V_T", ranks=[2, 1, 3], gaps=[-0.1, 0.1, -0.2])
+                self._write_final_eval(final / f"seed_{seed}" / "eval_V_A_T", ranks=[1, 1, 2], gaps=[0.1, 0.2, -0.05])
+                self._write_final_eval(
+                    final / f"seed_{seed}" / "eval_V_T.stale_20260723_182400",
+                    ranks=[3, 3],
+                    gaps=[-0.3, -0.3],
+                )
+
+            summary = aggregate_final(
+                input_root=final,
+                output_dir=root / "stats",
+                required_seeds=[13, 23],
+                bootstrap_samples=200,
+                permutation_samples=200,
+                random_seed=7,
+            )
+
+            self.assertEqual(["V_A_T", "V_T"], sorted(summary["mode_summary"]))
+            self.assertEqual(3, json.loads((root / "stats" / "audit.json").read_text())["eval_count"])
+
     def test_final_aggregation_supports_prespecified_multiple_comparisons(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
