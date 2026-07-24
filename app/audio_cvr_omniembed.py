@@ -642,13 +642,17 @@ def _metric_summary(
     records: Sequence[dict[str, Any]],
     *,
     mask_reference: bool,
+    excluded_gallery_indices: Sequence[int] = (),
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     work = np.asarray(scores, dtype=np.float32).copy()
     positive = np.asarray([row["positive_index"] for row in records], dtype=np.int64)
     reference = np.asarray([row["reference_index"] for row in records], dtype=np.int64)
+    excluded = {int(index) for index in excluded_gallery_indices}
     allowed = np.zeros(work.shape, dtype=bool)
     for index, row in enumerate(records):
         allowed[index, np.asarray(row["candidate_indices"], dtype=np.int64)] = True
+    if excluded:
+        allowed[:, np.asarray(sorted(excluded), dtype=np.int64)] = False
     work[~allowed] = -np.inf
     rows = np.arange(len(records))
     positive_scores = work[rows, positive].copy()
@@ -673,9 +677,18 @@ def _metric_summary(
         "query_count": len(records),
         "gallery_count": work.shape[1],
         "effective_gallery_count_per_query": int(
-            np.median([len(row["candidate_indices"]) for row in records])
+            np.median(
+                [
+                    sum(
+                        int(candidate_index) not in excluded
+                        for candidate_index in row["candidate_indices"]
+                    )
+                    for row in records
+                ]
+            )
         )
         - int(mask_reference),
+        "excluded_gallery_count": len(excluded),
         "reference_in_gallery": not mask_reference,
         "R@1": float(np.mean(values["correct_at_1"])),
         "R@5": float(np.mean(values["correct_at_5"])),
@@ -702,6 +715,7 @@ def _evaluate_condition(
     gallery: list[dict[str, Any]],
     lookup: dict[tuple[str, str, str, str, str], dict[str, Any]],
     cache_dir: Path,
+    excluded_gallery_indices: Sequence[int] = (),
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     query = _l2(
         np.stack(
@@ -715,8 +729,12 @@ def _evaluate_condition(
             ]
         )
     )
+    excluded = {int(index) for index in excluded_gallery_indices}
     documents = []
-    for row in gallery:
+    for gallery_index, row in enumerate(gallery):
+        if gallery_index in excluded:
+            documents.append(np.zeros(query.shape[1], dtype=np.float32))
+            continue
         item_condition = condition if row.get("kind") == "reference" and dataset == "audiocvr" else "exact"
         documents.append(
             _vector(
@@ -727,8 +745,18 @@ def _evaluate_condition(
         )
     document = _l2(np.stack(documents))
     scores = query @ document.T
-    with_ref, with_values = _metric_summary(scores, records, mask_reference=False)
-    masked, masked_values = _metric_summary(scores, records, mask_reference=True)
+    with_ref, with_values = _metric_summary(
+        scores,
+        records,
+        mask_reference=False,
+        excluded_gallery_indices=excluded_gallery_indices,
+    )
+    masked, masked_values = _metric_summary(
+        scores,
+        records,
+        mask_reference=True,
+        excluded_gallery_indices=excluded_gallery_indices,
+    )
     with_ref["masked_R@1"] = masked["R@1"]
     with_ref["reference_induced_R@1_drop"] = masked["R@1"] - with_ref["R@1"]
     rows = []
@@ -770,10 +798,64 @@ def evaluate(
     lookup = _lookup_inventory(inventory_path)
     result: dict[str, Any] = {"audiocvr": {}, "omnicvr": {}}
     per_query: list[dict[str, Any]] = []
+    excluded_gallery_rows: list[dict[str, Any]] = []
+    excluded_counts: dict[str, int] = {}
     for dataset in ("audiocvr", "omnicvr"):
         records = _load_jsonl(records_dir / f"{dataset}_records.jsonl")
         gallery = _load_jsonl(records_dir / f"{dataset}_gallery.jsonl")
         conditions = CONDITIONS if dataset == "audiocvr" else ("exact",)
+        excluded_gallery_indices: list[int] = []
+        for gallery_index, gallery_row in enumerate(gallery):
+            missing_requirements = []
+            for mode in MODES:
+                for condition in conditions:
+                    item_condition = (
+                        condition
+                        if gallery_row.get("kind") == "reference"
+                        and dataset == "audiocvr"
+                        else "exact"
+                    )
+                    key = (
+                        dataset,
+                        mode,
+                        item_condition,
+                        "document",
+                        gallery_row["gallery_id"],
+                    )
+                    inventory_row = lookup.get(key)
+                    if inventory_row is None or not (
+                        cache_dir
+                        / "items"
+                        / f"{inventory_row['embedding_key']}.npy"
+                    ).is_file():
+                        missing_requirements.append(
+                            {"mode": mode, "condition": item_condition}
+                        )
+            if missing_requirements:
+                excluded_gallery_indices.append(gallery_index)
+                excluded_gallery_rows.append(
+                    {
+                        "dataset": dataset,
+                        "gallery_index": gallery_index,
+                        "gallery_id": gallery_row["gallery_id"],
+                        "kind": gallery_row.get("kind"),
+                        "media_path": gallery_row.get("media_path"),
+                        "missing_requirements": missing_requirements,
+                    }
+                )
+        excluded_set = set(excluded_gallery_indices)
+        protected = {
+            int(index)
+            for record in records
+            for index in (record["positive_index"], record["reference_index"])
+        }
+        invalid_protected = sorted(protected & excluded_set)
+        if invalid_protected:
+            raise ValueError(
+                f"{dataset} has missing target/reference embeddings at gallery "
+                f"indices {invalid_protected[:20]}"
+            )
+        excluded_counts[dataset] = len(excluded_gallery_indices)
         for mode in MODES:
             result[dataset][mode] = {}
             for condition in conditions:
@@ -785,12 +867,16 @@ def evaluate(
                     gallery=gallery,
                     lookup=lookup,
                     cache_dir=cache_dir,
+                    excluded_gallery_indices=excluded_gallery_indices,
                 )
                 result[dataset][mode][condition] = metrics
                 per_query.extend(rows)
     output_dir.mkdir(parents=True, exist_ok=True)
     _atomic_json(output_dir / "results.json", result)
     _atomic_jsonl(output_dir / "per_query_results.jsonl", per_query)
+    _atomic_jsonl(
+        output_dir / "excluded_gallery_items.jsonl", excluded_gallery_rows
+    )
     summary = {
         "model": MODEL_LABEL,
         "training_checkpoint": "MultiVENT video retrieval",
@@ -799,6 +885,8 @@ def evaluate(
         "omnicvr_query_count": 1000,
         "modes": list(MODES),
         "reference_conditions": list(CONDITIONS),
+        "excluded_gallery_count_by_dataset": excluded_counts,
+        "excluded_gallery_count": len(excluded_gallery_rows),
         "masking_reuses_same_score_matrix": True,
         "selection_uses_test_metrics": False,
         "nan_or_inf_count": 0,

@@ -206,7 +206,8 @@ class AudioCVROmniEmbedTests(unittest.TestCase):
                             "edit_text": f"change {index}",
                             "positive_index": index,
                             "reference_index": index + 2,
-                            "candidate_indices": [0, 1, 2, 3],
+                            "candidate_indices": [0, 1, 2, 3]
+                            + ([4] if dataset == "omnicvr" else []),
                         }
                     )
                     gallery.append(
@@ -222,6 +223,14 @@ class AudioCVROmniEmbedTests(unittest.TestCase):
                         {
                             "gallery_id": f"{dataset}::reference::{sample_id}",
                             "kind": "reference",
+                            "media_path": str(media),
+                        }
+                    )
+                if dataset == "omnicvr":
+                    gallery.append(
+                        {
+                            "gallery_id": "omnicvr::random::missing",
+                            "kind": "candidate",
                             "media_path": str(media),
                         }
                     )
@@ -272,6 +281,16 @@ class AudioCVROmniEmbedTests(unittest.TestCase):
 
             inventory = root / "inventory.jsonl"
             _write_jsonl(inventory, inventory_rows)
+            for mode in MODES:
+                missing = _embedding_item(
+                    dataset="omnicvr",
+                    mode=mode,
+                    condition="exact",
+                    role="document",
+                    item_id="omnicvr::random::missing",
+                    media_path=str(media),
+                )
+                (cache / "items" / f"{missing['embedding_key']}.npy").unlink()
             summary = evaluate(
                 records_dir=records_dir,
                 inventory_path=inventory,
@@ -279,11 +298,21 @@ class AudioCVROmniEmbedTests(unittest.TestCase):
                 output_dir=root / "evaluation",
             )
             self.assertTrue(summary["masking_reuses_same_score_matrix"])
+            self.assertEqual(
+                {"audiocvr": 0, "omnicvr": 1},
+                summary["excluded_gallery_count_by_dataset"],
+            )
             results = json.loads(
                 (root / "evaluation" / "results.json").read_text(encoding="utf-8")
             )
             self.assertEqual(set(CONDITIONS), set(results["audiocvr"]["V_T"]))
             self.assertEqual(2, results["omnicvr"]["V_A_T"]["exact"]["with_reference"]["query_count"])
+            self.assertEqual(
+                1,
+                results["omnicvr"]["V_A_T"]["exact"]["with_reference"][
+                    "excluded_gallery_count"
+                ],
+            )
 
 
 if __name__ == "__main__":
