@@ -234,7 +234,7 @@ encode_omniembed() {
     gpu="${GPUS[$shard]}"
     jobs+=(
       "$OUT_ROOT/logs/omniembed_shard${shard}.log"
-      "CUDA_VISIBLE_DEVICES=$gpu OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false QWEN_OMNI_UTILS_ROOT=\"$QWEN_OMNI_UTILS_ROOT\" \"$OMNIEMBED_PYTHON\" -m app.audio_cvr_omniembed encode --inventory-path \"$OMNIEMBED_INVENTORY\" --cache-dir \"$OMNIEMBED_CACHE\" --base-model \"$OMNIEMBED_BASE\" --adapter-model \"$OMNIEMBED_ADAPTER\" --shard-index $shard --shard-count 8 --device cuda --retries $ENCODING_RETRIES"
+      "CUDA_VISIBLE_DEVICES=$gpu OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false QWEN_OMNI_UTILS_ROOT=\"$QWEN_OMNI_UTILS_ROOT\" \"$OMNIEMBED_PYTHON\" -m app.audio_cvr_omniembed encode --inventory-path \"$OMNIEMBED_INVENTORY\" --cache-dir \"$OMNIEMBED_CACHE\" --base-model \"$OMNIEMBED_BASE\" --adapter-model \"$OMNIEMBED_ADAPTER\" --shard-index $shard --shard-count 8 --device cuda --retries $ENCODING_RETRIES --attn-implementation sdpa"
     )
   done
   run_parallel "${jobs[@]}"
