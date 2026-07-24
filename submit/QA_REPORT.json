@@ -1,0 +1,42 @@
+{
+  "state": "COMPLETE",
+  "test1000_sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "checksums": {
+    "01_main_paper/Audio-CVR_AAAI27_anonymous.pdf": "fdc5d1a0bd235800a28c3edaefdfc1d41c01c0f9bf4ee4fbb2010757003f1e88",
+    "03_reproducibility_checklist/ReproducibilityChecklist.pdf": "abad17340673bd8da6cfedf5c7f0c8d9f3af93db3c73eac47507065c438d5d0e",
+    "06_code_and_data_supplement/Audio-CVR_code_and_data_anonymous.zip": "47f8722f687cfec0389e626cfa4a301e08e78879ab8ee8674f4de5df7c314fde"
+  },
+  "openreview_text": {
+    "title_characters": 107,
+    "tldr_characters": 176,
+    "abstract_characters": 1610
+  },
+  "main_pdf": {
+    "bytes": 868625,
+    "pages": 7,
+    "letter": true,
+    "encrypted": false,
+    "font_count": 19,
+    "type3_font_count": 0,
+    "text_characters": 33051
+  },
+  "checklist_pdf": {
+    "bytes": 99107,
+    "pages": 2,
+    "letter": true,
+    "encrypted": false,
+    "font_count": 4,
+    "type3_font_count": 0,
+    "text_characters": 5419
+  },
+  "code_zip": {
+    "bytes": 17136489,
+    "entry_count": 153,
+    "full_code_tests": true
+  },
+  "tooling": {
+    "pdfinfo": "pdfinfo.exe",
+    "pdffonts": "pdffonts.exe",
+    "pdftotext": "pdftotext.exe"
+  }
+}

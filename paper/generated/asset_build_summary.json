@@ -12,36 +12,36 @@
       "sha256": "b51ba17167e1bef567bf68975ebe5f7c650fdf8fe6888d47e8f1b560b5908a3d"
     },
     "figures\\generated\\figure1_reference_confusion.pdf": {
-      "bytes": 66819,
-      "sha256": "e7312f4c1c2821b547067e6e56638eb78f9d318f73cd88cc649c76277bfdab6a"
+      "bytes": 269631,
+      "sha256": "7e9fd8537edacca2615995a2d98f945ac673a7142350111089337ecd198de73f"
     },
     "figures\\generated\\figure1_reference_confusion.svg": {
-      "bytes": 56862,
-      "sha256": "85f77f9288ed4eac03774acbedc871db339fdf5a9f57649ecdbe058f5ab6563c"
+      "bytes": 295796,
+      "sha256": "e1c252dc8258611e9b14c0bf9456f6fd8e6a25e8d931598f6aafc249d4ae69c6"
     },
     "figures\\generated\\figure1_reference_confusion.png": {
-      "bytes": 310465,
-      "sha256": "ae34429f461c8a15a4b5ba3d59126d48cf5e76fc1250eceb0ff03e3e1b290dd8"
+      "bytes": 1006316,
+      "sha256": "e25f5c405d3a03653a21679abd9f96066b36e94c148e6d84e15366d90b34826a"
     },
     "figures\\generated\\figure1_reference_confusion.tiff": {
-      "bytes": 20066714,
-      "sha256": "525298807a57d3522c850ef1c7863a2287d68e948c9376dd77ef2a1020eedb5f"
+      "bytes": 2095776,
+      "sha256": "74e3ee7ce7aaf50ca262da317950a60b9b669142f80c58cbb72890142590719e"
     },
     "figures\\generated\\figure2_curation_pipeline.pdf": {
-      "bytes": 59457,
-      "sha256": "937c6a4a2064356fdfff0c2b350dbda586fa77a3a0f6511a8e6a9d8a52f9ef4b"
+      "bytes": 333117,
+      "sha256": "79e160e0de3ae122ec8a5973b03532b6116c239a6409cad5f89b80b575ae2ddd"
     },
     "figures\\generated\\figure2_curation_pipeline.svg": {
-      "bytes": 55313,
-      "sha256": "04985ef000749fb00f7ce1d56d0357fb2a6e6bcd8cbda27939686d41d2513a3a"
+      "bytes": 368764,
+      "sha256": "ce91a81028ea11f4d848e59035ffcf7c967a7901958ffe9a4cedde55a447379d"
     },
     "figures\\generated\\figure2_curation_pipeline.png": {
-      "bytes": 407281,
-      "sha256": "dae6f713d467defa906fd013a7b2cefd168ef6aa23519eec2512c67d91d0cbb3"
+      "bytes": 945519,
+      "sha256": "4085350c1a1c49e1bf488ed68129be163f01d72f977d367d84688a13bc606bce"
     },
     "figures\\generated\\figure2_curation_pipeline.tiff": {
-      "bytes": 18844066,
-      "sha256": "b02d58f3893f989e89d27e87c4057ece1208a6c39dd23a2b04832ec605c71bc8"
+      "bytes": 1899180,
+      "sha256": "5b3c94032c9217c69e7ac08c7f0d1c766d4d24372bc8e258c8e48e33620d7921"
     }
   }
 }

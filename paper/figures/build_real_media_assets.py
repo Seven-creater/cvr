@@ -17,6 +17,7 @@ FRAME_QUANTILES = (0.2, 0.5, 0.8)
 NAVY = (29, 52, 77)
 BLUE = (45, 114, 178)
 CORAL = (213, 94, 73)
+GREEN = (32, 128, 107)
 LIGHT = (239, 243, 247)
 MID = (192, 203, 214)
 
@@ -178,7 +179,7 @@ def build_assets(candidate_root: Path, selected_index: int, output: Path) -> Non
     _filmstrip(ref_selected, output / "reference_filmstrip.jpg")
     _filmstrip(tgt_selected, output / "target_filmstrip.jpg")
     _waveform(ref_audio, output / "reference_waveform.png", BLUE)
-    _waveform(tgt_audio, output / "target_waveform.png", CORAL)
+    _waveform(tgt_audio, output / "target_waveform.png", GREEN)
     _audio_pair(
         Image.open(output / "reference_waveform.png").convert("RGBA"),
         Image.open(output / "target_waveform.png").convert("RGBA"),
@@ -230,7 +231,7 @@ def main() -> None:
         type=Path,
         default=Path("paper/figures/assets/test1000_candidates"),
     )
-    parser.add_argument("--selected-index", type=int, default=5)
+    parser.add_argument("--selected-index", type=int, default=6)
     parser.add_argument(
         "--output",
         type=Path,

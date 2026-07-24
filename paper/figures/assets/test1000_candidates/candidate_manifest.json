@@ -9,11 +9,7 @@
       "reference_video": "clips/audio_cvr_6_9s/avatar_6T9OU0OFnaw_00027_f5e66611/avatar_6T9OU0OFnaw_00027_f5e66611__single_001.mp4",
       "target_video": "clips/audio_cvr_6_9s/avatar_6T9OU0OFnaw_00027_f5e66611/avatar_6T9OU0OFnaw_00027_f5e66611__single_002.mp4",
       "raw_source_id": "avatar:avatar_6T9OU0OFnaw_00027_f5e66611",
-      "index": 0,
-      "reference_remote": "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s/avatar_6T9OU0OFnaw_00027_f5e66611/avatar_6T9OU0OFnaw_00027_f5e66611__single_001.mp4",
-      "reference_local": "paper/figures/assets/test1000_candidates/00_d8ad1840/reference.mp4",
-      "target_remote": "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s/avatar_6T9OU0OFnaw_00027_f5e66611/avatar_6T9OU0OFnaw_00027_f5e66611__single_002.mp4",
-      "target_local": "paper/figures/assets/test1000_candidates/00_d8ad1840/target.mp4"
+      "index": 0
     },
     {
       "sample_id": "speech_audio_content_audio_first_audio_event_261d9c2b26c0",
@@ -23,53 +19,37 @@
       "reference_video": "clips/audio_cvr_avatar_like_6_9s/existing_vggsound_415abffe21ae_0i84rueeIZE_000030_1e1b2ef1/existing_vggsound_415abffe21ae_0i84rueeIZE_000030_1e1b2ef1__single_001.mp4",
       "target_video": "clips/audio_cvr_avatar_like_6_9s/existing_vggsound_415abffe21ae_0i84rueeIZE_000030_1e1b2ef1/existing_vggsound_415abffe21ae_0i84rueeIZE_000030_1e1b2ef1__single_002.mp4",
       "raw_source_id": "vggsound:existing_vggsound_415abffe21ae_0i84rueeIZE_000030_1e1b2ef1",
-      "index": 1,
-      "reference_remote": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_avatar_like_test1000_20260722_013107/construction_data/clips/audio_cvr_avatar_like_6_9s/existing_vggsound_415abffe21ae_0i84rueeIZE_000030_1e1b2ef1/existing_vggsound_415abffe21ae_0i84rueeIZE_000030_1e1b2ef1__single_001.mp4",
-      "reference_local": "paper/figures/assets/test1000_candidates/01_9c2b26c0/reference.mp4",
-      "target_remote": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_avatar_like_test1000_20260722_013107/construction_data/clips/audio_cvr_avatar_like_6_9s/existing_vggsound_415abffe21ae_0i84rueeIZE_000030_1e1b2ef1/existing_vggsound_415abffe21ae_0i84rueeIZE_000030_1e1b2ef1__single_002.mp4",
-      "target_local": "paper/figures/assets/test1000_candidates/01_9c2b26c0/target.mp4"
+      "index": 1
     },
     {
       "sample_id": "ave_boundary_55a85407ef2f74213b1c",
       "dataset": "ave",
       "b_subtype": "sound_event",
       "edit_text": "Add the sound of a train horn.",
-      "reference_video": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_5NwrPL4p0Co/ave_5NwrPL4p0Co__reference.mp4",
-      "target_video": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_5NwrPL4p0Co/ave_5NwrPL4p0Co__target.mp4",
+      "reference_video": "${REPO_ROOT}/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_5NwrPL4p0Co/ave_5NwrPL4p0Co__reference.mp4",
+      "target_video": "${REPO_ROOT}/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_5NwrPL4p0Co/ave_5NwrPL4p0Co__target.mp4",
       "raw_source_id": "ave:5NwrPL4p0Co",
-      "index": 2,
-      "reference_remote": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_5NwrPL4p0Co/ave_5NwrPL4p0Co__reference.mp4",
-      "reference_local": "paper/figures/assets/test1000_candidates/02_74213b1c/reference.mp4",
-      "target_remote": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_5NwrPL4p0Co/ave_5NwrPL4p0Co__target.mp4",
-      "target_local": "paper/figures/assets/test1000_candidates/02_74213b1c/target.mp4"
+      "index": 2
     },
     {
       "sample_id": "ave_boundary_55a5e5a60f0c0733b607",
       "dataset": "ave",
       "b_subtype": "music",
       "edit_text": "Add accordion music.",
-      "reference_video": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_56g7w0ILhR8/ave_56g7w0ILhR8__reference.mp4",
-      "target_video": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_56g7w0ILhR8/ave_56g7w0ILhR8__target.mp4",
+      "reference_video": "${REPO_ROOT}/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_56g7w0ILhR8/ave_56g7w0ILhR8__reference.mp4",
+      "target_video": "${REPO_ROOT}/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_56g7w0ILhR8/ave_56g7w0ILhR8__target.mp4",
       "raw_source_id": "ave:56g7w0ILhR8",
-      "index": 3,
-      "reference_remote": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_56g7w0ILhR8/ave_56g7w0ILhR8__reference.mp4",
-      "reference_local": "paper/figures/assets/test1000_candidates/03_0733b607/reference.mp4",
-      "target_remote": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_56g7w0ILhR8/ave_56g7w0ILhR8__target.mp4",
-      "target_local": "paper/figures/assets/test1000_candidates/03_0733b607/target.mp4"
+      "index": 3
     },
     {
       "sample_id": "ave_boundary_f32948eb04478fa78636",
       "dataset": "ave",
       "b_subtype": "sound_event",
       "edit_text": "Add the sound of food frying.",
-      "reference_video": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_2Ar8YM5zfbs/ave_2Ar8YM5zfbs__reference.mp4",
-      "target_video": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_2Ar8YM5zfbs/ave_2Ar8YM5zfbs__target.mp4",
+      "reference_video": "${REPO_ROOT}/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_2Ar8YM5zfbs/ave_2Ar8YM5zfbs__reference.mp4",
+      "target_video": "${REPO_ROOT}/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_2Ar8YM5zfbs/ave_2Ar8YM5zfbs__target.mp4",
       "raw_source_id": "ave:2Ar8YM5zfbs",
-      "index": 4,
-      "reference_remote": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_2Ar8YM5zfbs/ave_2Ar8YM5zfbs__reference.mp4",
-      "reference_local": "paper/figures/assets/test1000_candidates/04_8fa78636/reference.mp4",
-      "target_remote": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_ave_boundary_fill_20260723_120906/ave_pool/clips/ave_2Ar8YM5zfbs/ave_2Ar8YM5zfbs__target.mp4",
-      "target_local": "paper/figures/assets/test1000_candidates/04_8fa78636/target.mp4"
+      "index": 4
     },
     {
       "sample_id": "speech_audio_content_audio_first_audio_event_0831c27cc098",
@@ -79,11 +59,17 @@
       "reference_video": "clips/audio_cvr_6_9s_noavatar_220_20260526_162015/worldsense_EaPoverA_49f5cf01/worldsense_EaPoverA_49f5cf01__single_002.mp4",
       "target_video": "clips/audio_cvr_6_9s_noavatar_220_20260526_162015/worldsense_EaPoverA_49f5cf01/worldsense_EaPoverA_49f5cf01__single_006.mp4",
       "raw_source_id": "worldsense:worldsense_EaPoverA_49f5cf01",
-      "index": 5,
-      "reference_remote": "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s_noavatar_220_20260526_162015/worldsense_EaPoverA_49f5cf01/worldsense_EaPoverA_49f5cf01__single_002.mp4",
-      "reference_local": "paper/figures/assets/test1000_candidates/05_c27cc098/reference.mp4",
-      "target_remote": "/data02/pretrained_model/cvr_learn/cvr_data/composed_omni_retrieval/clips/audio_cvr_6_9s_noavatar_220_20260526_162015/worldsense_EaPoverA_49f5cf01/worldsense_EaPoverA_49f5cf01__single_006.mp4",
-      "target_local": "paper/figures/assets/test1000_candidates/05_c27cc098/target.mp4"
+      "index": 5
+    },
+    {
+      "sample_id": "speech_audio_content_audio_first_audio_event_7deeeafb18ce",
+      "dataset": "avatar",
+      "b_subtype": "sound_event",
+      "edit_text": "add a dog bark to the audio",
+      "reference_video": "clips/audio_cvr_6_9s/avatar_2rJQT6a0RN4_00015_d7546995/avatar_2rJQT6a0RN4_00015_d7546995__single_001.mp4",
+      "target_video": "clips/audio_cvr_6_9s/avatar_2rJQT6a0RN4_00015_d7546995/avatar_2rJQT6a0RN4_00015_d7546995__single_002.mp4",
+      "raw_source_id": "avatar:avatar_2rJQT6a0RN4_00015_d7546995",
+      "index": 6
     }
   ]
 }

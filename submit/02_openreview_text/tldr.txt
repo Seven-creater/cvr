@@ -1,0 +1,1 @@
+Audio-CVR isolates whether retrievers rank an audio-edited target above its unchanged reference, revealing cross-model source anchoring and conditionally useful audio evidence.
