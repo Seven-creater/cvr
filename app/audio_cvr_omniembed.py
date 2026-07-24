@@ -291,6 +291,8 @@ def _embedding_item(
         "edit_text": edit_text,
         "prompt_version": PROMPT_VERSION,
     }
+    if mode == "V_A_T":
+        identity["audio_processing_version"] = "use_audio_in_video_v2"
     return {"embedding_key": _stable_digest(identity), **identity}
 
 
@@ -461,6 +463,7 @@ class OmniEmbedEncoder:
             videos=video_inputs,
             return_tensors="pt",
             padding="longest",
+            use_audio_in_video=use_audio,
         )
         inputs = {
             key: value.to(self.device) if hasattr(value, "to") else value

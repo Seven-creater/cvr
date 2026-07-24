@@ -102,6 +102,32 @@ class AudioCVROmniEmbedTests(unittest.TestCase):
         _, use_audio = _message(item)
         self.assertTrue(use_audio)
 
+    def test_audio_mode_uses_a_versioned_cache_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            media = Path(temp_dir) / "reference.mp4"
+            media.write_bytes(b"video")
+            visual = _embedding_item(
+                dataset="audiocvr",
+                mode="V_T",
+                condition="exact",
+                role="query",
+                item_id="sample",
+                media_path=str(media),
+            )
+            audiovisual = _embedding_item(
+                dataset="audiocvr",
+                mode="V_A_T",
+                condition="exact",
+                role="query",
+                item_id="sample",
+                media_path=str(media),
+            )
+            self.assertNotIn("audio_processing_version", visual)
+            self.assertEqual(
+                "use_audio_in_video_v2",
+                audiovisual["audio_processing_version"],
+            )
+
     def test_qwen_omni_utilities_root_is_optional(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             utilities_root = str(Path(temp_dir).resolve())
