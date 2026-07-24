@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +13,7 @@ from app.audio_cvr_omniembed import (
     CONDITIONS,
     MODES,
     _embedding_item,
+    _ensure_qwen_omni_utils_root,
     _message,
     _normalize_omnicvr,
     audit_cache,
@@ -98,6 +101,31 @@ class AudioCVROmniEmbedTests(unittest.TestCase):
         item["mode"] = "V_A_T"
         _, use_audio = _message(item)
         self.assertTrue(use_audio)
+
+    def test_qwen_omni_utilities_root_is_optional(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            utilities_root = str(Path(temp_dir).resolve())
+            previous = os.environ.get("QWEN_OMNI_UTILS_ROOT")
+            if utilities_root in sys.path:
+                sys.path.remove(utilities_root)
+            os.environ["QWEN_OMNI_UTILS_ROOT"] = utilities_root
+            try:
+                self.assertEqual(utilities_root, _ensure_qwen_omni_utils_root())
+                self.assertIn(utilities_root, sys.path)
+            finally:
+                sys.path.remove(utilities_root)
+                if previous is None:
+                    os.environ.pop("QWEN_OMNI_UTILS_ROOT", None)
+                else:
+                    os.environ["QWEN_OMNI_UTILS_ROOT"] = previous
+
+    def test_qwen_omni_utilities_root_can_be_unset(self) -> None:
+        previous = os.environ.pop("QWEN_OMNI_UTILS_ROOT", None)
+        try:
+            self.assertEqual("", _ensure_qwen_omni_utils_root())
+        finally:
+            if previous is not None:
+                os.environ["QWEN_OMNI_UTILS_ROOT"] = previous
 
     def test_encoding_is_item_atomic_and_resumable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

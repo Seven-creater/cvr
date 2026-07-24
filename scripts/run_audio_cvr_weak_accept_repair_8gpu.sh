@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="/data02/usr/wangqihao/miniconda3/envs/omni_src/bin/python"
+OMNIEMBED_PYTHON="/data02/usr/wangqihao/miniconda3/envs/peft/bin/python"
+QWEN_OMNI_UTILS_ROOT="/data02/usr/wangqihao/miniconda3/envs/omni/lib/python3.10/site-packages"
 FULL_TEST="runs/audio_cvr_test1000_unified_auditonly_20260723_142000/final_test1000/test_main_1000.jsonl"
 CORE_TEST="runs/audiocvr_benchmark150_auto_20260720_164327/benchmark_v1_final150_val28/test_main_150.jsonl"
 OMNICVR_RECORDS="runs/omnicvr_reference_diagnostics_20260721_144436/records_audio_center/eval.jsonl"
@@ -42,6 +44,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --out-root) OUT_ROOT="$2"; shift 2 ;;
     --python) PYTHON_BIN="$2"; shift 2 ;;
+    --omniembed-python) OMNIEMBED_PYTHON="$2"; shift 2 ;;
+    --qwen-omni-utils-root) QWEN_OMNI_UTILS_ROOT="$2"; shift 2 ;;
     --full-test) FULL_TEST="$2"; shift 2 ;;
     --core-test) CORE_TEST="$2"; shift 2 ;;
     --omnicvr-records) OMNICVR_RECORDS="$2"; shift 2 ;;
@@ -218,7 +222,7 @@ start_audit_server() {
 
 encode_omniembed() {
   write_status "RUNNING" "ENCODE_OMNIEMBED" "encoding Audio-CVR and OmniCVR with frozen OmniEmbed-MultiVent"
-  "$PYTHON_BIN" -m app.audio_cvr_omniembed prepare \
+  "$OMNIEMBED_PYTHON" -m app.audio_cvr_omniembed prepare \
     --audio-test "$FULL_TEST" --omnicvr-records "$OMNICVR_RECORDS" \
     --omnicvr-gallery "$OMNICVR_GALLERY" --variant-manifest "$VARIANT_MANIFEST" \
     --output-dir "$OMNIEMBED_ROOT/inventory" --audio-test-sha256 "$EXPECTED_SHA256" \
@@ -228,19 +232,19 @@ encode_omniembed() {
     gpu="${GPUS[$shard]}"
     jobs+=(
       "$OUT_ROOT/logs/omniembed_shard${shard}.log"
-      "CUDA_VISIBLE_DEVICES=$gpu OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false \"$PYTHON_BIN\" -m app.audio_cvr_omniembed encode --inventory-path \"$OMNIEMBED_INVENTORY\" --cache-dir \"$OMNIEMBED_CACHE\" --base-model \"$OMNIEMBED_BASE\" --adapter-model \"$OMNIEMBED_ADAPTER\" --shard-index $shard --shard-count 8 --device cuda --retries $ENCODING_RETRIES"
+      "CUDA_VISIBLE_DEVICES=$gpu OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false QWEN_OMNI_UTILS_ROOT=\"$QWEN_OMNI_UTILS_ROOT\" \"$OMNIEMBED_PYTHON\" -m app.audio_cvr_omniembed encode --inventory-path \"$OMNIEMBED_INVENTORY\" --cache-dir \"$OMNIEMBED_CACHE\" --base-model \"$OMNIEMBED_BASE\" --adapter-model \"$OMNIEMBED_ADAPTER\" --shard-index $shard --shard-count 8 --device cuda --retries $ENCODING_RETRIES"
     )
   done
   run_parallel "${jobs[@]}"
-  "$PYTHON_BIN" -m app.audio_cvr_omniembed audit-cache \
+  "$OMNIEMBED_PYTHON" -m app.audio_cvr_omniembed audit-cache \
     --inventory-path "$OMNIEMBED_INVENTORY" --cache-dir "$OMNIEMBED_CACHE" \
     --output-path "$OMNIEMBED_ROOT/cache_audit.json" \
     > "$OUT_ROOT/logs/omniembed_cache_audit.log" 2>&1
-  "$PYTHON_BIN" -m app.audio_cvr_omniembed evaluate \
+  "$OMNIEMBED_PYTHON" -m app.audio_cvr_omniembed evaluate \
     --records-dir "$OMNIEMBED_ROOT/inventory" --inventory-path "$OMNIEMBED_INVENTORY" \
     --cache-dir "$OMNIEMBED_CACHE" --output-dir "$OMNIEMBED_ROOT/evaluation" \
     > "$OUT_ROOT/logs/omniembed_evaluate.log" 2>&1
-  "$PYTHON_BIN" -m app.audio_cvr_omniembed statistics \
+  "$OMNIEMBED_PYTHON" -m app.audio_cvr_omniembed statistics \
     --per-query-path "$OMNIEMBED_ROOT/evaluation/per_query_results.jsonl" \
     --output-dir "$OMNIEMBED_ROOT/statistics" --iterations 20000 \
     > "$OUT_ROOT/logs/omniembed_statistics.log" 2>&1

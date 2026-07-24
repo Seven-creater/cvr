@@ -5,6 +5,7 @@ import gc
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import time
 from collections import Counter
@@ -92,6 +93,13 @@ def _l2(value: np.ndarray) -> np.ndarray:
     array = np.asarray(value, dtype=np.float32)
     denominator = np.linalg.norm(array, axis=-1, keepdims=True)
     return array / np.maximum(denominator, 1e-12)
+
+
+def _ensure_qwen_omni_utils_root() -> str:
+    utilities_root = os.environ.get("QWEN_OMNI_UTILS_ROOT", "").strip()
+    if utilities_root and utilities_root not in sys.path:
+        sys.path.append(utilities_root)
+    return utilities_root
 
 
 def _first_text(row: dict[str, Any], *keys: str) -> str:
@@ -433,6 +441,7 @@ class OmniEmbedEncoder:
         self.model.padding_side = "left"
 
     def encode(self, item: dict[str, Any]) -> np.ndarray:
+        _ensure_qwen_omni_utils_root()
         from qwen_omni_utils import process_mm_info
 
         message, use_audio = _message(item)
