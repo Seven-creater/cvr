@@ -95,6 +95,17 @@ class AudioCVRWeakAcceptTests(unittest.TestCase):
                 for dataset in EXTRA_AUDIT_QUOTAS
             }
             self.assertEqual(EXTRA_AUDIT_QUOTAS, counts)
+            summary = json.loads(
+                (output / "audit_manifest_summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                EXTRA_AUDIT_QUOTAS, summary["supplement_requested_quotas"]
+            )
+            self.assertEqual(
+                EXTRA_AUDIT_QUOTAS, summary["supplement_realized_quotas"]
+            )
             self.assertEqual(30, sum(row["requires_variant_check"] for row in primaries))
 
     def test_human_summary_reports_intrarater_agreement(self) -> None:

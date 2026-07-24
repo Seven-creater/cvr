@@ -42,6 +42,13 @@ EXTRA_AUDIT_QUOTAS = {
     "vgg_monoaudio": 5,
 }
 REFERENCE_VARIANTS = ("transcoded", "temporal", "spatial")
+AUDIT_QUOTA_FALLBACK_ORDER = (
+    "vggsound",
+    "ave",
+    "avatar",
+    "vgg_monoaudio",
+    "worldsense",
+)
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -260,17 +267,45 @@ def prepare_human_audit(
     core_set = set(core_indices)
     extra_indices: list[int] = []
     available: dict[str, int] = {}
+    candidate_pools: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    realized_quotas: Counter[str] = Counter()
     for dataset, quota in EXTRA_AUDIT_QUOTAS.items():
         candidates = [
             (index, row)
             for index, row in enumerate(full_rows)
             if index not in core_set and _dataset_label(row) == dataset
         ]
+        ordered = sorted(
+            candidates,
+            key=lambda item: _stable_digest(
+                seed, dataset, _sample_id(item[1])
+            ),
+        )
+        candidate_pools[dataset] = ordered
         available[dataset] = len(candidates)
-        if len(candidates) < quota:
-            raise ValueError(f"audit quota {dataset}={quota}, only {len(candidates)} available")
-        ordered = sorted(candidates, key=lambda item: _stable_digest(seed, dataset, _sample_id(item[1])))
-        extra_indices.extend(index for index, _ in ordered[:quota])
+        selected = ordered[: min(quota, len(ordered))]
+        extra_indices.extend(index for index, _ in selected)
+        realized_quotas[dataset] += len(selected)
+
+    deficit = 50 - len(extra_indices)
+    selected_set = set(extra_indices)
+    for dataset in AUDIT_QUOTA_FALLBACK_ORDER:
+        if deficit <= 0:
+            break
+        remaining = [
+            (index, row)
+            for index, row in candidate_pools[dataset]
+            if index not in selected_set
+        ]
+        take = min(deficit, len(remaining))
+        extra_indices.extend(index for index, _ in remaining[:take])
+        selected_set.update(index for index, _ in remaining[:take])
+        realized_quotas[dataset] += take
+        deficit -= take
+    if deficit:
+        raise ValueError(
+            f"extra audit sample is short by {deficit} after deterministic quota fallback"
+        )
     if len(extra_indices) != 50 or len(set(extra_indices)) != 50:
         raise ValueError("extra audit sample must contain exactly 50 unique records")
 
@@ -370,7 +405,9 @@ def prepare_human_audit(
         "hidden_repeat_count": 20,
         "display_item_count": 220,
         "variant_semantics_check_count": 30,
-        "supplement_quotas": EXTRA_AUDIT_QUOTAS,
+        "supplement_requested_quotas": EXTRA_AUDIT_QUOTAS,
+        "supplement_realized_quotas": dict(realized_quotas),
+        "supplement_quota_fallback_order": list(AUDIT_QUOTA_FALLBACK_ORDER),
         "supplement_available": available,
         "selection_uses_model_scores": False,
         "rater_count": 1,
