@@ -1021,6 +1021,8 @@ class E5AudioDeltaTrainTests(unittest.TestCase):
             self.assertTrue((root / "eval" / "adapter_geometry.json").exists())
             score_row = json.loads((root / "eval" / "per_query_scores.jsonl").read_text(encoding="utf-8").splitlines()[0])
             self.assertIsNotNone(score_row["reference_gallery_index"])
+            self.assertIsNotNone(score_row["base_reference_rank"])
+            self.assertIsNotNone(score_row["adapter_reference_rank"])
 
     def test_cache_embeddings_can_reuse_old_cache_for_reference_negative_gallery(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

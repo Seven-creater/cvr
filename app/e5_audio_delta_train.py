@@ -3748,6 +3748,16 @@ def _write_eval_topk_outputs(
                 "reference_gallery_index": reference,
                 "base_target_rank": _rank_of_index(base_order, positive),
                 "adapter_target_rank": _rank_of_index(adapted_order, positive),
+                "base_reference_rank": (
+                    _rank_of_index(base_order, reference)
+                    if reference is not None
+                    else None
+                ),
+                "adapter_reference_rank": (
+                    _rank_of_index(adapted_order, reference)
+                    if reference is not None
+                    else None
+                ),
                 "base_target_score": float(base_scores[row, positive]),
                 "adapter_target_score": float(adapted_scores[row, positive]),
                 "base_reference_score": base_reference_score,
