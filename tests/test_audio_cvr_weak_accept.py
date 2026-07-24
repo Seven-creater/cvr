@@ -142,6 +142,44 @@ class AudioCVRWeakAcceptTests(unittest.TestCase):
             self.assertEqual(1.0, report["hidden_repeat"]["exact_all_gate_agreement"])
             self.assertEqual(30, report["variant_semantics"]["count"])
 
+    def test_partial_human_summary_reports_actual_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            full, core, _ = self._full_fixture(root)
+            audit = root / "audit"
+            prepare_human_audit(
+                full_path=full,
+                core_path=core,
+                output_dir=audit,
+                media_roots=[root],
+                expected_full_sha256="",
+            )
+            manifest = [
+                json.loads(line)
+                for line in (audit / "private_manifest.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+            responses = [
+                {
+                    "review_id": row["review_id"],
+                    "confidence": 4,
+                    "note": "",
+                    **{gate: True for gate in AUDIT_GATES},
+                }
+                for row in manifest[:10]
+            ]
+            _write_jsonl(audit / "responses.jsonl", responses)
+            with self.assertRaisesRegex(ValueError, "human audit incomplete"):
+                summarize_human_audit(audit, root / "strict_summary")
+            report = summarize_human_audit(
+                audit, root / "partial_summary", allow_partial=True
+            )
+            self.assertTrue(report["partial_audit"])
+            self.assertEqual(10, report["completed_display_item_count"])
+            self.assertEqual(len(manifest), report["planned_display_item_count"])
+
     def test_reference_variant_generation_is_item_atomic_and_resumable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

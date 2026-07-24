@@ -680,21 +680,36 @@ def _validity_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def summarize_human_audit(audit_dir: Path, output_dir: Path) -> dict[str, Any]:
+def summarize_human_audit(
+    audit_dir: Path, output_dir: Path, *, allow_partial: bool = False
+) -> dict[str, Any]:
     manifest = _load_jsonl(audit_dir / "private_manifest.jsonl")
     responses = {
         row["review_id"]: row for row in _load_jsonl(audit_dir / "responses.jsonl")
     }
-    if len(responses) != len(manifest):
+    if len(responses) != len(manifest) and not allow_partial:
         raise ValueError(f"human audit incomplete: {len(responses)}/{len(manifest)}")
-    combined = [{**row, **responses[row["review_id"]]} for row in manifest]
+    combined = [
+        {**row, **responses[row["review_id"]]}
+        for row in manifest
+        if row["review_id"] in responses
+    ]
     primaries = [row for row in combined if not row["is_hidden_repeat"]]
     repeats = [row for row in combined if row["is_hidden_repeat"]]
 
     by_review_id = {row["review_id"]: row for row in combined}
-    repeat_pairs = [(by_review_id[row["repeat_of_review_id"]], row) for row in repeats]
+    repeat_pairs = [
+        (by_review_id[row["repeat_of_review_id"]], row)
+        for row in repeats
+        if row["repeat_of_review_id"] in by_review_id
+    ]
     gate_agreement = {
-        gate: sum(first[gate] == second[gate] for first, second in repeat_pairs) / len(repeat_pairs)
+        gate: (
+            sum(first[gate] == second[gate] for first, second in repeat_pairs)
+            / len(repeat_pairs)
+            if repeat_pairs
+            else None
+        )
         for gate in AUDIT_GATES
     }
     exact = sum(
@@ -706,6 +721,10 @@ def summarize_human_audit(audit_dir: Path, output_dir: Path) -> dict[str, Any]:
         "audit_version": AUDIT_VERSION,
         "rater_count": 1,
         "claim_scope": "blinded single-rater human audit",
+        "partial_audit": len(combined) != len(manifest),
+        "planned_display_item_count": len(manifest),
+        "completed_display_item_count": len(combined),
+        "completion_rate": len(combined) / len(manifest) if manifest else None,
         "unique_sample_count": len(primaries),
         "display_item_count": len(combined),
         "core150": _validity_summary([row for row in primaries if row["audit_partition"] == "core150"]),
@@ -727,7 +746,11 @@ def summarize_human_audit(audit_dir: Path, output_dir: Path) -> dict[str, Any]:
         },
         "hidden_repeat": {
             "count": len(repeat_pairs),
-            "exact_all_gate_agreement": exact / len(repeat_pairs),
+            "completed_repeat_item_count": len(repeats),
+            "unpaired_repeat_item_count": len(repeats) - len(repeat_pairs),
+            "exact_all_gate_agreement": (
+                exact / len(repeat_pairs) if repeat_pairs else None
+            ),
             "gate_level_agreement": gate_agreement,
         },
         "automatic_human_overall_agreement": _validity_summary(primaries)["valid_rate"],
@@ -735,9 +758,13 @@ def summarize_human_audit(audit_dir: Path, output_dir: Path) -> dict[str, Any]:
             "count": len(variant_rows),
             "temporal_preservation_rate": (
                 sum(bool(row["temporal_preserves_pre_edit"]) for row in variant_rows) / len(variant_rows)
+                if variant_rows
+                else None
             ),
             "spatial_preservation_rate": (
                 sum(bool(row["spatial_preserves_pre_edit"]) for row in variant_rows) / len(variant_rows)
+                if variant_rows
+                else None
             ),
         },
     }
@@ -1389,6 +1416,7 @@ def _build_parser() -> argparse.ArgumentParser:
     summarize = subparsers.add_parser("summarize-human-audit")
     summarize.add_argument("--audit-dir", required=True)
     summarize.add_argument("--output-dir", required=True)
+    summarize.add_argument("--allow-partial", action="store_true")
 
     valid = subparsers.add_parser("evaluate-human-valid-subset")
     valid.add_argument("--valid-path", required=True)
@@ -1467,7 +1495,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         return
     elif args.command == "summarize-human-audit":
-        value = summarize_human_audit(Path(args.audit_dir), Path(args.output_dir))
+        value = summarize_human_audit(
+            Path(args.audit_dir),
+            Path(args.output_dir),
+            allow_partial=args.allow_partial,
+        )
     elif args.command == "evaluate-human-valid-subset":
         value = evaluate_human_valid_subset(
             valid_path=Path(args.valid_path),
