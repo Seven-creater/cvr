@@ -26,6 +26,7 @@ MEDIA_ROOTS=()
 FINAL_SEEDS="13,23,42,71,101"
 VARIANT_WORKERS=8
 ENCODING_RETRIES=4
+OMNIEMBED_RETRIES=4
 
 usage() {
   cat <<'EOF'
@@ -65,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --media-root) MEDIA_ROOTS+=("$2"); shift 2 ;;
     --variant-workers) VARIANT_WORKERS="$2"; shift 2 ;;
     --encoding-retries) ENCODING_RETRIES="$2"; shift 2 ;;
+    --omniembed-retries) OMNIEMBED_RETRIES="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -234,7 +236,7 @@ encode_omniembed() {
     gpu="${GPUS[$shard]}"
     jobs+=(
       "$OUT_ROOT/logs/omniembed_shard${shard}.log"
-      "CUDA_VISIBLE_DEVICES=$gpu OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false QWEN_OMNI_UTILS_ROOT=\"$QWEN_OMNI_UTILS_ROOT\" \"$OMNIEMBED_PYTHON\" -m app.audio_cvr_omniembed encode --inventory-path \"$OMNIEMBED_INVENTORY\" --cache-dir \"$OMNIEMBED_CACHE\" --base-model \"$OMNIEMBED_BASE\" --adapter-model \"$OMNIEMBED_ADAPTER\" --shard-index $shard --shard-count 8 --device cuda --retries $ENCODING_RETRIES --attn-implementation sdpa"
+      "CUDA_VISIBLE_DEVICES=$gpu OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false QWEN_OMNI_UTILS_ROOT=\"$QWEN_OMNI_UTILS_ROOT\" \"$OMNIEMBED_PYTHON\" -m app.audio_cvr_omniembed encode --inventory-path \"$OMNIEMBED_INVENTORY\" --cache-dir \"$OMNIEMBED_CACHE\" --base-model \"$OMNIEMBED_BASE\" --adapter-model \"$OMNIEMBED_ADAPTER\" --shard-index $shard --shard-count 8 --device cuda --retries $OMNIEMBED_RETRIES --attn-implementation sdpa"
     )
   done
   run_parallel "${jobs[@]}"
