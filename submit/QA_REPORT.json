@@ -4,7 +4,7 @@
   "checksums": {
     "01_main_paper/Audio-CVR_AAAI27_anonymous.pdf": "fdc5d1a0bd235800a28c3edaefdfc1d41c01c0f9bf4ee4fbb2010757003f1e88",
     "03_reproducibility_checklist/ReproducibilityChecklist.pdf": "abad17340673bd8da6cfedf5c7f0c8d9f3af93db3c73eac47507065c438d5d0e",
-    "06_code_and_data_supplement/Audio-CVR_code_and_data_anonymous.zip": "47f8722f687cfec0389e626cfa4a301e08e78879ab8ee8674f4de5df7c314fde"
+    "06_code_and_data_supplement/Audio-CVR_code_and_data_anonymous.zip": "7510d582f0a181f36c2f13cc3fe640be442ba0266b2677a8d40451a68303e342"
   },
   "openreview_text": {
     "title_characters": 107,
@@ -30,7 +30,7 @@
     "text_characters": 5419
   },
   "code_zip": {
-    "bytes": 17136489,
+    "bytes": 17136157,
     "entry_count": 153,
     "full_code_tests": true
   },
