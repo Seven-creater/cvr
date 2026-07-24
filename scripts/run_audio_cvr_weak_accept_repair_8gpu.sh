@@ -130,7 +130,9 @@ cleanup() {
       kill -TERM "$pid" 2>/dev/null || true
     fi
   done
-  wait 2>/dev/null || true
+  for pid in "${CHILD_PIDS[@]:-}"; do
+    [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true
+  done
   if [[ "$RUN_STATE" != "COMPLETE" ]]; then
     write_status "FAILED" "launcher" "exit_code=$code; all atomic caches and audit responses are preserved"
   fi
