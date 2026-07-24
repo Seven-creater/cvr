@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+paper/.venv-figures/
+paper/build_main/
 runs/
 tests/AVIGATE-CVPR2025/
 tmp*/

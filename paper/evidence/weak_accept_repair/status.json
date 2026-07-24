@@ -1,0 +1,8 @@
+{
+  "full1000_sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "launcher_pid": 2432508,
+  "message": "automatic evidence complete; blinded human audit server remains available",
+  "stage": "PAPER_EVIDENCE_COMPLETE",
+  "state": "COMPLETE",
+  "updated_unix": 1784879115.9590287
+}

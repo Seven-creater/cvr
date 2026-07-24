@@ -1,0 +1,14 @@
+{
+  "model_label": "task-adapted Audio-as-Text VLM2Vec reproduction",
+  "seed": 13,
+  "train_count": 89,
+  "val_count": 28,
+  "rank": 32,
+  "steps": 400,
+  "learning_rate": 0.001,
+  "batch_size": 8,
+  "trainable_parameter_count": 458752,
+  "val_target_beats_reference": 0.4642857313156128,
+  "val_target_reference_gap": 0.043474677950143814,
+  "test_used_for_selection": false
+}

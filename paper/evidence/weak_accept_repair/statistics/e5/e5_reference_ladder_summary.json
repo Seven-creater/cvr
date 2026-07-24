@@ -1,0 +1,23 @@
+{
+  "conditions": [
+    "exact",
+    "transcoded",
+    "temporal",
+    "spatial"
+  ],
+  "model_family": "E5-Omni",
+  "modes": [
+    "V_T",
+    "V_A_T"
+  ],
+  "query_count": 1000,
+  "score_matrix_reused_for_masking": true,
+  "seeds": [
+    13,
+    23,
+    42,
+    71,
+    101
+  ],
+  "selection_uses_test_metrics": false
+}

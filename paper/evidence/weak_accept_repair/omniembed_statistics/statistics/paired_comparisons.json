@@ -1,0 +1,96 @@
+{
+  "comparisons": {
+    "V_A_T_spatial_reference_drop_vs_exact": {
+      "bootstrap_95_ci": [
+        -0.5650249999999999,
+        -0.5029750000000022
+      ],
+      "holm_adjusted_p": 0.00044997750112494374,
+      "iterations": 20000,
+      "mean_difference": -0.534,
+      "paired_randomization_p_two_sided": 4.999750012499375e-05
+    },
+    "V_A_T_temporal_reference_drop_vs_exact": {
+      "bootstrap_95_ci": [
+        -0.423,
+        -0.361
+      ],
+      "holm_adjusted_p": 0.00044997750112494374,
+      "iterations": 20000,
+      "mean_difference": -0.392,
+      "paired_randomization_p_two_sided": 4.999750012499375e-05
+    },
+    "V_A_T_transcoded_reference_drop_vs_exact": {
+      "bootstrap_95_ci": [
+        -0.03,
+        -0.013
+      ],
+      "holm_adjusted_p": 0.00044997750112494374,
+      "iterations": 20000,
+      "mean_difference": -0.021,
+      "paired_randomization_p_two_sided": 4.999750012499375e-05
+    },
+    "V_T_spatial_reference_drop_vs_exact": {
+      "bootstrap_95_ci": [
+        -0.557,
+        -0.495
+      ],
+      "holm_adjusted_p": 0.00044997750112494374,
+      "iterations": 20000,
+      "mean_difference": -0.526,
+      "paired_randomization_p_two_sided": 4.999750012499375e-05
+    },
+    "V_T_temporal_reference_drop_vs_exact": {
+      "bootstrap_95_ci": [
+        -0.407,
+        -0.347
+      ],
+      "holm_adjusted_p": 0.00044997750112494374,
+      "iterations": 20000,
+      "mean_difference": -0.377,
+      "paired_randomization_p_two_sided": 4.999750012499375e-05
+    },
+    "V_T_transcoded_reference_drop_vs_exact": {
+      "bootstrap_95_ci": [
+        -0.042,
+        -0.021
+      ],
+      "holm_adjusted_p": 0.00044997750112494374,
+      "iterations": 20000,
+      "mean_difference": -0.031,
+      "paired_randomization_p_two_sided": 4.999750012499375e-05
+    },
+    "audio_gain_R@1": {
+      "bootstrap_95_ci": [
+        -0.017,
+        -0.004
+      ],
+      "holm_adjusted_p": 0.004049797510124494,
+      "iterations": 20000,
+      "mean_difference": -0.01,
+      "paired_randomization_p_two_sided": 0.0013499325033748313
+    },
+    "audio_gain_target_beats_reference": {
+      "bootstrap_95_ci": [
+        -0.003,
+        0.0
+      ],
+      "holm_adjusted_p": 1.0,
+      "iterations": 20000,
+      "mean_difference": -0.001,
+      "paired_randomization_p_two_sided": 1.0
+    },
+    "audio_gain_target_reference_gap": {
+      "bootstrap_95_ci": [
+        -6.53441622853279e-05,
+        0.002540702144801616
+      ],
+      "holm_adjusted_p": 0.12499375031248437,
+      "iterations": 20000,
+      "mean_difference": 0.001256728708744049,
+      "paired_randomization_p_two_sided": 0.062496875156242186
+    }
+  },
+  "iterations": 20000,
+  "model": "OmniEmbed-v0.1-multivent"
+}

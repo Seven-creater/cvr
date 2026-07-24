@@ -1,0 +1,76 @@
+{
+  "protocol": "audiocvr_training_split_audit_v1",
+  "input_paths": {
+    "train": "runs/audiocvr_benchmark150_auto_20260720_164327/benchmark_v1_final150_val28/train.jsonl",
+    "val": "runs/audiocvr_benchmark150_auto_20260720_164327/benchmark_v1_final150_val28/val.jsonl",
+    "test": "runs/audio_cvr_test1000_unified_auditonly_20260723_142000/final_test1000/test_main_1000.jsonl"
+  },
+  "splits": {
+    "train": {
+      "count": 606,
+      "unique_source_count": 262,
+      "unique_pair_count": 606,
+      "subtype_distribution": {
+        "music": 17,
+        "sound_event": 48,
+        "speech_topic_in_video_context": 541
+      },
+      "dataset_distribution": {
+        "avatar": 113,
+        "daily_omni": 1,
+        "hdtf": 466,
+        "vggsound": 1,
+        "voxceleb": 17,
+        "worldsense": 8
+      },
+      "direction_distribution": {
+        "forward": 606
+      }
+    },
+    "val": {
+      "count": 28,
+      "unique_source_count": 28,
+      "unique_pair_count": 28,
+      "subtype_distribution": {
+        "music": 8,
+        "sound_event": 20
+      },
+      "dataset_distribution": {
+        "avatar": 28
+      },
+      "direction_distribution": {
+        "forward": 28
+      }
+    },
+    "test": {
+      "count": 1000,
+      "unique_source_count": 1000,
+      "unique_pair_count": 635,
+      "subtype_distribution": {
+        "music": 171,
+        "sound_event": 829
+      },
+      "dataset_distribution": {
+        "avatar": 174,
+        "ave": 196,
+        "unknown": 366,
+        "vgg_monoaudio": 9,
+        "vggsound": 245,
+        "worldsense": 10
+      },
+      "direction_distribution": {
+        "forward": 1000
+      }
+    }
+  },
+  "train_forward_count": 606,
+  "train_inverse_count": 0,
+  "leakage": {
+    "violation_count": 0,
+    "violations": []
+  },
+  "violation_count": 0,
+  "violations": [],
+  "ready_for_inverse_augmentation": true,
+  "ready_for_training": true
+}

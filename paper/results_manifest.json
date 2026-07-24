@@ -1,0 +1,537 @@
+{
+  "schema_version": 1,
+  "paper_title": "Audio-CVR: Automatic Curation and Reference-Aware Evaluation for Directional Audio Composed Video Retrieval",
+  "storyline": "doc/aaai_audiocvr_paper_storyline_canonical.md",
+  "frozen_test": {
+    "path": "runs/audio_cvr_test1000_unified_auditonly_20260723_142000/final_test1000/test_main_1000.jsonl",
+    "sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+    "query_count": 1000,
+    "sound_event": 829,
+    "music": 171,
+    "speech": 0,
+    "logical_gallery_entries": 2000,
+    "review_scope": "automatically curated and model-verified",
+    "human_validated": false,
+    "fixed_core_count": 516,
+    "selected_addition_count": 484,
+    "dataset_distribution": {
+      "avatar": 510,
+      "ave": 196,
+      "vggsound": 275,
+      "worldsense": 10,
+      "vgg_monoaudio": 9
+    },
+    "audit": {
+      "duplicate_sample_count": 0,
+      "duplicate_source_count": 0,
+      "duplicate_pair_count": 0,
+      "leakage_violation_count": 0,
+      "missing_media_count": 0,
+      "selection_uses_model_scores": false,
+      "repeat_review_policy": "post_freeze_audit_only",
+      "repeat_review_requested": 78,
+      "repeat_review_completed": 78,
+      "exact_decision_agreement": 0.7948717948717948,
+      "field_level_agreement": 0.8564102564102564,
+      "speech_role_agreement": 0.5769230769230769,
+      "disagreement_count": 53,
+      "missing_repeat_count": 0,
+      "freeze_time_repeat_review_completed": 40,
+      "postfreeze_repeat_reviews_added": 38,
+      "frozen_test_selection_changed": false,
+      "selection_uses_postfreeze_review": false,
+      "human_audit": {
+        "protocol": "blinded single-rater partial audit",
+        "planned_display_count": 220,
+        "completed_display_count": 51,
+        "unique_sample_count": 50,
+        "valid_count": 34,
+        "valid_rate": 0.68,
+        "partial_audit": true,
+        "core150_count": 38,
+        "core150_valid_count": 24,
+        "core150_valid_rate": 0.631578947368421,
+        "core150_wilson_95_ci": [0.47283959557009003, 0.7661578075284404],
+        "supplement_count": 12,
+        "supplement_valid_count": 10,
+        "supplement_valid_rate": 0.8333333333333334,
+        "supplement_wilson_95_ci": [0.5519691377470266, 0.9530348578161463],
+        "completed_paired_repeats": 0,
+        "variant_semantics_count": 8,
+        "temporal_semantics_preserved_rate": 1.0,
+        "spatial_semantics_preserved_rate": 1.0
+      }
+    }
+  },
+  "benchmarks": {
+    "core150": {
+      "query_count": 150,
+      "sound_event": 120,
+      "music": 30,
+      "speech": 0,
+      "logical_gallery_entries": 1000,
+      "review_scope": "historical Core150 sensitivity subset; superseded by the partial blinded Full1000 audit",
+      "manual_spot_check_count": 10,
+      "manual_reviewer_count": 2,
+      "spot_check_sampling": "random",
+      "formal_inter_reviewer_agreement_recorded": false
+    },
+    "full1000": {
+      "query_count": 1000,
+      "sound_event": 829,
+      "music": 171,
+      "speech": 0,
+      "logical_gallery_entries": 2000,
+      "review_scope": "automatically curated and model-verified; post-freeze repeat review is an audit, not a selection gate"
+    },
+    "omnicvr995": {
+      "query_count": 995,
+      "logical_gallery_entries": 1994,
+      "review_scope": "external audio-centered diagnostic"
+    },
+    "omnicvr1000_vlm2vec": {
+      "query_count": 1000,
+      "logical_gallery_entries": 2000,
+      "review_scope": "external audio-centered diagnostic using the Audio-as-Text VLM2Vec reproduction"
+    }
+  },
+  "results": {
+    "core150": {
+      "e5_adapter_vt": {
+        "with_reference_r1": 0.1133,
+        "target_over_reference": 0.1133
+      },
+      "e5_adapter_vat": {
+        "with_reference_r1": 0.2293,
+        "without_reference_r1": 0.9947,
+        "target_over_reference": 0.2320,
+        "audio_gain_r1": 0.1160,
+        "audio_gain_ci95": [0.063, 0.171],
+        "audio_gain_holm_p": 0.001
+      }
+    },
+    "full1000": {
+      "e5_base_vt": {
+        "with_reference_r1": 0.0070,
+        "without_reference_r1": 0.9970,
+        "target_over_reference": 0.0060,
+        "target_reference_margin": -0.0350
+      },
+      "e5_base_vat": {
+        "with_reference_r1": 0.0030,
+        "without_reference_r1": 0.9970,
+        "target_over_reference": 0.0030,
+        "target_reference_margin": -0.0308
+      },
+      "e5_adapter_vt": {
+        "with_reference_r1": 0.0594,
+        "with_reference_r1_std": 0.0099,
+        "without_reference_r1": 0.9828,
+        "without_reference_r1_std": 0.0098,
+        "target_over_reference": 0.0606,
+        "target_over_reference_std": 0.0107,
+        "target_reference_margin": -0.0282,
+        "target_reference_margin_std": 0.0011,
+        "reference_masking_gain_r1": 0.9234,
+        "reference_masking_gain_ci95": [0.9106, 0.9356],
+        "reference_masking_gain_holm_p": 0.00024998750062496874
+      },
+      "e5_adapter_vat": {
+        "with_reference_r1": 0.1278,
+        "with_reference_r1_std": 0.0255,
+        "without_reference_r1": 0.9726,
+        "without_reference_r1_std": 0.0191,
+        "target_over_reference": 0.1320,
+        "target_over_reference_std": 0.0284,
+        "target_reference_margin": -0.0208,
+        "target_reference_margin_std": 0.0012,
+        "audio_gain_r1": 0.0684,
+        "audio_gain_r1_ci95": [0.0516, 0.0852],
+        "audio_gain_r1_raw_p": 0.00004999750012499375,
+        "audio_gain_r1_holm_p": 0.001799910004499775,
+        "audio_gain_r5": -0.0022,
+        "audio_gain_r5_ci95": [-0.0052, 0.0010],
+        "audio_gain_r5_holm_p": 0.6404679766011699,
+        "audio_gain_r10": -0.0006,
+        "audio_gain_r10_ci95": [-0.0028, 0.0016],
+        "audio_gain_r10_holm_p": 1.0,
+        "audio_gain_target_over_reference": 0.0714,
+        "audio_gain_target_over_reference_ci95": [0.0548, 0.0886],
+        "audio_gain_margin": 0.0073904841840267185,
+        "audio_gain_margin_ci95": [0.0063966549769043915, 0.008413910913467406],
+        "reference_masking_gain_r1": 0.8448,
+        "reference_masking_gain_ci95": [0.8264, 0.8628],
+        "reference_masking_gain_holm_p": 0.001799910004499775,
+        "top1_error_count_across_seeds": 4361,
+        "top1_error_own_reference_count": 4317,
+        "top1_error_own_reference_rate": 0.989910570969961
+      },
+      "imagebind_vt": {
+        "with_reference_r1": 0.1170,
+        "without_reference_r1": 0.9930,
+        "target_over_reference": 0.1080,
+        "target_reference_margin": -0.00767,
+        "reference_masking_gain_r1": 0.8760,
+        "reference_masking_gain_ci95": [0.8550, 0.8960],
+        "reference_masking_gain_holm_p": 0.0008999550022498875,
+        "top1_own_reference_rate": 0.8810
+      },
+      "imagebind_vat": {
+        "with_reference_r1": 0.0250,
+        "without_reference_r1": 0.9850,
+        "target_over_reference": 0.0250,
+        "target_reference_margin": -0.02334,
+        "audio_gain_r1": -0.0920,
+        "audio_gain_r1_ci95": [-0.1130, -0.0710],
+        "audio_gain_r1_raw_p": 0.00004999750012499375,
+        "audio_gain_r1_holm_p": 0.0008999550022498875,
+        "audio_gain_margin": -0.01567463332414627,
+        "audio_gain_margin_ci95": [-0.017653052900731565, -0.01383409005403519],
+        "reference_masking_gain_r1": 0.9600,
+        "reference_masking_gain_ci95": [0.9470, 0.9720],
+        "reference_masking_gain_holm_p": 0.0008999550022498875,
+        "top1_own_reference_rate": 0.9750
+      },
+      "omniembed_vt": {
+        "with_reference_r1": 0.0100,
+        "without_reference_r1": 0.9920,
+        "target_over_reference": 0.0010,
+        "target_reference_margin": -0.05656563118100166,
+        "reference_masking_gain_r1": 0.9820,
+        "top1_own_reference_rate": 0.9890
+      },
+      "omniembed_vat": {
+        "with_reference_r1": 0.0,
+        "without_reference_r1": 0.9920,
+        "target_over_reference": 0.0,
+        "target_reference_margin": -0.055308904498815536,
+        "audio_gain_r1": -0.0100,
+        "audio_gain_r1_ci95": [-0.0170, -0.0040],
+        "audio_gain_r1_raw_p": 0.0013499325033748313,
+        "audio_gain_r1_holm_p": 0.004049797510124494,
+        "reference_masking_gain_r1": 0.9920,
+        "top1_own_reference_rate": 1.0
+      },
+      "vlm2vec_zero_vt": {
+        "with_reference_r1": 0.1100,
+        "without_reference_r1": 0.5740,
+        "target_over_reference": 0.1620,
+        "target_reference_margin": -0.023041576147079468,
+        "reference_masking_gain_r1": 0.4640,
+        "top1_own_reference_rate": 0.6520
+      },
+      "vlm2vec_zero_vat": {
+        "with_reference_r1": 0.0220,
+        "without_reference_r1": 0.0930,
+        "target_over_reference": 0.2320,
+        "target_reference_margin": -0.044139474630355835,
+        "audio_gain_r1": -0.0880,
+        "audio_gain_r1_ci95": [-0.1090, -0.0670],
+        "audio_gain_r1_raw_p": 0.00004999750012499375,
+        "audio_gain_target_over_reference": 0.0700,
+        "audio_gain_target_over_reference_ci95": [0.0370, 0.1030],
+        "audio_gain_margin": -0.02109789787232876,
+        "audio_gain_margin_ci95": [-0.030041271742433307, -0.012023301416635516],
+        "reference_masking_gain_r1": 0.0710,
+        "top1_own_reference_rate": 0.1620
+      }
+    },
+    "omnicvr995": {
+      "e5_base_vat": {
+        "with_reference_r1": 0.0,
+        "without_reference_r1": 0.1739
+      },
+      "e5_adapter_vat": {
+        "with_reference_r1": 0.0012,
+        "without_reference_r1": 0.1421,
+        "audio_gain_r1": 0.0012,
+        "audio_gain_holm_p": 0.2449,
+        "audio_gain_margin": 0.0281,
+        "audio_gain_margin_ci95": [0.0252, 0.0309],
+        "audio_gain_margin_holm_p": 0.001
+      }
+    },
+    "omnicvr1000_vlm2vec": {
+      "vlm2vec_zero_vt": {
+        "with_reference_r1": 0.0110,
+        "without_reference_r1": 0.1370,
+        "target_over_reference": 0.0240,
+        "target_reference_margin": -0.12650299072265625,
+        "reference_masking_gain_r1": 0.1260,
+        "top1_own_reference_rate": 0.9260
+      },
+      "vlm2vec_zero_vat": {
+        "with_reference_r1": 0.0850,
+        "without_reference_r1": 0.1670,
+        "target_over_reference": 0.2910,
+        "target_reference_margin": -0.06476191431283951,
+        "audio_gain_r1": 0.0740,
+        "audio_gain_r1_ci95": [0.0570, 0.0920],
+        "audio_gain_r1_raw_p": 0.00004999750012499375,
+        "audio_gain_target_over_reference": 0.2670,
+        "audio_gain_target_over_reference_ci95": [0.2380, 0.2960],
+        "audio_gain_margin": 0.06174107536673546,
+        "audio_gain_margin_ci95": [0.04371081461645662, 0.08002727708239103],
+        "reference_masking_gain_r1": 0.0820,
+        "top1_own_reference_rate": 0.5770
+      }
+    },
+    "omnicvr1000_omniembed": {
+      "omniembed_vt": {
+        "with_reference_r1": 0.0010,
+        "without_reference_r1": 0.1450,
+        "target_over_reference": 0.0010,
+        "target_reference_margin": -0.39263,
+        "reference_masking_gain_r1": 0.1440,
+        "top1_own_reference_rate": 0.9970
+      },
+      "omniembed_vat": {
+        "with_reference_r1": 0.0,
+        "without_reference_r1": 0.1400,
+        "target_over_reference": 0.0,
+        "target_reference_margin": -0.41410,
+        "reference_masking_gain_r1": 0.1400,
+        "top1_own_reference_rate": 1.0
+      }
+    }
+  },
+  "supplementary_results": {
+    "reference_perturbation_ladder": {
+      "conditions": ["exact", "transcoded", "temporal", "spatial"],
+      "metric": "reference_induced_R@1_drop",
+      "e5_base_vt": [0.990, 0.943, 0.261, 0.449],
+      "e5_base_vat": [0.994, 0.973, 0.308, 0.609],
+      "e5_adapter_vt": [0.9234, 0.8414, 0.3262, 0.4152],
+      "e5_adapter_vat": [0.8448, 0.7894, 0.4290, 0.5104],
+      "imagebind_vt": [0.876, 0.806, 0.585, 0.270],
+      "imagebind_vat": [0.960, 0.940, 0.840, 0.815],
+      "omniembed_vt": [0.982, 0.951, 0.605, 0.456],
+      "omniembed_vat": [0.992, 0.971, 0.600, 0.458],
+      "variant_count": 3000,
+      "missing_variant_count": 0,
+      "all_condition_sample_ids_identical": true
+    },
+    "human_valid_subset": {
+      "query_count": 34,
+      "scope": "descriptive sensitivity analysis on the completed human-valid subset",
+      "e5_adapter_vt": {
+        "with_reference_r1": 0.11176470588235295,
+        "without_reference_r1": 0.9705882352941175,
+        "target_over_reference": 0.11176470588235295,
+        "target_reference_margin": -0.01862439618391149
+      },
+      "e5_adapter_vat": {
+        "with_reference_r1": 0.17058823529411765,
+        "without_reference_r1": 0.9352941176470588,
+        "target_over_reference": 0.2058823529411765,
+        "target_reference_margin": -0.011876305061228134
+      },
+      "imagebind_vt": {
+        "with_reference_r1": 0.23529411764705882,
+        "without_reference_r1": 1.0
+      },
+      "imagebind_vat": {
+        "with_reference_r1": 0.058823529411764705,
+        "without_reference_r1": 0.9411764705882353
+      },
+      "omniembed_vt": {
+        "with_reference_r1": 0.08823529411764706,
+        "without_reference_r1": 1.0
+      },
+      "omniembed_vat": {
+        "with_reference_r1": 0.0,
+        "without_reference_r1": 1.0
+      }
+    },
+    "verified_bidirectional_ablation": {
+      "benchmark": "Core150",
+      "forward_only_r1_mean": 0.2293,
+      "forward_only_r1_std": 0.0531,
+      "forward_plus_inverse_r1_mean": 0.1893,
+      "forward_plus_inverse_r1_std": 0.0272,
+      "r1_difference": -0.0400,
+      "r1_ci95": [-0.0760, -0.005333],
+      "r1_holm_p": 0.0372981,
+      "margin_difference": 0.003433,
+      "margin_ci95": [0.001721, 0.005076],
+      "margin_holm_p": 0.000149993
+    },
+    "reference_dominance_controls": {
+      "full1000": {
+        "query_count": 1000,
+        "seed_count": 5,
+        "mode": "V_A_T",
+        "adapter_target_beats_own_reference_mean": 0.1320,
+        "adapter_own_reference_rank1_mean": 0.8588,
+        "adapter_target_beats_visual_hard_mean": 1.0,
+        "adapter_target_beats_audio_hard_mean": 1.0,
+        "adapter_target_beats_asr_hard_mean": 1.0,
+        "base_target_beats_own_reference": 0.0030,
+        "base_target_beats_visual_hard": 1.0,
+        "base_target_beats_audio_hard": 1.0,
+        "base_target_beats_asr_hard": 1.0
+      },
+      "historical_mixed_gallery": {
+        "status": "historical protocol diagnostic, not a final benchmark result",
+        "query_count": 128,
+        "gallery_count": 1000,
+        "adapter_reference_beats_three_typed_hards": 1.0,
+        "adapter_reference_beats_local_pairwise": 0.833333,
+        "adapter_local_comparison_count": 36,
+        "adapter_local_query_count": 9,
+        "adapter_reference_beats_random_pairwise": 0.999433,
+        "adapter_random_comparison_count": 33536,
+        "base_reference_beats_three_typed_hards": 1.0,
+        "base_reference_beats_local_pairwise": 1.0,
+        "base_reference_beats_random_pairwise": 1.0
+      }
+    },
+    "e5_adapter_seven_modes": {
+      "T_only_fullAV": {"r1_mean": 0.0122, "r1_std": 0.0035, "r5_mean": 0.0412, "r10_mean": 0.0662},
+      "V_only": {"r1_mean": 0.0222, "r1_std": 0.0159, "r5_mean": 0.9982, "r10_mean": 0.9988},
+      "A_only": {"r1_mean": 0.1288, "r1_std": 0.0137, "r5_mean": 0.7330, "r10_mean": 0.8216},
+      "V_T": {"r1_mean": 0.0594, "r1_std": 0.0099, "r5_mean": 0.9938, "r10_mean": 0.9962},
+      "A_T": {"r1_mean": 0.1354, "r1_std": 0.0049, "r5_mean": 0.7284, "r10_mean": 0.8114},
+      "V_A": {"r1_mean": 0.0936, "r1_std": 0.0433, "r5_mean": 0.9930, "r10_mean": 0.9962},
+      "V_A_T": {"r1_mean": 0.1278, "r1_std": 0.0255, "r5_mean": 0.9916, "r10_mean": 0.9956}
+    },
+    "imagebind_zero_shot_seven_modes": {
+      "T_only_fullAV": {"with_reference_r1": 0.0210, "without_reference_r1": 0.0320, "r5": 0.0960, "r10": 0.1520},
+      "V_only": {"with_reference_r1": 0.0090, "without_reference_r1": 0.9960, "r5": 0.9990, "r10": 1.0000},
+      "A_only": {"with_reference_r1": 0.0000, "without_reference_r1": 0.9420, "r5": 0.9730, "r10": 0.9830},
+      "V_T": {"with_reference_r1": 0.1170, "without_reference_r1": 0.9930, "r5": 0.9980, "r10": 0.9980},
+      "A_T": {"with_reference_r1": 0.0410, "without_reference_r1": 0.9290, "r5": 0.9760, "r10": 0.9850},
+      "V_A": {"with_reference_r1": 0.0000, "without_reference_r1": 0.9810, "r5": 0.9920, "r10": 0.9960},
+      "V_A_T": {"with_reference_r1": 0.0250, "without_reference_r1": 0.9850, "r5": 0.9940, "r10": 0.9960}
+    },
+    "vlm2vec_fewshot_adapter": {
+      "train_instances": 89,
+      "validation_queries": 28,
+      "seeds": [13, 23, 42, 71, 101],
+      "audiocvr": {
+        "V_T": {"with_reference_r1_mean": 0.0258, "with_reference_r1_std": 0.0032, "target_over_reference_mean": 0.4320, "target_reference_margin_mean": -0.0111},
+        "V_A_T": {"with_reference_r1_mean": 0.0224, "with_reference_r1_std": 0.0062, "target_over_reference_mean": 0.5060, "target_reference_margin_mean": 0.0504}
+      },
+      "omnicvr": {
+        "V_T": {"with_reference_r1_mean": 0.0176, "with_reference_r1_std": 0.0041, "target_over_reference_mean": 0.3020, "target_reference_margin_mean": -0.1003},
+        "V_A_T": {"with_reference_r1_mean": 0.0090, "with_reference_r1_std": 0.0019, "target_over_reference_mean": 0.4094, "target_reference_margin_mean": -0.0701}
+      }
+    }
+  },
+  "provenance": {
+    "core150": [
+      "doc/aaai_audiocvr_submission_dossier_20260717.md",
+      "doc/aaai_audiocvr_abstract_draft_20260720.md"
+    ],
+    "omnicvr995": [
+      "doc/omnicvr_reference_cross_benchmark_results_20260721.md"
+    ],
+    "vlm2vec": [
+      "paper/evidence/server_final1000/audiovlm2vec/final_results/paper_results.md",
+      "paper/evidence/server_final1000/audiovlm2vec/zero_shot/zero_shot_results.json",
+      "paper/evidence/server_final1000/audiovlm2vec/final_results/adapter_results.json",
+      "paper/evidence/server_final1000/audiovlm2vec/final_results/final_audit.json",
+      "paper/evidence/server_final1000/audiovlm2vec/final_results/model_provenance.json",
+      "paper/evidence/server_final1000/audiovlm2vec/caption_audit.json",
+      "paper/evidence/server_final1000/audiovlm2vec/embedding_audit.json"
+    ],
+    "full1000": [
+      "paper/evidence/server_final1000/final_status.json",
+      "paper/evidence/server_final1000/dataset/frozen_benchmark_manifest.json",
+      "paper/evidence/server_final1000/dataset/frozen_benchmark.sha256",
+      "paper/evidence/server_final1000/dataset/postfreeze_repeat_audit.json",
+      "paper/evidence/server_final1000/dataset/review_agreement_summary_complete.json",
+      "paper/evidence/server_final1000/e5_statistics/test_main_mean_std.json",
+      "paper/evidence/server_final1000/e5_statistics/paired_comparisons.json",
+      "paper/evidence/server_final1000/e5_statistics/error_breakdown.json",
+      "paper/evidence/server_final1000/adapter_training/adapter_config_seed13.json",
+      "paper/evidence/server_final1000/adapter_training/inverse_summary.json",
+      "paper/evidence/server_final1000/adapter_training/five_seed_training_audit.json",
+      "paper/evidence/server_final1000/adapter_training/validation_selection.json",
+      "paper/evidence/core150_manual_spot_check.md",
+      "paper/evidence/server_final1000/imagebind_statistics/paper_results.md",
+      "paper/evidence/server_final1000/imagebind_statistics/statistics_summary.json",
+      "paper/evidence/server_final1000/audits/common_query_audit.json",
+      "paper/evidence/weak_accept_repair/final_audit.json",
+      "paper/evidence/weak_accept_repair/human_audit_summary/human_audit_summary.json",
+      "paper/evidence/weak_accept_repair/statistics/e5/e5_reference_ladder_mean_std.json",
+      "paper/evidence/weak_accept_repair/statistics/e5/e5_paired_comparisons.json",
+      "paper/evidence/weak_accept_repair/statistics/imagebind/imagebind_reference_ladder.json",
+      "paper/evidence/weak_accept_repair/statistics/imagebind/imagebind_paired_comparisons.json",
+      "paper/evidence/weak_accept_repair/omniembed_evaluation/results.json",
+      "paper/evidence/weak_accept_repair/omniembed_statistics/paired_comparisons.json"
+    ],
+    "reference_dominance_controls": [
+      "paper/evidence/reference_dominance_controls/reference_dominance_audit.json",
+      "paper/evidence/reference_dominance_controls/full1000/seed_13_V_A_T_summary.json",
+      "paper/evidence/reference_dominance_controls/full1000/seed_23_V_A_T_summary.json",
+      "paper/evidence/reference_dominance_controls/full1000/seed_42_V_A_T_summary.json",
+      "paper/evidence/reference_dominance_controls/full1000/seed_71_V_A_T_summary.json",
+      "paper/evidence/reference_dominance_controls/full1000/seed_101_V_A_T_summary.json",
+      "paper/evidence/reference_dominance_controls/historical128/summary.json",
+      "paper/evidence/reference_dominance_controls/historical128/diagnostics.json",
+      "paper/evidence/reference_dominance_controls/historical128/per_query_scores.jsonl",
+      "paper/evidence/reference_dominance_controls/historical128/eval_records.jsonl",
+      "paper/evidence/reference_dominance_controls/historical128/eval_gallery.jsonl"
+    ]
+  },
+  "server_reproducibility": {
+    "git_head": "6ede6560e8a6c6af24746ee4c6729933bca97ad8",
+    "run_root": "runs/audio_cvr_e5_imagebind_final1000_20260723_143500",
+    "e5_seed_count": 5,
+    "e5_seeds": [13, 23, 42, 71, 101],
+    "e5_evaluation_modes": 9,
+    "imagebind_training": "none",
+    "imagebind_excluded_queries": 0,
+    "common_query_count": 1000,
+    "sample_sets_identical": true,
+    "nan_or_inf_count": 0,
+    "audit_violation_count": 0,
+    "vlm2vec_reproduction": {
+      "run_root": "runs/audiovlm2vec_reference_diagnostic_20260724_020838",
+      "git_head": "41ba838918c2777baa83ade45775681ecfca270b",
+      "model_label": "Audio-as-Text VLM2Vec reproduction",
+      "upstream_checkpoint": "TIGER-Lab/VLM2Vec-Qwen2VL-7B",
+      "audio_captioner": "Qwen2-Audio",
+      "official_audiovlm2vec_checkpoint_public": false,
+      "audiocvr_query_count": 1000,
+      "omnicvr_query_count": 1000,
+      "caption_count": 4186,
+      "embedding_count": 12702,
+      "adapter_seeds": [13, 23, 42, 71, 101],
+      "audit_violation_count": 0
+    },
+    "adapter_training": {
+      "backbone": "E5-Omni-7B",
+      "embedding_dim": 3584,
+      "architecture": "low_rank_residual",
+      "rank": 32,
+      "trainable_parameter_count": 688131,
+      "forward_pairs": 65,
+      "accepted_inverse_pairs": 24,
+      "directional_training_instances": 89,
+      "validation_queries": 28,
+      "steps": 400,
+      "learning_rate": 0.001,
+      "batch_size": 8,
+      "selection_split": "validation_only",
+      "selection_rule": "one-standard-error"
+    },
+    "weak_accept_repair": {
+      "run_root": "runs/audio_cvr_weak_accept_repair_20260724_weak_accept_89f1ab7",
+      "git_head": "c4327d71d9a02433497ecc2e992dfa80877c6fca",
+      "state": "PAPER_EVIDENCE_COMPLETE",
+      "full1000_membership_unchanged": true,
+      "reference_variant_count": 3000,
+      "reference_variant_missing_count": 0,
+      "omniembed_model": "Tevatron/OmniEmbed-v0.1-multivent",
+      "omniembed_audiocvr_query_count": 1000,
+      "omniembed_omnicvr_query_count": 1000,
+      "omniembed_excluded_gallery_count": 1,
+      "omniembed_nan_or_inf_count": 0,
+      "human_audit_unique_count": 50,
+      "human_audit_partial": true,
+      "final_audit_violation_count": 0
+    }
+  }
+}

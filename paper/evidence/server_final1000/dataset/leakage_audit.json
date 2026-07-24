@@ -1,0 +1,9 @@
+{
+  "violation_count": 0,
+  "duplicate_sample_count": 0,
+  "duplicate_source_count": 0,
+  "duplicate_pair_count": 0,
+  "fixed_addition_overlap_count": 0,
+  "protected_addition_overlap_count": 0,
+  "missing_media_field_count": 0
+}

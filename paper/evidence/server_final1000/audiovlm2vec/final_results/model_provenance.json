@@ -1,0 +1,10 @@
+{
+  "model_label": "Audio-as-Text VLM2Vec reproduction",
+  "official_audiovlm2vec_checkpoint_public": false,
+  "upstream_repository": "https://github.com/TIGER-AI-Lab/VLM2Vec",
+  "upstream_branch": "v1",
+  "upstream_checkpoint": "TIGER-Lab/VLM2Vec-Qwen2VL-7B",
+  "audio_captioner": "Qwen2-Audio",
+  "visual_temporal_representation": "four-frame contact sheet",
+  "test_selection_uses_metrics": false
+}

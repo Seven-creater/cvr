@@ -1,0 +1,24 @@
+{
+  "e5_gallery": {
+    "distractor_count": 0,
+    "forbidden_source_count": 1000,
+    "gallery_count": 2000,
+    "gallery_protocol": "reference",
+    "hard_negative_count": 0,
+    "hard_negative_type_counts": {},
+    "include_reference_negative": true,
+    "local_same_source_candidate_sample_count": 0,
+    "local_same_source_candidates_path": null,
+    "pool_paths": [],
+    "positive_count": 1000,
+    "reference_negative_count": 1000,
+    "requested_gallery_size": 2000
+  },
+  "media_count": 2012,
+  "pre516_inherited": true,
+  "pre516_sha256": "6f4f17aada3967a72ee0eaf5305c9f3a8fd5dc3ab76f6b867e94f37766977db1",
+  "selection_uses_test_metrics": false,
+  "test_count": 1000,
+  "test_sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "text_count": 729
+}

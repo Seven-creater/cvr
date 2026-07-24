@@ -1,0 +1,128 @@
+[
+  {
+    "file": "06_OmniCVR_A_Benchmark_for_Omni_Composed_Video_Retrieval.pdf",
+    "title": "OmniCVR: A Benchmark for Omni-Composed Video Retrieval with Vision, Audio, and Text",
+    "category": "closest benchmark",
+    "relevance": "Audio-centered composed video retrieval, source-in-gallery evaluation, and cross-benchmark diagnosis.",
+    "source_url": "https://openreview.net/pdf/176b2a470b198e55600b0568604f5bc694982ae7.pdf"
+  },
+  {
+    "file": "07_CoVR_2_Automatic_Data_Construction_for_Composed_Video_Retrieval.pdf",
+    "title": "CoVR-2: Automatic Data Construction for Composed Video Retrieval",
+    "category": "automatic curation",
+    "relevance": "Closest precedent for scalable automatic construction of composed-video triplets.",
+    "source_url": "https://arxiv.org/pdf/2308.14746"
+  },
+  {
+    "file": "08_Composed_Video_Retrieval_via_Enriched_Context_and_Discriminative_Embeddings.pdf",
+    "title": "Composed Video Retrieval via Enriched Context and Discriminative Embeddings",
+    "category": "composed video retrieval",
+    "relevance": "Strong visual CoVR model and modality/input ablations for comparison with the adapter baseline.",
+    "source_url": "https://arxiv.org/pdf/2403.16997"
+  },
+  {
+    "file": "09_Beyond_Simple_Edits_Composed_Video_Retrieval_with_Dense_Modifications.pdf",
+    "title": "Beyond Simple Edits: Composed Video Retrieval with Dense Modifications",
+    "category": "composed video retrieval",
+    "relevance": "Recent large-scale CoVR dataset construction and fine-grained modification design.",
+    "source_url": "https://arxiv.org/pdf/2508.14039"
+  },
+  {
+    "file": "10_CoVR_R_Reason_Aware_Composed_Video_Retrieval.pdf",
+    "title": "CoVR-R: Reason-Aware Composed Video Retrieval",
+    "category": "composed video retrieval",
+    "relevance": "Recent reasoning-oriented formulation of source, modification, and target consistency.",
+    "source_url": "https://arxiv.org/pdf/2603.20190"
+  },
+  {
+    "file": "11_Training_Free_Composed_Video_Retrieval_via_Video_LLM_Reasoning.pdf",
+    "title": "Training-Free Composed Video Retrieval via Visual Representation-Guided Video-LLM Reasoning",
+    "category": "composed video retrieval",
+    "relevance": "Training-free retrieval baseline and candidate reranking perspective.",
+    "source_url": "https://arxiv.org/pdf/2606.02321"
+  },
+  {
+    "file": "12_ImageBind_One_Embedding_Space_To_Bind_Them_All.pdf",
+    "title": "ImageBind: One Embedding Space To Bind Them All",
+    "category": "independent baseline",
+    "relevance": "Primary source for the independent zero-shot audiovisual embedding baseline.",
+    "source_url": "https://arxiv.org/pdf/2305.05665"
+  },
+  {
+    "file": "13_Few_Shot_Composition_Learning_for_Image_Retrieval_with_Prompt_Tuning.pdf",
+    "title": "Few-Shot Composition Learning for Image Retrieval with Prompt Tuning",
+    "category": "few-shot adaptation",
+    "relevance": "Precedent for frozen-backbone parameter-efficient adaptation with few query-target pairs.",
+    "source_url": "https://ojs.aaai.org/index.php/AAAI/article/download/25597/25369"
+  },
+  {
+    "file": "14_Bi_Directional_Training_for_Composed_Image_Retrieval.pdf",
+    "title": "Bi-Directional Training for Composed Image Retrieval via Text Prompt Learning",
+    "category": "few-shot adaptation",
+    "relevance": "Direct methodological precedent for verified forward and inverse training directions.",
+    "source_url": "https://arxiv.org/pdf/2303.16604"
+  },
+  {
+    "file": "15_WavCaps_ChatGPT_Assisted_Weakly_Labelled_Audio_Captioning_Dataset.pdf",
+    "title": "WavCaps: A ChatGPT-Assisted Weakly-Labelled Audio Captioning Dataset",
+    "category": "automatic curation",
+    "relevance": "Multi-stage language-model filtering and rewriting for large audio-language datasets.",
+    "source_url": "https://arxiv.org/pdf/2303.17395"
+  },
+  {
+    "file": "16_AudioSetCaps_Automated_Audio_Caption_Generation_Pipeline.pdf",
+    "title": "AudioSetCaps: An Enriched Audio-Caption Dataset using Automated Generation Pipeline with Large Audio and Language Models",
+    "category": "automatic curation",
+    "relevance": "Audio-model extraction, language-model generation, and CLAP-based refinement pipeline.",
+    "source_url": "https://arxiv.org/pdf/2411.18953"
+  },
+  {
+    "file": "17_ACAV100M_Automatic_Curation_of_Large_Scale_Audio_Visual_Datasets.pdf",
+    "title": "ACAV100M: Automatic Curation of Large-Scale Datasets for Audio-Visual Video Representation Learning",
+    "category": "automatic curation",
+    "relevance": "Scalable automatic selection based on audio-visual correspondence.",
+    "source_url": "https://arxiv.org/pdf/2101.10803"
+  },
+  {
+    "file": "18_VGGSound_A_Large_Scale_Audio_Visual_Dataset.pdf",
+    "title": "VGGSound: A Large-scale Audio-Visual Dataset",
+    "category": "source dataset",
+    "relevance": "Primary source for the sound-event video corpus used in Full1000.",
+    "source_url": "https://arxiv.org/pdf/2004.14368"
+  },
+  {
+    "file": "19_AVE_Audio_Visual_Event_Localization_in_Unconstrained_Videos.pdf",
+    "title": "Audio-Visual Event Localization in Unconstrained Videos",
+    "category": "source dataset",
+    "relevance": "Primary source for AVE and its visible-and-audible event criterion.",
+    "source_url": "https://arxiv.org/pdf/1803.08842"
+  },
+  {
+    "file": "20_PinPoint_Composed_Retrieval_with_Explicit_Negatives.pdf",
+    "title": "PinPoint: Evaluation of Composed Image Retrieval with Explicit Negatives, Multi-Image Queries, and Paraphrase Testing",
+    "category": "diagnostic evaluation",
+    "relevance": "Explicit hard negatives and failure-focused composed-retrieval evaluation.",
+    "source_url": "https://arxiv.org/pdf/2603.04598"
+  },
+  {
+    "file": "21_FlatSounds_Benchmarking_Single_Factor_Physical_Video_to_Audio_Generation.pdf",
+    "title": "Benchmarking Single-Factor Physical Video-to-Audio Generation",
+    "category": "counterfactual evaluation",
+    "relevance": "Controlled counterfactual pairs and single-factor audiovisual diagnostics.",
+    "source_url": "https://arxiv.org/pdf/2605.30339"
+  },
+  {
+    "file": "22_VGGSounder_Audio_Visual_Modal_Contribution_Labels.pdf",
+    "title": "VGGSounder",
+    "category": "audiovisual diagnostics",
+    "relevance": "Audible, visible, voice-over, and background-music labels for modality contribution analysis.",
+    "source_url": "https://arxiv.org/pdf/2508.08237"
+  },
+  {
+    "file": "23_Objects_That_Sound_Avoiding_Audio_Visual_Data_Shortcuts.pdf",
+    "title": "Objects that Sound",
+    "category": "shortcut control",
+    "relevance": "Audio-visual correspondence learning and a cautionary treatment of data-preparation shortcuts.",
+    "source_url": "https://arxiv.org/pdf/1712.06651"
+  }
+]

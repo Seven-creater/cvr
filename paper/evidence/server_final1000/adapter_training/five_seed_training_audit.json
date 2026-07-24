@@ -1,0 +1,27 @@
+{
+  "verified_on": "2026-07-23",
+  "server_git_head": "6ede6560e8a6c6af24746ee4c6729933bca97ad8",
+  "training_run": "runs/audiocvr_fewshot_bidir_final_20260721_071148",
+  "training_records_path": "runs/audiocvr_fewshot_bidir_final_20260721_071148/inverse_review/b_train_bidirectional_triplets.jsonl",
+  "training_cache": "runs/audiocvr_fewshot_bidir_final_20260721_071148/cache_train_bidir",
+  "training_cache_record_count": 89,
+  "forward_record_count": 65,
+  "accepted_inverse_record_count": 24,
+  "unique_sample_direction_count": 89,
+  "seeds": [
+    13,
+    23,
+    42,
+    71,
+    101
+  ],
+  "all_seed_train_summaries_use_training_cache": true,
+  "all_final_evaluations_use_matching_seed_adapter": true,
+  "adapter_architecture": "low_rank_residual",
+  "adapter_rank": 32,
+  "trainable_parameter_count": 688131,
+  "steps": 400,
+  "batch_size": 8,
+  "learning_rate": 0.001,
+  "validation_query_count": 28
+}

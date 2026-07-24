@@ -872,3 +872,242 @@ visible_text
 ```
 
 这其实是进展，不是原地踏步。
+
+## 13. 当前实际在用的 Omni 模型
+
+这一节专门澄清一个很容易混淆的问题：
+
+```text
+“模型已经下载好”
+不等于
+“模型已经接入当前正在跑的 nohup 实验”
+```
+
+### 13.1 当前 Omni-Detective 数据构造链路里真正用上的模型
+
+截至 2026-04-22 晚间，当前 **实际接入并正在用于数据构造实验** 的 Omni 模型只有一个：
+
+```text
+Qwen3-Omni-30B-A3B-Instruct
+路径：
+/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-instruct
+服务：
+http://127.0.0.1:8093/v1
+```
+
+它当前负责：
+
+- `detective-annotate-clips`
+- `propose-group-pairs`
+- `pair judge`
+
+也就是说，当前这条 Omni-Detective pilot 链路里的：
+
+- detective annotation
+- pair proposal
+- pair judge
+
+都还是同一个 `Qwen3-Omni Instruct` 在做。
+
+### 13.2 已下载但还没有真正接入当前 nohup 实验的模型
+
+#### A. Qwen3-Omni Captioner
+
+模型路径：
+
+```text
+/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-captioner
+```
+
+状态：
+
+```text
+已下载
+尚未接入当前 Omni-Detective nohup 实验
+```
+
+这意味着当前 pipeline 还没有单独把 Captioner 当作独立 `audio observer` 使用。  
+虽然我们在设计上已经把它定位为：
+
+- audio events
+- speech
+- acoustic scene
+
+的优先补强模型，但它现在还没有真正串进主链路。
+
+#### B. Qwen3-Omni Thinking
+
+模型路径：
+
+```text
+/data02/pretrained_model/cvr_learn/cvr_model/03_audio_vlm2vec_backbone/qwen3-omni-30b-a3b-thinking
+```
+
+状态：
+
+```text
+已下载
+尚未接入当前正在运行的 nohup 实验
+```
+
+原因很直接：
+
+- 当前实验脚本和手工命令仍然把 `MODEL` 指向 `qwen3-omni-30b-a3b-instruct`
+- `BASE_URL` 仍然指向 `8093`
+
+所以即使 Thinking 已经下载好了，只要服务入口和命令没有切换，它就还只是“已准备”，不是“已使用”。
+
+### 13.3 历史上用过、但属于另一条实验线的 Omni 模型
+
+在更早的 AVIGATE / MSRVTT agent 检索实验中，我们还用过：
+
+```text
+Qwen2.5-Omni
+```
+
+那条线主要是：
+
+- V2T / T2V rerank
+- Omni checker
+- official retrieval 上层 agent
+
+它和当前这条 **新数据集构造 / Omni-Detective** 链路不是同一条实验线。
+
+所以当前项目里可以把 Omni 模型的使用状态理解成：
+
+```text
+历史旧线：
+- Qwen2.5-Omni（已用过）
+
+当前新线：
+- Qwen3-Omni Instruct（正在用）
+- Qwen3-Omni Captioner（已下载，未接入）
+- Qwen3-Omni Thinking（已下载，未接入）
+```
+
+### 13.4 当前最合理的角色分工
+
+从方法设计上，后续推荐的分工是：
+
+#### Instruct
+
+- 继续做基线 detective annotation
+- pair proposal
+- baseline pair judge
+- 基础流程控制
+
+#### Captioner
+
+- 强化 `audio_events`
+- 强化 `speech`
+- 强化 `acoustic scene`
+- 作为真正的独立 `audio_observer`
+
+#### Thinking
+
+- 更严格的 pair judge
+- 失败样本分析
+- detective planning / follow-up reasoning
+- 人工 review 辅助总结
+
+当前的核心事实不是“模型不够”，而是：
+
+```text
+模型已经准备得比当前 pipeline 用到的更多，
+但 Captioner / Thinking 还没有真正接到实验链路里。
+```
+
+## 14. 服务器工作区状态与后续运行约束
+
+### 14.1 旧工作区必须冻结
+
+服务器旧工作区：
+
+```text
+/data02/usr/wangqihao/Demo/test/cvr
+```
+
+当前状态不是干净仓库，而是：
+
+- 本地 HEAD 停在旧提交 `8b4dd8d`
+- 暂存区里叠有本地 hotfix
+- 存在若干未跟踪文件
+
+这意味着它不适合继续作为正式实验目录。
+
+当前旧工作区应被视为：
+
+```text
+历史实验现场
+只保留
+不继续在其中跑新实验
+```
+
+### 14.2 干净工作区已经建立
+
+服务器已建立新的干净 worktree：
+
+```text
+/data02/usr/wangqihao/Demo/test/cvr_clean_main
+```
+
+对应提交：
+
+```text
+1bf72f99547945669a2ae7d19a4d75b9638fba60
+improve omni detective pair diagnostics
+```
+
+后续所有新的 Omni-Detective 实验，应该默认在这个目录下继续。
+
+### 14.3 当前脚本的一个实际限制
+
+虽然 clean worktree 已经建立，但当前仓库中的：
+
+```text
+scripts/run_omni_detective_pilot.sh
+```
+
+仍然把运行目录写成了：
+
+```text
+/data02/usr/wangqihao/Demo/test/cvr
+```
+
+也就是说，**如果直接运行这份脚本，它仍然会跳回旧的脏工作区**。
+
+因此在 clean worktree 阶段，推荐的做法是：
+
+```text
+先用手工命令串行执行 pipeline
+不要直接复用旧脚本
+```
+
+等我们后续把 clean worktree 路径方案固定好，再决定是否更新脚本。
+
+### 14.4 clean worktree 的一次环境性测试问题
+
+在 clean worktree 上第一次运行 unittest 时，出现过 1 个错误：
+
+```text
+FileNotFoundError: ... /cvr_clean_main/runs/... does not exist
+```
+
+这个错误的性质是：
+
+```text
+运行时目录不存在
+不是核心代码逻辑错误
+```
+
+也就是说，它更像是环境准备问题，而不是当前 `Omni-Detective pair diagnostics` 这次提交本身的功能 bug。
+
+## 15. 当前阶段的一句话更新
+
+截至 2026-04-22 当前时点，项目状态可以概括为：
+
+```text
+我们已经把“高上下文组内配对”跑通，并确认当前真正在线使用的是 Qwen3-Omni Instruct；
+Captioner 和 Thinking 都已经就位，但还没有正式接入当前实验链路。
+下一步的关键不是再刷旧 pilot，而是把 Captioner / Thinking 有计划地接进 clean worktree 下的 Omni-Detective pipeline。
+```

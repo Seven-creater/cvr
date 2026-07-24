@@ -1,0 +1,14 @@
+{
+  "embedding_path": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/imagebind_overlap_pre516_test1000_20260723_010521/final_assembly/imagebind_embeddings.npz",
+  "excluded_query_count": 0,
+  "exclusion_rate": 0.0,
+  "gallery_count": 2000,
+  "human_checked_core_count": 150,
+  "input_record_count": 1000,
+  "preexisting_query_count": 516,
+  "records_path": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_test1000_unified_auditonly_20260723_142000/final_test1000/test_main_1000.jsonl",
+  "records_sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "valid_query_count": 1000,
+  "with_reference_gallery_count": 2000,
+  "without_reference_effective_gallery_count_per_query": 1999
+}

@@ -1,231 +1,411 @@
-# Audio-CVR：AAAI 可用实验结果与证据总览
+# Audio-CVR：AAAI 最终实验数据与论文证据总览
 
-> 更新日期：2026-07-21
->
-> 本文只记录可以进入论文的冻结实验。早期 30/37/68-query pilot 不进入主表。
->
-> 论文定位：Audio-CVR 任务与自动构造方法、reference-aware benchmark，以及 adapter-only baseline。
+> 更新日期：2026-07-23  
+> 状态：最终 Test1000、E5-Omni、ImageBind 和 OmniCVR 实验均已完成。  
+> 证据规则：本文只保留当前论文可使用的最终结果；已被替代的 pilot、旧 gallery 结果和旧训练实验不再列入。
 
-## 1. 论文核心问题
+## 1. 论文主线
 
-Audio-CVR 的输入和目标是：
+Audio-CVR 研究的不是一般视频相似性检索，而是：
 
 ```text
-query  = reference video/audio + audio edit text
-target = target video/audio
+reference video/audio + directional audio edit text -> target video/audio
 ```
 
-任务要求模型在视觉语境保持时，根据有方向的声音修改找到 target：
+其中，reference 表示修改前状态，target 表示满足 edit 后的状态。核心问题是：
+
+> 模型能否在视觉语境基本保持时，根据声音修改方向，把 target 排在 unchanged reference 前面？
+
+本文围绕三项贡献组织：
+
+1. **Audio-primary directional CVR**：构造以声音变化决定 target、同时筛查视觉和 ASR 捷径的检索任务。
+2. **多阶段自动构造方法**：通过 audio-only 分析与验证、muted-video shortcut screening、full-AV consistency、ASR-shortcut screening、去重和 source-disjoint 审计构造数据。
+3. **Reference-specific diagnosis**：把 unchanged reference 视为 query-specific pre-edit counterfactual，使用 target-over-reference、score margin、错误归因和 exact own-reference masking 显式测量 source-target confusion。
+
+E5 adapter 是任务适配 baseline，ImageBind 是独立零样本 baseline。二者都不是论文的主要方法贡献。
+
+## 2. 最终 Audio-CVR Test1000
+
+### 2.1 构造流程
 
 ```text
-reference 不满足 edit
-target 满足 edit
-静音画面不能稳定确定 target
-样本不能退化为 transcript / ASR matching
+异构原始视频
+-> 6-9 秒 source-aware clips
+-> 同源候选配对
+-> audio-only change analysis / edit generation
+-> directional audio verification
+-> muted-video shortcut screening
+-> full-AV consistency
+-> ASR-shortcut screening
+-> sampled repeat audit
+-> sample/source/pair 去重与泄漏审计
+-> 冻结 Test1000
 ```
 
-核心困难不是从无关视频中召回相似内容，而是把已经满足 edit 的 target 排在尚未发生 edit 的 reference 前面。reference 因而是天然的反事实负例。
+该流程的目标是降低视觉和 transcript 捷径风险，而不是声称所有捷径已被人工彻底排除。
 
-## 2. 论文三项贡献
+### 2.2 冻结规模
 
-1. **Audio-primary directional CVR**：定义视觉语境保持条件下的方向性声音组合检索，并控制视觉与 ASR 捷径。
-2. **多阶段多模态自动构造方法**：从自然视频执行 source-aware 配对、audio-only edit 构造与验证、muted-video shortcut rejection、full-AV consistency、anti-ASR、重复审核和 source-disjoint 切分。
-3. **Reference-aware benchmark**：强制加入 unchanged reference，并通过有无 reference、七模态消融、类型化困难负例和方向性指标测量模型是否真正使用 audio edit。
-
-E5-Omni、低秩 adapter 和 e5-compatible recipe 都是 baseline，不包装成原创贡献。
-
-## 3. 冻结 Benchmark
-
-冻结路径：
-
-```text
-runs/audiocvr_benchmark150_auto_20260720_164327/benchmark_v1_final150_val28
-test SHA256 = f4b22e25e1f1262d488ff5474fdae9511301919611b42b9cc89f55c3aa633fd6
-```
-
-### 3.1 Split
-
-| Split | Records | Sound event | Music | Speech |
-|---|---:|---:|---:|---:|
-| Train pool | 606 | 48 | 17 | 541 |
-| Primary train subset | **65** | **48** | **17** | **0** |
-| Validation | **28** | **20** | **8** | **0** |
-| Test | **150** | **120** | **30** | **0** |
-
-主训练只使用 65 条与 test subtype 对齐的 non-speech forward pair。train/val/test 的 source、pair 和 inverse group 泄漏均为 0。
-
-### 3.2 自动审核
-
-- Benchmark 为 `automatically curated and model-verified`，不是 human-validated。
-- 430 条候选经过独立 Omni benchmark audit；46 条执行重复审核。
-- 重复审核 exact decision agreement 为 97.8%。
-- Speech 候选因 `full_av_not_required`、`audio_only_solvability_high` 和 ASR 风险被隔离，不进入主 benchmark。
-- 冻结 test 的来源为 avatar 135、vggsound 7、worldsense 8。
-
-### 3.3 Gallery
-
-正式测试使用固定 1,000-item gallery，包含：
-
-```text
-target positives
-mandatory reference negatives
-visual hard negatives
-audio hard negatives
-ASR hard negatives
-random distractors
-```
-
-有无 reference 的评估复用同一 cache，只精确 mask `reference_negative`。20 个 variant/seed/mode 审计项全部通过，`violation_count=0`。
-
-当前正式 test 没有 strict `local_same_source` negative。论文不得声称已完成 strict-local 主实验。
-
-## 4. Baseline 与训练协议
-
-```text
-backbone: frozen E5-Omni-7B
-embedding dimension: 3584
-adapter: identity-initialized low-rank residual projections
-adapter rank: 32
-trainable parameters: 688,131
-steps: 400
-learning rate: 1e-3
-batch size: 8
-final seeds: 13, 23, 42, 71, 101
-LoRA: disabled
-AudioDelta-specific auxiliary losses: disabled
-```
-
-模型选择只读取 val28。候选 rank、steps 和 learning rate 经过 coarse search，前四项使用 3 个 validation seeds 复核；one-standard-error 规则最终选择 `rank=32, steps=400, lr=1e-3`。test150 在配置冻结后才读取。
-
-共核验 38 条训练 loss curve，`NaN/Inf=0`。
-
-## 5. 正式主结果：Forward-only Adapter
-
-### 5.1 七模态结果
-
-| Mode | R@1 mean ± std | R@5 | R@10 | Target beats reference | Gap |
-|---|---:|---:|---:|---:|---:|
-| T-only-fullAV | 2.27 ± 1.00 | 6.13 | 11.87 | 62.00 | +0.0059 |
-| V-only | 8.80 ± 3.36 | 100.00 | 100.00 | 8.93 | -0.0198 |
-| A-only | 18.40 ± 3.28 | 84.27 | 92.53 | 22.00 | -0.0167 |
-| **V+T** | **11.33 ± 2.83** | **100.00** | **100.00** | **11.33 ± 2.83** | **-0.0172** |
-| A+T | 23.20 ± 1.95 | 86.27 | 93.87 | 28.40 | -0.0117 |
-| V+A | 19.20 ± 4.45 | 100.00 | 100.00 | 19.73 | -0.0160 |
-| **V+A+T** | **22.93 ± 5.31** | **100.00** | **100.00** | **23.20 ± 5.12** | **-0.0128** |
-| Late fusion | 21.33 ± 4.20 | 92.40 | 96.13 | 24.26 | -0.0129 |
-
-百分数表中 gap 保持 cosine score 原值。
-
-### 5.2 Audio necessity
-
-预设主比较 `V+A+T - V+T`：
-
-| Metric | Difference | 95% paired bootstrap CI | Randomization p | Holm p |
-|---|---:|---:|---:|---:|
-| R@1 | **+11.60pp** | **[+6.27,+17.07]pp** | 0.000050 | **0.000300** |
-| Target beats reference | **+11.87pp** | **[+6.53,+17.47]pp** | 0.000100 | **0.000600** |
-| Target-reference gap | **+0.004394** | **[+0.002110,+0.006701]** | 0.000250 | **0.001000** |
-| MRR | +0.058111 | [+0.031331,+0.085556] | 0.000100 | 0.000400 |
-
-可用于摘要的结论：在相同 query、相同 gallery 和五种子下，audio 显著改善 top-rank retrieval 与 reference-target 方向判别。
-
-### 5.3 Base E5 与 Adapter
-
-| Method | Mode | R@1 | R@5 | R@10 |
-|---|---|---:|---:|---:|
-| Base E5 | V+A+T | 1.33 | 100.00 | 100.00 |
-| Low-rank adapter | V+A+T | **22.93 ± 5.31** | 100.00 | 100.00 |
-
-Base E5 已能把 target 放入很小候选范围，但几乎总把 reference 排在前面。adapter 提升的是任务适配和方向排序，而不是普通召回。
-
-## 6. Reference Counterfactual 实验
-
-| Mode | With reference R@1 | Without reference R@1 | Inflation after removal |
-|---|---:|---:|---:|
-| V+T | 11.33 | 99.60 | **+88.27pp** |
-| V+A+T | 22.93 | 99.47 | **+76.53pp** |
-
-`V+A+T_no_ref - V+A+T` 的 R@1 置信区间为 `[+70.80,+82.00]pp`，Holm p=0.000300。forward-only 的 578 个跨种子 top-1 错误全部由 `reference_negative` 引起。
-
-这是论文最有辨识度的实验：如果删除 reference，接近 100% 的 R@1 会掩盖模型对 edit direction 的失败。
-
-## 7. Hard-negative 诊断
-
-Forward-only、V+A+T 下：
-
-| Negative | Positive beats negative |
+| 项目 | 数量 |
 |---|---:|
-| reference_negative | 23.20%（五种子均值） |
-| visual_hard | 100% |
-| audio_hard | 100% |
-| asr_hard | 100% |
+| 最终 query | **1,000** |
+| Sound event | **829** |
+| Music | **171** |
+| Speech | **0** |
+| 固定既有集合 | 516 |
+| 最终新增样本 | 484 |
+| Target gallery items | 1,000 |
+| Unchanged reference items | 1,000 |
+| With-reference gallery | **2,000** |
+| Without-reference effective gallery | **1,999 / query** |
 
-这说明现有 typed hard negatives 偏容易，reference 才是主要难例。论文不能把 visual/audio/asr hard negative 的饱和结果写成模型已经解决复杂困难负例，而应把它作为 benchmark 后续增强方向。
+`without-reference` 不重新采样 gallery，只在同一 score matrix 中 mask 当前 query 自己的 reference；其他 1,999 个候选完全不变。
 
-## 8. Verified Bidirectional Augmentation：负消融
+最终补齐漏斗如下：
+
+| 阶段 | 数量 | Sound event | Music |
+|---|---:|---:|---:|
+| 固定既有集合 | 516 | 414 | 102 |
+| 待审核候选池 | 1,519 | - | - |
+| 当前策略下 eligible | 518 | 448 | 70 |
+| 选入的新增样本 | 484 | 415 | 69 |
+| **冻结 Test1000** | **1,000** | **829** | **171** |
+| Shortfall | **0** | - | - |
+
+### 2.3 数据来源
+
+| 数据来源族 | Query 数 | 占比 |
+|---|---:|---:|
+| AVATAR family | 510 | 51.0% |
+| VGGSound family | 275 | 27.5% |
+| AVE | 196 | 19.6% |
+| WorldSense | 10 | 1.0% |
+| VGG-MonoAudio | 9 | 0.9% |
+| **总计** | **1,000** | **100%** |
+
+其中 AVATAR family 合并内部 `avatar` 与 `avqa_videos` 标签，VGGSound family 合并新旧 VGGSound 标签。
+
+### 2.4 数据审计
+
+| 审计项 | 结果 |
+|---|---:|
+| Duplicate sample | 0 |
+| Duplicate source | 0 |
+| Duplicate canonical pair | 0 |
+| Leakage violations | 0 |
+| Missing media | 0 |
+| Selection uses retrieval scores | false |
+| Repeat review requested | 78 |
+| Repeat review completed | 78 |
+| Exact decision agreement | 79.49% |
+| Field-level agreement | 85.64% |
+| Speech-role agreement | 57.69% |
+| Missing repeat reviews | 0 |
+
+准确口径是：
+
+> Full Test1000 is automatically curated and model-verified, not fully human-validated. All 78 requested sampled repeats were completed after freezing as an observational stability audit; they did not change test membership or selection.
+
+Core150 中随机抽取的 10 条由两位作者共同人工查看，并被定性判断为质量较高；这只是抽查，不是 150 条全量审核、独立盲审或正式人工一致性实验。本文的最终成绩统一以 Test1000 为准。
+
+### 2.5 冻结标识
 
 ```text
-65 forward pairs
-24 Omni-accepted inverse records
-= 89 directional training instances
-inverse acceptance rate = 36.9%
+test:
+runs/audio_cvr_test1000_unified_auditonly_20260723_142000/
+final_test1000/test_main_1000.jsonl
+
+SHA256:
+70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e
 ```
 
-| Variant | V+A+T R@1 | Target beats ref | Gap |
-|---|---:|---:|---:|
-| Forward-only | **22.93 ± 5.31** | **23.20 ± 5.12** | -0.0128 ± 0.0015 |
-| Forward+Bidir | 18.93 ± 2.72 | 19.47 ± 3.30 | **-0.0094 ± 0.0013** |
+## 3. 最终实验设置
 
-`Forward+Bidir - Forward-only`：
+### 3.1 模型
 
-| Metric | Difference | 95% CI | Holm p |
-|---|---:|---:|---:|
-| R@1 | **-4.00pp** | **[-7.60,-0.53]pp** | **0.0373** |
-| Target beats reference | -3.73pp | [-7.33,-0.13]pp | 0.0470 |
-| Gap | +0.003433 | [+0.001721,+0.005076] | 0.000150 |
+| 项目 | E5-Omni baseline | ImageBind baseline |
+|---|---|---|
+| Backbone | Frozen E5-Omni-7B | ImageBind-Huge |
+| Embedding dim | 3,584 | 1,024 |
+| 训练方式 | Low-rank residual adapter | Zero-shot，无训练 |
+| Adapter rank | 32 | - |
+| Trainable parameters | 688,131 | 0 |
+| 训练数据 | 65 forward + 24 verified inverse = 89 directional instances | 不使用训练集 |
+| 独立 source pairs | 65 | - |
+| Validation queries | 28 | - |
+| Steps / LR / batch | 400 / 1e-3 / 8 | - |
+| Final seeds | 13, 23, 42, 71, 101 | 单次确定性推理 |
+| 配置选择 | 仅使用 validation；one-standard-error rule | 固定等权模态组合 |
 
-Inverse augmentation 改善平均分差，却显著降低 R@1 和 target-beats-reference。论文主方法因此使用 forward-only；inverse 只作为负消融，说明在极少样本下增加相关方向实例不能替代新的独立 source diversity。
+E5 的 AudioDelta、reference、hard-negative 和 edit-type 专用附加损失权重均为 0；最终贡献不能写成新 loss。ImageBind 的 V/A/T 向量分别归一化后等权相加，再次归一化；没有在 Test1000 上调融合权重。
 
-## 9. 可以写入论文的核心发现
+### 3.2 评估模式
 
-1. 自动多阶段流程可以构造满足 audio-primary 条件的自然视频 triplets，并以模型重复审核量化一致性。
-2. 原始 E5-Omni embedding 几乎不能解决 target-reference 方向排序；轻量 adapter 将 V+A+T R@1 从 1.33% 提升到 22.93%。
-3. Audio 在严格 reference-aware protocol 下带来显著的 +11.60pp R@1 和 +11.87pp target-over-reference 增益。
-4. 删除 reference 会把 R@1 从 22.93% 虚高到 99.47%；reference 是决定 benchmark 难度的核心反事实负例。
-5. Typed visual/audio/asr negatives 目前过容易，不能替代 mandatory reference。
-6. Verified inverse augmentation 没有改善最终排序，独立 source diversity 比机械增加方向实例更重要。
+| 模式 | Query | Gallery document |
+|---|---|---|
+| T-only-fullAV | Edit text | Full audiovisual candidate |
+| V-only | Reference vision | Candidate vision |
+| A-only | Reference audio | Candidate audio |
+| V+T | Reference vision + edit text | Candidate vision |
+| A+T | Reference audio + edit text | Candidate audio |
+| V+A | Reference vision + audio | Candidate vision + audio |
+| V+A+T | Reference vision + audio + edit text | Candidate vision + audio |
 
-## 10. 必须披露的限制
+### 3.3 指标与统计
 
-- 独立训练 pair 只有 65 条；这是 few-shot baseline，不是大规模训练。
-- Test 150 中 avatar 占 90%，跨数据集泛化证据有限。
-- 当前 benchmark 是自动构造和模型复核，不是 human-validated。
-- 正式 test 不含 speech，只覆盖 sound event 和 music。
-- 正式 gallery 没有 strict local_same_source negatives。
-- R@5/R@10 接近饱和，主分析应聚焦 R@1、MRR、target-over-reference 和 reference-induced drop。
-- 当前导出的 subtype 评估字段把测试记录统一归为 `audio_event`，因此论文暂不报告 sound-event/music 的分项模型性能。
-
-## 11. 论文结果段落候选
-
-> On the frozen 150-query source-disjoint test set, the forward-only low-rank adapter obtains 22.9% R@1 with full audiovisual input, compared with 11.3% when audio is removed. The paired 11.6-point gain is statistically significant (95% CI: 6.3--17.1; Holm-adjusted p<0.001), and target-over-reference accuracy improves by 11.9 points. In contrast, removing the unchanged reference raises R@1 to 99.5%. These results show that easy galleries substantially overestimate composed retrieval performance and that the unchanged reference is the decisive counterfactual for measuring directional audio understanding.
-
-## 12. 最终证据路径
-
-本地：
+主指标为：
 
 ```text
-C:/Users/29785/Desktop/research/runs/fewshot_bidir_results_final_20260721/fewshot_bidir_results
+R@1 / R@5 / R@10 / MRR
+target-over-reference accuracy
+target-reference cosine margin
+reference-induced R@1 gain after exact masking
+top-1 own-reference error attribution
 ```
 
-核心文件：
+配对检验使用 20,000 次 bootstrap、20,000 次 randomization test、McNemar 检验和 Holm 多重比较校正。E5 与 ImageBind 在相同的 1,000 个 query 上评估，NaN/Inf 和审计违规均为 0。
+
+## 4. E5-Omni 最终结果
+
+Adapter 结果为五个 seeds 的 mean ± std；Base E5 为确定性结果。R@K、MRR 和 target-over-reference 使用百分数，margin 使用 cosine score 原值。
+
+### 4.1 七模态检索结果
+
+| Mode | Model | R@1 | R@5 | R@10 | MRR | Mean rank | Median rank |
+|---|---|---:|---:|---:|---:|---:|---:|
+| T-only-fullAV | Adapter | 1.22 ± 0.35 | 4.12 ± 1.70 | 6.62 ± 2.56 | 3.38 ± 1.04 | 574.72 ± 42.53 | 333.90 ± 71.92 |
+| T-only-fullAV | Base E5 | 2.40 | 10.40 | 17.10 | 7.35 | 327.54 | 75.50 |
+| V-only | Adapter | 2.22 ± 1.59 | 99.82 ± 0.16 | 99.88 ± 0.04 | 50.89 ± 0.65 | 2.03 ± 0.01 | 2.00 |
+| V-only | Base E5 | 0.10 | 99.90 | 99.90 | 49.96 | 2.04 | 2.00 |
+| A-only | Adapter | 12.88 ± 1.37 | 73.30 ± 8.54 | 82.16 ± 6.94 | 41.50 ± 4.07 | 18.90 ± 6.70 | 2.20 ± 0.40 |
+| A-only | Base E5 | 0.00 | 96.00 | 96.90 | 47.43 | 7.32 | 2.00 |
+| V+T | Adapter | 5.94 ± 0.99 | 99.38 ± 0.45 | 99.62 ± 0.31 | 52.50 ± 0.38 | 2.10 ± 0.12 | 2.00 |
+| V+T | Base E5 | 0.70 | 99.90 | 100.00 | 50.27 | 2.00 | 2.00 |
+| A+T | Adapter | 13.54 ± 0.49 | 72.84 ± 8.21 | 81.14 ± 6.66 | 41.46 ± 3.95 | 17.50 ± 6.52 | 2.20 ± 0.40 |
+| A+T | Base E5 | 2.10 | 96.80 | 97.70 | 48.90 | 4.86 | 2.00 |
+| V+A | Adapter | 9.36 ± 4.33 | 99.30 ± 1.05 | 99.62 ± 0.51 | 54.08 ± 1.58 | 2.02 ± 0.13 | 2.00 |
+| V+A | Base E5 | 0.00 | 99.90 | 99.90 | 49.92 | 2.01 | 2.00 |
+| **V+A+T** | **Adapter** | **12.78 ± 2.55** | **99.16 ± 0.84** | **99.56 ± 0.53** | **55.69 ± 0.95** | **2.14 ± 0.32** | **2.00** |
+| V+A+T | Base E5 | 0.30 | 100.00 | 100.00 | 50.09 | 2.00 | 2.00 |
+| V+T, masked ref | Adapter | 98.28 ± 0.98 | 99.46 ± 0.40 | 99.68 ± 0.26 | 98.80 ± 0.74 | 1.16 ± 0.13 | 1.00 |
+| V+T, masked ref | Base E5 | 99.70 | 100.00 | 100.00 | 99.80 | 1.01 | 1.00 |
+| V+A+T, masked ref | Adapter | 97.26 ± 1.91 | 99.30 ± 0.75 | 99.60 ± 0.50 | 98.14 ± 1.37 | 1.27 ± 0.34 | 1.00 |
+| V+A+T, masked ref | Base E5 | 99.70 | 100.00 | 100.00 | 99.83 | 1.00 | 1.00 |
+
+### 4.2 方向性指标
+
+| Mode | Model | Target over reference | Target-reference margin |
+|---|---|---:|---:|
+| T-only-fullAV | Adapter | 61.82 ± 0.26 | +0.0066 ± 0.0007 |
+| T-only-fullAV | Base E5 | 61.80 | +0.0047 |
+| V-only | Adapter | 2.18 ± 1.71 | -0.0328 ± 0.0007 |
+| V-only | Base E5 | 0.00 | -0.0394 |
+| A-only | Adapter | 18.28 ± 3.94 | -0.0163 ± 0.0013 |
+| A-only | Base E5 | 0.00 | -0.0306 |
+| V+T | Adapter | 6.06 ± 1.07 | -0.0282 ± 0.0011 |
+| V+T | Base E5 | 0.60 | -0.0350 |
+| A+T | Adapter | 22.44 ± 3.10 | -0.0136 ± 0.0013 |
+| A+T | Base E5 | 2.10 | -0.0260 |
+| V+A | Adapter | 9.52 ± 4.60 | -0.0233 ± 0.0014 |
+| V+A | Base E5 | 0.00 | -0.0343 |
+| **V+A+T** | **Adapter** | **13.20 ± 2.84** | **-0.0208 ± 0.0012** |
+| V+A+T | Base E5 | 0.30 | -0.0308 |
+
+R@5/R@10 接近饱和，而 median rank 为 2，说明 target 通常已经被定位到极小候选范围，但 unchanged reference 排在它前面。因此 R@1 与 reference-specific metrics 才是本任务的决定性指标。
+
+### 4.3 预设配对比较
+
+| Comparison | Metric | Difference | 95% bootstrap CI | Holm-adjusted p |
+|---|---|---:|---:|---:|
+| V+A+T - V+T | R@1 | **+6.84pp** | **[+5.18,+8.54]pp** | **0.000250** |
+| V+A+T - V+T | R@5 | -0.22pp | [-0.52,+0.10]pp | 0.640 |
+| V+A+T - V+T | R@10 | -0.06pp | [-0.28,+0.16]pp | 1.000 |
+| V+A+T - V+T | Target over reference | **+7.14pp** | **[+5.48,+8.86]pp** | **0.000250** |
+| V+A+T - V+T | Target-reference margin | **+0.00739** | **[+0.00640,+0.00841]** | **0.000250** |
+| V+A+T - V+T | Reciprocal rank | **+0.03188** | **[+0.02335,+0.04070]** | **0.000250** |
+| Masked-ref V+T - with-ref V+T | R@1 | **+92.34pp** | **[+91.06,+93.56]pp** | **0.000250** |
+| Masked-ref V+A+T - with-ref V+A+T | R@1 | **+84.48pp** | **[+82.60,+86.24]pp** | **0.000250** |
+| V+A+T - V+A | R@1 | +3.42pp | [+2.34,+4.54]pp | 0.000250 |
+| A+T - A-only | R@1 | +0.66pp | [-0.50,+1.84]pp | 0.290 |
+
+### 4.4 Reference 错误归因
+
+| 项目 | 数量 / 比例 |
+|---|---:|
+| 五 seeds 的 V+A+T top-1 errors | 4,361 |
+| Top-1 被 own reference 占据 | 4,317 |
+| Own-reference error share | **98.99%** |
+| 其他 top-1 errors | 44 |
+
+结论：E5 并不是普遍找不到 target，而是几乎总在最后一步把修改前的 reference 排在修改后的 target 前面。
+
+## 5. ImageBind-Huge 最终结果
+
+ImageBind 不训练 adapter，使用预先固定的零样本等权模态算术。下表 R@5/R@10 为 with-reference 条件。
+
+### 5.1 七模态与 reference masking
+
+| Mode | With-ref R@1 | Masked-ref R@1 | Masking gain | R@5 | R@10 | Target over reference | Margin |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| T-only-fullAV | 2.10 | 3.20 | +1.10pp | 9.60 | 15.20 | 52.20 | +0.00433 |
+| V-only | 0.90 | 99.60 | +98.70pp | 99.90 | 100.00 | 0.00 | -0.01323 |
+| A-only | 0.00 | 94.20 | +94.20pp | 97.30 | 98.30 | 0.00 | -0.07324 |
+| **V+T** | **11.70** | **99.30** | **+87.60pp** | **99.80** | **99.80** | **10.80** | **-0.00767** |
+| A+T | 4.10 | 92.90 | +88.80pp | 97.60 | 98.50 | 4.10 | -0.04377 |
+| V+A | 0.00 | 98.10 | +98.10pp | 99.20 | 99.60 | 0.00 | -0.03267 |
+| **V+A+T** | **2.50** | **98.50** | **+96.00pp** | **99.40** | **99.60** | **2.50** | **-0.02334** |
+
+### 5.2 配对统计
+
+| Comparison | Metric | Difference | 95% bootstrap CI | Holm-adjusted p |
+|---|---|---:|---:|---:|
+| V+A+T - V+T | R@1 | **-9.20pp** | **[-11.30,-7.10]pp** | **0.000200** |
+| V+A+T - V+T | Target-reference margin | **-0.01567** | **[-0.01765,-0.01383]** | **0.000200** |
+| Masked-ref V+T - with-ref V+T | R@1 | **+87.60pp** | **[+85.50,+89.60]pp** | **0.000200** |
+| Masked-ref V+A+T - with-ref V+A+T | R@1 | **+96.00pp** | **[+94.70,+97.20]pp** | **0.000200** |
+
+ImageBind 支持 reference confusion 的跨模型结论，但不支持“直接加入 audio 一定提高 Recall”。在零样本等权融合下，audio 造成显著模态干扰；任务适配后的 E5 才能把音频转化为正向的方向性增益。
+
+## 6. 跨模型核心对照
+
+| Model | Mode | With-ref R@1 | Masked-ref R@1 | Masking gain | Audio gain |
+|---|---|---:|---:|---:|---:|
+| Base E5 | V+T | 0.70 | 99.70 | +99.00pp | - |
+| Base E5 | V+A+T | 0.30 | 99.70 | +99.40pp | -0.40pp |
+| E5 Adapter | V+T | 5.94 ± 0.99 | 98.28 ± 0.98 | +92.34pp | - |
+| E5 Adapter | V+A+T | 12.78 ± 2.55 | 97.26 ± 1.91 | +84.48pp | **+6.84pp** |
+| ImageBind zero-shot | V+T | 11.70 | 99.30 | +87.60pp | - |
+| ImageBind zero-shot | V+A+T | 2.50 | 98.50 | +96.00pp | **-9.20pp** |
+
+最稳的论文结论是：
+
+1. **Reference confusion 跨模型成立。** Base E5、E5 Adapter 和 ImageBind 在保留 own reference 时均显著失败，mask 后均接近饱和。
+2. **Audio 收益依赖表示与任务适配。** E5 Adapter 的 audio 增益显著；ImageBind 的简单零样本融合反而下降。
+3. **高 R@5/R@10 不能替代方向性评估。** 模型通常找到了正确视觉语境，却没有理解修改前后状态。
+
+## 7. OmniCVR 跨 Benchmark 诊断
+
+OmniCVR 已经把 source 放入 gallery。该实验的贡献不是“加入 source”，而是在外部 benchmark 上用相同 cache 精确 mask 当前 query 的 source，检验 source-target confusion 是否只存在于 Audio-CVR。
+
+### 7.1 审计设置
+
+| 项目 | 数值 |
+|---|---:|
+| 原始 audio-centered queries | 1,000 |
+| 有效 queries | 995 |
+| 原始 gallery | 2,000 |
+| 统一排除的解码失败视频 | 6 |
+| Effective gallery | 1,994 |
+| 统一排除的受影响 queries | 5 |
+| Seeds | 5 |
+| Sample IDs identical | true |
+| Audit violations | 0 |
+
+### 7.2 E5 跨 benchmark 结果
+
+| Mode | Model | R@1 | R@5 | R@10 | MRR | Target over reference | Margin |
+|---|---|---:|---:|---:|---:|---:|---:|
+| V+A+T with-ref | Adapter | 0.12 ± 0.04 | 30.71 ± 2.30 | 44.56 ± 2.60 | 15.29 ± 0.76 | 0.12 ± 0.04 | -0.2304 |
+| V+A+T with-ref | Base E5 | 0.00 | 41.71 | 57.89 | 19.16 | 0.00 | -0.2366 |
+| V+A+T masked-ref | Adapter | 14.21 ± 0.85 | 34.35 ± 2.40 | 46.41 ± 2.73 | 24.52 ± 1.27 | - | - |
+| V+A+T masked-ref | Base E5 | 17.39 | 45.33 | 60.50 | 31.00 | - | - |
+| V+T with-ref | Adapter | 0.00 | 29.17 ± 1.91 | 43.84 ± 2.07 | 14.68 ± 0.78 | 0.04 ± 0.05 | -0.2584 |
+| V+T with-ref | Base E5 | 0.00 | 36.58 | 54.57 | 17.54 | 0.00 | -0.2633 |
+| V+T masked-ref | Adapter | 12.86 ± 1.16 | 33.47 ± 2.40 | 45.95 ± 1.96 | 23.33 ± 1.43 | - | - |
+| V+T masked-ref | Base E5 | 15.18 | 41.21 | 56.68 | 28.01 | - | - |
+
+### 7.3 OmniCVR 配对检验
+
+| Comparison | Metric | Difference | 95% bootstrap CI | Holm-adjusted p | 结论 |
+|---|---|---:|---:|---:|---|
+| Masked-ref V+A+T - with-ref | R@1 | **+14.09pp** | **[+12.20,+16.02]pp** | **<0.001** | Reference effect 显著 |
+| Masked-ref V+T - with-ref | R@1 | **+12.86pp** | **[+11.10,+14.71]pp** | **<0.001** | Reference effect 显著 |
+| V+A+T - V+T | R@1 | +0.12pp | [0.00,+0.32]pp | 0.2449 | 不显著 |
+| V+A+T - V+T | R@5 | +1.55pp | [-0.24,+3.34]pp | 0.0904 | 不显著 |
+| V+A+T - V+T | Target over reference | +0.08pp | [-0.08,+0.28]pp | 1.0000 | 不显著 |
+| V+A+T - V+T | Target-reference margin | **+0.0281** | **[+0.0252,+0.0309]** | **<0.001** | 分差显著改善 |
+| V+A+T - V+T | Reciprocal rank | +0.0061 | [+0.00004,+0.0122] | 0.0477 | 边界显著 |
+
+OmniCVR 只支持两个有边界的结论：
+
+1. source/reference confusion 在独立 benchmark 上同样存在；
+2. audio 改善平均 target-reference margin，但没有带来显著 R@1 增益。
+
+Audio-CVR adapter 在 OmniCVR 的 masked-reference V+A+T R@1 为 14.21%，低于 Base E5 的 17.39%，因此不能声称 adapter 具有跨 benchmark 性能优势。
+
+## 8. 论文可写结论与边界
+
+### 8.1 可以主张
+
+| 主张 | 直接证据 |
+|---|---|
+| Aggregate Recall 会掩盖 source-target directional failure | Test1000 中 E5 与 ImageBind mask own reference 后 R@1 提升 84.48-99.40pp |
+| Reference confusion 不是单一 adapter 的偶然现象 | Base E5、E5 Adapter、ImageBind 和 OmniCVR 均复现 |
+| 任务适配后的 E5 能利用 audio | V+A+T 比 V+T 提升 6.84pp R@1，CI 不含 0，Holm p=0.000250 |
+| Audio 改善 E5 的方向判别 | Target-over-reference +7.14pp；margin +0.00739 |
+| 简单多模态融合不保证获益 | ImageBind V+A+T 比 V+T 下降 9.20pp |
+| 自动构造流程可扩展到 1,000-query benchmark | Test1000 冻结、去重/泄漏/missing media 均为 0 |
+
+### 8.2 必须披露
+
+| 限制 | 准确表述 |
+|---|---|
+| 人工核验 | Full Test1000 不是 fully human-validated gold set；Core150 仅有两位作者共同完成的随机 10 条定性抽查 |
+| 重复审核 | 78/78 完成；exact-decision 79.49%，field-level 85.64%；属于 post-freeze、audit-only 的同模型稳定性检查 |
+| 类型范围 | 主集为 829 sound event + 171 music，不覆盖 speech |
+| 数据分布 | AVATAR family 占 51.0%，数据源仍不均衡 |
+| 训练规模 | Adapter 仅使用 65 个独立 source pair 和 24 个 verified inverse |
+| 模型结论 | Audio 的 top-1 收益只在 task-adapted E5 上成立，不可外推到所有模型 |
+| OmniCVR | Audio 的 R@1 增益不显著；该实验主要验证 reference-specific diagnosis |
+| Gallery | 主 gallery 为 target + reference；本轮不声称完整验证 strict local/typed hard-negative benchmark |
+
+### 8.3 不得声称
 
 ```text
-status.json
-paper_results.md
-validation_selection.json
-loss_audit.json
-reference_exclusion_audit.json
-statistics_forward_only/test_main_comparison.md
-statistics_forward_only/paired_comparisons.md
-statistics_variant_comparison/paired_comparisons.md
+我们首次把 source/reference 放入 gallery
+audio 对所有 composed video retrieval 模型都提高 Recall
+adapter 已经解决 reference confusion
+Full Test1000 是完整人工 gold annotation
+ImageBind 的下降说明 audio 不重要
+OmniCVR 证明 adapter 能跨 benchmark 泛化
+```
+
+## 9. 最终论文结果摘要
+
+> On the frozen 1,000-query Audio-CVR benchmark, a low-rank adapter on frozen E5-Omni obtains 12.78% R@1 with visual, audio, and text input, compared with 5.94% without audio. The paired gain is 6.84 points (95% CI: 5.18-8.54; Holm-adjusted p<0.001), while target-over-reference accuracy improves by 7.14 points. However, masking only the query-specific unchanged reference raises R@1 to 97.26%. Across five seeds, 4,317 of 4,361 top-1 errors are attributable to the own reference. ImageBind independently reproduces the reference effect, although its zero-shot equal-weight audio fusion reduces R@1, showing that audio gains depend on representation and task adaptation. On 995 valid OmniCVR queries, exact source masking also raises R@1 by 14.09 points for the adapter, confirming that source-target confusion extends beyond our benchmark.
+
+## 10. 最终证据路径
+
+### 10.1 Test1000 与最终 E5/ImageBind
+
+```text
+paper/evidence/server_final1000/final_status.json
+paper/evidence/server_final1000/dataset/frozen_benchmark_manifest.json
+paper/evidence/server_final1000/dataset/frozen_benchmark.sha256
+paper/evidence/server_final1000/dataset/dedup_audit.json
+paper/evidence/server_final1000/dataset/leakage_audit.json
+paper/evidence/server_final1000/adapter_training/adapter_config_seed13.json
+paper/evidence/server_final1000/adapter_training/validation_selection.json
+paper/evidence/server_final1000/adapter_training/inverse_summary.json
+paper/evidence/server_final1000/e5_statistics/test_main_comparison.md
+paper/evidence/server_final1000/e5_statistics/paired_comparisons.json
+paper/evidence/server_final1000/e5_statistics/error_breakdown.json
+paper/evidence/server_final1000/imagebind_statistics/paper_results.md
+paper/evidence/server_final1000/imagebind_statistics/paired_comparisons.json
+paper/evidence/server_final1000/audits/common_query_audit.json
+```
+
+服务器最终 run：
+
+```text
+runs/audio_cvr_e5_imagebind_final1000_20260723_143500
+Git HEAD = 6ede6560e8a6c6af24746ee4c6729933bca97ad8
+```
+
+### 10.2 OmniCVR
+
+```text
+doc/omnicvr_reference_cross_benchmark_results_20260721.md
+C:/Users/29785/Desktop/research/runs/
+omnicvr_reference_diagnostics_paper_results_20260721/
 ```

@@ -33,11 +33,11 @@ The active work is split into three connected parts:
    - Verify that hard negatives do not satisfy the edit text.
    - Run audio necessity ablations, especially `V+T` vs `V+A+T`.
 
-3. **AudioDelta-E5 training**
-   - Train a lightweight adapter on frozen E5-Omni embeddings.
-   - Current first-stage recipe follows E5-Omni-style ideas:
-     modality-aware temperature, negative curriculum/debiasing, and covariance alignment.
-   - AudioDelta-specific losses remain available for later controlled ablations.
+3. **E5-Omni adapter baseline**
+   - Keep E5-Omni-7B frozen and train a lightweight residual adapter.
+   - Use validation-only model selection and multi-seed evaluation.
+   - Treat the adapter and E5-compatible recipe as baselines, not as the paper's
+     primary method contribution.
 
 The older AVIGATE wrapper code is still present for historical experiments, but
 it is no longer the main project entry point.
@@ -69,6 +69,11 @@ scripts/setup_e5_train_env.sh
 Important docs:
 
 ```text
+doc/aaai_audiocvr_paper_north_star_20260720.md
+doc/aaai_audiocvr_plain_language_storyline_20260721.md
+doc/aaai_audiocvr_abstract_draft_20260720.md
+doc/aaai_audiocvr_submission_dossier_20260717.md
+doc/omnicvr_reference_cross_benchmark_results_20260721.md
 doc/linux_data_structure.md
 doc/audio_lines_ab_flow_20260511.md
 doc/audio_cvr_large_scale_handoff_20260514.md
@@ -77,6 +82,17 @@ doc/audio_delta_e5_training_runbook_20260519.md
 doc/audio_cvr_data_negative_audio_necessity_protocol_20260523.md
 doc/audio_cvr_protocol_smoke_report_20260525.md
 ```
+
+The AAAI paper is organized around three contributions: the Audio-CVR task,
+the multi-stage multimodal automatic curation pipeline, and reference-specific
+diagnosis. Prior benchmarks such as OmniCVR already place the source video in
+the gallery; our protocol instead isolates source-target confusion through
+target-over-reference metrics and exact reference removal. On the frozen
+Audio-CVR test, removing the reference inflates adapter R@1 from
+22.93% to 99.47%; a separate 995-query OmniCVR diagnostic shows the same
+effect across benchmarks (0.12% to 14.21%). The OmniCVR experiment is evidence
+for the evaluation protocol, not evidence of adapter transfer or significant
+audio R@1 improvement on OmniCVR.
 
 ## Data Layout
 

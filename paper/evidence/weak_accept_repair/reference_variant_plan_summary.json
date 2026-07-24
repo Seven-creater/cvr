@@ -1,0 +1,12 @@
+{
+  "conditions": [
+    "transcoded",
+    "temporal",
+    "spatial"
+  ],
+  "full1000_path": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audio_cvr_test1000_unified_auditonly_20260723_142000/final_test1000/test_main_1000.jsonl",
+  "full1000_sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "planned_item_count": 3000,
+  "sample_count": 1000,
+  "variant_version": "reference_identity_ladder_v1"
+}

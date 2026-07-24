@@ -1,0 +1,80 @@
+{
+  "protocol": "audiocvr_fixed_test_fill_v1",
+  "human_validated": false,
+  "automatically_curated": true,
+  "model_verified_additions": true,
+  "selection_uses_model_scores": false,
+  "fixed_test_path": "runs/audio_cvr_vggsound_only_test1000_20260722_191553/pre_vgg_existing_test.jsonl",
+  "fixed_test_count": 516,
+  "exclude_paths": [
+    "runs/audiocvr_benchmark150_auto_20260720_164327/benchmark_v1_final150_val28/train.jsonl",
+    "runs/audiocvr_benchmark150_auto_20260720_164327/benchmark_v1_final150_val28/val.jsonl"
+  ],
+  "candidate_path": "runs/audio_cvr_test1000_unified_auditonly_20260723_142000/review_pool/automatic_review_candidates.jsonl",
+  "preverified_candidate_paths": [
+    "runs/audio_cvr_vggsound_only_test1000_20260722_191553/live_cpu_dedup/vgg_accepted_deduplicated.jsonl"
+  ],
+  "repeat_review_policy": "audit_only",
+  "allow_preverified_review_disagreement": true,
+  "test_target_count": 1000,
+  "test_final_count": 1000,
+  "test_subtype_distribution": {
+    "music": 171,
+    "sound_event": 829
+  },
+  "test_dataset_distribution": {
+    "avatar": 510,
+    "ave": 196,
+    "vgg_monoaudio": 9,
+    "vggsound": 275,
+    "worldsense": 10
+  },
+  "selected_addition_count": 484,
+  "selected_addition_sources": {
+    "runs/audio_cvr_ave_boundary_fill_20260723_120906/review_pool/automatic_review_candidates.jsonl": 196,
+    "runs/audio_cvr_test1000_fixed_fill_20260723_104611/review_pool/automatic_review_candidates.jsonl": 184,
+    "runs/audio_cvr_vgg_monoaudio_fill_20260723_134659/review_pool/automatic_review_candidates.jsonl": 9,
+    "unknown": 95
+  },
+  "review_agreement": {
+    "repeat_review_count": 78,
+    "repeat_review_requested_count": 78,
+    "repeat_review_completed_count": 40,
+    "exact_decision_agreement": 0.725,
+    "field_level_agreement": 0.83,
+    "speech_role_agreement": 0.55,
+    "disagreement_count": 29,
+    "missing_repeat_count": 38
+  },
+  "review_rejection_counts": {
+    "construction_preverified_non_speech_only": 143,
+    "overlaps_fixed_or_protected_after_review": 20,
+    "pass1_reject": 977
+  },
+  "dedup_audit": {
+    "violation_count": 0,
+    "duplicate_sample_count": 0,
+    "duplicate_source_count": 0,
+    "duplicate_pair_count": 0,
+    "duplicate_sample_examples": [],
+    "duplicate_source_examples": [],
+    "duplicate_pair_examples": []
+  },
+  "leakage_audit": {
+    "violation_count": 0,
+    "duplicate_sample_count": 0,
+    "duplicate_source_count": 0,
+    "duplicate_pair_count": 0,
+    "fixed_addition_overlap_count": 0,
+    "protected_addition_overlap_count": 0,
+    "missing_media_field_count": 0
+  },
+  "test_main_sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "random_seed": 20260723,
+  "outputs": {
+    "test_main": "runs/audio_cvr_test1000_unified_auditonly_20260723_142000/final_test1000/test_main_1000.jsonl",
+    "manifest": "runs/audio_cvr_test1000_unified_auditonly_20260723_142000/final_test1000/frozen_benchmark_manifest.json",
+    "sha256": "runs/audio_cvr_test1000_unified_auditonly_20260723_142000/final_test1000/frozen_benchmark.sha256"
+  },
+  "limitation": "Automatically curated and model-verified additions; not fully human-validated."
+}

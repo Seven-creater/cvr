@@ -1,0 +1,43 @@
+{
+  "target_count": 1000,
+  "fixed_test_count": 516,
+  "exclude_paths": [
+    "runs/audiocvr_benchmark150_auto_20260720_164327/benchmark_v1_final150_val28/train.jsonl",
+    "runs/audiocvr_benchmark150_auto_20260720_164327/benchmark_v1_final150_val28/val.jsonl"
+  ],
+  "preverified_candidate_paths": [
+    "runs/audio_cvr_vggsound_only_test1000_20260722_191553/live_cpu_dedup/vgg_accepted_deduplicated.jsonl"
+  ],
+  "preverified_candidate_count": 430,
+  "protected_exclude_count": 634,
+  "candidate_count": 1519,
+  "consensus_eligible_count": 518,
+  "selected_addition_count": 484,
+  "final_count": 1000,
+  "shortfall": 0,
+  "max_speech_count": 0,
+  "sound_event_ratio": 0.8,
+  "repeat_review_policy": "audit_only",
+  "allow_preverified_review_disagreement": true,
+  "fixed_subtypes": {
+    "music": 102,
+    "sound_event": 414
+  },
+  "eligible_subtypes": {
+    "music": 70,
+    "sound_event": 448
+  },
+  "selected_subtypes": {
+    "music": 69,
+    "sound_event": 415
+  },
+  "final_subtypes": {
+    "music": 171,
+    "sound_event": 829
+  },
+  "rejection_counts": {
+    "construction_preverified_non_speech_only": 143,
+    "overlaps_fixed_or_protected_after_review": 20,
+    "pass1_reject": 977
+  }
+}

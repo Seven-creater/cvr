@@ -1,0 +1,18 @@
+{
+  "protocol": "audiocvr_repeat_review_completion_v1",
+  "random_seed": 20260723,
+  "repeat_review_fraction": 0.2,
+  "requested_count": 78,
+  "preexisting_completed_count": 40,
+  "missing_count": 38,
+  "missing_by_source": {
+    "ave": 2,
+    "fixed": 36
+  },
+  "fixed_candidate_path": "runs/audio_cvr_repeat_review_completion_20260723_201402/candidates/fixed_missing36.jsonl",
+  "ave_candidate_path": "runs/audio_cvr_repeat_review_completion_20260723_201402/candidates/ave_missing2.jsonl",
+  "frozen_test_path": "runs/audio_cvr_test1000_unified_auditonly_20260723_142000/final_test1000/test_main_1000.jsonl",
+  "frozen_test_sha256_before": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "expected_frozen_test_sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "selection_changes_allowed": false
+}

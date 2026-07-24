@@ -1,0 +1,201 @@
+{
+  "reference_rank_summary": {
+    "count": 128,
+    "mean_rank": 2.5,
+    "median_rank": 1.0,
+    "max_rank": 34,
+    "rank_le_1_rate": 0.5234,
+    "rank_le_5_rate": 0.9219
+  },
+  "base_reference_rank_summary": {
+    "count": 128,
+    "mean_rank": 1.0312,
+    "median_rank": 1.0,
+    "max_rank": 3,
+    "rank_le_1_rate": 0.9766,
+    "rank_le_5_rate": 1.0
+  },
+  "target_beats_reference": {
+    "base_e5": {
+      "count": 128,
+      "target_beats_reference_rate": 0.0234,
+      "target_minus_reference_mean": -0.032508,
+      "target_minus_reference_median": -0.024292,
+      "target_minus_reference_min": -0.107141,
+      "target_minus_reference_max": 0.013243
+    },
+    "audio_delta_adapter": {
+      "count": 128,
+      "target_beats_reference_rate": 0.4453,
+      "target_minus_reference_mean": -0.002736,
+      "target_minus_reference_median": -0.004772,
+      "target_minus_reference_min": -0.107356,
+      "target_minus_reference_max": 0.096513
+    }
+  },
+  "delta_score_distribution": {
+    "count": 128,
+    "mean": -0.002736,
+    "median": -0.004772,
+    "min": -0.107356,
+    "max": 0.096513,
+    "positive_delta_rate": 0.4453
+  },
+  "base_delta_score_distribution": {
+    "count": 128,
+    "mean": -0.032508,
+    "median": -0.024292,
+    "min": -0.107141,
+    "max": 0.013243,
+    "positive_delta_rate": 0.0234
+  },
+  "base_hard_negative_recall_by_type": {
+    "asr_hard": {
+      "count": 128,
+      "positive_beats_negative_rate": 1.0
+    },
+    "audio_hard": {
+      "count": 128,
+      "positive_beats_negative_rate": 1.0
+    },
+    "reference_negative": {
+      "count": 128,
+      "positive_beats_negative_rate": 0.0234
+    },
+    "visual_hard": {
+      "count": 128,
+      "positive_beats_negative_rate": 1.0
+    }
+  },
+  "hard_negative_recall_by_type": {
+    "asr_hard": {
+      "count": 128,
+      "positive_beats_negative_rate": 1.0
+    },
+    "audio_hard": {
+      "count": 128,
+      "positive_beats_negative_rate": 1.0
+    },
+    "reference_negative": {
+      "count": 128,
+      "positive_beats_negative_rate": 0.4453
+    },
+    "visual_hard": {
+      "count": 128,
+      "positive_beats_negative_rate": 1.0
+    }
+  },
+  "by_shortcut_label": {
+    "clean_audio_delta": {
+      "count": 128,
+      "base_e5": {
+        "R@1": 0.0156,
+        "R@5": 0.9453,
+        "R@10": 0.9844
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.3281,
+        "R@5": 0.9297,
+        "R@10": 0.9688
+      }
+    }
+  },
+  "by_split_tier": {
+    "extended": {
+      "count": 57,
+      "base_e5": {
+        "R@1": 0.0175,
+        "R@5": 0.9298,
+        "R@10": 1.0
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.2807,
+        "R@5": 0.8596,
+        "R@10": 0.9298
+      }
+    },
+    "main": {
+      "count": 71,
+      "base_e5": {
+        "R@1": 0.0141,
+        "R@5": 0.9577,
+        "R@10": 0.9718
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.3662,
+        "R@5": 0.9859,
+        "R@10": 1.0
+      }
+    }
+  },
+  "score_diagnostics": {
+    "base_e5": {
+      "target": {
+        "count": 128,
+        "mean": 0.868346,
+        "std": 0.038569,
+        "min": 0.794341,
+        "median": 0.86686,
+        "max": 0.941942
+      },
+      "reference": {
+        "count": 128,
+        "mean": 0.900854,
+        "std": 0.029382,
+        "min": 0.820141,
+        "median": 0.907946,
+        "max": 0.967054
+      },
+      "distractor": {
+        "count": 127744,
+        "mean": 0.421507,
+        "std": 0.086585,
+        "min": 0.203174,
+        "median": 0.403021,
+        "max": 0.930215
+      },
+      "target_minus_reference": {
+        "count": 128,
+        "mean": -0.032508,
+        "std": 0.024339,
+        "min": -0.107141,
+        "median": -0.024292,
+        "max": 0.013243
+      }
+    },
+    "audio_delta_adapter": {
+      "target": {
+        "count": 128,
+        "mean": 0.346911,
+        "std": 0.068825,
+        "min": 0.178232,
+        "median": 0.344202,
+        "max": 0.527266
+      },
+      "reference": {
+        "count": 128,
+        "mean": 0.349648,
+        "std": 0.067834,
+        "min": 0.155076,
+        "median": 0.35105,
+        "max": 0.53809
+      },
+      "distractor": {
+        "count": 127744,
+        "mean": -0.029222,
+        "std": 0.103738,
+        "min": -0.308146,
+        "median": -0.037009,
+        "max": 0.402936
+      },
+      "target_minus_reference": {
+        "count": 128,
+        "mean": -0.002736,
+        "std": 0.030354,
+        "min": -0.107356,
+        "median": -0.004772,
+        "max": 0.096513
+      }
+    }
+  }
+}

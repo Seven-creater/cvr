@@ -1,0 +1,39 @@
+Review of Submission
+
+Title. Audio-CVR: Automatic Curation and Reference-Aware Evaluation for Directional Audio Composed Video Retrieval
+
+1. Summary
+
+This paper introduces Audio-CVR, a one thousand query non-speech benchmark for composed video retrieval in which a directional audio edit must distinguish a post-edit target from an unchanged pre-edit reference under preserved visual context. The paper combines a staged automatic curation pipeline with exact own-reference score masking, deterministic identity perturbations, target-over-reference metrics, and reference-specific error attribution. It evaluates frozen and adapted E5-Omni, zero-shot ImageBind, retrieval-trained OmniEmbed, and an external OmniCVR subset, and argues that source anchoring is widespread while the utility of audio depends on representation and fusion.
+
+2. Strengths
+
+1. The paper now makes a clear and useful distinction between contextual retrieval and edit-direction satisfaction. The exact masking intervention is particularly clean because it modifies only one score in an otherwise identical two thousand item gallery. This design supports a stronger diagnosis than comparing results across separately sampled galleries. The top-one error attribution, target-over-reference metric, and target-reference margin all align with this interpretation.
+
+2. The identity perturbation ladder directly addresses the strongest alternative explanation for the masking result. Transcoding, temporal trimming, and spatial cropping reduce exact identity while preserving the reference index and the rest of the gallery. The paper does not overstate the remaining 27.0 to 84.0 point drops as pure semantic reasoning; it accurately frames them as identity-sensitive pre-edit source anchoring. This is a substantial improvement in claim discipline.
+
+3. The audio findings are unusually honest and informative. The adapted E5 model gains 6.84 R@1 points, whereas equal-weight ImageBind loses 9.2 points and OmniEmbed loses 1.0 point. The paper further reports that E5 R@5 and R@10 do not improve significantly, that the gain reverses under temporal and spatial perturbation, and that audio-only and audio-plus-text are not weaker than the full audiovisual input. These controls support the bounded conclusion that task adaptation can exploit audio for top-rank target-reference ordering, not the stronger claim that the model has learned complete audiovisual edit semantics.
+
+4. The revised related-work positioning is strong. ReTrack is correctly separated as an algorithmic treatment of reference-oriented directional bias, whereas Audio-CVR is presented as a paired diagnostic protocol. CoVA and AVIGATE are used to motivate conditional rather than universal audio utility. OmniRet is acknowledged as a stronger recent retrieval system outside the evaluated baseline set rather than being omitted. The contribution list is correspondingly focused on curation, diagnosis, and empirical findings rather than the lightweight adapter.
+
+3. Weaknesses
+
+1. Benchmark validity remains the main concern. The blinded audit covers only fifty unique queries and judges thirty-four valid, or 68.0 percent. The human-valid sensitivity analysis shows that masking still raises adapted V+A+T R@1 from 17.1 percent to 93.5 percent, which is useful, but this analysis contains only thirty-four cases and cannot establish Full1000-wide validity. The same-model repeat review measures stability rather than correctness. By comparison, recent composed-video benchmark work has used fully manually verified test sets [1]. The paper is transparent about this boundary, but reviewers may still question whether Full1000 is sufficiently reliable to function as a benchmark rather than a diagnostic collection.
+
+2. The identity and direction factors are reduced but not fully separated. Temporal and spatial transformations remain deterministic edits of the same underlying clip, and only eight transformed references receive the reported semantic-preservation audit. The residual reference dominance may reflect semantic pre-edit anchoring, persistent instance identity, or both. The revised wording handles this correctly, so the issue is now a scope limitation rather than a logical flaw, but it limits causal claims about directional reasoning.
+
+3. The evaluated model set does not span the strongest recent retrieval and pairwise reasoning systems. OmniEmbed is a useful retrieval-trained checkpoint, but OmniRet is cited rather than run, and no candidate-level video-language reranker is evaluated. This matters because a pairwise reasoner may react differently to the intentionally sharp target-reference boundary than a single-vector embedding system. The cross-model evidence is sufficient to establish that the observed effect is not unique to one architecture, but it is not sufficient to claim that the failure characterizes all current composed-video retrievers.
+
+4. Full1000 is narrow and source imbalanced. It excludes speech, 51 percent of queries come from Avatar, and nine VGG-MonoAudio queries are controlled synthetic supplements. The task and gallery are intentionally designed for source-target diagnosis rather than open-world difficulty. The paper now states these restrictions clearly, but they constrain generalization to broader audiovisual composed retrieval.
+
+4. Questions and Suggestions
+
+Could the authors release the fifty-query audit decisions and the deterministic sampling manifest with the benchmark? This would let users reproduce the human-valid subset and understand which gates failed without changing the frozen test membership. It would also be useful to report the eight transformed-reference semantic checks in the supplementary material at the item level.
+
+The most valuable future extension would be a larger independent human audit and evaluation of one strong pairwise reasoning or OmniRet-style retriever. Neither addition is necessary to understand the current diagnostic, but together they would determine whether the residual source anchoring persists beyond embedding similarity and whether Full1000 validity generalizes beyond the small audited subset.
+
+The current manuscript should retain its controlled-diagnostic framing. In particular, the nearly saturated masked result should continue to be described as localization of a top-rank failure rather than as evidence that the benchmark is generally easy, and the E5 audio result should remain a statement about exploiting task-relevant ranking evidence rather than understanding audio.
+
+5. References
+
+[1] Omkar Thawakar, Dmitry Demidov, Ritesh Thawkar, Rao Muhammad Anwer, Mubarak Shah, Fahad Shahbaz Khan, and Salman Khan. Beyond Simple Edits: Composed Video Retrieval with Dense Modifications. In IEEE/CVF International Conference on Computer Vision, 2025.

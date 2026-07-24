@@ -1,0 +1,1 @@
+{"dataset": "omnicvr", "gallery_id": "omnicvr::omnicvr_video8872.mp4", "gallery_index": 1472, "kind": "candidate", "media_path": "/data02/pretrained_model/cvr_learn/cvr_data/omnicvr_public/extracted_videos/omnicvr_video8872.mp4", "missing_requirements": [{"condition": "exact", "mode": "V_T"}, {"condition": "exact", "mode": "V_A_T"}]}

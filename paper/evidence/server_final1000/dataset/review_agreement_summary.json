@@ -1,0 +1,10 @@
+{
+  "repeat_review_count": 78,
+  "repeat_review_requested_count": 78,
+  "repeat_review_completed_count": 40,
+  "exact_decision_agreement": 0.725,
+  "field_level_agreement": 0.83,
+  "speech_role_agreement": 0.55,
+  "disagreement_count": 29,
+  "missing_repeat_count": 38
+}

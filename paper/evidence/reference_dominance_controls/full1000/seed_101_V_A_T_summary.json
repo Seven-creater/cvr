@@ -1,0 +1,338 @@
+{
+  "cache_dir": "runs/e5_overlap_avatar_vgg_20260722_204500/cache_V_A_T",
+  "adapter_dir": "runs/audiocvr_fewshot_bidir_final_20260721_071148/final_forward_bidir/seed_101/adapter",
+  "output_dir": "runs/audio_cvr_e5_imagebind_final1000_20260723_143500/e5_evaluation/seed_101/eval_V_A_T",
+  "eval_count": 1000,
+  "gallery_count": 2000,
+  "effective_gallery_count": 2000,
+  "effective_gallery_count_min": 2000,
+  "effective_gallery_count_max": 2000,
+  "candidate_gallery_count_min": 2000,
+  "candidate_gallery_count_max": 2000,
+  "has_per_query_candidate_mask": true,
+  "excluded_gallery_kinds": [],
+  "excluded_gallery_count": 0,
+  "exclude_query_reference": false,
+  "excluded_query_reference_count": 0,
+  "reference_in_gallery": true,
+  "adapter_architecture": "low_rank_residual",
+  "adapter_rank": 32,
+  "topk": [
+    1,
+    5,
+    10
+  ],
+  "has_local_segments": false,
+  "local_mix_weight": 0.5,
+  "has_reference_gallery_index": true,
+  "rows": [
+    {
+      "method": "base_e5_global",
+      "R@1": 0.003,
+      "R@5": 1.0,
+      "R@10": 1.0,
+      "MRR": 0.5009,
+      "mean_rank": 2.001,
+      "median_rank": 2.0
+    },
+    {
+      "method": "audio_delta_adapter_global",
+      "R@1": 0.131,
+      "R@5": 0.996,
+      "R@10": 0.999,
+      "MRR": 0.5618,
+      "mean_rank": 1.913,
+      "median_rank": 2.0
+    }
+  ],
+  "by_split_tier": {
+    "diagnostic": {
+      "count": 1,
+      "base_e5": {
+        "R@1": 0.0,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.5,
+        "mean_rank": 2.0,
+        "median_rank": 2.0
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.0,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.5,
+        "mean_rank": 2.0,
+        "median_rank": 2.0
+      }
+    },
+    "extended": {
+      "count": 43,
+      "base_e5": {
+        "R@1": 0.0,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.5,
+        "mean_rank": 2.0,
+        "median_rank": 2.0
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.093,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.5426,
+        "mean_rank": 1.9302,
+        "median_rank": 2.0
+      }
+    },
+    "main": {
+      "count": 956,
+      "base_e5": {
+        "R@1": 0.0031,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.501,
+        "mean_rank": 2.001,
+        "median_rank": 2.0
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.1328,
+        "R@5": 0.9958,
+        "R@10": 0.999,
+        "MRR": 0.5627,
+        "mean_rank": 1.9121,
+        "median_rank": 2.0
+      }
+    }
+  },
+  "by_audio_delta_type": {
+    "audio_event": {
+      "count": 652,
+      "base_e5": {
+        "R@1": 0.0046,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.502,
+        "mean_rank": 1.9969,
+        "median_rank": 2.0
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.1595,
+        "R@5": 0.9939,
+        "R@10": 0.9985,
+        "MRR": 0.5749,
+        "mean_rank": 1.9018,
+        "median_rank": 2.0
+      }
+    },
+    "music": {
+      "count": 32,
+      "base_e5": {
+        "R@1": 0.0,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.5,
+        "mean_rank": 2.0,
+        "median_rank": 2.0
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.0,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.5,
+        "mean_rank": 2.0,
+        "median_rank": 2.0
+      }
+    },
+    "sound_event": {
+      "count": 316,
+      "base_e5": {
+        "R@1": 0.0,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.4987,
+        "mean_rank": 2.0095,
+        "median_rank": 2.0
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.0854,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.5409,
+        "mean_rank": 1.9272,
+        "median_rank": 2.0
+      }
+    }
+  },
+  "by_dataset_group": {
+    "avatar": {
+      "count": 510,
+      "base_e5": {
+        "R@1": 0.0039,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.502,
+        "mean_rank": 1.9961,
+        "median_rank": 2.0
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.1765,
+        "R@5": 0.9941,
+        "R@10": 1.0,
+        "MRR": 0.5834,
+        "mean_rank": 1.8725,
+        "median_rank": 2.0
+      }
+    },
+    "non_avatar": {
+      "count": 490,
+      "base_e5": {
+        "R@1": 0.002,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.4998,
+        "mean_rank": 2.0061,
+        "median_rank": 2.0
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.0837,
+        "R@5": 0.998,
+        "R@10": 0.998,
+        "MRR": 0.5393,
+        "mean_rank": 1.9551,
+        "median_rank": 2.0
+      }
+    }
+  },
+  "by_shortcut_label": {
+    "unknown": {
+      "count": 1000,
+      "base_e5": {
+        "R@1": 0.003,
+        "R@5": 1.0,
+        "R@10": 1.0,
+        "MRR": 0.5009,
+        "mean_rank": 2.001,
+        "median_rank": 2.0
+      },
+      "audio_delta_adapter": {
+        "R@1": 0.131,
+        "R@5": 0.996,
+        "R@10": 0.999,
+        "MRR": 0.5618,
+        "mean_rank": 1.913,
+        "median_rank": 2.0
+      }
+    }
+  },
+  "reference_rank_summary": {
+    "count": 1000,
+    "mean_rank": 1.151,
+    "median_rank": 1.0,
+    "max_rank": 12,
+    "rank_le_1_rate": 0.864,
+    "rank_le_5_rate": 0.999
+  },
+  "base_reference_rank_summary": {
+    "count": 1000,
+    "mean_rank": 1.004,
+    "median_rank": 1.0,
+    "max_rank": 2,
+    "rank_le_1_rate": 0.996,
+    "rank_le_5_rate": 1.0
+  },
+  "target_beats_reference": {
+    "base_e5": {
+      "count": 1000,
+      "target_beats_reference_rate": 0.003,
+      "target_minus_reference_mean": -0.030811,
+      "target_minus_reference_median": -0.021159,
+      "target_minus_reference_min": -0.225305,
+      "target_minus_reference_max": 0.002657
+    },
+    "audio_delta_adapter": {
+      "count": 1000,
+      "target_beats_reference_rate": 0.133,
+      "target_minus_reference_mean": -0.019255,
+      "target_minus_reference_median": -0.014443,
+      "target_minus_reference_min": -0.141701,
+      "target_minus_reference_max": 0.032796
+    }
+  },
+  "delta_score_distribution": {
+    "count": 1000,
+    "mean": -0.019255,
+    "median": -0.014443,
+    "min": -0.141701,
+    "max": 0.032796,
+    "positive_delta_rate": 0.133
+  },
+  "base_delta_score_distribution": {
+    "count": 1000,
+    "mean": -0.030811,
+    "median": -0.021159,
+    "min": -0.225305,
+    "max": 0.002657,
+    "positive_delta_rate": 0.003
+  },
+  "base_hard_negative_recall_by_type": {
+    "asr_hard": {
+      "count": 514,
+      "positive_beats_negative_rate": 1.0
+    },
+    "audio_hard": {
+      "count": 795,
+      "positive_beats_negative_rate": 1.0
+    },
+    "reference_negative": {
+      "count": 795,
+      "positive_beats_negative_rate": 0.3572
+    },
+    "visual_hard": {
+      "count": 795,
+      "positive_beats_negative_rate": 1.0
+    }
+  },
+  "hard_negative_recall_by_type": {
+    "asr_hard": {
+      "count": 514,
+      "positive_beats_negative_rate": 1.0
+    },
+    "audio_hard": {
+      "count": 795,
+      "positive_beats_negative_rate": 1.0
+    },
+    "reference_negative": {
+      "count": 795,
+      "positive_beats_negative_rate": 0.4704
+    },
+    "visual_hard": {
+      "count": 795,
+      "positive_beats_negative_rate": 1.0
+    }
+  },
+  "base_gallery_negative_recall_by_type": {
+    "reference_negative": {
+      "count": 1000,
+      "positive_beats_negative_rate": 0.003
+    },
+    "same_source_any": {
+      "count": 1000,
+      "positive_beats_negative_rate": 0.003
+    }
+  },
+  "gallery_negative_recall_by_type": {
+    "reference_negative": {
+      "count": 1000,
+      "positive_beats_negative_rate": 0.133
+    },
+    "same_source_any": {
+      "count": 1000,
+      "positive_beats_negative_rate": 0.133
+    }
+  },
+  "diagnostics_path": "runs/audio_cvr_e5_imagebind_final1000_20260723_143500/e5_evaluation/seed_101/eval_V_A_T/diagnostics.json",
+  "score_diagnostics_path": "runs/audio_cvr_e5_imagebind_final1000_20260723_143500/e5_evaluation/seed_101/eval_V_A_T/score_diagnostics.json",
+  "adapter_geometry_path": "runs/audio_cvr_e5_imagebind_final1000_20260723_143500/e5_evaluation/seed_101/eval_V_A_T/adapter_geometry.json",
+  "per_query_topk_path": "runs/audio_cvr_e5_imagebind_final1000_20260723_143500/e5_evaluation/seed_101/eval_V_A_T/per_query_topk.jsonl",
+  "per_query_scores_path": "runs/audio_cvr_e5_imagebind_final1000_20260723_143500/e5_evaluation/seed_101/eval_V_A_T/per_query_scores.jsonl"
+}

@@ -1,0 +1,62 @@
+{
+  "model_label": "Audio-as-Text VLM2Vec reproduction",
+  "audio_test_sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "audio": {
+    "test": {
+      "split": "test",
+      "count": 1000,
+      "gallery_count": 2000,
+      "unique_media_count": 2000,
+      "subtypes": {
+        "sound_event": 829,
+        "music": 171
+      },
+      "datasets": {
+        "avatar": 174,
+        "worldsense": 10,
+        "vggsound": 245,
+        "unknown": 366,
+        "ave": 196,
+        "vgg_monoaudio": 9
+      }
+    },
+    "train": {
+      "split": "train",
+      "count": 89,
+      "unique_media_count": 130
+    },
+    "val": {
+      "split": "val",
+      "count": 28,
+      "unique_media_count": 56
+    }
+  },
+  "omnicvr": {
+    "query_count": 1000,
+    "gallery_union_count": 2000,
+    "official_prepare_summary": {
+      "dataset": "OmniCVR",
+      "category": "audio-center",
+      "annotation_path": "/data02/pretrained_model/cvr_learn/cvr_data/omnicvr_public/repository/omnicvr.jsonl",
+      "videos_dir": "/data02/pretrained_model/cvr_learn/cvr_data/omnicvr_public/extracted_videos",
+      "output_dir": "/data02/usr/wangqihao/Demo/test/cvr_aaai_repro_main/runs/audiovlm2vec_reference_diagnostic_20260724_020838/records/omnicvr/prepared_e5",
+      "start_index": 0,
+      "query_count": 1000,
+      "gallery_union_count": 2000,
+      "candidate_count_min": 2000,
+      "candidate_count_max": 2000,
+      "expected_gallery_size": 2000,
+      "shared_candidate_pool": false,
+      "source_in_candidates_count": 1000,
+      "target_in_candidates_count": 1000,
+      "missing_media_count": 0,
+      "eval_protocol": "official_omnicvr_audio_center"
+    }
+  },
+  "media_inventory_count": 4186,
+  "audio_source_overlap": {
+    "train_val": 0,
+    "train_test": 0,
+    "val_test": 0
+  }
+}

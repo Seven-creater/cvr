@@ -1,0 +1,11 @@
+{
+  "error_count_across_seeds": 4361,
+  "counts": {
+    "positive": 44,
+    "reference_negative": 4317
+  },
+  "rates": {
+    "positive": 0.010089429030038982,
+    "reference_negative": 0.989910570969961
+  }
+}

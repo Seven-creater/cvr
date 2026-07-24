@@ -1,0 +1,76 @@
+{
+  "purpose": "Test whether the query's own unchanged reference is uniquely difficult relative to typed, local, and random negatives.",
+  "interpretation_boundary": "These controls establish own-reference dominance under exact source inclusion. They do not decompose exact-identity anchoring from semantic edit-direction reasoning.",
+  "full1000_primary_diagnostic": {
+    "run_root": "runs/audio_cvr_e5_imagebind_final1000_20260723_143500",
+    "query_count": 1000,
+    "gallery_count": 2000,
+    "mode": "V_A_T",
+    "seeds": [13, 23, 42, 71, 101],
+    "adapter": {
+      "target_beats_own_reference_by_seed": [0.082, 0.142, 0.133, 0.17, 0.133],
+      "target_beats_own_reference_mean": 0.132,
+      "own_reference_rank1_mean": 0.8588,
+      "target_beats_visual_hard_by_seed": [1.0, 1.0, 1.0, 1.0, 1.0],
+      "target_beats_audio_hard_by_seed": [1.0, 1.0, 1.0, 1.0, 1.0],
+      "target_beats_asr_hard_by_seed": [1.0, 1.0, 1.0, 1.0, 1.0]
+    },
+    "base_e5": {
+      "target_beats_own_reference": 0.003,
+      "target_beats_visual_hard": 1.0,
+      "target_beats_audio_hard": 1.0,
+      "target_beats_asr_hard": 1.0
+    },
+    "note": "Typed hard negatives are per-query supplementary diagnostics; the shared formal gallery contains 1,000 targets and 1,000 unchanged references."
+  },
+  "historical_mixed_gallery_control": {
+    "status": "Historical protocol diagnostic, not a final benchmark result.",
+    "run_root": "runs/audio_necessity_7mode_all_220_20260527_164758",
+    "configuration": "loss_schedule_core/C1_ref_delta/eval_V_A_T",
+    "query_count": 128,
+    "gallery_count": 1000,
+    "gallery_composition": {
+      "positive": 128,
+      "reference_negative": 128,
+      "visual_hard": 128,
+      "audio_hard": 128,
+      "asr_hard": 128,
+      "random_distractor": 262,
+      "local_same_source": 36,
+      "local_fallback_visual": 62
+    },
+    "base_e5_direct_pairwise": {
+      "own_reference_beats_target": 0.976562,
+      "own_reference_beats_visual_hard": 1.0,
+      "own_reference_beats_audio_hard": 1.0,
+      "own_reference_beats_asr_hard": 1.0,
+      "own_reference_beats_local_same_source": 1.0,
+      "local_same_source_candidate_comparisons": 36,
+      "local_same_source_query_count": 9,
+      "own_reference_beats_local_fallback_visual": 1.0,
+      "local_fallback_query_count": 62,
+      "own_reference_beats_random_distractor": 1.0,
+      "random_pairwise_comparisons": 33536,
+      "own_reference_beats_every_random_distractor_per_query": 1.0
+    },
+    "adapter_direct_pairwise": {
+      "own_reference_beats_target": 0.554688,
+      "own_reference_beats_visual_hard": 1.0,
+      "own_reference_beats_audio_hard": 1.0,
+      "own_reference_beats_asr_hard": 1.0,
+      "own_reference_beats_local_same_source": 0.833333,
+      "local_same_source_candidate_comparisons": 36,
+      "local_same_source_query_count": 9,
+      "own_reference_beats_local_fallback_visual": 1.0,
+      "local_fallback_query_count": 62,
+      "own_reference_beats_random_distractor": 0.999433,
+      "random_pairwise_comparisons": 33536,
+      "own_reference_beats_every_random_distractor_per_query": 0.960938
+    },
+    "score_reconstruction_check": {
+      "base_target_score_max_absolute_error": 4.172325134277344e-07,
+      "adapter_target_score_max_absolute_error": 1.7881393432617188e-07
+    },
+    "local_negative_boundary": "The 36 strict local candidates were historical candidate_unverified records and cover only nine queries; use them only as a limited mechanism control."
+  }
+}

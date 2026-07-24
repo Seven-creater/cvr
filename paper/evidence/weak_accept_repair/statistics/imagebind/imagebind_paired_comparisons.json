@@ -1,0 +1,230 @@
+{
+  "ImageBind_exact_V_A_T_reference_drop": {
+    "bootstrap_95_ci": [
+      0.947,
+      0.972
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mcnemar": {
+      "discordant": 960,
+      "first_only": 960,
+      "p_two_sided": 2.0522684006491881e-289,
+      "second_only": 0
+    },
+    "mean_difference": 0.96,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_exact_V_T_reference_drop": {
+    "bootstrap_95_ci": [
+      0.856,
+      0.896
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mcnemar": {
+      "discordant": 876,
+      "first_only": 876,
+      "p_two_sided": 3.9696644133184383e-264,
+      "second_only": 0
+    },
+    "mean_difference": 0.876,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_exact_audio_gain_R@1": {
+    "bootstrap_95_ci": [
+      -0.113,
+      -0.071
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mean_difference": -0.092,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_spatial_V_A_T_R@1_vs_exact": {
+    "bootstrap_95_ci": [
+      0.123,
+      0.166
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mean_difference": 0.144,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_spatial_V_A_T_reference_drop": {
+    "bootstrap_95_ci": [
+      0.791,
+      0.839
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mcnemar": {
+      "discordant": 815,
+      "first_only": 815,
+      "p_two_sided": 9.153422936374701e-246,
+      "second_only": 0
+    },
+    "mean_difference": 0.815,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_spatial_V_T_R@1_vs_exact": {
+    "bootstrap_95_ci": [
+      0.576,
+      0.638
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mean_difference": 0.607,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_spatial_V_T_reference_drop": {
+    "bootstrap_95_ci": [
+      0.243,
+      0.298
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mcnemar": {
+      "discordant": 270,
+      "first_only": 270,
+      "p_two_sided": 1.0542197943230523e-81,
+      "second_only": 0
+    },
+    "mean_difference": 0.27,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_spatial_audio_gain_R@1": {
+    "bootstrap_95_ci": [
+      -0.587,
+      -0.523
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mean_difference": -0.555,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_temporal_V_A_T_R@1_vs_exact": {
+    "bootstrap_95_ci": [
+      0.098,
+      0.139
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mean_difference": 0.118,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_temporal_V_A_T_reference_drop": {
+    "bootstrap_95_ci": [
+      0.817,
+      0.862
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mcnemar": {
+      "discordant": 840,
+      "first_only": 840,
+      "p_two_sided": 2.727932613007635e-253,
+      "second_only": 0
+    },
+    "mean_difference": 0.84,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_temporal_V_T_R@1_vs_exact": {
+    "bootstrap_95_ci": [
+      0.262,
+      0.322
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mean_difference": 0.292,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_temporal_V_T_reference_drop": {
+    "bootstrap_95_ci": [
+      0.554,
+      0.615
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mcnemar": {
+      "discordant": 585,
+      "first_only": 585,
+      "p_two_sided": 1.5793650827938261e-176,
+      "second_only": 0
+    },
+    "mean_difference": 0.585,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_temporal_audio_gain_R@1": {
+    "bootstrap_95_ci": [
+      -0.3,
+      -0.233
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mean_difference": -0.266,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_transcoded_V_A_T_R@1_vs_exact": {
+    "bootstrap_95_ci": [
+      0.009,
+      0.029
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mean_difference": 0.019,
+    "paired_randomization_p_two_sided": 0.00034998250087495624
+  },
+  "ImageBind_transcoded_V_A_T_reference_drop": {
+    "bootstrap_95_ci": [
+      0.925,
+      0.954
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mcnemar": {
+      "discordant": 940,
+      "first_only": 940,
+      "p_two_sided": 2.151959390479123e-283,
+      "second_only": 0
+    },
+    "mean_difference": 0.94,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_transcoded_V_T_R@1_vs_exact": {
+    "bootstrap_95_ci": [
+      0.051,
+      0.088
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mean_difference": 0.069,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_transcoded_V_T_reference_drop": {
+    "bootstrap_95_ci": [
+      0.781,
+      0.83
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mcnemar": {
+      "discordant": 806,
+      "first_only": 806,
+      "p_two_sided": 4.686552543423847e-243,
+      "second_only": 0
+    },
+    "mean_difference": 0.806,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  },
+  "ImageBind_transcoded_audio_gain_R@1": {
+    "bootstrap_95_ci": [
+      -0.168,
+      -0.117
+    ],
+    "holm_adjusted_p": 0.0008999550022498875,
+    "iterations": 20000,
+    "mean_difference": -0.142,
+    "paired_randomization_p_two_sided": 4.999750012499375e-05
+  }
+}

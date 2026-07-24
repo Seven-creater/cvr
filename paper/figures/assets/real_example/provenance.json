@@ -1,0 +1,28 @@
+{
+  "frozen_test_sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "selection_rule": "fixed seed 20260723, source-family stratified, no retrieval metrics",
+  "selection_note": "The selected example was chosen for visual legibility from a fixed, score-independent candidate set.",
+  "selected_record": {
+    "sample_id": "speech_audio_content_audio_first_audio_event_0831c27cc098",
+    "dataset": "worldsense",
+    "b_subtype": "sound_event",
+    "edit_text": "add the sound of a crowd applauding to the audio",
+    "raw_source_id": "worldsense:worldsense_EaPoverA_49f5cf01"
+  },
+  "frame_quantiles": [
+    0.2,
+    0.5,
+    0.8
+  ],
+  "reference_video_sha256": "378eb2b17f2d1ea5e12d43efb4d5ac67e7c9036fb82618e59fb43a40b7d53723",
+  "target_video_sha256": "5cafc671e66c66657a6f87e1f6dd5fba8767b2470d9cb47911bdac2391c80d80",
+  "assets": [
+    "audio_only_pair.png",
+    "muted_video_pair.jpg",
+    "real_gallery.jpg",
+    "reference_filmstrip.jpg",
+    "reference_waveform.png",
+    "target_filmstrip.jpg",
+    "target_waveform.png"
+  ]
+}

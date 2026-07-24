@@ -1,0 +1,18 @@
+{
+  "test_sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "audiocvr_query_count": 1000,
+  "audiocvr_train_count": 89,
+  "audiocvr_val_count": 28,
+  "omnicvr_query_count": 1000,
+  "caption_count": 4186,
+  "embedding_count": 12702,
+  "adapter_seeds": [
+    13,
+    23,
+    42,
+    71,
+    101
+  ],
+  "violation_count": 0,
+  "violations": []
+}

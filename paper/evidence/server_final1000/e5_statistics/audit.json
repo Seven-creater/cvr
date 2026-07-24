@@ -1,0 +1,9 @@
+{
+  "seed_count": 5,
+  "mode_count": 9,
+  "eval_count": 1000,
+  "gallery_count": 2000,
+  "sample_ids_identical": true,
+  "violation_count": 0,
+  "violations": []
+}

@@ -1,0 +1,25 @@
+{
+  "audiocvr_query_count": 1000,
+  "excluded_gallery_count": 1,
+  "excluded_gallery_count_by_dataset": {
+    "audiocvr": 0,
+    "omnicvr": 1
+  },
+  "masking_reuses_same_score_matrix": true,
+  "model": "OmniEmbed-v0.1-multivent",
+  "modes": [
+    "V_T",
+    "V_A_T"
+  ],
+  "nan_or_inf_count": 0,
+  "omnicvr_query_count": 1000,
+  "prompt_version": "audiocvr_fixed_retrieval_prompt_v1",
+  "reference_conditions": [
+    "exact",
+    "transcoded",
+    "temporal",
+    "spatial"
+  ],
+  "selection_uses_test_metrics": false,
+  "training_checkpoint": "MultiVENT video retrieval"
+}

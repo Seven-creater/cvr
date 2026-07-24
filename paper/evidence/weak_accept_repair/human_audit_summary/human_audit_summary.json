@@ -1,0 +1,106 @@
+{
+  "audit_version": "single_rater_blind_audit_v1",
+  "automatic_human_overall_agreement": 0.68,
+  "claim_scope": "blinded single-rater human audit",
+  "completed_display_item_count": 51,
+  "completion_rate": 0.2318181818181818,
+  "core150": {
+    "count": 38,
+    "valid_count": 24,
+    "valid_rate": 0.631578947368421,
+    "wilson_95_ci": [
+      0.47283959557009003,
+      0.7661578075284404
+    ]
+  },
+  "display_item_count": 51,
+  "failure_gate_counts": {
+    "audible_change_clear": 18,
+    "muted_video_insufficient": 0,
+    "no_transcript_asr_shortcut": 0,
+    "overall_valid": 16,
+    "reference_does_not_satisfy_edit": 2,
+    "target_satisfies_edit": 18,
+    "visual_context_preserved": 2
+  },
+  "hidden_repeat": {
+    "completed_repeat_item_count": 1,
+    "count": 0,
+    "exact_all_gate_agreement": null,
+    "gate_level_agreement": {
+      "audible_change_clear": null,
+      "muted_video_insufficient": null,
+      "no_transcript_asr_shortcut": null,
+      "overall_valid": null,
+      "reference_does_not_satisfy_edit": null,
+      "target_satisfies_edit": null,
+      "visual_context_preserved": null
+    },
+    "unpaired_repeat_item_count": 1
+  },
+  "partial_audit": true,
+  "planned_display_item_count": 220,
+  "rater_count": 1,
+  "supplement50": {
+    "count": 12,
+    "valid_count": 10,
+    "valid_rate": 0.8333333333333334,
+    "wilson_95_ci": [
+      0.5519691377470266,
+      0.9530348578161463
+    ]
+  },
+  "supplement_by_dataset": {
+    "avatar": {
+      "count": 4,
+      "valid_count": 3,
+      "valid_rate": 0.75,
+      "wilson_95_ci": [
+        0.30064184258240184,
+        0.9544127391902995
+      ]
+    },
+    "ave": {
+      "count": 1,
+      "valid_count": 1,
+      "valid_rate": 1.0,
+      "wilson_95_ci": [
+        0.20654931437723745,
+        1.0
+      ]
+    },
+    "vgg_monoaudio": {
+      "count": 2,
+      "valid_count": 2,
+      "valid_rate": 1.0,
+      "wilson_95_ci": [
+        0.34238022750665303,
+        1.0
+      ]
+    },
+    "vggsound": {
+      "count": 5,
+      "valid_count": 4,
+      "valid_rate": 0.8,
+      "wilson_95_ci": [
+        0.37553462976252533,
+        0.9637758913675698
+      ]
+    },
+    "worldsense": {
+      "count": 0,
+      "valid_count": 0,
+      "valid_rate": null,
+      "wilson_95_ci": [
+        null,
+        null
+      ]
+    }
+  },
+  "unique_sample_count": 50,
+  "variant_semantics": {
+    "count": 8,
+    "spatial_preservation_rate": 1.0,
+    "temporal_preservation_rate": 1.0
+  }
+}

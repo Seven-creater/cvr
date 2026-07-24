@@ -1,0 +1,11 @@
+{
+  "full1000_count": 1000,
+  "full1000_membership_unchanged": true,
+  "full1000_sha256": "70bd998c33bd4c2168ac18afb26ec6fbe928b234c61241f53412be387d52ec9e",
+  "human_audit_complete": true,
+  "human_audit_response_count": 51,
+  "missing_outputs": [],
+  "state": "PAPER_EVIDENCE_COMPLETE",
+  "violation_count": 0,
+  "violations": []
+}

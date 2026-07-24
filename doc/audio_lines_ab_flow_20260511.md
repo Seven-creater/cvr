@@ -15,6 +15,7 @@
 - 所有 raw datasets 都要先经过 B 线；只要 B 线 accepted，先全部保留，后续再人工审核、训练/验证/测试划分。
 - A 线暂时不大规模跑；等 B 线做好后，再根据 A 线可产出数量和研究叙事做合理分配。
 - 本文只写方法和产物，不写部署或执行命令。
+- 数据集选择不再按“哪个最快出样本”来定，而是按 `audio subtype`、`source group 丰富度`、`local hard negative 能力` 和 `ASR 退化风险` 做均衡采样。
 
 ## 2. 任务定义
 
@@ -97,6 +98,128 @@ VoxCeleb 特别规则：
 - VoxCeleb 默认不直接进入 `B-main`，优先进入 `B-extended` 或 `B-diagnostic`。
 - VoxCeleb 只有在 `video_context_strength >= 0.70`、`asr_degeneracy_risk <= 0.30`、`visual_shortcut_risk=false`、`audio_only_verification.accept=true`、且 `video_only_shortcut.can_identify_target_without_audio=false` 时，才允许进入 `B-main`。
 - 这样做是为了避免 B 线被审稿人质疑成 talking-head speech retrieval 或 ASR retrieval。
+
+### 3.1 数据集选择目标
+
+数据集选择的目标不是单纯最大化 accepted 数量，而是构造一个能支撑 Audio-CVR 论文实验的分层数据集。选择 raw source 时必须同时考虑四件事：
+
+- `audio subtype` 覆盖：`sound_event`、`music`、`speech_topic_in_video_context` 都要有，且主测试集不能被 speech 主导。
+- `source group 丰富度`：正式 benchmark 优先选择同一个原视频能切出至少 3 个 6-9s clip 的 source，否则很难构造 `local_same_source` negative。
+- 视觉语境保留：同源或同类场景中，画面应足够接近，避免任务退化成普通跨场景检索。
+- shortcut 风险：避免只靠视觉、字幕、ASR transcript 或纯音频关键词就能找到 target。
+
+因此，下一轮大规模构造时应优先扩大长视频和中长视频来源，再用短视频数据集补充音效、音乐和 speech 类型，而不是让任一单一数据集占主导。
+
+### 3.2 数据集角色分工
+
+不同数据集在 B 线中承担的作用不同。正式构造时应按角色采样，而不是把所有 mp4 混成一个无差别池。
+
+| 数据集 | 主要角色 | 优先产出 | 风险 | 选择策略 |
+|---|---|---|---|---|
+| `worldsense` | 长视频、多场景、多事件 | `sound_event`、ambient、speech in context、local negatives | 主题跨度大，可能视觉变化明显 | 高优先级；优先选择可切出 3 个以上 clip 的 source |
+| `daily_omni` | 30s 通用视频 | speech/topic、ambient、教程/生活场景 | 样本量较小 | 高优先级；适合构造局部同源负例 |
+| `hdtf` | 长 talking-head speech | contextual speech、同人同场景 speech | ASR / talking-head 退化 | 只用 `videos/` 长视频；默认进 extended/diagnostic，严格筛后少量进 main |
+| `vggsound` | 声音事件和音乐主力 | `sound_event`、`music` | 视频多为短 clip，同源 local 不足 | 高优先级用于 sound/music 训练量；主测试需配合其他数据集 hard negatives |
+| `vgg_monoaudio` | 音频事件混合视频 | sound/music/audio-hard negative | 数据量小，语义可能特殊 | 中优先级；适合补 audio_hard |
+| `avatar` | 短视频补充 | 少量 sound/music/ambient | 每 source 常只有 1-2 clip，local_same_source 能力弱 | 不再作为主要来源；只作补充和 random distractor |
+| `voxceleb` | speech 扩展和诊断 | speech topic、speaker context | ASR / talking-head 风险最高 | 默认不进 B-main；主要进 extended/diagnostic |
+
+核心原则：
+
+- `worldsense`、`daily_omni`、`hdtf/videos` 是构造 `local_same_source` 和 reference-aware benchmark 的重点。
+- `vggsound` 和 `vgg_monoaudio` 是补足 `music/sound_event` 数量的重点。
+- `avatar` 和 `voxceleb` 不能主导 B-main；前者 local 同源困难负例不足，后者容易退化成 ASR/talking-head retrieval。
+
+### 3.3 采样配比建议
+
+构造阶段允许所有数据集进入 B 线，但建议对不同用途设置不同配比。
+
+`B-main test/val` 建议：
+
+- `sound_event + music >= 60%`。
+- `speech_topic_in_video_context <= 35%`，最多不超过 40%。
+- `worldsense + daily_omni + hdtf/videos` 应优先占据 test/val source，因为它们更容易形成同源局部负例。
+- `avatar` 和普通 `voxceleb` 样本原则上不进入 B-main test，除非通过更严格的 video context 和 anti-ASR gate。
+
+`B-extended train` 建议：
+
+- 可以保留更多 `vggsound`、`vgg_monoaudio`、`hdtf`、`voxceleb` 样本，服务 AudioDelta-E5 训练量。
+- speech 可适当放宽，但必须保留 `asr_degeneracy_risk`、`speech_role` 和 `shortcut_label`，后续训练和分析可分层使用。
+
+`B-diagnostic` 建议：
+
+- 收纳 ASR-like、generic talking-head、audio-only-solvable、visual shortcut、ambiguous 样本。
+- 不进入主 benchmark，但用于证明 pipeline 能识别并隔离 shortcut 风险。
+
+### 3.4 source group 与切片规则
+
+B 线正式构造时，source group 的质量比单条 clip 数量更重要。每个 source group 应尽量满足：
+
+- `min_clips_per_source >= 3`：至少能形成 reference、target、local negative 三种角色。
+- `preferred_clips_per_source = 4-8`：既能提供多个 pair，也能提供 `local_same_source` negative。
+- `clip_seconds=8`，允许范围 `6-9s`。
+- 长视频用滑窗切片，短视频只能作为完整 clip 或 tail clip，不应期待它贡献大量 local negative。
+
+短视频策略：
+
+- `avatar`、`vggsound`、`vgg_monoaudio` 这类 8-15s 视频，通常只能形成 1-2 个 clip。它们适合补充训练样本和 sound/music subtype，但不适合作为 `local_same_source` 主来源。
+- 如果一个 source group 只有 2 个 clip，reference 和 target 被占用后，不存在第三个同源片段可作为 local negative。这种样本仍可进入训练，但正式 local benchmark 中应标记 `local_same_source_missing_reason=no_extra_source_clip`。
+
+长视频策略：
+
+- `worldsense`、`daily_omni`、`hdtf/videos` 应优先切出 3 个以上 clip。
+- 对 30s 左右视频，推荐至少保留 3 个窗口，例如前段、中段、后段。
+- 对 60s 以上视频，可保留更多窗口，但候选 pair 要按 audio delta 和 visual context 排序，避免组合爆炸。
+
+### 3.5 正式构造时的 source 选择优先级
+
+进入 B 线前，raw source 选择应按以下优先级排序：
+
+1. 能切出 `>=3` 个有效 6-9s clip，且有音频轨。
+2. 同源 clip 之间视觉语境相近，但音频内容存在可听辨差异。
+3. 数据集能补足当前稀缺 subtype，例如 sound_event、music 或 contextual speech。
+4. ASR/talking-head 风险低，或能被明确放入 extended/diagnostic。
+5. 文件可稳定读取，不存在坏音轨、静音、极短时长、低于 6s 的问题。
+
+如果资源有限，优先顺序建议为：
+
+```text
+worldsense / daily_omni / hdtf/videos for local-aware benchmark
+vggsound / vgg_monoaudio for sound_event and music scale
+avatar for supplemental distractors and limited training samples
+voxceleb for speech extended/diagnostic, not B-main by default
+```
+
+### 3.6 数据集均衡与去重
+
+构造数据时必须记录每条样本的 `dataset`、`raw_source_id`、`source_disjoint_group_id` 和 `pair_group_id`。这些字段用于：
+
+- 防止同一个 raw source 跨 train/val/test 泄漏。
+- 统计每个数据集的 accepted 数量、B-main 数量、diagnostic 数量。
+- 控制 B-main 的数据集占比，避免单一数据集带来偏置。
+- 追踪 `local_same_source` coverage 是否真实来自同源，而不是 fallback。
+
+建议每次构造后检查：
+
+- 每个数据集进入 B-main / B-extended / B-diagnostic 的数量。
+- 每个数据集的 `sound_event/music/speech` 分布。
+- 每个数据集的 `local_same_source` 覆盖率。
+- 每个数据集的 `asr_degeneracy_risk` 和 `visual_shortcut_risk` 分布。
+- 是否存在同一 raw source 的样本跨 split。
+
+### 3.7 当前经验教训
+
+前期 pilot 暴露了两个重要问题，后续构造必须吸收：
+
+- 只用短视频或每 source 只保留 2 个 clip，会导致 `local_same_source` 覆盖率接近 0。原因不是没有同源视频，而是 reference 和 target 占掉了仅有的两个片段。
+- random gallery 会让 R@K 虚高。正式评测必须加入 `reference_negative`、`local_same_source`、`visual_hard`、`audio_hard`、`asr_hard`，否则无法证明 audio 模态必要性。
+
+因此，构造数据集时不能只盯着 accepted triplet 数量，还要同步追踪：
+
+- 每个 sample 是否有 reference negative。
+- 是否能挖到 strict `local_same_source` negative。
+- typed hard negatives 是否覆盖。
+- audio necessity 评估中 `V+A+T` 是否明显强于 `V+T`。
 
 ## 4. 总流程
 

@@ -1,0 +1,24 @@
+{
+  "source": "drawio\\audio_cvr_figures.drawio",
+  "exported_at": "2026-07-23T16:40:39.476Z",
+  "outputs": [
+    {
+      "page": "Figure 1 - Reference Confusion",
+      "width": 1800,
+      "height": 650,
+      "svg": "generated\\figure1_reference_confusion.svg",
+      "pdf": "generated\\figure1_reference_confusion.pdf",
+      "png": "generated\\figure1_reference_confusion.png",
+      "tiff": "generated\\figure1_reference_confusion.tiff"
+    },
+    {
+      "page": "Figure 2 - Automatic Curation",
+      "width": 1800,
+      "height": 650,
+      "svg": "generated\\figure2_curation_pipeline.svg",
+      "pdf": "generated\\figure2_curation_pipeline.pdf",
+      "png": "generated\\figure2_curation_pipeline.png",
+      "tiff": "generated\\figure2_curation_pipeline.tiff"
+    }
+  ]
+}

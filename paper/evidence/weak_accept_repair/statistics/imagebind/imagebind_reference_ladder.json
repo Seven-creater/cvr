@@ -1,0 +1,162 @@
+{
+  "exact": {
+    "V_A_T": {
+      "masked_reference": {
+        "MRR": 0.9897458874458875,
+        "R@1": 0.985,
+        "R@10": 0.996,
+        "R@5": 0.995
+      },
+      "query_count": 1000,
+      "reference_induced_R@1_drop": 0.96,
+      "with_reference": {
+        "MRR": 0.5083429010602925,
+        "R@1": 0.025,
+        "R@10": 0.996,
+        "R@5": 0.994,
+        "reference_rank_mean": 1.025,
+        "target_beats_reference": 0.025,
+        "target_reference_gap": -0.023339985013008116
+      }
+    },
+    "V_T": {
+      "masked_reference": {
+        "MRR": 0.9954400000000001,
+        "R@1": 0.993,
+        "R@10": 0.998,
+        "R@5": 0.998
+      },
+      "query_count": 1000,
+      "reference_induced_R@1_drop": 0.876,
+      "with_reference": {
+        "MRR": 0.5566842948717949,
+        "R@1": 0.117,
+        "R@10": 0.998,
+        "R@5": 0.998,
+        "reference_rank_mean": 1.111,
+        "target_beats_reference": 0.108,
+        "target_reference_gap": -0.007665351688861847
+      }
+    }
+  },
+  "spatial": {
+    "V_A_T": {
+      "masked_reference": {
+        "MRR": 0.9892439111613025,
+        "R@1": 0.984,
+        "R@10": 0.996,
+        "R@5": 0.995
+      },
+      "query_count": 1000,
+      "reference_induced_R@1_drop": 0.815,
+      "with_reference": {
+        "MRR": 0.5801744227994227,
+        "R@1": 0.169,
+        "R@10": 0.996,
+        "R@5": 0.994,
+        "reference_rank_mean": 1.17,
+        "target_beats_reference": 0.169,
+        "target_reference_gap": -0.01751714062690735
+      }
+    },
+    "V_T": {
+      "masked_reference": {
+        "MRR": 0.9961185897435897,
+        "R@1": 0.994,
+        "R@10": 0.998,
+        "R@5": 0.998
+      },
+      "query_count": 1000,
+      "reference_induced_R@1_drop": 0.27,
+      "with_reference": {
+        "MRR": 0.8606114285714285,
+        "R@1": 0.724,
+        "R@10": 0.998,
+        "R@5": 0.998,
+        "reference_rank_mean": 1.737,
+        "target_beats_reference": 0.725,
+        "target_reference_gap": 0.0028235236406326295
+      }
+    }
+  },
+  "temporal": {
+    "V_A_T": {
+      "masked_reference": {
+        "MRR": 0.9886292207792208,
+        "R@1": 0.983,
+        "R@10": 0.996,
+        "R@5": 0.995
+      },
+      "query_count": 1000,
+      "reference_induced_R@1_drop": 0.84,
+      "with_reference": {
+        "MRR": 0.5671262343936257,
+        "R@1": 0.143,
+        "R@10": 0.996,
+        "R@5": 0.995,
+        "reference_rank_mean": 1.147,
+        "target_beats_reference": 0.144,
+        "target_reference_gap": -0.014988061785697938
+      }
+    },
+    "V_T": {
+      "masked_reference": {
+        "MRR": 0.9959502564102565,
+        "R@1": 0.994,
+        "R@10": 0.998,
+        "R@5": 0.998
+      },
+      "query_count": 1000,
+      "reference_induced_R@1_drop": 0.585,
+      "with_reference": {
+        "MRR": 0.7028598901098901,
+        "R@1": 0.409,
+        "R@10": 0.998,
+        "R@5": 0.998,
+        "reference_rank_mean": 1.414,
+        "target_beats_reference": 0.409,
+        "target_reference_gap": -0.0031271597146987915
+      }
+    }
+  },
+  "transcoded": {
+    "V_A_T": {
+      "masked_reference": {
+        "MRR": 0.9892458874458876,
+        "R@1": 0.984,
+        "R@10": 0.996,
+        "R@5": 0.995
+      },
+      "query_count": 1000,
+      "reference_induced_R@1_drop": 0.94,
+      "with_reference": {
+        "MRR": 0.5176762343936256,
+        "R@1": 0.044,
+        "R@10": 0.996,
+        "R@5": 0.994,
+        "reference_rank_mean": 1.044,
+        "target_beats_reference": 0.044,
+        "target_reference_gap": -0.02176069647073746
+      }
+    },
+    "V_T": {
+      "masked_reference": {
+        "MRR": 0.9949432234432235,
+        "R@1": 0.992,
+        "R@10": 0.998,
+        "R@5": 0.998
+      },
+      "query_count": 1000,
+      "reference_induced_R@1_drop": 0.806,
+      "with_reference": {
+        "MRR": 0.5910203703703703,
+        "R@1": 0.186,
+        "R@10": 0.998,
+        "R@5": 0.998,
+        "reference_rank_mean": 1.19,
+        "target_beats_reference": 0.186,
+        "target_reference_gap": -0.0066502164602279664
+      }
+    }
+  }
+}

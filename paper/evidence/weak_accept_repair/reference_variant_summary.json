@@ -1,0 +1,18 @@
+{
+  "accepted_missing_rate": true,
+  "complete_by_condition": {
+    "spatial": 1000,
+    "temporal": 1000,
+    "transcoded": 1000
+  },
+  "complete_count": 3000,
+  "condition_sample_ids_identical": true,
+  "expected_by_condition": {
+    "spatial": 1000,
+    "temporal": 1000,
+    "transcoded": 1000
+  },
+  "missing_count": 0,
+  "missing_rate": 0.0,
+  "planned_count": 3000
+}

@@ -1,0 +1,93 @@
+[
+  {
+    "file": "06_OmniCVR_A_Benchmark_for_Omni_Composed_Video_Retrieval.pdf",
+    "status": "failed",
+    "bytes": 0,
+    "error": "Error: HTTP 403"
+  },
+  {
+    "file": "07_CoVR_2_Automatic_Data_Construction_for_Composed_Video_Retrieval.pdf",
+    "status": "reused",
+    "bytes": 14624628
+  },
+  {
+    "file": "08_Composed_Video_Retrieval_via_Enriched_Context_and_Discriminative_Embeddings.pdf",
+    "status": "reused",
+    "bytes": 2837551
+  },
+  {
+    "file": "09_Beyond_Simple_Edits_Composed_Video_Retrieval_with_Dense_Modifications.pdf",
+    "status": "reused",
+    "bytes": 12812143
+  },
+  {
+    "file": "10_CoVR_R_Reason_Aware_Composed_Video_Retrieval.pdf",
+    "status": "reused",
+    "bytes": 31173218
+  },
+  {
+    "file": "11_Training_Free_Composed_Video_Retrieval_via_Video_LLM_Reasoning.pdf",
+    "status": "reused",
+    "bytes": 241194
+  },
+  {
+    "file": "12_ImageBind_One_Embedding_Space_To_Bind_Them_All.pdf",
+    "status": "reused",
+    "bytes": 5482135
+  },
+  {
+    "file": "13_Few_Shot_Composition_Learning_for_Image_Retrieval_with_Prompt_Tuning.pdf",
+    "status": "reused",
+    "bytes": 565999
+  },
+  {
+    "file": "14_Bi_Directional_Training_for_Composed_Image_Retrieval.pdf",
+    "status": "reused",
+    "bytes": 3655080
+  },
+  {
+    "file": "15_WavCaps_ChatGPT_Assisted_Weakly_Labelled_Audio_Captioning_Dataset.pdf",
+    "status": "reused",
+    "bytes": 1213807
+  },
+  {
+    "file": "16_AudioSetCaps_Automated_Audio_Caption_Generation_Pipeline.pdf",
+    "status": "reused",
+    "bytes": 6993725
+  },
+  {
+    "file": "17_ACAV100M_Automatic_Curation_of_Large_Scale_Audio_Visual_Datasets.pdf",
+    "status": "reused",
+    "bytes": 3081416
+  },
+  {
+    "file": "18_VGGSound_A_Large_Scale_Audio_Visual_Dataset.pdf",
+    "status": "reused",
+    "bytes": 647881
+  },
+  {
+    "file": "19_AVE_Audio_Visual_Event_Localization_in_Unconstrained_Videos.pdf",
+    "status": "reused",
+    "bytes": 562297
+  },
+  {
+    "file": "20_PinPoint_Composed_Retrieval_with_Explicit_Negatives.pdf",
+    "status": "reused",
+    "bytes": 5273117
+  },
+  {
+    "file": "21_FlatSounds_Benchmarking_Single_Factor_Physical_Video_to_Audio_Generation.pdf",
+    "status": "reused",
+    "bytes": 6634003
+  },
+  {
+    "file": "22_VGGSounder_Audio_Visual_Modal_Contribution_Labels.pdf",
+    "status": "reused",
+    "bytes": 9569462
+  },
+  {
+    "file": "23_Objects_That_Sound_Avoiding_Audio_Visual_Data_Shortcuts.pdf",
+    "status": "reused",
+    "bytes": 3014948
+  }
+]

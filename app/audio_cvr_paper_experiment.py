@@ -5,10 +5,12 @@ from collections import Counter, defaultdict
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
 import statistics
+import subprocess
 import sys
 from typing import Any, Iterable
 
@@ -620,6 +622,11 @@ def review_benchmark_omni(
     shard_count: int = 1,
     timeout_seconds: float = 180.0,
     omni_retries: int = 2,
+    audio_review_max_seconds: float = 0.0,
+    video_review_max_dimension: int = 0,
+    video_review_fps: float = 0.0,
+    skip_review_errors: bool = False,
+    retry_terminal_review_errors: bool = False,
     resume: bool = False,
     fail_on_error: bool = False,
 ) -> dict[str, Any]:
@@ -659,7 +666,15 @@ def review_benchmark_omni(
     completed_ids: set[str] = set()
     if resume and output_file.exists():
         existing_rows = _read_jsonl(output_file)
-        retained_rows = [row for row in existing_rows if str(row.get("decision") or "") != "error"]
+        retained_rows = [
+            row
+            for row in existing_rows
+            if str(row.get("decision") or "") != "error"
+            and not (
+                retry_terminal_review_errors
+                and bool(row.get("terminal_review_error"))
+            )
+        ]
         completed_ids = {_sample_id(row) for row in retained_rows}
         if len(retained_rows) != len(existing_rows):
             _write_jsonl(output_file, retained_rows)
@@ -682,9 +697,35 @@ def review_benchmark_omni(
         sample_id = _sample_id(row)
         if sample_id in completed_ids:
             continue
+        review_stage = "media_prepare"
         try:
             reference_path = _resolve_media_path(media_root_path, _first_text(row, ("reference_video", "reference_clip_path")))
             target_path = _resolve_media_path(media_root_path, _first_text(row, ("target_video", "target_clip_path")))
+            reference_review_video = reference_path
+            target_review_video = target_path
+            video_review_proxy: dict[str, Any] = {}
+            if int(video_review_max_dimension) > 0 or float(video_review_fps) > 0:
+                reference_review_video = _transcode_review_video_cache(
+                    video_path=reference_path,
+                    cache_dir=cache_root / "video_review_proxies",
+                    sample_id=sample_id,
+                    role="reference",
+                    max_dimension=int(video_review_max_dimension),
+                    fps=float(video_review_fps),
+                )
+                target_review_video = _transcode_review_video_cache(
+                    video_path=target_path,
+                    cache_dir=cache_root / "video_review_proxies",
+                    sample_id=sample_id,
+                    role="target",
+                    max_dimension=int(video_review_max_dimension),
+                    fps=float(video_review_fps),
+                )
+                video_review_proxy = {
+                    "max_dimension": int(video_review_max_dimension),
+                    "fps": float(video_review_fps),
+                    "purpose": "context_length_bounded_video_verification",
+                }
             reference_audio = _extract_audio_only_cache(
                 video_path=reference_path,
                 cache_dir=cache_root / "audio_only",
@@ -695,19 +736,54 @@ def review_benchmark_omni(
                 cache_dir=cache_root / "audio_only",
                 clip_id=f"{sample_id}_target",
             )
+            audio_review_window: dict[str, Any] = {}
+            if float(audio_review_max_seconds) > 0:
+                reference_start = _ave_review_audio_start(
+                    row,
+                    role="reference",
+                    max_seconds=float(audio_review_max_seconds),
+                )
+                target_start = _ave_review_audio_start(
+                    row,
+                    role="target",
+                    max_seconds=float(audio_review_max_seconds),
+                )
+                reference_audio = _trim_review_audio_cache(
+                    audio_path=reference_audio,
+                    cache_dir=cache_root / "audio_review_windows",
+                    sample_id=sample_id,
+                    role="reference",
+                    start_seconds=reference_start,
+                    max_seconds=float(audio_review_max_seconds),
+                )
+                target_audio = _trim_review_audio_cache(
+                    audio_path=target_audio,
+                    cache_dir=cache_root / "audio_review_windows",
+                    sample_id=sample_id,
+                    role="target",
+                    start_seconds=target_start,
+                    max_seconds=float(audio_review_max_seconds),
+                )
+                audio_review_window = {
+                    "max_seconds": float(audio_review_max_seconds),
+                    "reference_start_seconds": reference_start,
+                    "target_start_seconds": target_start,
+                    "purpose": "context_length_bounded_audio_only_verification",
+                }
             reference_silent = _extract_video_only_cache(
-                video_path=reference_path,
+                video_path=reference_review_video,
                 cache_dir=cache_root / "video_only",
                 clip_id=f"{sample_id}_reference",
             )
             target_silent = _extract_video_only_cache(
-                video_path=target_path,
+                video_path=target_review_video,
                 cache_dir=cache_root / "video_only",
                 clip_id=f"{sample_id}_target",
             )
             edit_text = str(row.get("edit_text") or row.get("audio_only_edit_text") or "").strip()
             proposal = _automatic_audio_proposal(row)
             local_gate = row.get("local_gate_report") if isinstance(row.get("local_gate_report"), dict) else {}
+            review_stage = "audio_only"
             audio_verify, raw_audio = _call_omni_with_retries(
                 label=f"benchmark_audio_only:{sample_id}:pass{review_pass_id}",
                 retries=int(omni_retries),
@@ -719,6 +795,7 @@ def review_benchmark_omni(
                     audio_only_proposal=proposal,
                 ),
             )
+            review_stage = "video_only"
             video_verify, raw_video = _call_omni_with_retries(
                 label=f"benchmark_video_only:{sample_id}:pass{review_pass_id}",
                 retries=int(omni_retries),
@@ -731,25 +808,27 @@ def review_benchmark_omni(
                     local_gate_report=local_gate,
                 ),
             )
+            review_stage = "full_av"
             full_av, raw_full_av = _call_omni_with_retries(
                 label=f"benchmark_full_av:{sample_id}:pass{review_pass_id}",
                 retries=int(omni_retries),
                 fail_on_transient=bool(fail_on_error),
                 func=lambda: client.verify_b_line_full_av_consistency(
-                    reference_clip_path=str(reference_path),
-                    target_clip_path=str(target_path),
+                    reference_clip_path=str(reference_review_video),
+                    target_clip_path=str(target_review_video),
                     edit_text=edit_text,
                     audio_only_evidence={"proposal": proposal, "verification": audio_verify},
                     local_gate_report=local_gate,
                 ),
             )
+            review_stage = "context"
             context, raw_context = _call_omni_with_retries(
                 label=f"benchmark_context:{sample_id}:pass{review_pass_id}",
                 retries=int(omni_retries),
                 fail_on_transient=bool(fail_on_error),
                 func=lambda: client.audit_audiocvr_benchmark_context(
-                    reference_clip_path=str(reference_path),
-                    target_clip_path=str(target_path),
+                    reference_clip_path=str(reference_review_video),
+                    target_clip_path=str(target_review_video),
                     edit_text=edit_text,
                     audio_only_evidence={"proposal": proposal, "verification": audio_verify},
                     review_pass_id=int(review_pass_id),
@@ -772,17 +851,30 @@ def review_benchmark_omni(
                     "raw_context_verification": raw_context,
                 }
             )
+            if audio_review_window:
+                review["audio_review_window"] = audio_review_window
+            if video_review_proxy:
+                review["video_review_proxy"] = video_review_proxy
         except Exception as exc:
             if fail_on_error:
                 raise
+            terminal_skip = bool(skip_review_errors)
             review = {
                 "sample_id": sample_id,
                 "reviewer_type": "omni",
                 "review_profile": AUTOMATIC_REVIEW_PROFILE,
                 "review_pass_id": int(review_pass_id),
                 "model": model,
-                "decision": "error",
-                "reject_reasons": [f"review_error:{type(exc).__name__}:{exc}"],
+                "decision": "reject" if terminal_skip else "error",
+                "reject_reasons": [
+                    (
+                        "review_skipped_after_error"
+                        if terminal_skip
+                        else "review_error"
+                    )
+                    + f":{review_stage}:{type(exc).__name__}:{exc}"
+                ],
+                "terminal_review_error": terminal_skip,
             }
         _append_jsonl(output_file, review)
         decision_counts[str(review.get("decision") or "unknown")] += 1
@@ -1191,26 +1283,36 @@ def finalize_fixed_test_fill(
     candidate_path: str | Path,
     pass1_review_paths: Iterable[str | Path],
     pass2_review_paths: Iterable[str | Path],
+    preverified_candidate_paths: Iterable[str | Path] = (),
     output_dir: str | Path,
     exclude_paths: Iterable[str | Path] = (),
     target_count: int = 1000,
     max_speech_count: int = 50,
     sound_event_ratio: float = 0.80,
     repeat_review_fraction: float = 0.20,
+    repeat_review_policy: str = "gate",
     random_seed: int = 20260720,
 ) -> dict[str, Any]:
-    """Extend a fixed test set with source-disjoint Omni-consensus candidates."""
+    """Extend a fixed test set with reviewed or construction-preverified candidates."""
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     fixed_path = Path(fixed_test_path)
     fixed_original = _read_jsonl(fixed_path)
     candidates = _read_jsonl(Path(candidate_path))
+    preverified_paths = tuple(Path(path) for path in preverified_candidate_paths)
+    preverified_rows = [
+        _normalize_automatic_pool_row(row, input_path=path)
+        for path in preverified_paths
+        for row in _read_jsonl(path)
+    ]
     if not fixed_original or not candidates:
         raise ValueError("fixed-test finalization requires non-empty fixed test and candidates")
     if int(target_count) < len(fixed_original):
         raise ValueError("target_count cannot be smaller than the fixed test")
     if not 0.0 <= float(sound_event_ratio) <= 1.0:
         raise ValueError("sound_event_ratio must be in [0, 1]")
+    if repeat_review_policy not in {"gate", "audit_only"}:
+        raise ValueError("repeat_review_policy must be gate or audit_only")
 
     fixed_normalized = [
         _normalize_automatic_pool_row(row, input_path=fixed_path) for row in fixed_original
@@ -1235,6 +1337,13 @@ def finalize_fixed_test_fill(
     if not pass1:
         raise ValueError("fixed-test fill finalization requires pass-1 reviews")
     candidate_by_id = {_sample_id(row): row for row in candidates}
+    preverified_by_id: dict[str, dict[str, Any]] = {}
+    for row in preverified_rows:
+        sample_id = _sample_id(row)
+        if not sample_id or sample_id in candidate_by_id or sample_id in preverified_by_id:
+            continue
+        preverified_by_id[sample_id] = row
+    candidate_by_id.update(preverified_by_id)
     repeat_ids = _deterministic_repeat_ids(
         [
             candidate_by_id[sample_id]
@@ -1251,17 +1360,24 @@ def finalize_fixed_test_fill(
     for sample_id, row in candidate_by_id.items():
         first = pass1.get(sample_id)
         if first is None:
-            rejection_counts["missing_pass1_review"] += 1
-            continue
-        reason = _automatic_consensus_reject_reason(
-            first, pass2.get(sample_id), repeated=sample_id in repeat_ids
-        )
-        enriched = _row_with_automatic_review(
-            row, first, pass2.get(sample_id), consensus_reason=reason
-        )
+            if sample_id not in preverified_by_id:
+                rejection_counts["missing_pass1_review"] += 1
+                continue
+            reason = _construction_preverified_reject_reason(row)
+            enriched = _row_with_construction_verification(row, reject_reason=reason)
+        else:
+            reason = _automatic_consensus_reject_reason(
+                first,
+                pass2.get(sample_id),
+                repeated=sample_id in repeat_ids and repeat_review_policy == "gate",
+            )
+            enriched = _row_with_automatic_review(
+                row, first, pass2.get(sample_id), consensus_reason=reason
+            )
+            enriched["repeat_review_policy"] = repeat_review_policy
         if reason:
             rejection_counts[reason] += 1
-            if _automatic_review_is_diagnostic(first, pass2.get(sample_id)):
+            if first is None or _automatic_review_is_diagnostic(first, pass2.get(sample_id)):
                 diagnostic_rows.append(enriched)
             continue
         if _row_overlaps_identities(enriched, protected_identities):
@@ -1313,6 +1429,8 @@ def finalize_fixed_test_fill(
         "target_count": int(target_count),
         "fixed_test_count": len(fixed_original),
         "exclude_paths": [str(path) for path in protected_paths],
+        "preverified_candidate_paths": [str(path) for path in preverified_paths],
+        "preverified_candidate_count": len(preverified_by_id),
         "protected_exclude_count": len(protected_rows),
         "candidate_count": len(candidates),
         "consensus_eligible_count": len(consensus_rows),
@@ -1321,6 +1439,7 @@ def finalize_fixed_test_fill(
         "shortfall": max(0, int(target_count) - len(final_rows)),
         "max_speech_count": int(max_speech_count),
         "sound_event_ratio": float(sound_event_ratio),
+        "repeat_review_policy": repeat_review_policy,
         "fixed_subtypes": dict(sorted(fixed_counts.items())),
         "eligible_subtypes": dict(
             sorted(Counter(_canonical_subtype(row) for row in consensus_rows).items())
@@ -1378,6 +1497,8 @@ def finalize_fixed_test_fill(
         "fixed_test_count": len(fixed_original),
         "exclude_paths": [str(path) for path in protected_paths],
         "candidate_path": str(candidate_path),
+        "preverified_candidate_paths": [str(path) for path in preverified_paths],
+        "repeat_review_policy": repeat_review_policy,
         "test_target_count": int(target_count),
         "test_final_count": len(final_rows),
         "test_subtype_distribution": capacity_summary["final_subtypes"],
@@ -2022,6 +2143,88 @@ def _row_with_automatic_review(
     else:
         output["split_tier"] = "diagnostic"
         output["benchmark_eligible"] = False
+    return output
+
+
+def _construction_preverified_reject_reason(row: dict[str, Any]) -> str:
+    """Validate a prior B-line acceptance without pretending it is a repeat review."""
+    if _canonical_subtype(row) not in {"sound_event", "music"}:
+        return "construction_preverified_non_speech_only"
+    if not _truthy(row.get("final_omni_accept")):
+        return "construction_final_omni_not_accepted"
+    if not _truthy(row.get("local_gate_passed")):
+        return "construction_local_gate_failed"
+    if _truthy(row.get("fallback")) or _truthy(row.get("fallback_used")):
+        return "construction_fallback_used"
+
+    audio = row.get("audio_only_verification")
+    if not isinstance(audio, dict) or not _truthy(audio.get("accept")):
+        return "construction_audio_only_not_accepted"
+    if _truthy(audio.get("reference_satisfies_edit")):
+        return "construction_reference_satisfies_edit"
+    if not _truthy(audio.get("target_satisfies_edit")):
+        return "construction_target_does_not_satisfy_edit"
+    if not _truthy(audio.get("edit_text_audio_only")):
+        return "construction_edit_not_audio_only"
+
+    video = row.get("video_only_shortcut")
+    if not isinstance(video, dict):
+        return "construction_video_only_review_missing"
+    if _truthy(video.get("can_identify_target_without_audio")):
+        return "construction_video_only_shortcut"
+    if not _truthy(video.get("visual_context_preserved")):
+        return "construction_visual_context_not_preserved"
+
+    full_av = row.get("full_av_consistency")
+    if not isinstance(full_av, dict) or not _truthy(full_av.get("accept")):
+        return "construction_full_av_not_accepted"
+    if not _truthy(full_av.get("audio_edit_still_valid")):
+        return "construction_audio_edit_invalid_in_full_av"
+    return ""
+
+
+def _row_with_construction_verification(
+    row: dict[str, Any], *, reject_reason: str
+) -> dict[str, Any]:
+    output = dict(row)
+    final_review = row.get("final_omni_verification")
+    final_review = final_review if isinstance(final_review, dict) else {}
+    local_report = row.get("local_gate_report")
+    local_report = local_report if isinstance(local_report, dict) else {}
+    output["reviewer_type"] = "omni_construction_pipeline"
+    output["review_profile"] = str(
+        row.get("acceptance_profile") or "b_audio_blind_review_v2"
+    )
+    output["human_validated"] = False
+    output["model_verified"] = not bool(reject_reason)
+    output["construction_preverified"] = True
+    output["automatic_review_consensus"] = None
+    output["automatic_consensus_reasons"] = [reject_reason] if reject_reason else []
+    output["repeat_review_policy"] = "not_selected_for_repeat_audit"
+    output["min_stage_confidence"] = min(
+        float(row.get("confidence") or 0.0),
+        float(final_review.get("confidence") or 0.0),
+    )
+    output["video_context_strength"] = float(
+        row.get("video_context_strength")
+        or final_review.get("video_context_strength")
+        or local_report.get("video_context_strength")
+        or 0.0
+    )
+    output["recomputed_asr_risk"] = float(
+        row.get("asr_degeneracy_risk")
+        or final_review.get("asr_degeneracy_risk")
+        or local_report.get("asr_degeneracy_risk")
+        or 0.0
+    )
+    output["transcript_like"] = False
+    output["full_av_required"] = True
+    if reject_reason:
+        output["split_tier"] = "diagnostic"
+        output["benchmark_eligible"] = False
+    else:
+        output["split_tier"] = "main"
+        output["benchmark_eligible"] = True
     return output
 
 
@@ -2782,6 +2985,19 @@ def build_parser() -> argparse.ArgumentParser:
     automatic_review.add_argument("--shard-count", type=int, default=1)
     automatic_review.add_argument("--timeout-seconds", type=float, default=180.0)
     automatic_review.add_argument("--omni-retries", type=int, default=2)
+    automatic_review.add_argument("--audio-review-max-seconds", type=float, default=0.0)
+    automatic_review.add_argument("--video-review-max-dimension", type=int, default=0)
+    automatic_review.add_argument("--video-review-fps", type=float, default=0.0)
+    automatic_review.add_argument(
+        "--skip-review-errors",
+        action="store_true",
+        help="Record exhausted review errors as terminal rejects instead of retryable errors.",
+    )
+    automatic_review.add_argument(
+        "--retry-terminal-review-errors",
+        action="store_true",
+        help="On resume, retry rows previously recorded as terminal review errors.",
+    )
     automatic_review.add_argument("--resume", action="store_true")
     automatic_review.add_argument("--fail-on-error", action="store_true")
 
@@ -2811,13 +3027,19 @@ def build_parser() -> argparse.ArgumentParser:
     fixed_fill_finalize.add_argument("--fixed-test-path", required=True)
     fixed_fill_finalize.add_argument("--candidate-path", required=True)
     fixed_fill_finalize.add_argument("--pass1-review-path", action="append", required=True)
-    fixed_fill_finalize.add_argument("--pass2-review-path", action="append", required=True)
+    fixed_fill_finalize.add_argument("--pass2-review-path", action="append", default=[])
+    fixed_fill_finalize.add_argument(
+        "--preverified-candidate-path", action="append", default=[]
+    )
     fixed_fill_finalize.add_argument("--exclude-path", action="append", default=[])
     fixed_fill_finalize.add_argument("--output-dir", required=True)
     fixed_fill_finalize.add_argument("--target-count", type=int, default=1000)
     fixed_fill_finalize.add_argument("--max-speech-count", type=int, default=50)
     fixed_fill_finalize.add_argument("--sound-event-ratio", type=float, default=0.80)
     fixed_fill_finalize.add_argument("--repeat-review-fraction", type=float, default=0.20)
+    fixed_fill_finalize.add_argument(
+        "--repeat-review-policy", choices=("gate", "audit_only"), default="gate"
+    )
     fixed_fill_finalize.add_argument("--random-seed", type=int, default=20260720)
 
     split_audit = subparsers.add_parser("audit-training-splits")
@@ -2961,6 +3183,11 @@ def main() -> None:
             shard_count=args.shard_count,
             timeout_seconds=args.timeout_seconds,
             omni_retries=args.omni_retries,
+            audio_review_max_seconds=args.audio_review_max_seconds,
+            video_review_max_dimension=args.video_review_max_dimension,
+            video_review_fps=args.video_review_fps,
+            skip_review_errors=args.skip_review_errors,
+            retry_terminal_review_errors=args.retry_terminal_review_errors,
             resume=args.resume,
             fail_on_error=args.fail_on_error,
         )
@@ -2987,12 +3214,14 @@ def main() -> None:
             candidate_path=args.candidate_path,
             pass1_review_paths=args.pass1_review_path,
             pass2_review_paths=args.pass2_review_path,
+            preverified_candidate_paths=args.preverified_candidate_path,
             exclude_paths=args.exclude_path,
             output_dir=args.output_dir,
             target_count=args.target_count,
             max_speech_count=args.max_speech_count,
             sound_event_ratio=args.sound_event_ratio,
             repeat_review_fraction=args.repeat_review_fraction,
+            repeat_review_policy=args.repeat_review_policy,
             random_seed=args.random_seed,
         )
     elif args.command == "audit-training-splits":
@@ -4067,6 +4296,173 @@ def _existing_min_stage_confidence(row: dict[str, Any]) -> float:
             except (TypeError, ValueError):
                 pass
     return min(values) if values else 0.0
+
+
+def _ave_review_audio_start(
+    row: dict[str, Any],
+    *,
+    role: str,
+    max_seconds: float,
+    clip_seconds: float = 6.0,
+) -> float:
+    if role not in {"reference", "target"}:
+        raise ValueError("role must be reference or target")
+    window = min(float(clip_seconds), max(0.1, float(max_seconds)))
+    latest_start = max(0.0, float(clip_seconds) - window)
+    try:
+        clip_start = float(row.get(f"{role}_start_seconds") or 0.0)
+        event_start = float(row.get("ave_event_start") or 0.0) - clip_start
+        event_end = float(row.get("ave_event_end") or 0.0) - clip_start
+    except (TypeError, ValueError):
+        return 0.0
+
+    starts: list[float] = []
+    current = 0.0
+    while current <= latest_start + 1e-9:
+        starts.append(round(current, 6))
+        current += 0.5
+    overlaps = [
+        (
+            max(0.0, min(start + window, event_end) - max(start, event_start)),
+            start,
+        )
+        for start in starts
+    ]
+    if role == "target":
+        return max(overlaps, key=lambda value: (value[0], -value[1]))[1]
+    return min(overlaps, key=lambda value: (value[0], value[1]))[1]
+
+
+def _trim_review_audio_cache(
+    *,
+    audio_path: Path,
+    cache_dir: Path,
+    sample_id: str,
+    role: str,
+    start_seconds: float,
+    max_seconds: float,
+) -> Path:
+    stat = audio_path.stat()
+    key = json.dumps(
+        {
+            "path": str(audio_path.resolve()),
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+            "role": role,
+            "start_seconds": round(float(start_seconds), 6),
+            "max_seconds": round(float(max_seconds), 6),
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_id).strip("_") or "sample"
+    output_path = cache_dir / f"{safe_id}_{role}_{digest}.wav"
+    if output_path.is_file() and output_path.stat().st_size > 0:
+        return output_path
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp.wav")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{float(start_seconds):.3f}",
+        "-i",
+        str(audio_path),
+        "-t",
+        f"{float(max_seconds):.3f}",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(temp_path),
+    ]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if not temp_path.is_file() or temp_path.stat().st_size <= 0:
+            raise RuntimeError("ffmpeg produced an empty review audio window")
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+    return output_path
+
+
+def _transcode_review_video_cache(
+    *,
+    video_path: Path,
+    cache_dir: Path,
+    sample_id: str,
+    role: str,
+    max_dimension: int,
+    fps: float,
+) -> Path:
+    stat = video_path.stat()
+    dimension = max(2, int(max_dimension))
+    frame_rate = max(0.1, float(fps))
+    key = json.dumps(
+        {
+            "path": str(video_path.resolve()),
+            "mtime_ns": stat.st_mtime_ns,
+            "size": stat.st_size,
+            "role": role,
+            "max_dimension": dimension,
+            "fps": round(frame_rate, 6),
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_id).strip("_") or "sample"
+    output_path = cache_dir / f"{safe_id}_{role}_{digest}.mp4"
+    if output_path.is_file() and output_path.stat().st_size > 0:
+        return output_path
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp.mp4")
+    video_filter = (
+        f"fps={frame_rate:g},"
+        f"scale={dimension}:{dimension}:force_original_aspect_ratio=decrease,"
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    )
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-vf",
+        video_filter,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "26",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "96k",
+        "-movflags",
+        "+faststart",
+        str(temp_path),
+    ]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if not temp_path.is_file() or temp_path.stat().st_size <= 0:
+            raise RuntimeError("ffmpeg produced an empty review video proxy")
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+    return output_path
 
 
 def _resolve_media_path(media_root: Path, value: str) -> Path:

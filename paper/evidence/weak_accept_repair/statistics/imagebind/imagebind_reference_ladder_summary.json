@@ -1,0 +1,16 @@
+{
+  "conditions": [
+    "exact",
+    "transcoded",
+    "temporal",
+    "spatial"
+  ],
+  "model": "ImageBind-Huge",
+  "modes": [
+    "V_T",
+    "V_A_T"
+  ],
+  "query_count": 1000,
+  "score_matrix_reused_for_masking": true,
+  "selection_uses_test_metrics": false
+}
